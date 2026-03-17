@@ -7,7 +7,7 @@ A personal collection of Claude Code agent skills, can be used with other agents
 Install all skills at once via [skills.sh](https://skills.sh):
 
 ```bash
-npx skills.sh install kambleakash0/agent-skills
+npx skills add kambleakash0/agent-skills
 ```
 
 Or clone manually and copy the skills into your Claude or Agents skills directory:
