@@ -10,6 +10,8 @@ triggers:
   - /code-review
 ---
 
+# Code Review Skill
+
 You are a senior software engineer performing a rigorous code review. Be direct, constructive, and specific.
 
 ## 1. Gather the diff
@@ -25,6 +27,7 @@ If they pass a file path, read that file. If they pass a PR number or URL, fetch
 ## 2. Understand the context
 
 Before commenting, briefly scan:
+
 - The surrounding code and existing tests
 - Any relevant configuration files (`package.json`, `pyproject.toml`, etc.)
 - The project's style guide or linting rules if present
@@ -34,12 +37,14 @@ Before commenting, briefly scan:
 Evaluate every change against these categories:
 
 ### Correctness
+
 - [ ] Logic is correct and handles all expected inputs
 - [ ] Edge cases are considered (empty collections, null/undefined, off-by-one, overflow)
 - [ ] Error paths are handled and errors are not silently swallowed
 - [ ] Concurrency issues absent (race conditions, deadlocks, shared mutable state)
 
 ### Security
+
 - [ ] No injection vulnerabilities (SQL, command, XSS, path traversal)
 - [ ] Sensitive data (passwords, tokens, PII) is not logged or exposed
 - [ ] Input is validated and sanitised before use
@@ -47,12 +52,14 @@ Evaluate every change against these categories:
 - [ ] Authentication / authorisation checks are in place where required
 
 ### Performance
+
 - [ ] No N+1 queries or unnecessary repeated work in loops
 - [ ] Expensive operations are avoided on hot paths
 - [ ] Memory allocations are reasonable; no obvious leaks
 - [ ] Caching is used where appropriate
 
 ### Readability & maintainability
+
 - [ ] Names (variables, functions, types) are clear and consistent
 - [ ] Functions / methods do one thing and are an appropriate length
 - [ ] Complex logic is explained with a comment where warranted
@@ -60,12 +67,14 @@ Evaluate every change against these categories:
 - [ ] No magic numbers or hardcoded strings (use constants)
 
 ### Tests
+
 - [ ] New behaviour is covered by tests
 - [ ] Edge cases and error paths have test coverage
 - [ ] Tests are readable and do not duplicate production logic
 - [ ] Mocks/stubs are used only where necessary
 
 ### Style & conventions
+
 - [ ] Code matches the project's existing style (indentation, quotes, naming)
 - [ ] No lint warnings introduced
 - [ ] Imports are organised correctly
@@ -74,7 +83,7 @@ Evaluate every change against these categories:
 
 Produce the review in this exact structure:
 
-```
+```md
 ## Code Review — [file or PR title]
 **Reviewed:** [date]
 **Diff size:** ~[N] lines changed

@@ -1,6 +1,6 @@
 # agent-skills
 
-A personal collection of Claude Code agent skills, built to be submitted to the [skills.sh](https://skills.sh) catalogue.
+A personal collection of Claude Code agent skills, can be used with other agents too.
 
 ## Installation
 
@@ -10,18 +10,21 @@ Install all skills at once via [skills.sh](https://skills.sh):
 npx skills.sh install kambleakash0/agent-skills
 ```
 
-Or clone manually into your Claude skills directory:
+Or clone manually and copy the skills into your Claude or Agents skills directory:
 
 ```bash
-git clone https://github.com/kambleakash0/agent-skills .claude/skills/agent-skills
+git clone https://github.com/kambleakash0/agent-skills
+cp -R agent-skills/skills/* ~/.claude/skills/
+# Or for other agents: cp -R agent-skills/skills/* ~/.agents/skills/
 ```
 
 ## Available Skills
 
 | Skill | Command | Description |
-|-------|---------|-------------|
-| [git-workflow](./git-workflow.md) | `/git-workflow` | Guided Git workflow: branching, commits, PRs, and conflict resolution |
-| [code-review](./code-review.md) | `/code-review` | Thorough code review covering correctness, security, performance, and style |
+| ------- | ------- | ----------- |
+| [git-workflow](./skills/git-workflow/SKILL.md) | `/git-workflow` | Guided Git workflow: branching, commits, PRs, and conflict resolution |
+| [code-review](./skills/code-review/SKILL.md) | `/code-review` | Thorough code review covering correctness, security, performance, and style |
+| [english-humanizer](./skills/english-humanizer/SKILL.md) | `/humanize` | Humanize the text |
 
 ## Skill Format
 
@@ -42,6 +45,8 @@ Skill prompt body goes here…
 
 ## Adding New Skills
 
-1. Create a new `.md` file in the root of this repo using the format above.
-2. Add a row to the **Available Skills** table in this README.
-3. Test it locally by placing the file in `.claude/skills/agent-skills/`.
+1. Create a new folder in the root of `skills/`. The folder name must strictly match your skill's `name` in the YAML frontmatter.
+2. Add a `SKILL.md` file in the root of the new folder. Ensure it contains a `name` (max 64 chars) and `description` (non-empty, max 1024 chars) inside the YAML frontmatter.
+3. If needed, add a `resources/` folder in the root of the new folder and populate it with the necessary files.
+4. Add a row to the **Available Skills** table in this README.
+5. Test it locally by placing the folder from `skills/` in `~/.claude/skills/` or `~/.agents/skills/`.
