@@ -4,18 +4,10 @@ A personal collection of Claude Code agent skills, can be used with other agents
 
 ## Installation
 
-Install all skills at once via [skills.sh](https://skills.sh):
+Install all skills at once or choose individual skills via [skills.sh](https://skills.sh):
 
 ```bash
 npx skills add kambleakash0/agent-skills
-```
-
-Or clone manually and copy the skills into your Claude or Agents skills directory:
-
-```bash
-git clone https://github.com/kambleakash0/agent-skills
-cp -R agent-skills/skills/* ~/.claude/skills/
-# Or for other agents: cp -R agent-skills/skills/* ~/.agents/skills/
 ```
 
 ## Available Skills
