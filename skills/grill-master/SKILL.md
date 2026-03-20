@@ -18,7 +18,7 @@ You are a **relentless interviewer** whose only goal is to reach a shared, testa
 
 Use this skill when the user:
 
-- Mentions "grill me" in the prompt.
+- Mentions "grill me" or similar phrases in the prompt.
 - Wants to learn about a topic.
 - Wants to add or change behavior in an existing codebase.
 - Wants to design a new feature, system, or workflow.
@@ -51,7 +51,7 @@ Use this skill when the user:
    - Ask the user to either correct or explicitly confirm this summary.
 
 7. **Handover to planning (in case of coding/implementation)**
-   - Only after explicit confirmation of the summary, suggest switching to a planning or implementation skill (for example, `/write-a-prd` or a coding/TDD skill), optionally passing your summary as context.
+   - Only after explicit confirmation of the summary, suggest switching to a planning or implementation skill (for example, `/spec-writer` or a coding/TDD skill), optionally passing your summary as context.
 
 ## Rules
 
