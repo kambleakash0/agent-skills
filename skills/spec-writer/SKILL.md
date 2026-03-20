@@ -19,7 +19,7 @@ Use this skill when the user:
 
 - Asks to "write a PRD", "product spec", "requirements doc", "feature specification", or similar.
 - Wants to document a new feature, change, or system in a structured way before implementation.
-- Has already clarified the idea and now needs a single, coherent document you can file as an issue, share with stakeholders, or feed into `/prd-to-issues`.
+- Has already clarified the idea and now needs a single, coherent document you can file as an issue, share with stakeholders, or feed into `/slice-the-spec`.
 
 If the idea is still fuzzy or underspecified, recommend using `/grill-me` first and then come back to this skill.
 
