@@ -2,14 +2,6 @@
 
 A personal collection of Claude Code agent skills, can be used with other agents too.
 
-## Installation
-
-Install all skills at once or choose individual skills via [skills.sh](https://skills.sh):
-
-```bash
-npx skills add kambleakash0/agent-skills
-```
-
 ## Available Skills
 
 | Skill | Command | Description |
@@ -17,6 +9,24 @@ npx skills add kambleakash0/agent-skills
 | [git-workflow](./skills/git-workflow/SKILL.md) | `/git-workflow` | Guided Git workflow: branching, commits, PRs, and conflict resolution |
 | [code-review](./skills/code-review/SKILL.md) | `/code-review` | Thorough code review covering correctness, security, performance, and style |
 | [english-humanizer](./skills/english-humanizer/SKILL.md) | `/humanize` | Humanize the text |
+| [grill-master](./skills/grill-master/SKILL.md) | `/grill`, `/grill-master`, `/grill-me` | Get relentlessly interviewed about a topic, plan or design until every branch of the decision tree is resolved. |
+
+## Installation via [skills.sh](https://skills.sh)
+
+Install all skills at once:
+
+```bash
+npx skills@latest add kambleakash0/agent-skills --all
+```
+
+or, install individual skills:
+
+```bash
+npx skills@latest add kambleakash0/agent-skills/skills/git-workflow
+npx skills@latest add kambleakash0/agent-skills/skills/code-review
+npx skills@latest add kambleakash0/agent-skills/skills/english-humanizer
+npx skills@latest add kambleakash0/agent-skills/skills/grill-master
+```
 
 ## Skill Format
 

@@ -6,6 +6,9 @@ description: >
   adherence to project conventions. Outputs prioritised, actionable feedback.
   TRIGGER when the user writes /code-review or asks for a code review, PR
   review, or feedback on their code.
+metadata:
+  author: kambleakash0
+  version: 1.0.0
 triggers:
   - /code-review
 ---

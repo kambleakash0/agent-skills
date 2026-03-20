@@ -5,6 +5,9 @@ description: >
   conventional commits, opening pull requests, resolving merge conflicts, and
   keeping history clean. TRIGGER when the user writes /git-workflow or asks
   for help with Git, branches, commits, PRs, or merge conflicts.
+metadata:
+  author: kambleakash0
+  version: 1.0.0
 triggers:
   - /git-workflow
 ---
