@@ -13,6 +13,7 @@ A personal collection of Claude Code agent skills, can be used with other agents
 | [spec-writer](./skills/spec-writer/SKILL.md) | `/spec`, `/spec-writer` | Create a PRD through user interview, codebase exploration, and module design, then submit as a GitHub issue. Use when user wants to write a PRD, create a product requirements document, or plan a new feature. |
 | [slice-the-spec](./skills/slice-the-spec/SKILL.md) | `/slice`, `/slice-the-spec` | Break a PRD into independently-grabbable GitHub issues using vertical slices. |
 | [incremental-tdd](./skills/incremental-tdd/SKILL.md) | `/tdd`, `/incremental-tdd` | Test-driven development with a red-green-refactor loop. Builds features or fixes bugs one vertical slice at a time. |
+| [deep-codebase-audit](./skills/deep-codebase-audit/SKILL.md) | `/deep-codebase-audit`, `/deep-audit`, `/codebase-audit` | Explore a codebase the way an AI agent experiences it: by reading files, following references, and trying to understand how to make safe changes. It surfaces architectural friction (shallow modules, tangled dependencies, missing seams) and suggests **deep-module** improvements that make the codebase easier to test, reason about, and modify with AI. |
 
 ## Installation via [skills.sh](https://skills.sh)
 
@@ -32,6 +33,7 @@ npx skills@latest add kambleakash0/agent-skills/skills/grill-master
 npx skills@latest add kambleakash0/agent-skills/skills/spec-writer
 npx skills@latest add kambleakash0/agent-skills/skills/slice-the-spec
 npx skills@latest add kambleakash0/agent-skills/skills/incremental-tdd
+npx skills@latest add kambleakash0/agent-skills/skills/deep-codebase-audit
 ```
 
 ## Skill Format
