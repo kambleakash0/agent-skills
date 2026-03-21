@@ -17,10 +17,10 @@ A personal collection of Claude Code agent skills, can be used with other agents
 
 ## Installation via [skills.sh](https://skills.sh)
 
-Install all skills at once:
+Install multiple skills at once:
 
 ```bash
-npx skills@latest add kambleakash0/agent-skills --all
+npx skills@latest add kambleakash0/agent-skills
 ```
 
 or, install individual skills:
