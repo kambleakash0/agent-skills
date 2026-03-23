@@ -136,3 +136,12 @@ A concise description of this vertical slice. Describe the **end-to-end behavior
 - ...
 
 <!-- Repeat for each phase -->
+```
+
+## Behavior and Rules
+
+1. Stay at the plan level. Do not drop into detailed implementation plans or specific file edits; that is work for execution skills like /tdd.
+2. Think in risk and value. Earlier phases should de-risk core architecture and ship something demoable quickly.
+3. Keep slices vertical. Avoid phases that are purely “set up database” or “build UI” without delivering end-to-end value.
+4. Make decisions explicit. Put durable architectural decisions in the plan header so downstream skills and humans can reuse them.
+5. Write for future you and agents. Plans should be readable, skimmable, and easy to hand to another engineer or AI agent as a starting point.

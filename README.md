@@ -15,6 +15,7 @@ A personal collection of Claude Code agent skills, can be used with other agents
 | [incremental-tdd](./skills/incremental-tdd/SKILL.md) | `/tdd`, `/incremental-tdd` | Test-driven development with a red-green-refactor loop. Builds features or fixes bugs one vertical slice at a time. |
 | [deep-codebase-audit](./skills/deep-codebase-audit/SKILL.md) | `/deep-codebase-audit`, `/deep-audit`, `/codebase-audit` | Explore a codebase the way an AI agent experiences it: by reading files, following references, and trying to understand how to make safe changes. It surfaces architectural friction (shallow modules, tangled dependencies, missing seams) and suggests **deep-module** improvements that make the codebase easier to test, reason about, and modify with AI. |
 | [spec-to-plan](./skills/spec-to-plan/SKILL.md) | `/spec-plan`, `/spec-to-plan` | Turn a PRD into a multi-phase implementation plan using tracer-bullet vertical slices. |
+| [domain-glossary](./skills/domain-glossary/SKILL.md) | `/domain-glossary`, `/glossary` | Turn an ongoing conversation into a **DDD-style ubiquitous language** document. It scans for domain terms, resolves ambiguities, proposes canonical names, and writes a living glossary to `DOMAIN_GLOSSARY.md` in the working directory. |
 
 ## Installation via [skills.sh](https://skills.sh)
 
@@ -36,6 +37,7 @@ npx skills@latest add kambleakash0/agent-skills/skills/slice-the-spec
 npx skills@latest add kambleakash0/agent-skills/skills/incremental-tdd
 npx skills@latest add kambleakash0/agent-skills/skills/deep-codebase-audit
 npx skills@latest add kambleakash0/agent-skills/skills/spec-to-plan
+npx skills@latest add kambleakash0/agent-skills/skills/domain-glossary
 ```
 
 ## Skill Format
