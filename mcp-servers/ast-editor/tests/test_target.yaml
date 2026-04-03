@@ -1,0 +1,5 @@
+project:
+  name: "ast-editor"
+  version: "1.0.0"
+dependencies:
+  tree-sitter: "^0.21.0"
