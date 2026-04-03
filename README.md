@@ -1,6 +1,6 @@
 # agent-skills
 
-A personal collection of Claude Code agent skills, can be used with other agents too.
+A personal collection of Claude Code agent skills and MCP servers, can be used with other agents too.
 
 ## Available Skills
 
@@ -17,6 +17,12 @@ A personal collection of Claude Code agent skills, can be used with other agents
 | [spec-to-plan](./skills/spec-to-plan/SKILL.md) | `/spec-plan`, `/spec-to-plan` | Turn a PRD into a multi-phase implementation plan using tracer-bullet vertical slices. |
 | [domain-glossary](./skills/domain-glossary/SKILL.md) | `/domain-glossary`, `/glossary` | Turn an ongoing conversation into a **DDD-style ubiquitous language** document. It scans for domain terms, resolves ambiguities, proposes canonical names, and writes a living glossary to `DOMAIN_GLOSSARY.md` in the working directory. |
 | [script-writer](./skills/script-writer/SKILL.md) | `/script-writer`, `/write-a-script` | Script-writer that drafts presentations, essays, emails, and slides using only the cognitive and persuasive heuristics from Patrick Winston's "How to Speak" lecture. |
+
+## MCP Servers
+
+| Server | Description |
+| ------ | ----------- |
+| [ast-editor](./mcp-servers/ast-editor/README.md) | AST-targeted code editing MCP server. Surgical edits via tree-sitter — no diffs, no search/replace, no file rewrites. Supports Python, JS, TS, JSON, YAML, and TOML. |
 
 ## Installation via [skills.sh](https://skills.sh)
 
