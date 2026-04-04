@@ -1,13 +1,21 @@
 import os
 from ast_editor.parser import TreeSitterParser
 
-class ApplierError(Exception): pass
+
+class ApplierError(Exception):
+    pass
+
 
 class Applier:
     def __init__(self, filepath: str):
         self.filepath = filepath
-        self.parser = TreeSitterParser(filepath)
-        
+        try:
+            self.parser = TreeSitterParser(filepath)
+        except ValueError as e:
+            # tree-sitter parser raises ValueError for unsupported extensions;
+            # convert to ApplierError so callers can distinguish user errors from internal ones.
+            raise ApplierError(str(e)) from e
+
         with open(filepath, "r", encoding="utf-8") as f:
             self.lines = f.read().splitlines()
 
@@ -23,7 +31,7 @@ class Applier:
             if not line.strip():
                 result.append(line)
             elif line.startswith(old_indent):
-                result.append(target_indent + line[len(old_indent):])
+                result.append(target_indent + line[len(old_indent) :])
             else:
                 result.append(target_indent + line.lstrip())
         return result
@@ -35,7 +43,7 @@ class Applier:
 
         # line indexing is 0-based
         start_line = node.start_point[0]
-        end_line = node.end_point[0] + 1 
+        end_line = node.end_point[0] + 1
 
         original_indent = self._get_indent(self.lines[start_line])
         content_lines = content.splitlines()
@@ -49,27 +57,16 @@ class Applier:
         node = self.parser.find_node_by_name(target)
         if not node:
             raise ApplierError(f"Target '{target}' not found")
-            
-        # Optional: Reindent multiline config values (like nested JSON objects)
-        content_lines = content.splitlines()
-        if len(content_lines) > 1:
-            key_indent = self._get_indent(self.lines[node.start_point[0]])
-            # For nested objects, we might want it indented one level deeper, but we'll trust the LLM's spacing or align it to the key.
-            # To be safe, mostly rely on the passed content for configs.
-            pass
-            
-        source_bytes = self.parser.source_code.encode('utf-8')
-        content_bytes = content.encode('utf-8')
-        
-        new_bytes = source_bytes[:node.start_byte] + content_bytes + source_bytes[node.end_byte:]
-        new_source = new_bytes.decode('utf-8')
-        
-        with open(self.filepath, "w", encoding="utf-8") as f:
-            f.write(new_source)
-            
-        # sync state
-        self.parser.source_code = new_source
-        self.lines = new_source.splitlines()
+
+        source_bytes = self.parser.source_bytes
+        content_bytes = content.encode("utf-8")
+
+        new_bytes = (
+            source_bytes[: node.start_byte]
+            + content_bytes
+            + source_bytes[node.end_byte :]
+        )
+        self._write_bytes(new_bytes)
         return "Update successful"
 
     def replace_function_body(self, target: str, content: str) -> str:
@@ -85,12 +82,15 @@ class Applier:
                     func_node = child
                     break
 
-        block_node = None
-        for child in func_node.children:
-            if child.type in ("block", "statement_block"):
-                block_node = child
-                break
-        
+        # Prefer the `body` field (works across Python, JS/TS, C/C++). Fall back to a
+        # children scan for edge cases.
+        block_node = func_node.child_by_field_name("body")
+        if not block_node:
+            for child in func_node.children:
+                if child.type in ("block", "statement_block", "compound_statement"):
+                    block_node = child
+                    break
+
         if not block_node:
             raise ApplierError(f"Could not find body block for target '{target}'")
 
@@ -104,10 +104,18 @@ class Applier:
                 start_line = block_node.start_point[0]
                 end_line = start_line + 1
 
-        target_indent = self._get_indent(self.lines[start_line]) if start_line < len(self.lines) else ""
-        if not target_indent and start_line < len(self.lines) and self.lines[start_line].strip() == "":
-             sig_indent = self._get_indent(self.lines[node.start_point[0]])
-             target_indent = sig_indent + ("    " if self.parser.ext == ".py" else "  ")
+        target_indent = (
+            self._get_indent(self.lines[start_line])
+            if start_line < len(self.lines)
+            else ""
+        )
+        if (
+            not target_indent
+            and start_line < len(self.lines)
+            and self.lines[start_line].strip() == ""
+        ):
+            sig_indent = self._get_indent(self.lines[node.start_point[0]])
+            target_indent = sig_indent + ("    " if self.parser.ext == ".py" else "  ")
 
         content_lines = self._reindent(content.splitlines(), target_indent)
 
@@ -118,29 +126,44 @@ class Applier:
         node = self.parser.find_node_by_name(class_target)
         if not node:
             raise ApplierError(f"Target class '{class_target}' not found")
-        
+
         if self.parser.ext != ".py":
-             insert_line = node.end_point[0]
-             indent = self._get_indent(self.lines[node.start_point[0]]) + "  "
+            # For non-Python, insert before the closing `}` of the class body.
+            # Prefer the body field (e.g., field_declaration_list in C++, class_body in JS/TS)
+            # so that trailing tokens like `;` after `}` are not pushed further down.
+            body = node.child_by_field_name("body")
+            insert_line = body.end_point[0] if body else node.end_point[0]
+            indent = self._get_indent(self.lines[node.start_point[0]]) + "  "
         else:
-             insert_line = node.end_point[0] + 1
-             indent = self._get_indent(self.lines[node.start_point[0]]) + "    "
+            insert_line = node.end_point[0] + 1
+            indent = self._get_indent(self.lines[node.start_point[0]]) + "    "
 
         content_lines = self._reindent(content.splitlines(), indent)
         if self.parser.ext != ".py":
-            self.lines = self.lines[:insert_line] + [""] + content_lines + [""] + self.lines[insert_line:]
+            self.lines = (
+                self.lines[:insert_line]
+                + [""]
+                + content_lines
+                + [""]
+                + self.lines[insert_line:]
+            )
         else:
-            self.lines = self.lines[:insert_line] + [""] + content_lines + self.lines[insert_line:]
+            self.lines = (
+                self.lines[:insert_line]
+                + [""]
+                + content_lines
+                + self.lines[insert_line:]
+            )
         return self._save()
-        
-    def delete_node(self, target: str) -> str:
+
+    def delete_symbol(self, target: str) -> str:
         node = self.parser.find_node_by_name(target)
         if not node:
             raise ApplierError(f"Target '{target}' not found")
-            
+
         start_line = node.start_point[0]
         end_line = node.end_point[0] + 1
-        
+
         self.lines = self.lines[:start_line] + self.lines[end_line:]
         return self._save()
 
@@ -151,3 +174,1517 @@ class Applier:
         with open(self.filepath, "w", encoding="utf-8") as f:
             f.write(new_source)
         return "Update successful"
+
+    def _import_node_types(self) -> tuple[str, ...]:
+        """Return the AST node types that represent import statements for this file's language."""
+        ext = self.parser.ext
+        if ext == ".py":
+            return (
+                "import_statement",
+                "import_from_statement",
+                "future_import_statement",
+            )
+        if ext in (".js", ".jsx", ".mjs", ".cjs", ".ts", ".tsx"):
+            return ("import_statement",)
+        if ext in (".c", ".h", ".cpp", ".cc", ".cxx", ".hpp", ".hxx", ".hh"):
+            return ("preproc_include",)
+        return ()
+
+    def add_import(self, import_text: str) -> str:
+        """
+        Add an import statement to the file. Accepts literal source text:
+          - Python: "import foo" or "from foo import bar"
+          - JS/TS:  "import { foo } from 'bar';"
+          - C/C++:  "#include <foo.h>"
+        Skips insertion if an identical import already exists.
+        Places the new import after existing imports, or at the top of the file if none exist.
+        """
+        valid_types = self._import_node_types()
+        if not valid_types:
+            raise ApplierError(
+                f"add_import is not supported for file type {self.parser.ext}"
+            )
+
+        stripped = import_text.strip()
+        for line in self.lines:
+            if line.strip() == stripped:
+                return "Import already exists -- no change made"
+
+        last_import_end = -1
+        for child in self.parser.tree.root_node.named_children:
+            if child.type in valid_types:
+                if child.end_point[0] > last_import_end:
+                    last_import_end = child.end_point[0]
+
+        if last_import_end >= 0:
+            insert_line = last_import_end + 1
+        else:
+            insert_line = 0
+
+        self.lines = self.lines[:insert_line] + [import_text] + self.lines[insert_line:]
+        return self._save()
+
+    def remove_import(self, import_text: str) -> str:
+        """
+        Remove a matching import statement from the file. Matches by stripped text content.
+        """
+        valid_types = self._import_node_types()
+        if not valid_types:
+            raise ApplierError(
+                f"remove_import is not supported for file type {self.parser.ext}"
+            )
+
+        stripped = import_text.strip()
+        for i, line in enumerate(self.lines):
+            if line.strip() == stripped:
+                self.lines = self.lines[:i] + self.lines[i + 1 :]
+                return self._save()
+
+        raise ApplierError(f"Import '{import_text}' not found in {self.filepath}")
+
+    def _refresh_parser_state(self) -> None:
+        """Re-parse the file after a byte-level mutation so subsequent edits see fresh AST."""
+        from ast_editor.parser import TreeSitterParser
+
+        self.parser = TreeSitterParser(self.filepath)
+        self.lines = self.parser.source_code.splitlines()
+
+    def _write_bytes(self, new_bytes: bytes) -> None:
+        """Write new source bytes to disk and refresh parser state."""
+        new_source = new_bytes.decode("utf-8")
+        if not new_source.endswith("\n"):
+            new_source += "\n"
+        with open(self.filepath, "w", encoding="utf-8") as f:
+            f.write(new_source)
+        self._refresh_parser_state()
+
+    def _find_json_object_at_path(self, dotted_path: str):
+        """Return the JSON object node at the dotted path, or the root object if path is empty."""
+        root = self.parser.tree.root_node
+        if not dotted_path:
+            for child in root.named_children:
+                if child.type == "object":
+                    return child
+            return None
+        value_node = self.parser._search_json_dotted(root, dotted_path)
+        if value_node and value_node.type == "object":
+            return value_node
+        return None
+
+    def _add_key_json(self, parent_target: str, key: str, value: str) -> str:
+        parent = self._find_json_object_at_path(parent_target)
+        if parent is None:
+            raise ApplierError(
+                f"JSON object at '{parent_target or '<root>'}' not found"
+            )
+
+        pairs = [c for c in parent.named_children if c.type == "pair"]
+        source_bytes = self.parser.source_bytes
+
+        if pairs:
+            last_pair = pairs[-1]
+            indent = self._get_indent(self.lines[last_pair.start_point[0]])
+            insertion = f',\n{indent}"{key}": {value}'
+            insert_byte = last_pair.end_byte
+        else:
+            # Empty object `{}` -- insert between braces
+            close_line = parent.end_point[0]
+            close_indent = (
+                self._get_indent(self.lines[close_line])
+                if close_line < len(self.lines)
+                else ""
+            )
+            inner_indent = close_indent + "  "
+            insertion = f'\n{inner_indent}"{key}": {value}\n{close_indent}'
+            insert_byte = parent.start_byte + 1  # immediately after `{`
+
+        new_bytes = (
+            source_bytes[:insert_byte]
+            + insertion.encode("utf-8")
+            + source_bytes[insert_byte:]
+        )
+        self._write_bytes(new_bytes)
+        return "Update successful"
+
+    def _add_key_yaml(self, parent_target: str, key: str, value: str) -> str:
+        root = self.parser.tree.root_node
+        if parent_target:
+            parent_value = self.parser._search_yaml_dotted(root, parent_target)
+            if parent_value is None:
+                raise ApplierError(f"YAML key '{parent_target}' not found")
+            # parent_value should be a block_node containing a block_mapping
+            block_mapping = None
+            if parent_value.type == "block_node":
+                for child in parent_value.named_children:
+                    if child.type == "block_mapping":
+                        block_mapping = child
+                        break
+            elif parent_value.type == "block_mapping":
+                block_mapping = parent_value
+            if block_mapping is None:
+                raise ApplierError(f"YAML value at '{parent_target}' is not a mapping")
+        else:
+            # Root: find top-level block_mapping
+            block_mapping = None
+            stack = [root]
+            while stack:
+                curr = stack.pop()
+                if curr.type == "block_mapping":
+                    block_mapping = curr
+                    break
+                stack.extend(curr.named_children)
+            if block_mapping is None:
+                raise ApplierError("No YAML mapping found at root")
+
+        pairs = [
+            c for c in block_mapping.named_children if c.type == "block_mapping_pair"
+        ]
+        if not pairs:
+            raise ApplierError(
+                "Cannot add key to empty YAML mapping (unsupported in v1)"
+            )
+
+        last_pair = pairs[-1]
+        indent = self._get_indent(self.lines[last_pair.start_point[0]])
+        insert_line = last_pair.end_point[0] + 1
+        new_line = f"{indent}{key}: {value}"
+        self.lines = self.lines[:insert_line] + [new_line] + self.lines[insert_line:]
+        return self._save()
+
+    def _add_key_toml(self, parent_target: str, key: str, value: str) -> str:
+        root = self.parser.tree.root_node
+        if parent_target:
+            # Find the table matching parent_target
+            table = None
+            queue = [root]
+            while queue:
+                curr = queue.pop(0)
+                if curr.type == "table":
+                    header = curr.named_children[0] if curr.named_children else None
+                    if header:
+                        name = self.parser.node_text(header).strip("[] \n")
+                        if name == parent_target:
+                            table = curr
+                            break
+                queue.extend(curr.named_children)
+            if table is None:
+                raise ApplierError(f"TOML table '[{parent_target}]' not found")
+            pairs = [c for c in table.named_children if c.type == "pair"]
+            if pairs:
+                last_pair = pairs[-1]
+                insert_line = last_pair.end_point[0] + 1
+                indent = self._get_indent(self.lines[last_pair.start_point[0]])
+            else:
+                # Empty table: insert on the line after the header
+                header = table.named_children[0]
+                insert_line = header.end_point[0] + 1
+                indent = ""
+        else:
+            # Root-level pair (before any table)
+            top_pairs = [c for c in root.named_children if c.type == "pair"]
+            if top_pairs:
+                last_pair = top_pairs[-1]
+                insert_line = last_pair.end_point[0] + 1
+                indent = self._get_indent(self.lines[last_pair.start_point[0]])
+            else:
+                insert_line = 0
+                indent = ""
+
+        new_line = f"{indent}{key} = {value}"
+        self.lines = self.lines[:insert_line] + [new_line] + self.lines[insert_line:]
+        return self._save()
+
+    def add_key(self, parent_target: str, key: str, value: str) -> str:
+        """
+        Add a new key-value pair inside a container:
+          - JSON objects / YAML mappings / TOML tables (via dotted path to parent)
+          - Python module-level dict literals (parent_target is the variable name)
+        """
+        ext = self.parser.ext
+        if ext == ".json":
+            return self._add_key_json(parent_target, key, value)
+        if ext in (".yml", ".yaml"):
+            return self._add_key_yaml(parent_target, key, value)
+        if ext == ".toml":
+            return self._add_key_toml(parent_target, key, value)
+        if ext == ".py":
+            return self.add_dict_entry(parent_target, key, value)
+        raise ApplierError(f"add_key is not supported for {ext}")
+
+    def _find_config_pair_by_path(self, dotted_path: str):
+        """Find the key-value pair node for a dotted path in JSON/YAML/TOML."""
+        root = self.parser.tree.root_node
+        ext = self.parser.ext
+        if ext == ".json":
+            value_node = self.parser._search_json_dotted(root, dotted_path)
+            if value_node and value_node.parent and value_node.parent.type == "pair":
+                return value_node.parent
+        elif ext in (".yml", ".yaml"):
+            value_node = self.parser._search_yaml_dotted(root, dotted_path)
+            if value_node:
+                p = value_node.parent
+                while p and p.type != "block_mapping_pair":
+                    p = p.parent
+                return p
+        elif ext == ".toml":
+            value_node = self.parser._search_toml_dotted(root, dotted_path)
+            if value_node and value_node.parent and value_node.parent.type == "pair":
+                return value_node.parent
+        return None
+
+    def delete_key(self, target: str) -> str:
+        """
+        Delete a key-value pair from a container:
+          - JSON / YAML / TOML config files (dotted path to key)
+          - Python module-level dict literals (target is 'DictName' + '.' + key-literal,
+            e.g. 'CONFIG."foo"'). For simplicity, Python callers should pass the dict
+            variable name as target and provide the key through the separate path.
+
+        For JSON, also removes the adjacent comma to keep the file valid.
+        """
+        ext = self.parser.ext
+        if ext == ".py":
+            # Expect target to be 'DictName.keyExpr' -- split on last '.'
+            if "." not in target:
+                raise ApplierError(
+                    f"For Python dicts, target must be 'DictName.keyExpr' (e.g. 'CONFIG.\"foo\"'), got '{target}'"
+                )
+            dict_name, key_part = target.rsplit(".", 1)
+            return self.delete_dict_entry(dict_name, key_part)
+
+        if ext not in (".json", ".yml", ".yaml", ".toml"):
+            raise ApplierError(
+                f"delete_key is only supported for config files or .py, not {ext}"
+            )
+
+        pair = self._find_config_pair_by_path(target)
+        if pair is None:
+            raise ApplierError(f"Key '{target}' not found in {self.filepath}")
+
+        if ext == ".json":
+            parent = pair.parent
+            sibling_pairs = [c for c in parent.named_children if c.type == "pair"]
+            idx = sibling_pairs.index(pair)
+
+            source_bytes = self.parser.source_bytes
+            start = pair.start_byte
+            end = pair.end_byte
+
+            if idx > 0:
+                prev_pair = sibling_pairs[idx - 1]
+                start = prev_pair.end_byte
+            elif idx + 1 < len(sibling_pairs):
+                next_pair = sibling_pairs[idx + 1]
+                end = next_pair.start_byte
+
+            new_bytes = source_bytes[:start] + source_bytes[end:]
+            self._write_bytes(new_bytes)
+            return "Update successful"
+
+        # YAML / TOML: remove the pair's line(s)
+        start_line = pair.start_point[0]
+        end_line = pair.end_point[0] + 1
+        self.lines = self.lines[:start_line] + self.lines[end_line:]
+        return self._save()
+
+    def _resolve_yaml_value(self, value_node):
+        """Unwrap a YAML block_node/flow_node to get the underlying collection (block_sequence, flow_sequence, block_mapping, flow_mapping)."""
+        if value_node is None:
+            return None
+        if value_node.type in (
+            "block_sequence",
+            "flow_sequence",
+            "block_mapping",
+            "flow_mapping",
+        ):
+            return value_node
+        for child in value_node.named_children:
+            inner = self._resolve_yaml_value(child)
+            if inner:
+                return inner
+        return None
+
+    def append_to_array(self, target: str, value: str) -> str:
+        """
+        Append a value to an array/list:
+          - JSON arrays / YAML sequences / TOML arrays (via dotted path to array)
+          - Python module-level list literals (target is the variable name)
+        """
+        ext = self.parser.ext
+        if ext == ".py":
+            return self.append_to_list(target, value)
+
+        root = self.parser.tree.root_node
+
+        if ext == ".json":
+            arr = self.parser._search_json_dotted(root, target)
+            if arr is None or arr.type != "array":
+                raise ApplierError(f"JSON array at '{target}' not found")
+            elements = [c for c in arr.named_children]
+            source_bytes = self.parser.source_bytes
+            if elements:
+                last = elements[-1]
+                indent = self._get_indent(self.lines[last.start_point[0]])
+                insertion = f",\n{indent}{value}"
+                insert_byte = last.end_byte
+            else:
+                close_line = arr.end_point[0]
+                close_indent = (
+                    self._get_indent(self.lines[close_line])
+                    if close_line < len(self.lines)
+                    else ""
+                )
+                inner_indent = close_indent + "  "
+                insertion = f"\n{inner_indent}{value}\n{close_indent}"
+                insert_byte = arr.start_byte + 1
+            new_bytes = (
+                source_bytes[:insert_byte]
+                + insertion.encode("utf-8")
+                + source_bytes[insert_byte:]
+            )
+            self._write_bytes(new_bytes)
+            return "Update successful"
+
+        if ext == ".toml":
+            arr = self.parser._search_toml_dotted(root, target)
+            if arr is None or arr.type != "array":
+                raise ApplierError(
+                    f"TOML array at '{target}' not found (is it an inline array?)"
+                )
+            elements = [c for c in arr.named_children]
+            source_bytes = self.parser.source_bytes
+            if elements:
+                last = elements[-1]
+                if arr.start_point[0] == arr.end_point[0]:
+                    insertion = f", {value}"
+                    insert_byte = last.end_byte
+                else:
+                    indent = self._get_indent(self.lines[last.start_point[0]])
+                    insertion = f",\n{indent}{value}"
+                    insert_byte = last.end_byte
+            else:
+                insertion = f"{value}"
+                insert_byte = arr.start_byte + 1
+            new_bytes = (
+                source_bytes[:insert_byte]
+                + insertion.encode("utf-8")
+                + source_bytes[insert_byte:]
+            )
+            self._write_bytes(new_bytes)
+            return "Update successful"
+
+        if ext in (".yml", ".yaml"):
+            value_node = self.parser._search_yaml_dotted(root, target)
+            collection = self._resolve_yaml_value(value_node)
+            if collection is None or collection.type not in (
+                "block_sequence",
+                "flow_sequence",
+            ):
+                raise ApplierError(f"YAML sequence at '{target}' not found")
+            if collection.type == "flow_sequence":
+                elements = [c for c in collection.named_children]
+                source_bytes = self.parser.source_bytes
+                if elements:
+                    insertion = f", {value}"
+                    insert_byte = elements[-1].end_byte
+                else:
+                    insertion = f"{value}"
+                    insert_byte = collection.start_byte + 1
+                new_bytes = (
+                    source_bytes[:insert_byte]
+                    + insertion.encode("utf-8")
+                    + source_bytes[insert_byte:]
+                )
+                self._write_bytes(new_bytes)
+                return "Update successful"
+            items = [
+                c for c in collection.named_children if c.type == "block_sequence_item"
+            ]
+            if not items:
+                raise ApplierError(
+                    "Cannot append to empty YAML block sequence (unsupported in v1)"
+                )
+            last = items[-1]
+            indent = self._get_indent(self.lines[last.start_point[0]])
+            insert_line = last.end_point[0] + 1
+            self.lines = (
+                self.lines[:insert_line]
+                + [f"{indent}- {value}"]
+                + self.lines[insert_line:]
+            )
+            return self._save()
+
+        raise ApplierError(f"append_to_array is not supported for {ext}")
+
+    def remove_from_array(self, target: str, value_match: str) -> str:
+        """
+        Remove the first element matching value_match (stripped text equality) from
+        an array/list in a config file OR a Python module-level list literal.
+        """
+        ext = self.parser.ext
+        if ext == ".py":
+            return self.remove_from_list(target, value_match)
+
+        root = self.parser.tree.root_node
+        stripped_match = value_match.strip()
+
+        def _remove_element_bytes(arr_node, elements):
+            if not elements:
+                raise ApplierError(f"Array at '{target}' is empty")
+            idx = None
+            for i, el in enumerate(elements):
+                text = self.parser.node_text(el).strip()
+                if text == stripped_match:
+                    idx = i
+                    break
+            if idx is None:
+                raise ApplierError(
+                    f"Value '{value_match}' not found in array at '{target}'"
+                )
+            source_bytes = self.parser.source_bytes
+            start = elements[idx].start_byte
+            end = elements[idx].end_byte
+            if idx > 0:
+                start = elements[idx - 1].end_byte
+            elif idx + 1 < len(elements):
+                end = elements[idx + 1].start_byte
+            new_bytes = source_bytes[:start] + source_bytes[end:]
+            self._write_bytes(new_bytes)
+
+        if ext == ".json":
+            arr = self.parser._search_json_dotted(root, target)
+            if arr is None or arr.type != "array":
+                raise ApplierError(f"JSON array at '{target}' not found")
+            _remove_element_bytes(arr, [c for c in arr.named_children])
+            return "Update successful"
+
+        if ext == ".toml":
+            arr = self.parser._search_toml_dotted(root, target)
+            if arr is None or arr.type != "array":
+                raise ApplierError(f"TOML array at '{target}' not found")
+            _remove_element_bytes(arr, [c for c in arr.named_children])
+            return "Update successful"
+
+        if ext in (".yml", ".yaml"):
+            value_node = self.parser._search_yaml_dotted(root, target)
+            collection = self._resolve_yaml_value(value_node)
+            if collection is None or collection.type not in (
+                "block_sequence",
+                "flow_sequence",
+            ):
+                raise ApplierError(f"YAML sequence at '{target}' not found")
+            if collection.type == "flow_sequence":
+                _remove_element_bytes(
+                    collection, [c for c in collection.named_children]
+                )
+                return "Update successful"
+            items = [
+                c for c in collection.named_children if c.type == "block_sequence_item"
+            ]
+            match_idx = None
+            for i, it in enumerate(items):
+                text = self.parser.node_text(it).strip().lstrip("-").strip()
+                if text == stripped_match:
+                    match_idx = i
+                    break
+            if match_idx is None:
+                raise ApplierError(
+                    f"Value '{value_match}' not found in YAML sequence at '{target}'"
+                )
+            start_line = items[match_idx].start_point[0]
+            end_line = items[match_idx].end_point[0] + 1
+            self.lines = self.lines[:start_line] + self.lines[end_line:]
+            return self._save()
+
+        raise ApplierError(f"remove_from_array is not supported for {ext}")
+
+    def add_field(self, class_target: str, content: str) -> str:
+        """
+        Add a field/attribute/member at the top of a class body. For Python this
+        is a class-level attribute; for JS/TS a class field; for C++ a member
+        variable. Inserts before any existing methods/fields, matching the
+        fields-before-methods convention.
+        """
+        node = self.parser.find_node_by_name(class_target)
+        if not node:
+            raise ApplierError(f"Target class '{class_target}' not found")
+
+        body = node.child_by_field_name("body")
+        if body is None:
+            raise ApplierError(f"Could not find class body for '{class_target}'")
+
+        if self.parser.ext == ".py":
+            # Python block: body.start_point[0] is the first statement inside the class
+            insert_line = body.start_point[0]
+            indent = (
+                self._get_indent(self.lines[insert_line])
+                if insert_line < len(self.lines)
+                else ""
+            )
+            if not indent:
+                # Fallback: class indent + 4
+                class_indent = self._get_indent(self.lines[node.start_point[0]])
+                indent = class_indent + "    "
+        else:
+            # JS/TS class_body / C++ field_declaration_list: body.start_point[0] is the `{` line
+            insert_line = body.start_point[0] + 1
+            indent = ""
+            for i in range(insert_line, min(len(self.lines), body.end_point[0])):
+                stripped = self.lines[i].strip()
+                if stripped and stripped not in (
+                    "{",
+                    "}",
+                    "public:",
+                    "private:",
+                    "protected:",
+                ):
+                    indent = self._get_indent(self.lines[i])
+                    break
+            if not indent:
+                class_indent = self._get_indent(self.lines[node.start_point[0]])
+                indent = class_indent + (
+                    "    "
+                    if self.parser.ext in (".ts", ".tsx", ".js", ".jsx", ".mjs", ".cjs")
+                    else "    "
+                )
+
+        content_lines = self._reindent(content.splitlines(), indent)
+        self.lines = self.lines[:insert_line] + content_lines + self.lines[insert_line:]
+        return self._save()
+
+    def replace_signature(self, target: str, new_signature: str) -> str:
+        """
+        Replace only the signature of a function (everything before its body),
+        preserving the body. The new_signature should include any trailing
+        punctuation expected by the language (e.g. ':' for Python, '(' style
+        for JS/C/C++). Decorators are preserved.
+        """
+        node = self.parser.find_node_by_name(target)
+        if not node:
+            raise ApplierError(f"Target '{target}' not found in {self.filepath}")
+
+        func_node = node
+        if node.type == "decorated_definition":
+            for child in node.named_children:
+                if child.type == "function_definition":
+                    func_node = child
+                    break
+
+        body = func_node.child_by_field_name("body")
+        if body is None:
+            raise ApplierError(f"Could not find body for target '{target}'")
+
+        sig_end = func_node.start_byte
+        for child in func_node.children:
+            if child == body:
+                break
+            sig_end = child.end_byte
+
+        source_bytes = self.parser.source_bytes
+        new_bytes = (
+            source_bytes[: func_node.start_byte]
+            + new_signature.encode("utf-8")
+            + source_bytes[sig_end:]
+        )
+        self._write_bytes(new_bytes)
+        return "Update successful"
+
+    def list_symbols(self) -> str:
+        """
+        Return a formatted outline of top-level functions, classes, and methods in
+        the file. Read-only. Output is a multi-line string: one entry per line,
+        formatted as `<type> <name> (line N)`.
+        """
+        ext = self.parser.ext
+        root = self.parser.tree.root_node
+
+        if ext == ".py":
+            class_types = {"class_definition"}
+            func_types = {"function_definition", "decorated_definition"}
+        elif ext in (".ts", ".tsx"):
+            class_types = {"class_declaration", "interface_declaration"}
+            func_types = {"function_declaration", "method_definition"}
+        elif ext in (".js", ".jsx", ".mjs", ".cjs"):
+            class_types = {"class_declaration"}
+            func_types = {"function_declaration", "method_definition"}
+        elif ext in (".c", ".h"):
+            class_types = {"struct_specifier", "union_specifier", "enum_specifier"}
+            func_types = {"function_definition"}
+        elif ext in (".cpp", ".cc", ".cxx", ".hpp", ".hxx", ".hh"):
+            class_types = {
+                "class_specifier",
+                "struct_specifier",
+                "union_specifier",
+                "enum_specifier",
+                "namespace_definition",
+            }
+            func_types = {"function_definition"}
+        else:
+            raise ApplierError(f"list_symbols is not supported for file type {ext}")
+
+        def get_name(node):
+            # Decorated python function
+            inner = node
+            if node.type == "decorated_definition":
+                for c in node.named_children:
+                    if c.type == "function_definition":
+                        inner = c
+                        break
+            name_node = inner.child_by_field_name("name")
+            if name_node is None and inner.type == "function_definition":
+                name_node = (
+                    self.parser._extract_c_function_name(inner)
+                    if hasattr(self.parser, "_extract_c_function_name")
+                    else None
+                )
+            if name_node is None:
+                return "<anonymous>"
+            return self.parser.node_text(name_node)
+
+        def walk_class_methods(class_node):
+            body = class_node.child_by_field_name("body")
+            if body is None:
+                return []
+            methods = []
+            for child in body.named_children:
+                if child.type in func_types:
+                    methods.append((get_name(child), child.start_point[0] + 1))
+            return methods
+
+        lines_out = []
+        for child in root.named_children:
+            if child.type in class_types:
+                name = get_name(child)
+                kind = (
+                    "class"
+                    if child.type
+                    in ("class_definition", "class_declaration", "class_specifier")
+                    else child.type
+                )
+                lines_out.append(f"{kind} {name} (line {child.start_point[0] + 1})")
+                for mname, mline in walk_class_methods(child):
+                    lines_out.append(f"  method {name}.{mname} (line {mline})")
+            elif child.type in func_types:
+                name = get_name(child)
+                lines_out.append(f"function {name} (line {child.start_point[0] + 1})")
+
+        if not lines_out:
+            return "(no top-level symbols found)"
+        return "\n".join(lines_out)
+
+    def get_signature(self, target: str) -> str:
+        """
+        Return the signature text of a function (everything before its body),
+        with surrounding whitespace stripped. Read-only.
+        """
+        node = self.parser.find_node_by_name(target)
+        if not node:
+            raise ApplierError(f"Target '{target}' not found in {self.filepath}")
+
+        func_node = node
+        if node.type == "decorated_definition":
+            for child in node.named_children:
+                if child.type == "function_definition":
+                    func_node = child
+                    break
+
+        body = func_node.child_by_field_name("body")
+        if body is None:
+            raise ApplierError(f"Could not find body for target '{target}'")
+
+        sig_end = func_node.start_byte
+        for child in func_node.children:
+            if child == body:
+                break
+            sig_end = child.end_byte
+
+        signature = self.parser.source_bytes[func_node.start_byte : sig_end].decode(
+            "utf-8"
+        )
+        return signature.strip()
+
+    def _get_function_body_node(self, target: str):
+        """Resolve target to the body block node (block/statement_block/compound_statement)."""
+        node = self.parser.find_node_by_name(target)
+        if not node:
+            raise ApplierError(f"Target '{target}' not found in {self.filepath}")
+
+        func_node = node
+        if node.type == "decorated_definition":
+            for child in node.named_children:
+                if child.type == "function_definition":
+                    func_node = child
+                    break
+
+        body = func_node.child_by_field_name("body")
+        if body is None:
+            for child in func_node.children:
+                if child.type in ("block", "statement_block", "compound_statement"):
+                    body = child
+                    break
+        if body is None:
+            raise ApplierError(f"Could not find body block for target '{target}'")
+        return func_node, body
+
+    def prepend_to_body(self, target: str, content: str) -> str:
+        """
+        Insert content at the top of a function body, preserving existing statements.
+        """
+        func_node, body = self._get_function_body_node(target)
+
+        if self.parser.ext == ".py":
+            # Python: body is a block. First statement determines the indent.
+            # Insert before body.start_point[0] (the first statement's line).
+            insert_line = body.start_point[0]
+            target_indent = (
+                self._get_indent(self.lines[insert_line])
+                if insert_line < len(self.lines)
+                else ""
+            )
+            if not target_indent:
+                sig_indent = self._get_indent(self.lines[func_node.start_point[0]])
+                target_indent = sig_indent + "    "
+        else:
+            # JS/TS/C/C++: body is `{...}`. Insert after the opening brace line.
+            insert_line = body.start_point[0] + 1
+            target_indent = ""
+            for i in range(insert_line, min(len(self.lines), body.end_point[0])):
+                stripped = self.lines[i].strip()
+                if stripped and stripped not in ("{", "}"):
+                    target_indent = self._get_indent(self.lines[i])
+                    break
+            if not target_indent:
+                sig_indent = self._get_indent(self.lines[func_node.start_point[0]])
+                target_indent = sig_indent + "  "
+
+        content_lines = self._reindent(content.splitlines(), target_indent)
+        self.lines = self.lines[:insert_line] + content_lines + self.lines[insert_line:]
+        return self._save()
+
+    def append_to_body(self, target: str, content: str) -> str:
+        """
+        Insert content at the bottom of a function body, preserving existing statements.
+        """
+        func_node, body = self._get_function_body_node(target)
+
+        if self.parser.ext == ".py":
+            # Python: body is a block. Last statement's end_point gives the last line of body.
+            insert_line = body.end_point[0] + 1
+            # Infer indent from the last non-blank line of the body
+            target_indent = ""
+            for i in range(body.end_point[0], body.start_point[0] - 1, -1):
+                if 0 <= i < len(self.lines) and self.lines[i].strip():
+                    target_indent = self._get_indent(self.lines[i])
+                    break
+            if not target_indent:
+                sig_indent = self._get_indent(self.lines[func_node.start_point[0]])
+                target_indent = sig_indent + "    "
+        else:
+            # JS/TS/C/C++: body is `{...}`. Insert before the closing brace line.
+            insert_line = body.end_point[0]
+            target_indent = ""
+            for i in range(insert_line - 1, body.start_point[0], -1):
+                if (
+                    0 <= i < len(self.lines)
+                    and self.lines[i].strip()
+                    and self.lines[i].strip() not in ("{", "}")
+                ):
+                    target_indent = self._get_indent(self.lines[i])
+                    break
+            if not target_indent:
+                sig_indent = self._get_indent(self.lines[func_node.start_point[0]])
+                target_indent = sig_indent + "  "
+
+        content_lines = self._reindent(content.splitlines(), target_indent)
+        self.lines = self.lines[:insert_line] + content_lines + self.lines[insert_line:]
+        return self._save()
+
+    def insert_before(self, target: str, content: str) -> str:
+        """
+        Insert content as a sibling immediately before a named symbol (function, class,
+        method, or top-level assignment).
+        """
+        node = self.parser.find_node_by_name(target)
+        if not node:
+            raise ApplierError(f"Target '{target}' not found in {self.filepath}")
+
+        insert_line = node.start_point[0]
+        target_indent = (
+            self._get_indent(self.lines[insert_line])
+            if insert_line < len(self.lines)
+            else ""
+        )
+        content_lines = self._reindent(content.splitlines(), target_indent)
+
+        # Add a blank separator line after the inserted content if the target line is non-blank
+        separator = (
+            [""]
+            if insert_line < len(self.lines) and self.lines[insert_line].strip()
+            else []
+        )
+
+        self.lines = (
+            self.lines[:insert_line]
+            + content_lines
+            + separator
+            + self.lines[insert_line:]
+        )
+        return self._save()
+
+    def insert_after(self, target: str, content: str) -> str:
+        """
+        Insert content as a sibling immediately after a named symbol (function, class,
+        method, or top-level assignment).
+        """
+        node = self.parser.find_node_by_name(target)
+        if not node:
+            raise ApplierError(f"Target '{target}' not found in {self.filepath}")
+
+        insert_line = node.end_point[0] + 1
+        target_indent = self._get_indent(self.lines[node.start_point[0]])
+        content_lines = self._reindent(content.splitlines(), target_indent)
+
+        # Blank separator before the inserted content if the preceding line is non-blank
+        separator = (
+            [""]
+            if insert_line - 1 >= 0
+            and insert_line - 1 < len(self.lines)
+            and self.lines[insert_line - 1].strip()
+            else []
+        )
+
+        self.lines = (
+            self.lines[:insert_line]
+            + separator
+            + content_lines
+            + self.lines[insert_line:]
+        )
+        return self._save()
+
+    def _find_python_literal(self, target: str, expected_type: str):
+        """Resolve target (module-level assignment name) to its right-hand dictionary/list literal."""
+        if self.parser.ext != ".py":
+            raise ApplierError(
+                f"Python literal ops only support .py files, not {self.parser.ext}"
+            )
+        node = self.parser.find_node_by_name(target)
+        if not node:
+            raise ApplierError(f"Target '{target}' not found in {self.filepath}")
+        # node should be an expression_statement containing an assignment
+        assignment = None
+        if node.type == "expression_statement":
+            for c in node.named_children:
+                if c.type == "assignment":
+                    assignment = c
+                    break
+        if assignment is None:
+            raise ApplierError(f"Target '{target}' is not a module-level assignment")
+        value = assignment.child_by_field_name("right")
+        if value is None and len(assignment.named_children) >= 2:
+            value = assignment.named_children[1]
+        if value is None:
+            raise ApplierError(f"Could not find assigned value for '{target}'")
+        if value.type != expected_type:
+            raise ApplierError(
+                f"Target '{target}' is a {value.type}, not a {expected_type}"
+            )
+        return value
+
+    def add_dict_entry(self, target: str, key: str, value: str) -> str:
+        """
+        Add a new key-value pair to a Python dictionary literal at a module-level assignment.
+        key and value should be literal source expressions (e.g. key='"foo"', value='42').
+        """
+        dict_node = self._find_python_literal(target, "dictionary")
+        pairs = [c for c in dict_node.named_children if c.type == "pair"]
+
+        source_bytes = self.parser.source_bytes
+        if pairs:
+            last_pair = pairs[-1]
+            indent = self._get_indent(self.lines[last_pair.start_point[0]])
+            insertion = f",\n{indent}{key}: {value}"
+            insert_byte = last_pair.end_byte
+        else:
+            close_line = dict_node.end_point[0]
+            close_indent = (
+                self._get_indent(self.lines[close_line])
+                if close_line < len(self.lines)
+                else ""
+            )
+            inner_indent = close_indent + "    "
+            insertion = f"\n{inner_indent}{key}: {value},\n{close_indent}"
+            insert_byte = dict_node.start_byte + 1  # after `{`
+
+        new_bytes = (
+            source_bytes[:insert_byte]
+            + insertion.encode("utf-8")
+            + source_bytes[insert_byte:]
+        )
+        self._write_bytes(new_bytes)
+        return "Update successful"
+
+    def delete_dict_entry(self, target: str, key: str) -> str:
+        """
+        Delete a key-value pair from a Python dictionary literal. key should be the
+        literal source expression of the key as it appears in source (e.g. '"foo"').
+        """
+        dict_node = self._find_python_literal(target, "dictionary")
+        pairs = [c for c in dict_node.named_children if c.type == "pair"]
+
+        stripped_key = key.strip()
+        idx = None
+        for i, pair in enumerate(pairs):
+            key_node = pair.child_by_field_name("key")
+            if key_node is None and pair.named_children:
+                key_node = pair.named_children[0]
+            if (
+                key_node is not None
+                and self.parser.node_text(key_node).strip() == stripped_key
+            ):
+                idx = i
+                break
+        if idx is None:
+            raise ApplierError(f"Key {key} not found in dict '{target}'")
+
+        source_bytes = self.parser.source_bytes
+        start = pairs[idx].start_byte
+        end = pairs[idx].end_byte
+        if idx > 0:
+            start = pairs[idx - 1].end_byte
+        elif idx + 1 < len(pairs):
+            end = pairs[idx + 1].start_byte
+
+        new_bytes = source_bytes[:start] + source_bytes[end:]
+        self._write_bytes(new_bytes)
+        return "Update successful"
+
+    def append_to_list(self, target: str, value: str) -> str:
+        """
+        Append a value to a Python list literal at a module-level assignment.
+        value should be a literal source expression (e.g. value='"foo"' or '42').
+        """
+        list_node = self._find_python_literal(target, "list")
+        elements = list(list_node.named_children)
+
+        source_bytes = self.parser.source_bytes
+        if elements:
+            last = elements[-1]
+            # Determine if multi-line or inline
+            if list_node.start_point[0] == list_node.end_point[0]:
+                insertion = f", {value}"
+                insert_byte = last.end_byte
+            else:
+                indent = self._get_indent(self.lines[last.start_point[0]])
+                insertion = f",\n{indent}{value}"
+                insert_byte = last.end_byte
+        else:
+            insertion = f"{value}"
+            insert_byte = list_node.start_byte + 1
+
+        new_bytes = (
+            source_bytes[:insert_byte]
+            + insertion.encode("utf-8")
+            + source_bytes[insert_byte:]
+        )
+        self._write_bytes(new_bytes)
+        return "Update successful"
+
+    def remove_from_list(self, target: str, value_match: str) -> str:
+        """
+        Remove the first element matching value_match (stripped text equality) from
+        a Python list literal.
+        """
+        list_node = self._find_python_literal(target, "list")
+        elements = list(list_node.named_children)
+
+        stripped = value_match.strip()
+        idx = None
+        for i, el in enumerate(elements):
+            if self.parser.node_text(el).strip() == stripped:
+                idx = i
+                break
+        if idx is None:
+            raise ApplierError(f"Value {value_match} not found in list '{target}'")
+
+        source_bytes = self.parser.source_bytes
+        start = elements[idx].start_byte
+        end = elements[idx].end_byte
+        if idx > 0:
+            start = elements[idx - 1].end_byte
+        elif idx + 1 < len(elements):
+            end = elements[idx + 1].start_byte
+
+        new_bytes = source_bytes[:start] + source_bytes[end:]
+        self._write_bytes(new_bytes)
+        return "Update successful"
+
+    def _find_python_from_import(self, module: str):
+        """Find a Python `from <module> import ...` statement."""
+        for child in self.parser.tree.root_node.named_children:
+            if child.type == "import_from_statement":
+                mod_node = child.child_by_field_name("module_name")
+                if mod_node and self.parser.node_text(mod_node) == module:
+                    return child
+        return None
+
+    def add_import_name(self, module: str, name: str) -> str:
+        """
+        Add a name to an existing Python `from <module> import a, b` statement.
+        If the name is already present, returns without changes. If the statement
+        doesn't exist, raises an error.
+        """
+        if self.parser.ext != ".py":
+            raise ApplierError(
+                f"add_import_name only supports .py files (got {self.parser.ext})"
+            )
+
+        stmt = self._find_python_from_import(module)
+        if stmt is None:
+            raise ApplierError(
+                f"'from {module} import ...' not found in {self.filepath}"
+            )
+
+        name_nodes = stmt.children_by_field_name("name")
+        existing = [self.parser.node_text(n) for n in name_nodes]
+        if name in existing:
+            return "Name already present -- no change made"
+        if not name_nodes:
+            raise ApplierError("Cannot add to an empty import list")
+
+        # Insert after the last name_node: ", <name>"
+        last = name_nodes[-1]
+        insertion = f", {name}"
+        source_bytes = self.parser.source_bytes
+        new_bytes = (
+            source_bytes[: last.end_byte]
+            + insertion.encode("utf-8")
+            + source_bytes[last.end_byte :]
+        )
+        self._write_bytes(new_bytes)
+        return "Update successful"
+
+    def remove_import_name(self, module: str, name: str) -> str:
+        """
+        Remove a name from a Python `from <module> import a, b, c` statement.
+        If removing the only remaining name, removes the entire import statement.
+        """
+        if self.parser.ext != ".py":
+            raise ApplierError(
+                f"remove_import_name only supports .py files (got {self.parser.ext})"
+            )
+
+        stmt = self._find_python_from_import(module)
+        if stmt is None:
+            raise ApplierError(
+                f"'from {module} import ...' not found in {self.filepath}"
+            )
+
+        name_nodes = stmt.children_by_field_name("name")
+        idx = None
+        for i, n in enumerate(name_nodes):
+            if self.parser.node_text(n) == name:
+                idx = i
+                break
+        if idx is None:
+            raise ApplierError(f"Name '{name}' not found in 'from {module} import ...'")
+
+        # If it's the only name, remove the whole statement line
+        if len(name_nodes) == 1:
+            start_line = stmt.start_point[0]
+            end_line = stmt.end_point[0] + 1
+            self.lines = self.lines[:start_line] + self.lines[end_line:]
+            return self._save()
+
+        # Otherwise remove just this name + adjacent comma
+        source_bytes = self.parser.source_bytes
+        start = name_nodes[idx].start_byte
+        end = name_nodes[idx].end_byte
+        if idx > 0:
+            start = name_nodes[idx - 1].end_byte
+        elif idx + 1 < len(name_nodes):
+            end = name_nodes[idx + 1].start_byte
+
+        new_bytes = source_bytes[:start] + source_bytes[end:]
+        self._write_bytes(new_bytes)
+        return "Update successful"
+
+    def _find_parameter_list(self, target: str):
+        """Locate the parameter list node for a function/method across languages."""
+        node = self.parser.find_node_by_name(target)
+        if not node:
+            raise ApplierError(f"Target '{target}' not found in {self.filepath}")
+
+        func_node = node
+        if node.type == "decorated_definition":
+            for c in node.named_children:
+                if c.type == "function_definition":
+                    func_node = c
+                    break
+
+        params = func_node.child_by_field_name("parameters")
+        if params is not None:
+            return params
+
+        # C/C++: parameters live inside the declarator chain
+        declarator = func_node.child_by_field_name("declarator")
+        while declarator:
+            if declarator.type == "function_declarator":
+                p = declarator.child_by_field_name("parameters")
+                if p is not None:
+                    return p
+                break
+            declarator = declarator.child_by_field_name("declarator")
+
+        raise ApplierError(f"Could not find parameter list for '{target}'")
+
+    def _parameter_name(self, param_node) -> str:
+        """Extract the identifier name from a parameter node across languages."""
+        # Python: identifier, typed_parameter, default_parameter, typed_default_parameter
+        # JS/TS: identifier, required_parameter, optional_parameter
+        # C/C++: parameter_declaration
+        if param_node.type == "identifier":
+            return self.parser.node_text(param_node)
+        # Try field name first
+        name_field = param_node.child_by_field_name("name")
+        if name_field is not None:
+            if name_field.type == "identifier":
+                return self.parser.node_text(name_field)
+            # Could be typed_parameter wrapper; recurse
+            return self._parameter_name(name_field)
+        # Fallback: search for first identifier in descendants
+        queue = list(param_node.named_children)
+        while queue:
+            c = queue.pop(0)
+            if c.type == "identifier":
+                return self.parser.node_text(c)
+            queue.extend(c.named_children)
+        return ""
+
+    def add_parameter(self, target: str, parameter: str, position: str = "end") -> str:
+        """
+        Add a parameter to a function signature. position may be 'end' (default) or
+        'start'. parameter should be the literal source text of the new parameter
+        (e.g. 'default=None' or 'const int* buf').
+        """
+        params = self._find_parameter_list(target)
+        existing = [c for c in params.named_children]
+
+        source_bytes = self.parser.source_bytes
+
+        if not existing:
+            # Empty parameter list: insert between ( and )
+            insert_byte = params.start_byte + 1
+            insertion = parameter
+        elif position == "start":
+            first = existing[0]
+            insert_byte = first.start_byte
+            insertion = f"{parameter}, "
+        else:  # end
+            last = existing[-1]
+            insert_byte = last.end_byte
+            insertion = f", {parameter}"
+
+        new_bytes = (
+            source_bytes[:insert_byte]
+            + insertion.encode("utf-8")
+            + source_bytes[insert_byte:]
+        )
+        self._write_bytes(new_bytes)
+        return "Update successful"
+
+    def remove_parameter(self, target: str, parameter_name: str) -> str:
+        """
+        Remove a parameter by name from a function signature.
+        """
+        params = self._find_parameter_list(target)
+        existing = [c for c in params.named_children]
+
+        idx = None
+        for i, p in enumerate(existing):
+            if self._parameter_name(p) == parameter_name:
+                idx = i
+                break
+        if idx is None:
+            raise ApplierError(f"Parameter '{parameter_name}' not found in '{target}'")
+
+        source_bytes = self.parser.source_bytes
+        start = existing[idx].start_byte
+        end = existing[idx].end_byte
+        if idx > 0:
+            start = existing[idx - 1].end_byte
+        elif idx + 1 < len(existing):
+            end = existing[idx + 1].start_byte
+
+        new_bytes = source_bytes[:start] + source_bytes[end:]
+        self._write_bytes(new_bytes)
+        return "Update successful"
+
+    def _comment_prefixes(self) -> tuple[str, ...]:
+        if self.parser.ext == ".py":
+            return ("#",)
+        if self.parser.ext in (".js", ".jsx", ".ts", ".tsx", ".mjs", ".cjs"):
+            return ("//",)
+        if self.parser.ext in (".c", ".h", ".cpp", ".cc", ".cxx", ".hpp", ".hxx", ".hh"):
+            return ("//",)
+        if self.parser.ext in (".yml", ".yaml", ".toml"):
+            return ("#",)
+        return ()
+
+    def _is_comment_line(self, line: str) -> bool:
+        stripped = line.lstrip()
+        return any(stripped.startswith(p) for p in self._comment_prefixes())
+
+    def add_comment_before(self, target: str, comment: str) -> str:
+        """
+        Insert comment line(s) immediately before a named symbol. The comment must
+        include its own comment marker (e.g. '# foo' for Python/YAML/TOML, '// foo'
+        for JS/C/C++). Existing content is shifted down.
+        """
+        if not self._comment_prefixes():
+            raise ApplierError(f"add_comment_before not supported for {self.parser.ext}")
+
+        node = self._find_symbol_for_comment(target)
+        if not node:
+            raise ApplierError(f"Target '{target}' not found in {self.filepath}")
+
+        insert_line = node.start_point[0]
+        target_indent = self._get_indent(self.lines[insert_line]) if insert_line < len(self.lines) else ""
+        comment_lines = self._reindent(comment.splitlines(), target_indent)
+        self.lines = self.lines[:insert_line] + comment_lines + self.lines[insert_line:]
+        return self._save()
+
+    def remove_leading_comment(self, target: str) -> str:
+        """
+        Remove the contiguous block of comment lines immediately above a named symbol.
+        Handles both line comments and C-style /* ... */ block comments. Stops at
+        the first blank line or non-comment code line.
+        """
+        if not self._comment_prefixes():
+            raise ApplierError(f"remove_leading_comment not supported for {self.parser.ext}")
+
+        node = self._find_symbol_for_comment(target)
+        if not node:
+            raise ApplierError(f"Target '{target}' not found in {self.filepath}")
+
+        start_line = node.start_point[0]
+        comment_range = self._find_leading_comment_range(start_line)
+        if comment_range is None:
+            raise ApplierError(f"No leading comment found above '{target}'")
+
+        first, stop = comment_range
+        self.lines = self.lines[:first] + self.lines[stop:]
+        return self._save()
+
+    def replace_leading_comment(self, target: str, new_comment: str) -> str:
+        """
+        Replace the contiguous leading comment block above a named symbol with
+        new_comment. Handles line comments and C-style /* ... */ block comments.
+        If no leading comment exists, inserts new_comment.
+        """
+        if not self._comment_prefixes():
+            raise ApplierError(f"replace_leading_comment not supported for {self.parser.ext}")
+
+        node = self._find_symbol_for_comment(target)
+        if not node:
+            raise ApplierError(f"Target '{target}' not found in {self.filepath}")
+
+        start_line = node.start_point[0]
+        target_indent = self._get_indent(self.lines[start_line]) if start_line < len(self.lines) else ""
+        comment_lines = self._reindent(new_comment.splitlines(), target_indent)
+
+        comment_range = self._find_leading_comment_range(start_line)
+        if comment_range is None:
+            self.lines = self.lines[:start_line] + comment_lines + self.lines[start_line:]
+        else:
+            first, stop = comment_range
+            self.lines = self.lines[:first] + comment_lines + self.lines[stop:]
+        return self._save()
+
+    def replace_docstring(self, target: str, new_docstring: str) -> str:
+        """
+        Replace or insert a Python docstring on a function or class. The new_docstring
+        should be a valid Python string literal including its surrounding triple
+        quotes. Python-specific.
+        """
+        if self.parser.ext != ".py":
+            raise ApplierError(
+                f"replace_docstring only supports .py files (got {self.parser.ext})"
+            )
+
+        node = self.parser.find_node_by_name(target)
+        if not node:
+            raise ApplierError(f"Target '{target}' not found in {self.filepath}")
+
+        func_node = node
+        if node.type == "decorated_definition":
+            for c in node.named_children:
+                if c.type == "function_definition":
+                    func_node = c
+                    break
+
+        body = func_node.child_by_field_name("body")
+        if body is None:
+            raise ApplierError(f"Could not find body for '{target}'")
+
+        # Check if first statement is an existing docstring (string expression)
+        first_stmt = body.named_children[0] if body.named_children else None
+        source_bytes = self.parser.source_bytes
+
+        if (
+            first_stmt
+            and first_stmt.type == "expression_statement"
+            and first_stmt.named_children
+            and first_stmt.named_children[0].type == "string"
+        ):
+            string_node = first_stmt.named_children[0]
+            new_bytes = (
+                source_bytes[: string_node.start_byte]
+                + new_docstring.encode("utf-8")
+                + source_bytes[string_node.end_byte :]
+            )
+            self._write_bytes(new_bytes)
+            return "Update successful (docstring replaced)"
+
+        # No existing docstring -- insert at the start of the body
+        insert_byte = body.start_byte
+        indent = (
+            self._get_indent(self.lines[body.start_point[0]])
+            if body.start_point[0] < len(self.lines)
+            else "    "
+        )
+        insertion = f"{new_docstring}\n{indent}"
+        new_bytes = (
+            source_bytes[:insert_byte]
+            + insertion.encode("utf-8")
+            + source_bytes[insert_byte:]
+        )
+        self._write_bytes(new_bytes)
+        return "Update successful (docstring inserted)"
+
+    def find_references(self, target: str) -> str:
+        """
+        Return all occurrences of an identifier named `target` in the file, as a
+        formatted multi-line string: 'line N: <source line>'. Read-only, syntactic
+        only (no scope awareness).
+        """
+        identifier_types = {
+            "identifier",
+            "field_identifier",
+            "type_identifier",
+            "property_identifier",
+        }
+        results = []
+        queue = [self.parser.tree.root_node]
+        while queue:
+            curr = queue.pop(0)
+            if curr.type in identifier_types and self.parser.node_text(curr) == target:
+                line_num = curr.start_point[0]
+                context = self.lines[line_num] if line_num < len(self.lines) else ""
+                results.append((line_num + 1, context.strip()))
+            queue.extend(curr.named_children)
+
+        if not results:
+            return f"(no references to '{target}' found in {self.filepath})"
+        return "\n".join(f"line {ln}: {ctx}" for ln, ctx in results)
+
+    def add_top_level(self, content: str) -> str:
+        """
+        Append arbitrary top-level content to the end of the file: a function,
+        class, constant, type alias, module-level call, or any other top-level
+        statement. Unified replacement for add_function / add_class / add_statement.
+        """
+        content_lines = content.splitlines()
+        while self.lines and not self.lines[-1].strip():
+            self.lines.pop()
+        if self.lines:
+            self.lines.append("")
+        self.lines.extend(content_lines)
+        return self._save()
+
+    def _supports_block_comments(self) -> bool:
+        """Languages that support C-style /* ... */ block comments."""
+        return self.parser.ext in (
+            ".js", ".jsx", ".ts", ".tsx", ".mjs", ".cjs",
+            ".c", ".h", ".cpp", ".cc", ".cxx", ".hpp", ".hxx", ".hh",
+        )
+
+    def _find_leading_comment_range(self, start_line: int):
+        """
+        Walk backwards from start_line, collecting the contiguous block of comment
+        lines immediately above it. Returns (first_line, stop_line_exclusive) or
+        None if no leading comment exists. Handles:
+          - Line comments: `#` (Python/YAML/TOML), `//` (JS/TS/C/C++)
+          - C-style block comments: /* ... */ (single-line and multi-line)
+        Stops at the first blank line or non-comment code line.
+        """
+        prefixes = self._comment_prefixes()
+        if not prefixes:
+            return None
+
+        supports_block = self._supports_block_comments()
+        i = start_line - 1
+        in_block = False
+
+        while i >= 0:
+            line = self.lines[i]
+            stripped = line.strip()
+
+            if in_block:
+                # Inside a multi-line block comment (scanning backwards)
+                if "/*" in stripped:
+                    # Reached the start of the block
+                    in_block = False
+                i -= 1
+                continue
+
+            if not stripped:
+                # Blank line separator -- stop walking
+                break
+
+            # Line comment (#, //, etc.)
+            if any(stripped.startswith(p) for p in prefixes):
+                i -= 1
+                continue
+
+            # C-style block comment handling
+            if supports_block:
+                # Pure single-line block comment: /* ... */
+                if stripped.startswith("/*") and stripped.endswith("*/"):
+                    i -= 1
+                    continue
+                # End of a multi-line block comment
+                if stripped.endswith("*/"):
+                    in_block = True
+                    i -= 1
+                    continue
+
+            # Not a comment line -- stop
+            break
+
+        first_comment_line = i + 1
+        if first_comment_line >= start_line:
+            return None
+        return (first_comment_line, start_line)
+
+    def _find_symbol_for_comment(self, target: str):
+        """
+        Resolve a comment target like find_node_by_name, but with a TOML-specific
+        fallback: if the target doesn't match a pair, try matching a [table] header.
+        Comment tools operate on positional anchors, so tables are valid targets.
+        """
+        node = self.parser.find_node_by_name(target)
+        if node is not None:
+            return node
+
+        if self.parser.ext == ".toml" and "." not in target:
+            queue = [self.parser.tree.root_node]
+            while queue:
+                curr = queue.pop(0)
+                if curr.type == "table":
+                    header = curr.named_children[0] if curr.named_children else None
+                    if header:
+                        name = self.parser.node_text(header).strip("[] \n")
+                        if name == target:
+                            return curr
+                queue.extend(curr.named_children)
+        return None

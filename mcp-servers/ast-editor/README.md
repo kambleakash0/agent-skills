@@ -4,57 +4,163 @@ A robust, language-agnostic Model Context Protocol (MCP) server that provides AI
 
 ## Why AST Edits?
 
-Every major AI coding tool makes a different bet on how models should express code edits: [Claude Code](https://platform.claude.com/docs/en/agents-and-tools/tool-use/text-editor-tool) uses search/replace, [Codex CLI](https://developers.openai.com/api/docs/guides/tools-apply-patch) uses patch diffs, [Cursor](https://cursor.com/blog/instant-apply) rewrites the entire file, and [Aider](https://aider.chat/docs/more/edit-formats.html) picks per model. None of them use AST-targeted edits.
+Every non-AST edit format — search/replace, unified diff, whole-file rewrite — requires the model to copy text *perfectly* from a file it saw once. One whitespace mismatch on a 4,000-line file and the edit fails. AST edits sidestep the problem entirely: the model names the target (e.g., `LRUCache.get`) and provides the new code; the parser figures out where it lives.
 
-[Geometric AGI tested all of them](https://geometricagi.github.io/2026/04/02/ast-edits.html). **AST won.**
-
-### The Benchmark
-
-They built 29 editing tasks ranging from one-line fixes in 100-line files to multi-site rewrites in 4,200-line modules, tested across 7 edit formats and 4 models (Claude Haiku 4.5, OpenAI o4-mini, GPT-5.4, Claude Opus 4.6).
-
-### Key Findings
-
-- **AST edit is the only format that hits 100% correctness on 3 out of 4 models.** Only "whole file rewrite" comes close.
-- **Whole file rewrite uses 18x more output tokens and takes 12x longer** than AST edit on a 4,200-line file.
-- **AST edit has zero format failures across all 4 models.** The JSON always parses, the function names always resolve. The only failures (4, all on Haiku) were logic errors where the model got the code change itself wrong, not the format.
-- **Unified diff is the riskiest choice** — it scores 93.1% on Opus but crashes to 20.7% on o4-mini due to context line mismatches and hunk header errors.
-- **Search/replace fails** when the model reproduces old code with slightly wrong whitespace, or when the search string matches multiple locations in large files.
-- **Picking the right format can matter more than picking the right model.** o4-mini goes from 100% (AST) down to 20.7% (unified diff).
-
-### Why Other Formats Fail
-
-All non-AST formats share the same fundamental flaw: **the model has to copy text perfectly from a file it saw once.** On a 4,200-line file, one whitespace mismatch in a context line tanks the whole edit. AST edit sidesteps this entirely — the model just names the function (e.g., `LRUCache.get`) and provides the new code. The parser figures out where it lives in the file.
+Geometric AGI benchmarked every major format across 4 models and 29 edit tasks. **AST edits were the only format to hit 100% correctness on 3 of 4 models, with 18x fewer output tokens than whole-file rewrite, and zero format failures.** Full methodology and results: [AST Edits: The Code Editing Format Nobody Uses](https://geometricagi.github.io/2026/04/02/ast-edits.html).
 
 ### Credits
 
-This MCP server was inspired by research from [Jack Foxabbott](https://www.linkedin.com/in/foxabbott/) and the team at [Geometric AGI](https://geometricagi.github.io/), who benchmarked AST-targeted edits against every major code editing format and demonstrated its superiority across models and file sizes. Their full findings, benchmark suite, and code are available here:
+This MCP server was inspired by research from [Jack Foxabbott](https://www.linkedin.com/in/foxabbott/) and the team at [Geometric AGI](https://geometricagi.github.io/). Their full findings, benchmark suite, and data are available here:
 
 - [AST Edits: The Code Editing Format Nobody Uses](https://geometricagi.github.io/2026/04/02/ast-edits.html) (Blog)
 - [Jack Foxabbott's original post](https://www.linkedin.com/posts/foxabbott_i-didnt-know-until-recently-that-all-the-share-7445506956783480832-dcXr/) (LinkedIn)
 - [GeometricAGI/blog](https://github.com/GeometricAGI/blog) (Benchmark code & data)
 
-## Supported Languages
+## Supported Languages & Capabilities
 
-- Python (`.py`)
-- JavaScript (`.js`, `.jsx`, `.cjs`, `.mjs`)
-- TypeScript (`.ts`, `.tsx`)
-- JSON (`.json`)
-- YAML (`.yml`, `.yaml`)
-- TOML (`.toml`)
+| Language | Extensions | Structural edits | Comments | Docstrings | Notes |
+| :--- | :--- | :--- | :--- | :--- | :--- |
+| **Python** | `.py` | ✅ | ✅ `#` | ✅ function/class | Decorators preserved. Module-level `dict`/`list` literals editable via `add_key` / `append_to_array`. |
+| **JavaScript** | `.js`, `.jsx`, `.mjs`, `.cjs` | ✅ | ✅ `//` + `/* ... */` | — | |
+| **TypeScript** | `.ts`, `.tsx` | ✅ | ✅ `//` + `/* ... */` | — | Interfaces are treated as classes for `add_method` / `add_field`. |
+| **C** | `.c`, `.h` | ✅ | ✅ `//` + `/* ... */` (single + multi-line) | — | `.h` defaults to C — use `.hpp`/`.hxx`/`.hh` for C++ headers. |
+| **C++** | `.cpp`, `.cc`, `.cxx`, `.hpp`, `.hxx`, `.hh` | ✅ | ✅ `//` + `/* ... */` (single + multi-line) | — | Supports `class`, `struct`, `union`, `enum`, `namespace`; `Class::method` qualified names resolve correctly. |
+| **JSON** | `.json` | ✅ (keys, values, arrays) | — (no comment syntax) | — | |
+| **YAML** | `.yml`, `.yaml` | ✅ (keys, values, sequences) | ✅ `#` | — | Block and flow sequences supported. |
+| **TOML** | `.toml` | ✅ (keys, values, arrays, tables) | ✅ `#` | — | `[table]` headers addressable by name for comment tools. |
+
+**Cross-cutting features:**
+
+- **Decorated functions** (Python `@decorator`): decorators are preserved on body/signature edits and included on delete.
+- **Byte-correct slicing**: multi-byte characters (emoji, `═`, `→`) handled safely in source text.
+- **Idempotent imports**: `add_import` skips exact duplicates automatically.
 
 ## Tools Exposed
 
 All tools require `file_path` to be an **absolute path** to an existing file.
 
+### Code editing — structural (Python, JS, TS, C, C++)
+
 | Tool | Parameters | Description |
 | :--- | :--- | :--- |
-| `replace_function` | `file_path`, `target`, `content` | Replace an entire function definition — including signature, decorators, and body — with new content. |
-| `replace_function_body` | `file_path`, `target`, `content` | Replace only the body of a function, preserving its signature and decorators. |
-| `add_method` | `file_path`, `class_target`, `content` | Add a new method to the end of a class block. |
-| `delete_node` | `file_path`, `target` | Delete an entire function or class definition block (including decorators). |
-| `replace_value` | `file_path`, `target`, `content` | For config files only (JSON, YAML, TOML). `target` is the dotted key path (e.g., `dependencies.mcp`). |
+| `replace_function` | `file_path`, `target`, `content` | Replace a full function definition (signature + body + decorators). |
+| `replace_function_body` | `file_path`, `target`, `content` | Replace only the body of a function, preserving signature and decorators. |
+| `replace_signature` | `file_path`, `target`, `new_signature` | Replace only the signature, preserving body and decorators. |
+| `prepend_to_body` | `file_path`, `target`, `content` | Insert content at the top of a function body. |
+| `append_to_body` | `file_path`, `target`, `content` | Insert content at the bottom of a function body. |
+| `add_top_level` | `file_path`, `content` | Append any top-level content (function, class, constant, type alias) to the end of the file. |
+| `add_method` | `file_path`, `class_target`, `content` | Add a method at the end of a class body. |
+| `add_field` | `file_path`, `class_target`, `content` | Add a field/attribute/member at the top of a class body. |
+| `insert_before` | `file_path`, `target`, `content` | Insert a sibling immediately before a named symbol. |
+| `insert_after` | `file_path`, `target`, `content` | Insert a sibling immediately after a named symbol. |
+| `delete_symbol` | `file_path`, `target` | Delete a function or class definition block (including decorators). |
 
-**Target format:** Use the exact function name (e.g., `get`) or dotted `Class.method` path (e.g., `LRUCache.get`). Decorated Python functions are fully supported — decorators are included when replacing or deleting the full function.
+### Parameters & signatures
+
+| Tool | Parameters | Description |
+| :--- | :--- | :--- |
+| `add_parameter` | `file_path`, `target`, `parameter`, `position` | Add a parameter to a function signature (`position`: `"start"` or `"end"`). |
+| `remove_parameter` | `file_path`, `target`, `parameter_name` | Remove a parameter by name. |
+
+### Imports & includes
+
+| Tool | Parameters | Description |
+| :--- | :--- | :--- |
+| `add_import` | `file_path`, `import_text` | Add an `import`/`from`/`#include` line. Skips duplicates. |
+| `remove_import` | `file_path`, `import_text` | Remove a matching import line. |
+| `add_import_name` | `file_path`, `module`, `name` | Add one name to an existing `from <module> import a, b`. Python-only. |
+| `remove_import_name` | `file_path`, `module`, `name` | Remove one name from a multi-name Python from-import. |
+
+### Comments & docstrings
+
+| Tool | Parameters | Description |
+| :--- | :--- | :--- |
+| `add_comment_before` | `file_path`, `target`, `comment` | Insert a comment block immediately before a named symbol. Works for Python/YAML/TOML (`#`), JS/TS/C/C++ (`//` or `/* */`). |
+| `remove_leading_comment` | `file_path`, `target` | Remove the contiguous comment block above a symbol. Recognizes both line comments and C-style single-line or multi-line `/* ... */` blocks. |
+| `replace_leading_comment` | `file_path`, `target`, `new_comment` | Replace the leading comment block above a symbol (or insert one if none exists). |
+| `replace_docstring` | `file_path`, `target`, `new_docstring` | Replace or insert a Python function/class docstring. Python-only. |
+
+### Dict/list editing (JSON, YAML, TOML, AND Python module-level dict/list literals)
+
+| Tool | Parameters | Description |
+| :--- | :--- | :--- |
+| `replace_value` | `file_path`, `target`, `content` | Replace the value of an existing config key. `target` is the dotted key path. |
+| `add_key` | `file_path`, `parent_target`, `key`, `value` | Add a key-value pair to a dict/object/mapping/table. For Python, `parent_target` is the dict variable name; for config, a dotted path (use `""` for root). |
+| `delete_key` | `file_path`, `target` | Delete a key-value pair. For Python, target is `DictName.keyExpr`. For JSON, also removes the adjacent comma. |
+| `append_to_array` | `file_path`, `target`, `value` | Append a literal value to a list/array/sequence. For Python, `target` is the list variable name; for config, a dotted path. |
+| `remove_from_array` | `file_path`, `target`, `value_match` | Remove the first matching element from a list/array/sequence. |
+
+### Navigation (read-only)
+
+| Tool | Parameters | Description |
+| :--- | :--- | :--- |
+| `list_symbols` | `file_path` | Formatted outline of all top-level functions, classes, and methods with line numbers. |
+| `get_signature` | `file_path`, `target` | Return the signature of a function as plain text. |
+| `find_references` | `file_path`, `target` | Syntactic search for all occurrences of an identifier (no scope awareness). |
+
+**Target format:** Use the exact function name (e.g., `get`) or dotted `Class.method` path (e.g., `LRUCache.get`). Decorated Python functions are fully supported — decorators are preserved when replacing bodies or signatures, and included when deleting or replacing the full function.
+
+**Tip:** Call `list_symbols` first to discover exact target names before editing. This avoids guessing and makes subsequent edits much more reliable.
+
+## Which tool should I use?
+
+A decision guide grouped by intent. Start at the top and pick the narrowest match.
+
+### Discovering what's in a file (do this first)
+
+- **Don't know what symbols exist?** → `list_symbols`
+- **Need just a function's signature?** → `get_signature`
+- **Where is a symbol used?** → `find_references`
+
+### Adding new content
+
+| Intent | Tool |
+| :--- | :--- |
+| New top-level function, class, constant, or type alias | `add_top_level` |
+| New method in an existing class | `add_method` |
+| New field/attribute/member in a class | `add_field` |
+| New content at a specific position relative to an existing symbol | `insert_before` / `insert_after` |
+| New lines at the top of an existing function body | `prepend_to_body` |
+| New lines at the bottom of an existing function body | `append_to_body` |
+| New parameter on an existing function | `add_parameter` |
+| New import or `#include` | `add_import` |
+| New name in an existing `from X import …` | `add_import_name` |
+| New comment above a symbol | `add_comment_before` |
+| New Python docstring on a function/class | `replace_docstring` |
+| New key in a dict/object/mapping/table (any lang) | `add_key` |
+| New item in a list/array/sequence (any lang) | `append_to_array` |
+
+### Modifying existing content
+
+| Intent | Tool |
+| :--- | :--- |
+| Rewrite the full function (signature + body) | `replace_function` |
+| Rewrite only the body, keep the signature | `replace_function_body` |
+| Change only the signature, keep the body | `replace_signature` |
+| Change only the leading comment above a symbol | `replace_leading_comment` |
+| Change only the Python docstring | `replace_docstring` |
+| Change the value of an existing config key | `replace_value` |
+
+### Removing content
+
+| Intent | Tool |
+| :--- | :--- |
+| Remove a function, method, or class | `delete_symbol` |
+| Remove a parameter from a function | `remove_parameter` |
+| Remove an import or `#include` | `remove_import` |
+| Remove one name from a multi-name Python from-import | `remove_import_name` |
+| Remove a leading comment above a symbol | `remove_leading_comment` |
+| Remove a key from a dict/config | `delete_key` |
+| Remove an item from a list/array | `remove_from_array` |
+
+### Anti-patterns to avoid
+
+- **Don't use `replace_function` to add a few lines** — use `prepend_to_body` or `append_to_body` instead. Rewriting the whole function is wasteful and error-prone.
+- **Don't use `replace_function_body` to add a few lines** either — same reasoning. Use `prepend_to_body`/`append_to_body`.
+- **Don't use `replace_signature` to add or remove one parameter** — use `add_parameter`/`remove_parameter`.
+- **Don't use `replace_value` to add a new key** — use `add_key`. `replace_value` only updates existing keys.
+- **Don't use `add_import` to add a name to an existing `from X import …`** — use `add_import_name`.
+- **Don't guess at target names.** Call `list_symbols` first. Names are case-sensitive and must match exactly.
 
 ## Logging & Debugging
 
@@ -171,9 +277,44 @@ Coding agents are heavily biased toward their default tools. You **must** explic
 
 ### Claude (Code & Desktop)
 
-Add to `CLAUDE.md`, `~/.claude/CLAUDE.md`, or **Custom Instructions**:
+Add the following block to `CLAUDE.md`, `~/.claude/CLAUDE.md`, or **Custom Instructions**:
 
-> *When editing `.py`, `.js`, or `.ts` files, do NOT use the `edit` tool. Instead, use the AST editing MCP tools (`replace_function_body`, `replace_function`, `add_method`) from the `ast-editor` server. When modifying `.json`, `.yaml`, or `.toml` files, use `replace_value` instead of `edit`.*
+> **When editing `.py`, `.js`, `.ts`, `.c`, `.cpp`, `.json`, `.yaml`, or `.toml` files, do NOT use the `edit` tool. Use the `ast-editor` MCP server instead. It exposes 29 surgical tools for structural code and config edits.**
+>
+> **Picking a tool — always start here:**
+>
+> 1. **Unsure of the file layout?** Call `list_symbols` first. Call `get_signature` if you only need an interface. Call `find_references` before renaming anything.
+> 2. **Adding new content** — choose the narrowest tool:
+>    - Top-level (function, class, constant, type alias): `add_top_level`
+>    - In a class: `add_method`, `add_field`
+>    - Inside a function body: `prepend_to_body`, `append_to_body`
+>    - Relative to an existing symbol: `insert_before`, `insert_after`
+>    - Imports: `add_import` (new line) or `add_import_name` (add to existing `from X import …`)
+>    - Parameters: `add_parameter`
+>    - Comments/docstrings: `add_comment_before`, `replace_docstring`
+>    - Any dict (config OR Python literal): `add_key`
+>    - Any list/array (config OR Python literal): `append_to_array`
+> 3. **Modifying existing content:**
+>    - Full function: `replace_function`
+>    - Body only: `replace_function_body`
+>    - Signature only: `replace_signature`
+>    - Config value: `replace_value`
+>    - Leading comment: `replace_leading_comment`
+>    - Python docstring: `replace_docstring`
+> 4. **Removing content:**
+>    - Function/class/method: `delete_symbol`
+>    - Parameter: `remove_parameter`
+>    - Import: `remove_import` (whole line) or `remove_import_name` (one name)
+>    - Leading comment: `remove_leading_comment`
+>    - Dict key or list item: `delete_key`, `remove_from_array`
+>
+> **Anti-patterns to avoid:**
+>
+> - Don't use `replace_function` or `replace_function_body` to add a couple of lines — use `prepend_to_body` / `append_to_body`.
+> - Don't use `replace_signature` to add one parameter — use `add_parameter` / `remove_parameter`.
+> - Don't use `replace_value` to add a new key — use `add_key`.
+> - Don't use `add_import` to add a name to an existing from-import — use `add_import_name`.
+> - Don't guess target names — call `list_symbols` first. Names are case-sensitive.
 
 ### Specific Tool Overrides
 
@@ -188,4 +329,4 @@ Add to `CLAUDE.md`, `~/.claude/CLAUDE.md`, or **Custom Instructions**:
 
 Add to rules or system prompt:
 
-> *When editing `.py`, `.js`, or `.ts` files, do NOT use your default editing tools (diff, whole, etc.). Instead, use the AST editing MCP tools (`replace_function_body`, `replace_function`, `add_method`, `delete_node`) to make surgical, syntax-aware edits. For configuration files (`.json`, `.yaml`, `.toml`), use `replace_value` with dotted key paths.*
+> *When editing `.py`, `.js`, `.ts`, `.c`, or `.cpp` files, do NOT use your default editing tools (diff, whole, etc.). Instead, use the `ast-editor` MCP server, which exposes 29 surgical tools for adding/modifying/removing functions, classes, methods, fields, parameters, imports, comments, and docstrings. Start any edit session by calling `list_symbols` to discover exact target names. For `.json`, `.yaml`, or `.toml` files, use `replace_value`/`add_key`/`append_to_array`/`delete_key` instead of freeform edits.*
