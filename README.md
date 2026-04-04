@@ -22,9 +22,9 @@ A personal collection of Claude Code agent skills and MCP servers, can be used w
 
 | Server | Description |
 | ------ | ----------- |
-| [ast-editor](./mcp-servers/ast-editor/README.md) | AST-targeted code editing MCP server. Surgical edits via tree-sitter — no diffs, no search/replace, no file rewrites. Supports Python, JS, TS, JSON, YAML, and TOML. |
+| [ast-editor](./mcp-servers/ast-editor/README.md) | AST-targeted code editing MCP server with **29 surgical tools**: functions, classes, methods, fields, parameters, imports, comments, docstrings, and dict/list editing (JSON/YAML/TOML config AND Python module-level literals in unified tools). Built on tree-sitter. Supports Python, JS, TS, C, C++, JSON, YAML, and TOML. |
 
-## Installation via [skills.sh](https://skills.sh)
+## Skills installation via [skills.sh](https://skills.sh)
 
 Install multiple skills at once:
 
@@ -77,3 +77,7 @@ Skill prompt body goes here…
 3. If needed, add a `resources/` folder in the root of the new folder and populate it with the necessary files.
 4. Add a row to the **Available Skills** table in this README.
 5. Test it locally by placing the folder from `skills/` in `~/.claude/skills/` or `~/.agents/skills/`.
+
+## MCP Servers' installation
+
+Refer to their respective READMEs for installation instructions.
