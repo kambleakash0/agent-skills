@@ -160,12 +160,14 @@ The server depends on `mcp`, `nbformat`, `jupyter_client`, and `ipykernel`. `uv`
 
 If your agent supports adding servers via CLI:
 
+`--scope user` installs the server globally so it's available in every project on your machine. Drop it if you only want the server active in the current project.
+
 ```bash
 # Claude Code / Codex
-[claude|codex] mcp add notebook-editor -- uv --directory /absolute/path/to/mcp-servers/notebook-editor run notebook-editor-mcp
+[claude|codex] mcp add notebook-editor --scope user -- uv --directory /absolute/path/to/mcp-servers/notebook-editor run notebook-editor-mcp
 
 # Gemini CLI
-gemini mcp add --transport stdio notebook-editor -- uv --directory /absolute/path/to/mcp-servers/notebook-editor run notebook-editor-mcp
+gemini mcp add --transport stdio --scope user notebook-editor -- uv --directory /absolute/path/to/mcp-servers/notebook-editor run notebook-editor-mcp
 ```
 
 ### Method 2: JSON Configuration

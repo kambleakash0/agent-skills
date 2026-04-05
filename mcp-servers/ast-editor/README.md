@@ -253,12 +253,14 @@ If your agent supports adding servers via CLI, run the following:
 
 **Claude Code / Codex CLI / Gemini CLI:**
 
+`--scope user` installs the server globally so it's available in every project on your machine. Drop it if you only want the server active in the current project.
+
 ```bash
 # Claude Code / Codex
-[claude|codex] mcp add ast-editor -- uv --directory /absolute/path/to/mcp-servers/ast-editor run ast-editor-mcp
+[claude|codex] mcp add ast-editor --scope user -- uv --directory /absolute/path/to/mcp-servers/ast-editor run ast-editor-mcp
 
 # Gemini CLI
-gemini mcp add --transport stdio ast-editor -- uv --directory /absolute/path/to/mcp-servers/ast-editor run ast-editor-mcp
+gemini mcp add --transport stdio --scope user ast-editor -- uv --directory /absolute/path/to/mcp-servers/ast-editor run ast-editor-mcp
 ```
 
 ### Method 2: JSON Configuration
