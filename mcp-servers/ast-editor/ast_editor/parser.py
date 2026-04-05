@@ -8,9 +8,15 @@ import tree_sitter_toml
 import tree_sitter_c
 import tree_sitter_cpp
 from tree_sitter import Language, Parser, Node
+import tree_sitter_ruby
+import tree_sitter_go
+import tree_sitter_java
 
 C_EXTS = (".c", ".h")
 CPP_EXTS = (".cpp", ".cc", ".cxx", ".hpp", ".hxx", ".hh")
+
+RUBY_EXTS = (".rb",)
+GO_EXTS = (".go",)
 
 
 class TreeSitterParser:
@@ -36,37 +42,31 @@ class TreeSitterParser:
                 self.language = Language(tree_sitter_c.language())
             elif self.ext in CPP_EXTS:
                 self.language = Language(tree_sitter_cpp.language())
+            elif self.ext in RUBY_EXTS:
+                self.language = Language(tree_sitter_ruby.language())
+            elif self.ext in GO_EXTS:
+                self.language = Language(tree_sitter_go.language())
+            elif self.ext == ".java":
+                self.language = Language(tree_sitter_java.language())
             else:
                 raise ValueError(f"Unsupported file extension: {self.ext}")
         except TypeError:
-            # TODO: This fallback handles older tree-sitter versions that require a second
-            # argument (language name string) to the Language constructor. Since pyproject.toml
-            # requires tree-sitter>=0.21.0 (which uses the new single-arg API), this block is
-            # likely dead code. It's also missing .mjs/.cjs for JS and has no fallback for
-            # YAML/TOML/C/C++. Consider removing this entirely once we confirm minimum supported
-            # tree-sitter versions, or fix the missing extensions if we want to keep it.
-            if self.ext == ".py":
+             # TODO: Older tree-sitter version fallback -- see note in parser source.
+             if self.ext == ".py":
                 self.language = Language(tree_sitter_python.language(), "python")
-            elif self.ext in (".js", ".jsx"):
-                self.language = Language(
-                    tree_sitter_javascript.language(), "javascript"
-                )
-            elif self.ext in (".ts", ".tsx"):
-                self.language = Language(
-                    tree_sitter_typescript.language_typescript(), "typescript"
-                )
-            elif self.ext == ".json":
+             elif self.ext in (".js", ".jsx"):
+                self.language = Language(tree_sitter_javascript.language(), "javascript")
+             elif self.ext in (".ts", ".tsx"):
+                self.language = Language(tree_sitter_typescript.language_typescript(), "typescript")
+             elif self.ext == ".json":
                 self.language = Language(tree_sitter_json.language(), "json")
-            elif self.ext in (".yml", ".yaml"):
+             elif self.ext in (".yml", ".yaml"):
                 self.language = Language(tree_sitter_yaml.language(), "yaml")
-            elif self.ext == ".toml":
+             elif self.ext == ".toml":
                 self.language = Language(tree_sitter_toml.language(), "toml")
 
-        # Newer tree_sitter versions take Language in Parser constructor directly
         self.parser = Parser(self.language)
 
-        # Tree-sitter node positions are BYTE offsets, so we need both the decoded
-        # string form (for splitlines/encode) AND the raw bytes (for node slicing).
         with open(filepath, "rb") as f:
             self.source_bytes = f.read()
         self.source_code = self.source_bytes.decode("utf-8")
@@ -83,37 +83,37 @@ class TreeSitterParser:
             var_types = ["expression_statement"]
         elif self.ext in (".ts", ".tsx"):
             class_types = ["class_declaration", "interface_declaration"]
-            func_types = [
-                "function_declaration",
-                "method_definition",
-                "arrow_function",
-                "variable_declaration",
-            ]
+            func_types = ["function_declaration", "method_definition", "arrow_function", "variable_declaration"]
             var_types = ["variable_declaration", "lexical_declaration"]
         elif self.ext in (".js", ".jsx", ".mjs", ".cjs"):
             class_types = ["class_declaration"]
-            func_types = [
-                "function_declaration",
-                "method_definition",
-                "arrow_function",
-                "variable_declaration",
-                "lexical_declaration",
-            ]
+            func_types = ["function_declaration", "method_definition", "arrow_function", "variable_declaration", "lexical_declaration"]
             var_types = ["variable_declaration", "lexical_declaration"]
         elif self.ext in C_EXTS:
             class_types = ["struct_specifier", "union_specifier", "enum_specifier"]
             func_types = ["function_definition"]
             var_types = []
         elif self.ext in CPP_EXTS:
-            class_types = [
-                "class_specifier",
-                "struct_specifier",
-                "union_specifier",
-                "enum_specifier",
-                "namespace_definition",
-            ]
+            class_types = ["class_specifier", "struct_specifier", "union_specifier", "enum_specifier", "namespace_definition"]
             func_types = ["function_definition"]
             var_types = []
+        elif self.ext in RUBY_EXTS:
+            class_types = ["class", "module"]
+            func_types = ["method", "singleton_method"]
+            var_types = ["assignment"]
+        elif self.ext in GO_EXTS:
+            parts = target_name.split(".")
+            if len(parts) == 2:
+                go_method = self._find_go_method_by_receiver(parts[0], parts[1])
+                if go_method is not None:
+                    return go_method
+            class_types = ["type_spec"]
+            func_types = ["function_declaration", "method_declaration"]
+            var_types = ["const_spec", "var_spec"]
+        elif self.ext == ".java":
+            class_types = ["class_declaration", "interface_declaration", "enum_declaration", "record_declaration"]
+            func_types = ["method_declaration", "constructor_declaration"]
+            var_types = ["field_declaration"]
         elif self.ext == ".json":
             return self._search_json_dotted(self.tree.root_node, target_name)
         elif self.ext in (".yml", ".yaml"):
@@ -123,9 +123,7 @@ class TreeSitterParser:
         else:
             return None
 
-        return self._search_tree_dotted(
-            self.tree.root_node, target_name, class_types, func_types, var_types
-        )
+        return self._search_tree_dotted(self.tree.root_node, target_name, class_types, func_types, var_types)
 
     def _search_tree_dotted(
         self,
@@ -170,9 +168,7 @@ class TreeSitterParser:
             declarator = declarator.child_by_field_name("declarator")
         return None
 
-    def _find_child_with_name(
-        self, node: Node, name: str, valid_types: list[str]
-    ) -> Node | None:
+    def _find_child_with_name(self, node: Node, name: str, valid_types: list[str]) -> Node | None:
         queue = [node]
         while queue:
             curr = queue.pop(0)
@@ -190,11 +186,7 @@ class TreeSitterParser:
                 name_node = curr.child_by_field_name("name")
 
                 # C/C++ function_definition: name is nested in declarator chain
-                if (
-                    not name_node
-                    and curr.type == "function_definition"
-                    and self.ext in C_EXTS + CPP_EXTS
-                ):
+                if not name_node and curr.type == "function_definition" and self.ext in C_EXTS + CPP_EXTS:
                     name_node = self._extract_c_function_name(curr)
 
                 # Check for python assignment
@@ -203,11 +195,22 @@ class TreeSitterParser:
                     if assignment and assignment.type == "assignment":
                         name_node = assignment.named_children[0]
 
+                # Ruby top-level assignment: first child is constant/identifier
+                if not name_node and curr.type == "assignment" and self.ext in RUBY_EXTS:
+                    if curr.named_children:
+                        first = curr.named_children[0]
+                        if first.type in ("constant", "identifier"):
+                            name_node = first
+
+                # Go const_spec / var_spec: name is via `name` field or first identifier child
+                if not name_node and curr.type in ("const_spec", "var_spec") and self.ext in GO_EXTS:
+                    for c in curr.named_children:
+                        if c.type == "identifier":
+                            name_node = c
+                            break
+
                 # Check for JS/TS variable declarators
-                if not name_node and curr.type in (
-                    "variable_declaration",
-                    "lexical_declaration",
-                ):
+                if not name_node and curr.type in ("variable_declaration", "lexical_declaration"):
                     for child in curr.named_children:
                         if child.type == "variable_declarator":
                             name_node = child.child_by_field_name("name")
@@ -302,3 +305,40 @@ class TreeSitterParser:
     def node_text(self, node) -> str:
         """Return the source text for a node using its byte offsets (safe for multi-byte chars)."""
         return self.source_bytes[node.start_byte : node.end_byte].decode("utf-8")
+
+    def _extract_go_receiver_type(self, recv_param_list: Node) -> str | None:
+        """
+        Extract the receiver type name from a Go method_declaration's receiver
+        parameter list (e.g. '(c *Cache)' -> 'Cache', '(s Store)' -> 'Store').
+        """
+        for param in recv_param_list.named_children:
+            if param.type != "parameter_declaration":
+                continue
+            for c in param.named_children:
+                if c.type == "type_identifier":
+                    return self.node_text(c)
+                if c.type == "pointer_type":
+                    for sub in c.named_children:
+                        if sub.type == "type_identifier":
+                            return self.node_text(sub)
+        return None
+
+    def _find_go_method_by_receiver(self, receiver_type: str, method_name: str) -> Node | None:
+        """
+        Walk top-level method_declarations and match (receiver_type, method_name).
+        Go methods are top-level siblings to their receiver type, so we can't use
+        the normal class-descendant search.
+        """
+        for child in self.tree.root_node.named_children:
+            if child.type != "method_declaration":
+                continue
+            name_node = child.child_by_field_name("name")
+            recv_node = child.child_by_field_name("receiver")
+            if name_node is None or recv_node is None:
+                continue
+            if self.node_text(name_node) != method_name:
+                continue
+            recv_type = self._extract_go_receiver_type(recv_node)
+            if recv_type == receiver_type:
+                return child
+        return None

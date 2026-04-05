@@ -133,6 +133,80 @@ int freeFunc(int x) {
 }
 """,
     },
+    "rb": {
+        "file": "test_target.rb",
+        "content": """require 'json'
+
+class LRUCache
+  def initialize(capacity)
+    @capacity = capacity
+    @items = {}
+  end
+
+  def get(key)
+    @items[key]
+  end
+end
+
+def helper(x)
+  x * 2
+end
+""",
+    },
+    "go": {
+        "file": "test_target.go",
+        "content": """package main
+
+import (
+\t"fmt"
+\t"strings"
+)
+
+type Cache struct {
+\tcapacity int
+\titems    map[string]string
+}
+
+func NewCache(capacity int) *Cache {
+\treturn &Cache{capacity: capacity, items: make(map[string]string)}
+}
+
+func (c *Cache) Get(key string) string {
+\treturn c.items[key]
+}
+
+func (c *Cache) Set(key, value string) {
+\tc.items[key] = value
+}
+""",
+    },
+    "java": {
+        "file": "test_target.java",
+        "content": """package com.example;
+
+import java.util.HashMap;
+import java.util.Map;
+
+public class LRUCache {
+    private int capacity;
+    private Map<String, String> items;
+
+    public LRUCache(int capacity) {
+        this.capacity = capacity;
+        this.items = new HashMap<>();
+    }
+
+    @Override
+    public String toString() {
+        return "LRUCache";
+    }
+
+    public String get(String key) {
+        return items.get(key);
+    }
+}
+""",
+    },
 }
 
 
@@ -1073,6 +1147,300 @@ def test_find_references():
 
 
 # ──────────────────────────────────────────────
+# Ruby tests
+# ──────────────────────────────────────────────
+
+def test_ruby():
+    print("\n═══ Ruby (.rb) ═══")
+
+    # replace_function_body on an instance method
+    path = reset_fixture("rb")
+    app = Applier(path)
+    app.replace_function_body(
+        "LRUCache.get",
+        "    @items.fetch(key, nil)"
+    )
+    result = read_file(path)
+    check("rb replace_function_body: new body injected", result, "@items.fetch(key, nil)")
+    check("rb replace_function_body: signature preserved", result, "def get(key)")
+    check("rb replace_function_body: class intact", result, "class LRUCache")
+
+    # add_method to a Ruby class
+    path = reset_fixture("rb")
+    app = Applier(path)
+    app.add_method("LRUCache", "  def set(key, value)\n    @items[key] = value\n  end")
+    result = read_file(path)
+    check("rb add_method: new method added", result, "def set(key, value)")
+    check("rb add_method: existing method intact", result, "def get(key)")
+
+    # add_field (option a: caller provides literal text)
+    path = reset_fixture("rb")
+    app = Applier(path)
+    app.add_field("LRUCache", "  attr_accessor :capacity")
+    result = read_file(path)
+    check("rb add_field: attr_accessor inserted", result, "attr_accessor :capacity")
+
+    # delete_symbol on a top-level function
+    path = reset_fixture("rb")
+    app = Applier(path)
+    app.delete_symbol("helper")
+    result = read_file(path)
+    check("rb delete_symbol: helper removed", "PASS" if "def helper" not in result else "FAIL", "PASS")
+    check("rb delete_symbol: class intact", result, "class LRUCache")
+
+    # add_import (require)
+    path = reset_fixture("rb")
+    app = Applier(path)
+    app.add_import("require 'set'")
+    result = read_file(path)
+    check("rb add_import: new require present", result, "require 'set'")
+    check("rb add_import: original require intact", result, "require 'json'")
+
+    # list_symbols
+    path = reset_fixture("rb")
+    app = Applier(path)
+    outline = app.list_symbols()
+    check("rb list_symbols: class listed", outline, "class LRUCache")
+    check("rb list_symbols: method listed", outline, "method LRUCache.get")
+    check("rb list_symbols: top-level function listed", outline, "function helper")
+
+    # get_signature
+    path = reset_fixture("rb")
+    app = Applier(path)
+    sig = app.get_signature("LRUCache.get")
+    check("rb get_signature: correct sig returned", sig, "def get(key)")
+
+    # add_comment_before
+    path = reset_fixture("rb")
+    app = Applier(path)
+    app.add_comment_before("LRUCache.get", "  # Fetch an item by key")
+    result = read_file(path)
+    check("rb add_comment_before: comment present", result, "# Fetch an item by key")
+
+
+# ──────────────────────────────────────────────
+# Go tests
+# ──────────────────────────────────────────────
+
+def test_go():
+    print("\n═══ Go (.go) ═══")
+
+    # replace_function_body on a free function
+    path = reset_fixture("go")
+    app = Applier(path)
+    app.replace_function_body(
+        "NewCache",
+        "\treturn &Cache{capacity: capacity}"
+    )
+    result = read_file(path)
+    check("go replace_function_body: new body injected", result, "return &Cache{capacity: capacity}")
+    check("go replace_function_body: signature preserved", result, "func NewCache(capacity int) *Cache")
+
+    # replace_function_body on a method (dotted receiver addressing)
+    path = reset_fixture("go")
+    app = Applier(path)
+    app.replace_function_body(
+        "Cache.Get",
+        "\tif v, ok := c.items[key]; ok {\n\t\treturn v\n\t}\n\treturn \"\""
+    )
+    result = read_file(path)
+    check("go method replace_function_body: new body injected", result, "if v, ok := c.items[key]; ok")
+    check("go method replace_function_body: signature preserved", result, "func (c *Cache) Get(key string) string")
+
+    # add_method on a struct (option a: inserts after type declaration as top-level sibling)
+    path = reset_fixture("go")
+    app = Applier(path)
+    app.add_method(
+        "Cache",
+        "func (c *Cache) Has(key string) bool {\n\t_, ok := c.items[key]\n\treturn ok\n}"
+    )
+    result = read_file(path)
+    check("go add_method: new method present", result, "func (c *Cache) Has(key string) bool")
+    check("go add_method: existing Get intact", result, "func (c *Cache) Get(key string) string")
+
+    # add_field on a struct (option a: caller provides literal text)
+    path = reset_fixture("go")
+    app = Applier(path)
+    app.add_field("Cache", "\tversion int")
+    result = read_file(path)
+    check("go add_field: new field present", result, "version int")
+    check("go add_field: existing fields intact", result, "capacity int")
+
+    # delete_symbol on a top-level function
+    path = reset_fixture("go")
+    app = Applier(path)
+    app.delete_symbol("NewCache")
+    result = read_file(path)
+    check("go delete_symbol: NewCache removed", "PASS" if "func NewCache" not in result else "FAIL", "PASS")
+    check("go delete_symbol: struct intact", result, "type Cache struct")
+
+    # add_import (new single import)
+    path = reset_fixture("go")
+    app = Applier(path)
+    app.add_import("import \"io\"")
+    result = read_file(path)
+    check("go add_import: new import present", result, "import \"io\"")
+    check("go add_import: existing imports intact", result, "\"fmt\"")
+
+    # list_symbols
+    path = reset_fixture("go")
+    app = Applier(path)
+    outline = app.list_symbols()
+    check("go list_symbols: struct listed", outline, "struct Cache")
+    check("go list_symbols: method listed under struct", outline, "method Cache.Get")
+    check("go list_symbols: top-level function listed", outline, "function NewCache")
+
+    # get_signature on a method
+    path = reset_fixture("go")
+    app = Applier(path)
+    sig = app.get_signature("Cache.Get")
+    check("go get_signature: correct sig returned", sig, "func (c *Cache) Get(key string) string")
+
+    # add_comment_before (// style)
+    path = reset_fixture("go")
+    app = Applier(path)
+    app.add_comment_before("Cache.Get", "// Retrieves an item by key")
+    result = read_file(path)
+    check("go add_comment_before: comment present", result, "// Retrieves an item by key")
+
+
+# ──────────────────────────────────────────────
+# Java tests
+# ──────────────────────────────────────────────
+
+def test_java():
+    print("\n═══ Java (.java) ═══")
+
+    # replace_function_body on a regular method
+    path = reset_fixture("java")
+    app = Applier(path)
+    app.replace_function_body(
+        "LRUCache.get",
+        "        return items.getOrDefault(key, \"default\");"
+    )
+    result = read_file(path)
+    check("java replace_function_body: new body injected", result, "getOrDefault(key, \"default\")")
+    check("java replace_function_body: signature preserved", result, "public String get(String key)")
+    check("java replace_function_body: class intact", result, "public class LRUCache")
+
+    # replace_function_body on a constructor (constructor_body type)
+    path = reset_fixture("java")
+    app = Applier(path)
+    app.replace_function_body(
+        "LRUCache.LRUCache",
+        "        this.capacity = capacity * 2;\n        this.items = new HashMap<>();"
+    )
+    result = read_file(path)
+    check("java replace_function_body: constructor body updated", result, "this.capacity = capacity * 2")
+
+    # add_method to a class
+    path = reset_fixture("java")
+    app = Applier(path)
+    app.add_method(
+        "LRUCache",
+        "    public void clear() {\n        items.clear();\n    }"
+    )
+    result = read_file(path)
+    check("java add_method: new method present", result, "public void clear()")
+    check("java add_method: existing method intact", result, "public String get(String key)")
+
+    # add_field (option a: caller provides literal text)
+    path = reset_fixture("java")
+    app = Applier(path)
+    app.add_field("LRUCache", "    private long createdAt;")
+    result = read_file(path)
+    check("java add_field: new field present", result, "private long createdAt")
+
+    # delete_symbol on a method -- annotations should go with it
+    path = reset_fixture("java")
+    app = Applier(path)
+    app.delete_symbol("LRUCache.toString")
+    result = read_file(path)
+    check("java delete_symbol: method removed", "PASS" if "toString()" not in result else "FAIL", "PASS")
+    check("java delete_symbol: @Override removed with method", "PASS" if "@Override" not in result else "FAIL", "PASS")
+    check("java delete_symbol: class intact", result, "public class LRUCache")
+
+    # add_import
+    path = reset_fixture("java")
+    app = Applier(path)
+    app.add_import("import java.util.List;")
+    result = read_file(path)
+    check("java add_import: new import present", result, "import java.util.List;")
+    check("java add_import: existing import intact", result, "import java.util.HashMap;")
+
+    # list_symbols
+    path = reset_fixture("java")
+    app = Applier(path)
+    outline = app.list_symbols()
+    check("java list_symbols: class listed", outline, "class LRUCache")
+    check("java list_symbols: method listed", outline, "method LRUCache.get")
+    check("java list_symbols: constructor listed", outline, "LRUCache.LRUCache")
+    check("java list_symbols: toString listed", outline, "method LRUCache.toString")
+
+    # get_signature on a method
+    path = reset_fixture("java")
+    app = Applier(path)
+    sig = app.get_signature("LRUCache.get")
+    check("java get_signature: correct sig returned", sig, "public String get(String key)")
+
+    # add_comment_before (// style)
+    path = reset_fixture("java")
+    app = Applier(path)
+    app.add_comment_before("LRUCache.get", "    // Retrieves an item by key")
+    result = read_file(path)
+    check("java add_comment_before: comment present", result, "// Retrieves an item by key")
+
+    # Javadoc /** */ block comment recognition (remove_leading_comment)
+    path = os.path.join(TESTS_DIR, "test_javadoc.java")
+    with open(path, "w") as f:
+        f.write("""public class Foo {
+    /**
+     * Javadoc comment for bar.
+     */
+    public void bar() {
+    }
+}
+""")
+    app = Applier(path)
+    app.remove_leading_comment("Foo.bar")
+    result = read_file(path)
+    check("java remove_leading_comment: Javadoc block removed", "PASS" if "Javadoc comment" not in result else "FAIL", "PASS")
+    check("java remove_leading_comment: method intact", result, "public void bar()")
+    os.remove(path)
+
+    # Interface with bodyless method
+    path = os.path.join(TESTS_DIR, "test_interface.java")
+    with open(path, "w") as f:
+        f.write("""public interface Store {
+    String get(String key);
+    void set(String key, String value);
+}
+""")
+    app = Applier(path)
+    outline = app.list_symbols()
+    check("java list_symbols: interface listed", outline, "interface Store")
+    check("java list_symbols: interface method listed", outline, "method Store.get")
+    os.remove(path)
+
+    # Enum with methods
+    path = os.path.join(TESTS_DIR, "test_enum.java")
+    with open(path, "w") as f:
+        f.write("""public enum Status {
+    OK, ERROR;
+
+    public boolean isOk() {
+        return this == OK;
+    }
+}
+""")
+    app = Applier(path)
+    outline = app.list_symbols()
+    check("java list_symbols: enum listed", outline, "enum Status")
+    check("java list_symbols: enum method listed", outline, "method Status.isOk")
+    os.remove(path)
+
+
+# ──────────────────────────────────────────────
 # Main
 # ──────────────────────────────────────────────
 
@@ -1102,6 +1470,9 @@ if __name__ == "__main__":
     test_comment_ops()
     test_replace_docstring()
     test_find_references()
+    test_ruby()
+    test_go()
+    test_java()
 
     # Reset all fixtures to clean state after tests
     for lang in FIXTURES:

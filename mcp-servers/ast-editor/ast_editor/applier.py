@@ -74,7 +74,6 @@ class Applier:
         if not node:
             raise ApplierError(f"Target '{target}' not found in {self.filepath}")
 
-        # If node is a decorated_definition, drill into the inner function for the body block
         func_node = node
         if node.type == "decorated_definition":
             for child in node.named_children:
@@ -82,40 +81,33 @@ class Applier:
                     func_node = child
                     break
 
-        # Prefer the `body` field (works across Python, JS/TS, C/C++). Fall back to a
-        # children scan for edge cases.
         block_node = func_node.child_by_field_name("body")
         if not block_node:
             for child in func_node.children:
-                if child.type in ("block", "statement_block", "compound_statement"):
+                if child.type in ("block", "statement_block", "compound_statement", "body_statement", "constructor_body"):
                     block_node = child
                     break
 
         if not block_node:
             raise ApplierError(f"Could not find body block for target '{target}'")
 
-        if self.parser.ext == ".py":
+        # Python and Ruby use indented body lines between def/class and end markers.
+        if self.parser.ext == ".py" or self.parser.ext in (".rb",):
             start_line = block_node.start_point[0]
             end_line = block_node.end_point[0] + 1
         else:
+            # JS/TS/C/C++/Go/Java: body is `{ ... }` -- skip the opening brace line.
             start_line = block_node.start_point[0] + 1
             end_line = block_node.end_point[0]
             if start_line > end_line:
                 start_line = block_node.start_point[0]
                 end_line = start_line + 1
 
-        target_indent = (
-            self._get_indent(self.lines[start_line])
-            if start_line < len(self.lines)
-            else ""
-        )
-        if (
-            not target_indent
-            and start_line < len(self.lines)
-            and self.lines[start_line].strip() == ""
-        ):
-            sig_indent = self._get_indent(self.lines[node.start_point[0]])
-            target_indent = sig_indent + ("    " if self.parser.ext == ".py" else "  ")
+        target_indent = self._get_indent(self.lines[start_line]) if start_line < len(self.lines) else ""
+        if not target_indent and start_line < len(self.lines) and self.lines[start_line].strip() == "":
+             sig_indent = self._get_indent(self.lines[node.start_point[0]])
+             default_indent = "    " if self.parser.ext in (".py", ".rb", ".java") else "  "
+             target_indent = sig_indent + default_indent
 
         content_lines = self._reindent(content.splitlines(), target_indent)
 
@@ -123,37 +115,57 @@ class Applier:
         return self._save()
 
     def add_method(self, class_target: str, content: str) -> str:
+        """
+        Add a new method to a class. Placement varies by language:
+          - Python/JS/TS/C++/Ruby: inside the class body at the end.
+          - Go: as a top-level sibling immediately after the type declaration
+                (Go methods are not lexically inside struct definitions).
+        """
         node = self.parser.find_node_by_name(class_target)
         if not node:
             raise ApplierError(f"Target class '{class_target}' not found")
 
-        if self.parser.ext != ".py":
-            # For non-Python, insert before the closing `}` of the class body.
-            # Prefer the body field (e.g., field_declaration_list in C++, class_body in JS/TS)
-            # so that trailing tokens like `;` after `}` are not pushed further down.
-            body = node.child_by_field_name("body")
-            insert_line = body.end_point[0] if body else node.end_point[0]
-            indent = self._get_indent(self.lines[node.start_point[0]]) + "  "
+        # Go: methods live outside the struct. Insert after the enclosing type_declaration.
+        if self.parser.ext == ".go":
+            # find_node_by_name returns the type_spec; walk up to the enclosing type_declaration
+            target_node = node
+            parent = node.parent
+            while parent and parent.type != "type_declaration":
+                parent = parent.parent
+            if parent is not None:
+                target_node = parent
+
+            insert_line = target_node.end_point[0] + 1
+            content_lines = content.splitlines()
+            # Add a blank separator before and the method content (and a trailing blank for readability)
+            sep_before = [""] if insert_line - 1 >= 0 and insert_line - 1 < len(self.lines) and self.lines[insert_line - 1].strip() else []
+            self.lines = self.lines[:insert_line] + sep_before + content_lines + self.lines[insert_line:]
+            return self._save()
+
+        if self.parser.ext != ".py" and self.parser.ext not in (".rb",):
+             # For non-Python/Ruby, insert before the closing `}` of the class body.
+             body = node.child_by_field_name("body")
+             insert_line = body.end_point[0] if body else node.end_point[0]
+             indent = self._get_indent(self.lines[node.start_point[0]]) + "  "
         else:
-            insert_line = node.end_point[0] + 1
-            indent = self._get_indent(self.lines[node.start_point[0]]) + "    "
+             # Python and Ruby: body is an indented block; insert at end of body
+             if self.parser.ext == ".rb":
+                 # Ruby's class body ends at `end` keyword; insert just before the `end` line
+                 body = node.child_by_field_name("body")
+                 if body is not None:
+                     insert_line = body.end_point[0] + 1
+                 else:
+                     insert_line = node.end_point[0]
+                 indent = self._get_indent(self.lines[node.start_point[0]]) + "  "
+             else:
+                 insert_line = node.end_point[0] + 1
+                 indent = self._get_indent(self.lines[node.start_point[0]]) + "    "
 
         content_lines = self._reindent(content.splitlines(), indent)
-        if self.parser.ext != ".py":
-            self.lines = (
-                self.lines[:insert_line]
-                + [""]
-                + content_lines
-                + [""]
-                + self.lines[insert_line:]
-            )
+        if self.parser.ext not in (".py", ".rb"):
+            self.lines = self.lines[:insert_line] + [""] + content_lines + [""] + self.lines[insert_line:]
         else:
-            self.lines = (
-                self.lines[:insert_line]
-                + [""]
-                + content_lines
-                + self.lines[insert_line:]
-            )
+            self.lines = self.lines[:insert_line] + [""] + content_lines + self.lines[insert_line:]
         return self._save()
 
     def delete_symbol(self, target: str) -> str:
@@ -179,15 +191,17 @@ class Applier:
         """Return the AST node types that represent import statements for this file's language."""
         ext = self.parser.ext
         if ext == ".py":
-            return (
-                "import_statement",
-                "import_from_statement",
-                "future_import_statement",
-            )
+            return ("import_statement", "import_from_statement", "future_import_statement")
         if ext in (".js", ".jsx", ".mjs", ".cjs", ".ts", ".tsx"):
             return ("import_statement",)
         if ext in (".c", ".h", ".cpp", ".cc", ".cxx", ".hpp", ".hxx", ".hh"):
             return ("preproc_include",)
+        if ext == ".go":
+            return ("import_declaration",)
+        if ext == ".java":
+            return ("import_declaration",)
+        if ext == ".rb":
+            return ("call",)
         return ()
 
     def add_import(self, import_text: str) -> str:
@@ -196,14 +210,14 @@ class Applier:
           - Python: "import foo" or "from foo import bar"
           - JS/TS:  "import { foo } from 'bar';"
           - C/C++:  "#include <foo.h>"
+          - Go:     "import \"fmt\"" or insert into existing import blocks
+          - Ruby:   "require 'foo'" or "require_relative 'bar'"
         Skips insertion if an identical import already exists.
         Places the new import after existing imports, or at the top of the file if none exist.
         """
         valid_types = self._import_node_types()
         if not valid_types:
-            raise ApplierError(
-                f"add_import is not supported for file type {self.parser.ext}"
-            )
+            raise ApplierError(f"add_import is not supported for file type {self.parser.ext}")
 
         stripped = import_text.strip()
         for line in self.lines:
@@ -212,9 +226,14 @@ class Applier:
 
         last_import_end = -1
         for child in self.parser.tree.root_node.named_children:
-            if child.type in valid_types:
-                if child.end_point[0] > last_import_end:
-                    last_import_end = child.end_point[0]
+            if child.type not in valid_types:
+                continue
+            # Ruby: filter "call" to only require/require_relative calls
+            if self.parser.ext == ".rb" and child.type == "call":
+                if not self._is_ruby_require_call(child):
+                    continue
+            if child.end_point[0] > last_import_end:
+                last_import_end = child.end_point[0]
 
         if last_import_end >= 0:
             insert_line = last_import_end + 1
@@ -700,53 +719,72 @@ class Applier:
 
     def add_field(self, class_target: str, content: str) -> str:
         """
-        Add a field/attribute/member at the top of a class body. For Python this
-        is a class-level attribute; for JS/TS a class field; for C++ a member
-        variable. Inserts before any existing methods/fields, matching the
-        fields-before-methods convention.
+        Add a field/attribute/member at the top of a class body (fields-before-methods
+        convention).
+
+        Design decision: option (a) -- the caller provides the literal text to insert.
+        The tool does NOT auto-wrap in language-specific constructs (e.g. no implicit
+        `attr_accessor :foo` for Ruby, no implicit type inference for Go). Pass exactly
+        what you want to appear in the source.
         """
         node = self.parser.find_node_by_name(class_target)
         if not node:
             raise ApplierError(f"Target class '{class_target}' not found")
+
+        # Go: field goes inside the struct_type's braces (which live inside type_spec)
+        if self.parser.ext == ".go":
+            struct_node = None
+            for c in node.named_children:
+                if c.type == "struct_type":
+                    struct_node = c
+                    break
+            if struct_node is None:
+                raise ApplierError(f"'{class_target}' is not a struct; add_field needs a struct_type")
+            # Insert inside the struct braces, after the opening line
+            insert_line = struct_node.start_point[0] + 1
+            # Infer indent from existing field, or fallback
+            indent = ""
+            for i in range(insert_line, min(len(self.lines), struct_node.end_point[0])):
+                stripped = self.lines[i].strip()
+                if stripped and stripped not in ("{", "}"):
+                    indent = self._get_indent(self.lines[i])
+                    break
+            if not indent:
+                struct_indent = self._get_indent(self.lines[node.start_point[0]])
+                indent = struct_indent + "\t"
+            content_lines = self._reindent(content.splitlines(), indent)
+            self.lines = self.lines[:insert_line] + content_lines + self.lines[insert_line:]
+            return self._save()
 
         body = node.child_by_field_name("body")
         if body is None:
             raise ApplierError(f"Could not find class body for '{class_target}'")
 
         if self.parser.ext == ".py":
-            # Python block: body.start_point[0] is the first statement inside the class
             insert_line = body.start_point[0]
-            indent = (
-                self._get_indent(self.lines[insert_line])
-                if insert_line < len(self.lines)
-                else ""
-            )
+            indent = self._get_indent(self.lines[insert_line]) if insert_line < len(self.lines) else ""
             if not indent:
-                # Fallback: class indent + 4
                 class_indent = self._get_indent(self.lines[node.start_point[0]])
                 indent = class_indent + "    "
+        elif self.parser.ext == ".rb":
+            # Ruby body_statement starts at the first statement inside the class
+            insert_line = body.start_point[0]
+            indent = self._get_indent(self.lines[insert_line]) if insert_line < len(self.lines) else ""
+            if not indent:
+                class_indent = self._get_indent(self.lines[node.start_point[0]])
+                indent = class_indent + "  "
         else:
             # JS/TS class_body / C++ field_declaration_list: body.start_point[0] is the `{` line
             insert_line = body.start_point[0] + 1
             indent = ""
             for i in range(insert_line, min(len(self.lines), body.end_point[0])):
                 stripped = self.lines[i].strip()
-                if stripped and stripped not in (
-                    "{",
-                    "}",
-                    "public:",
-                    "private:",
-                    "protected:",
-                ):
+                if stripped and stripped not in ("{", "}", "public:", "private:", "protected:"):
                     indent = self._get_indent(self.lines[i])
                     break
             if not indent:
                 class_indent = self._get_indent(self.lines[node.start_point[0]])
-                indent = class_indent + (
-                    "    "
-                    if self.parser.ext in (".ts", ".tsx", ".js", ".jsx", ".mjs", ".cjs")
-                    else "    "
-                )
+                indent = class_indent + "    "
 
         content_lines = self._reindent(content.splitlines(), indent)
         self.lines = self.lines[:insert_line] + content_lines + self.lines[insert_line:]
@@ -811,19 +849,20 @@ class Applier:
             class_types = {"struct_specifier", "union_specifier", "enum_specifier"}
             func_types = {"function_definition"}
         elif ext in (".cpp", ".cc", ".cxx", ".hpp", ".hxx", ".hh"):
-            class_types = {
-                "class_specifier",
-                "struct_specifier",
-                "union_specifier",
-                "enum_specifier",
-                "namespace_definition",
-            }
+            class_types = {"class_specifier", "struct_specifier", "union_specifier", "enum_specifier", "namespace_definition"}
             func_types = {"function_definition"}
+        elif ext == ".rb":
+            class_types = {"class", "module"}
+            func_types = {"method", "singleton_method"}
+        elif ext == ".go":
+            return self._list_symbols_go(root)
+        elif ext == ".java":
+            class_types = {"class_declaration", "interface_declaration", "enum_declaration", "record_declaration"}
+            func_types = {"method_declaration", "constructor_declaration"}
         else:
             raise ApplierError(f"list_symbols is not supported for file type {ext}")
 
         def get_name(node):
-            # Decorated python function
             inner = node
             if node.type == "decorated_definition":
                 for c in node.named_children:
@@ -832,11 +871,7 @@ class Applier:
                         break
             name_node = inner.child_by_field_name("name")
             if name_node is None and inner.type == "function_definition":
-                name_node = (
-                    self.parser._extract_c_function_name(inner)
-                    if hasattr(self.parser, "_extract_c_function_name")
-                    else None
-                )
+                name_node = self.parser._extract_c_function_name(inner) if hasattr(self.parser, "_extract_c_function_name") else None
             if name_node is None:
                 return "<anonymous>"
             return self.parser.node_text(name_node)
@@ -846,21 +881,34 @@ class Applier:
             if body is None:
                 return []
             methods = []
-            for child in body.named_children:
+            # BFS walk of the class body so we catch methods nested inside
+            # containers like Java's `enum_body_declarations`.
+            queue = list(body.named_children)
+            while queue:
+                child = queue.pop(0)
                 if child.type in func_types:
                     methods.append((get_name(child), child.start_point[0] + 1))
+                else:
+                    # Descend into sub-containers (e.g. enum_body_declarations)
+                    if child.type in ("enum_body_declarations", "class_body", "interface_body"):
+                        queue.extend(child.named_children)
             return methods
 
         lines_out = []
         for child in root.named_children:
             if child.type in class_types:
                 name = get_name(child)
-                kind = (
-                    "class"
-                    if child.type
-                    in ("class_definition", "class_declaration", "class_specifier")
-                    else child.type
-                )
+                kind_map = {
+                    "class_definition": "class",
+                    "class_declaration": "class",
+                    "class_specifier": "class",
+                    "class": "class",
+                    "module": "module",
+                    "interface_declaration": "interface",
+                    "enum_declaration": "enum",
+                    "record_declaration": "record",
+                }
+                kind = kind_map.get(child.type, child.type)
                 lines_out.append(f"{kind} {name} (line {child.start_point[0] + 1})")
                 for mname, mline in walk_class_methods(child):
                     lines_out.append(f"  method {name}.{mname} (line {mline})")
@@ -904,7 +952,7 @@ class Applier:
         return signature.strip()
 
     def _get_function_body_node(self, target: str):
-        """Resolve target to the body block node (block/statement_block/compound_statement)."""
+        """Resolve target to the body block node (block/statement_block/compound_statement/body_statement/constructor_body)."""
         node = self.parser.find_node_by_name(target)
         if not node:
             raise ApplierError(f"Target '{target}' not found in {self.filepath}")
@@ -919,7 +967,7 @@ class Applier:
         body = func_node.child_by_field_name("body")
         if body is None:
             for child in func_node.children:
-                if child.type in ("block", "statement_block", "compound_statement"):
+                if child.type in ("block", "statement_block", "compound_statement", "body_statement", "constructor_body"):
                     body = child
                     break
         if body is None:
@@ -1426,6 +1474,12 @@ class Applier:
             return ("//",)
         if self.parser.ext in (".c", ".h", ".cpp", ".cc", ".cxx", ".hpp", ".hxx", ".hh"):
             return ("//",)
+        if self.parser.ext == ".go":
+            return ("//",)
+        if self.parser.ext == ".java":
+            return ("//",)
+        if self.parser.ext == ".rb":
+            return ("#",)
         if self.parser.ext in (".yml", ".yaml", ".toml"):
             return ("#",)
         return ()
@@ -1606,6 +1660,8 @@ class Applier:
         return self.parser.ext in (
             ".js", ".jsx", ".ts", ".tsx", ".mjs", ".cjs",
             ".c", ".h", ".cpp", ".cc", ".cxx", ".hpp", ".hxx", ".hh",
+            ".go",
+            ".java",
         )
 
     def _find_leading_comment_range(self, start_line: int):
@@ -1688,3 +1744,71 @@ class Applier:
                             return curr
                 queue.extend(curr.named_children)
         return None
+
+    def _is_ruby_require_call(self, call_node) -> bool:
+        """Return True if a Ruby `call` node is a require/require_relative/load statement."""
+        if not call_node.named_children:
+            return False
+        first = call_node.named_children[0]
+        if first.type != "identifier":
+            return False
+        name = self.parser.node_text(first)
+        return name in ("require", "require_relative", "load", "autoload")
+
+    def _list_symbols_go(self, root) -> str:
+        """
+        Go-specific symbol listing. Groups methods under their receiver type, since
+        Go methods live at top level but logically belong to their struct/interface.
+        """
+        types_by_name: dict[str, dict] = {}
+        top_level_funcs: list[tuple[str, int]] = []
+        methods_by_receiver: dict[str, list[tuple[str, int]]] = {}
+
+        for child in root.named_children:
+            if child.type == "type_declaration":
+                for spec in child.named_children:
+                    if spec.type == "type_spec":
+                        name_node = spec.child_by_field_name("name")
+                        if name_node:
+                            name = self.parser.node_text(name_node)
+                            kind = "type"
+                            for inner in spec.named_children:
+                                if inner.type == "struct_type":
+                                    kind = "struct"
+                                    break
+                                if inner.type == "interface_type":
+                                    kind = "interface"
+                                    break
+                            types_by_name[name] = {"kind": kind, "line": spec.start_point[0] + 1}
+            elif child.type == "function_declaration":
+                name_node = child.child_by_field_name("name")
+                if name_node:
+                    top_level_funcs.append((self.parser.node_text(name_node), child.start_point[0] + 1))
+            elif child.type == "method_declaration":
+                name_node = child.child_by_field_name("name")
+                recv_node = child.child_by_field_name("receiver")
+                if name_node and recv_node:
+                    recv_type = self.parser._extract_go_receiver_type(recv_node)
+                    if recv_type:
+                        methods_by_receiver.setdefault(recv_type, []).append(
+                            (self.parser.node_text(name_node), child.start_point[0] + 1)
+                        )
+
+        lines_out = []
+        for name, info in types_by_name.items():
+            lines_out.append(f"{info['kind']} {name} (line {info['line']})")
+            for mname, mline in methods_by_receiver.get(name, []):
+                lines_out.append(f"  method {name}.{mname} (line {mline})")
+
+        for name, line in top_level_funcs:
+            lines_out.append(f"function {name} (line {line})")
+
+        # Orphan methods (receiver type not declared in this file)
+        for recv, methods in methods_by_receiver.items():
+            if recv not in types_by_name:
+                for mname, mline in methods:
+                    lines_out.append(f"method {recv}.{mname} (line {mline}) [external receiver]")
+
+        if not lines_out:
+            return "(no top-level symbols found)"
+        return "\n".join(lines_out)

@@ -44,6 +44,9 @@ The savings come from three compounding effects:
 | **TypeScript** | `.ts`, `.tsx` | ✅ | ✅ `//` + `/* ... */` | — | Interfaces are treated as classes for `add_method` / `add_field`. |
 | **C** | `.c`, `.h` | ✅ | ✅ `//` + `/* ... */` (single + multi-line) | — | `.h` defaults to C — use `.hpp`/`.hxx`/`.hh` for C++ headers. |
 | **C++** | `.cpp`, `.cc`, `.cxx`, `.hpp`, `.hxx`, `.hh` | ✅ | ✅ `//` + `/* ... */` (single + multi-line) | — | Supports `class`, `struct`, `union`, `enum`, `namespace`; `Class::method` qualified names resolve correctly. |
+| **Ruby** | `.rb` | ✅ | ✅ `#` | — | Classes, modules, instance methods, `singleton_method` (class methods via `def self.foo`). `require`/`require_relative`/`load`/`autoload` recognized as imports. |
+| **Go** | `.go` | ✅ | ✅ `//` + `/* ... */` | — | `struct`, `interface`, functions, methods. Methods are addressed by receiver: `Cache.Get` resolves to the top-level `func (c *Cache) Get(...)`. Grouped `import (...)` blocks supported. |
+| **Java** | `.java` | ✅ | ✅ `//` + `/* ... */` + Javadoc `/** ... */` | — | `class`, `interface`, `enum`, `record`; methods, constructors, fields. Annotations (`@Override`, `@Deprecated`) travel with their method on edits (wrapped in the `modifiers` node). Enum methods (nested in `enum_body_declarations`) discovered via BFS in `list_symbols`. |
 | **JSON** | `.json` | ✅ (keys, values, arrays) | — (no comment syntax) | — | |
 | **YAML** | `.yml`, `.yaml` | ✅ (keys, values, sequences) | ✅ `#` | — | Block and flow sequences supported. |
 | **TOML** | `.toml` | ✅ (keys, values, arrays, tables) | ✅ `#` | — | `[table]` headers addressable by name for comment tools. |
@@ -54,11 +57,26 @@ The savings come from three compounding effects:
 - **Byte-correct slicing**: multi-byte characters (emoji, `═`, `→`) handled safely in source text.
 - **Idempotent imports**: `add_import` skips exact duplicates automatically.
 
+### Language-specific design decisions
+
+A few tools have language-specific semantics where multiple reasonable interpretations exist. The chosen behavior is documented here for transparency:
+
+**`add_field` (Ruby and Go) — option (a): literal text passthrough**
+
+- **Ruby:** `add_field("LRUCache", "  attr_accessor :capacity")` inserts the literal string at the top of the class body. The tool does **not** auto-wrap bare names in `attr_accessor` — you provide the exact text you want (whether that's `attr_accessor`, `attr_reader`, `@instance_var = nil` in `initialize`, or `CLASS_CONST = 42`).
+- **Go:** `add_field("Cache", "\tversion int")` inserts the literal string inside the `struct { ... }` body. The tool does **not** infer types from bare names — you provide the full Go field declaration.
+- **Rationale:** consistent with how `add_field` works for other languages (Python, JS/TS, C++) where the caller provides the full source text. The alternative option (b) — auto-wrapping (e.g. `attr_accessor :foo` from the name `foo`) — would be more magical but harder to use for edge cases (typed fields, readonly fields, field with default value, etc.).
+
+**`add_method` (Go) — option (a): top-level sibling insertion**
+
+- `add_method("Cache", "func (c *Cache) Has(key string) bool { ... }")` locates the `type Cache struct { ... }` declaration and inserts the new method **immediately after it, at the top level** (not inside the struct's braces).
+- **Rationale:** Go methods are lexically top-level, not nested inside their receiver type — this matches how Go code is actually written. The alternative option (b) — refusing because "Go methods aren't inside structs" — would be pedantically correct but force callers to use `insert_after("Cache", content)` instead, which loses the semantic signal that this is a method addition.
+
 ## Tools Exposed
 
 All tools require `file_path` to be an **absolute path** to an existing file.
 
-### Code editing — structural (Python, JS, TS, C, C++)
+### Code editing — structural (Python, JS, TS, C, C++, Ruby, Go, Java)
 
 | Tool | Parameters | Description |
 | :--- | :--- | :--- |
@@ -94,7 +112,7 @@ All tools require `file_path` to be an **absolute path** to an existing file.
 
 | Tool | Parameters | Description |
 | :--- | :--- | :--- |
-| `add_comment_before` | `file_path`, `target`, `comment` | Insert a comment block immediately before a named symbol. Works for Python/YAML/TOML (`#`), JS/TS/C/C++ (`//` or `/* */`). |
+| `add_comment_before` | `file_path`, `target`, `comment` | Insert a comment block immediately before a named symbol. Works for Python/Ruby/YAML/TOML (`#`), JS/TS/C/C++/Go/Java (`//` or `/* */`; Java Javadoc `/** */` supported). |
 | `remove_leading_comment` | `file_path`, `target` | Remove the contiguous comment block above a symbol. Recognizes both line comments and C-style single-line or multi-line `/* ... */` blocks. |
 | `replace_leading_comment` | `file_path`, `target`, `new_comment` | Replace the leading comment block above a symbol (or insert one if none exists). |
 | `replace_docstring` | `file_path`, `target`, `new_docstring` | Replace or insert a Python function/class docstring. Python-only. |
@@ -298,7 +316,7 @@ Coding agents are heavily biased toward their default tools. You **must** explic
 
 Add the following block to `CLAUDE.md`, `~/.claude/CLAUDE.md`, or **Custom Instructions**:
 
-> **When editing `.py`, `.js`, `.ts`, `.c`, `.cpp`, `.json`, `.yaml`, or `.toml` files, do NOT use the `edit` tool. Use the `ast-editor` MCP server instead. It exposes 29 surgical tools for structural code and config edits.**
+> **When editing `.py`, `.js`, `.ts`, `.c`, `.cpp`, `.rb`, `.go`, `.java`, `.json`, `.yaml`, or `.toml` files, do NOT use the `edit` tool. Use the `ast-editor` MCP server instead. It exposes 29 surgical tools for structural code and config edits.**
 >
 > **Picking a tool — always start here:**
 >
@@ -348,4 +366,4 @@ Add the following block to `CLAUDE.md`, `~/.claude/CLAUDE.md`, or **Custom Instr
 
 Add to rules or system prompt:
 
-> *When editing `.py`, `.js`, `.ts`, `.c`, or `.cpp` files, do NOT use your default editing tools (diff, whole, etc.). Instead, use the `ast-editor` MCP server, which exposes 29 surgical tools for adding/modifying/removing functions, classes, methods, fields, parameters, imports, comments, and docstrings. Start any edit session by calling `list_symbols` to discover exact target names. For `.json`, `.yaml`, or `.toml` files, use `replace_value`/`add_key`/`append_to_array`/`delete_key` instead of freeform edits.*
+> *When editing `.py`, `.js`, `.ts`, `.c`, `.cpp`, `.rb`, `.go`, or `.java` files, do NOT use your default editing tools (diff, whole, etc.). Instead, use the `ast-editor` MCP server, which exposes 29 surgical tools for adding/modifying/removing functions, classes, methods, fields, parameters, imports, comments, and docstrings. Start any edit session by calling `list_symbols` to discover exact target names. For `.json`, `.yaml`, or `.toml` files, use `replace_value`/`add_key`/`append_to_array`/`delete_key` instead of freeform edits.*
