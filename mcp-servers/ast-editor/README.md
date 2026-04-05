@@ -357,13 +357,15 @@ Add the following block to `CLAUDE.md`, `~/.claude/CLAUDE.md`, or **Custom Instr
 
 | Agent | Target Instructions / File | Instruction |
 | :--- | :--- | :--- |
-| **Cursor** | `.cursorrules` / Settings | ...do NOT use `edit_file`. Use AST tools (`replace_function_body`, etc.) instead. |
-| **Codex CLI** | `copilot-instructions.md` | ...do NOT use `apply-patch`. Use AST tools instead. |
-| **Windsurf** | `.windsurfrules` / `AGENTS.md` | ...do NOT use Cascade's built-in write mode. Use AST tools instead. |
+| **Any agent that reads `AGENTS.md`** (recommended universal option) | `AGENTS.md` at repo root | Drop the Claude instruction block above into `AGENTS.md`. Read by Codex CLI, Windsurf, Zed, Cursor (as secondary), and a growing list of others. |
+| **Cursor** | `.cursor/rules/*.mdc` (current) or `AGENTS.md` — legacy: `.cursorrules` | ...do NOT use `edit_file`. Use AST tools (`replace_function_body`, etc.) instead. |
+| **Codex CLI** (OpenAI) | `AGENTS.md` at repo root | ...do NOT use `apply-patch`. Use AST tools instead. |
+| **GitHub Copilot** (VS Code / JetBrains) | `.github/copilot-instructions.md` | ...do NOT use inline suggestions for structural edits. Use AST tools from the `ast-editor` MCP server. |
+| **Windsurf** | `.windsurfrules` or `AGENTS.md` | ...do NOT use Cascade's built-in write mode. Use AST tools instead. |
 | **Antigravity** | `_agents/rules/` | ...do NOT use `write_to_file`, `replace_file_content`, or `multi_replace_file_content`. Use AST tools instead. |
 
 ### Generic / Aider / Gemini CLI
 
 Add to rules or system prompt:
 
-> *When editing `.py`, `.js`, `.ts`, `.c`, `.cpp`, `.rb`, `.go`, or `.java` files, do NOT use your default editing tools (diff, whole, etc.). Instead, use the `ast-editor` MCP server, which exposes 29 surgical tools for adding/modifying/removing functions, classes, methods, fields, parameters, imports, comments, and docstrings. Start any edit session by calling `list_symbols` to discover exact target names. For `.json`, `.yaml`, or `.toml` files, use `replace_value`/`add_key`/`append_to_array`/`delete_key` instead of freeform edits.*
+> *When editing `.py`, `.js`, `.ts`, `.c`, `.cpp`, `.rb`, `.go`, or `.java` files, do NOT use your default editing tools (diff, whole, etc.). Instead, use the `ast-editor` MCP server, which exposes 29 surgical tools for adding/modifying/removing functions, classes, methods, fields, parameters, imports, comments, and docstrings. Start any edit session by calling `list_symbols` to discover exact target names. **For small additions to a function body (logging, validation, cleanup), use `prepend_to_body` / `append_to_body` — these are the single biggest token-saving tools in the suite, giving ~20x fewer output tokens than rewriting the whole body.** For `.json`, `.yaml`, or `.toml` files, use `replace_value`/`add_key`/`append_to_array`/`delete_key` instead of freeform edits.*
