@@ -5,7 +5,7 @@ license: MIT
 allowed-tools: Read Write Edit Glob Grep AskUserQuestion
 metadata:
   author: kambleakash0
-  version: 1.0.0
+  version: 1.2.0
 triggers:
   - /humanize
 ---
@@ -30,6 +30,20 @@ Before fixing any patterns, internalize how a strong English writer actually thi
 **Alive (Human):**
 > AI is moving fast, and businesses are scrambling to figure out how to use it. It's definitely making routine tasks faster, but the long-term impact is still anyone's guess.
 
+## The Goal: Break Clustering, Not Erase Style
+
+The goal is **not** to scrub every pattern from every sentence. Any one of the 40 patterns, used once, can appear in perfectly good human writing — a single em-dash, one "furthermore," a rule-of-three list, an occasional metaphor. Humans write this way too.
+
+**The AI tell is clustering.** A model bundles multiple patterns into the same paragraph, and then repeats that density paragraph after paragraph. Three tropes in one sentence, four in the next, five in the following — that is the fingerprint. Breaking the clustering is the work, not exterminating each trope.
+
+**What to keep vs. what to rewrite is always a judgment call.** It depends on:
+
+- **The input text itself** — the patterns actually present, how densely they cluster, how much of the piece they dominate, and whether meaning survives removal.
+- **The surrounding context** — genre (a wedding speech can carry more flourish than a bug report), register (academic, casual, marketing), audience, and any instructions the user has given in the conversation.
+- **What the text is trying to do** — a persuasive essay may legitimately use anaphora; a product changelog should not.
+
+When in doubt, **thin the cluster, don't shave the words.** If a paragraph has six tells, removing three usually restores a human cadence; removing all six often produces a different kind of flat, sanitized prose that reads just as artificial. Leave enough stylistic variety that the result sounds like a specific person, not a scrubbed average.
+
 ## Two Modes of Operation
 
 **1. Default Mode ("Humanize"):**
@@ -41,7 +55,7 @@ If the user explicitly asks to "analyze" or "check" the text, return ONLY a list
 
 ## Core Patterns to Watch For
 
-*(For the full list of 25 patterns, refer to [English Humanizer: Full Pattern Library](resources/references.md))*
+*(For the full list of 40 patterns — plus meta-framings on clustering, regression-to-the-mean, and era-versioned vocabulary — refer to [English Humanizer: Full Pattern Library](resources/references.md))*
 
 **#1 The "AI Glossary"**:
 AI overuses certain words to sound authoritative: *delve, tapestry, crucial, testament, landscape, intricate, beacon, underscore, pivotal.*
