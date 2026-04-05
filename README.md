@@ -22,7 +22,7 @@ A personal collection of Claude Code agent skills and MCP servers, can be used w
 
 | Server | Description |
 | ------ | ----------- |
-| [ast-editor](./mcp-servers/ast-editor/README.md) | AST-targeted code editing MCP server with **29 surgical tools**: functions, classes, methods, fields, parameters, imports, comments, docstrings, and dict/list editing (JSON/YAML/TOML config AND Python module-level literals in unified tools). Built on tree-sitter. Supports Python, JS, TS, C, C++, JSON, YAML, and TOML. |
+| [ast-editor](./mcp-servers/ast-editor/README.md) | AST-targeted code editing MCP server with **29 surgical tools**: functions, classes, methods, fields, parameters, imports, comments, docstrings, and dict/list editing (JSON/YAML/TOML config AND Python module-level literals in unified tools). Built on tree-sitter. Supports **11 languages**: Python, JavaScript, TypeScript, C, C++, Ruby, Go, Java, JSON, YAML, and TOML. |
 
 ## Skills installation via [skills.sh](https://skills.sh)
 
