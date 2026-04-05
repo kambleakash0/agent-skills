@@ -1,0 +1,21 @@
+[project]
+name = "notebook-editor-mcp"
+version = "0.1.0"
+description = "MCP Server for editing Jupyter notebooks (.ipynb) with cell-level operations and kernel execution"
+requires-python = ">=3.10"
+dependencies = [
+    "mcp>=1.10.0",
+    "nbformat>=5.10.0",
+    "jupyter-client>=8.6.0",
+    "ipykernel>=6.29.0",
+]
+
+[build-system]
+requires = ["hatchling"]
+build-backend = "hatchling.build"
+
+[project.scripts]
+notebook-editor-mcp = "notebook_editor.server:main"
+
+[tool.hatch.build.targets.wheel]
+packages = ["notebook_editor"]
