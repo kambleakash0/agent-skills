@@ -925,6 +925,94 @@ def add_top_level(file_path: str, content: str) -> str:
         return f"Internal error in add_top_level: {type(e).__name__}: {e}"
 
 
+@mcp.tool()
+def read_symbol(file_path: str, target: str) -> str:
+    """
+    Return the full source text of a single named symbol (function, class, method,
+    config key) without reading the entire file. Read-only.
+
+    Use this when: You need to see the implementation of ONE specific function or
+    class. Far cheaper than reading the whole file -- typically 10-20x fewer tokens.
+    Don't use this when: You need a structural overview of the file -> use
+    `list_symbols`. You only need the signature -> use `get_signature`.
+
+    Example:
+        target="LRUCache.get"   # returns just the get method's source
+        target="LRUCache"       # returns the entire class source
+        target="project.version" # returns the value node for a config key
+    """
+    if err := _validate_file(file_path):
+        return err
+    try:
+        logger.info("read_symbol: target='%s' file='%s'", target, file_path)
+        applier = Applier(file_path)
+        return applier.read_symbol(target)
+    except ApplierError as e:
+        logger.warning("read_symbol: %s", e)
+        return f"Cannot read symbol: {e}"
+    except Exception as e:
+        logger.exception("read_symbol crashed")
+        return f"Internal error in read_symbol: {type(e).__name__}: {e}"
+
+
+@mcp.tool()
+def read_imports(file_path: str) -> str:
+    """
+    Return all import statements in a source file as a multi-line string. Read-only.
+
+    Use this when: You need to see a file's dependencies without reading the entire
+    file (e.g. before adding a new import, or to understand what a module uses).
+    Don't use this when: You want to add/remove imports -> use `add_import` /
+    `remove_import`.
+
+    Example:
+        file_path="/abs/path/to/module.py"
+    """
+    if err := _validate_file(file_path):
+        return err
+    try:
+        logger.info("read_imports: file='%s'", file_path)
+        applier = Applier(file_path)
+        return applier.read_imports()
+    except ApplierError as e:
+        logger.warning("read_imports: %s", e)
+        return f"Cannot read imports: {e}"
+    except Exception as e:
+        logger.exception("read_imports crashed")
+        return f"Internal error in read_imports: {type(e).__name__}: {e}"
+
+
+@mcp.tool()
+def read_interface(file_path: str, target: str) -> str:
+    """
+    Return a stub view of a class: its header, field declarations, and method
+    signatures -- with all method bodies replaced by ' ...'. For a function target,
+    returns just its signature. Read-only.
+
+    Use this when: You need to understand a class's public API (what methods and
+    fields it has) without reading every line of implementation. Typically 5-10x
+    fewer tokens than reading the full class.
+    Don't use this when: You need the full implementation -> use `read_symbol`.
+    You only need one method's signature -> use `get_signature`.
+
+    Example:
+        target="LRUCache"   # returns class header + method sigs + fields
+        target="process"     # returns function signature (no class)
+    """
+    if err := _validate_file(file_path):
+        return err
+    try:
+        logger.info("read_interface: target='%s' file='%s'", target, file_path)
+        applier = Applier(file_path)
+        return applier.read_interface(target)
+    except ApplierError as e:
+        logger.warning("read_interface: %s", e)
+        return f"Cannot read interface: {e}"
+    except Exception as e:
+        logger.exception("read_interface crashed")
+        return f"Internal error in read_interface: {type(e).__name__}: {e}"
+
+
 def main():
     logger.info("Starting AST Code Editor MCP server")
     mcp.run(transport="stdio")

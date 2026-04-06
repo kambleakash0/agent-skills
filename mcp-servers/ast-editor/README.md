@@ -27,13 +27,14 @@ Per-edit output token savings versus other common edit formats:
 | Function body rewrite | 4,000 LoC | **15–20x** | 3–5x | 3–5x |
 | Add 2 lines to a function | any size | **~20x** (via `prepend_to_body` / `append_to_body`) | 5–10x | 3–5x |
 
-**For daily agent users, a realistic 30–50% reduction in total tokens per session is achievable, on average.**
+**For daily agent users, a realistic 40–60% reduction in total tokens per session is achievable, on average** (combining output savings from surgical edits with input savings from targeted reads).
 
-The savings come from three compounding effects:
+The savings come from four compounding effects:
 
-- Using `prepend_to_body` / `append_to_body` for small additions instead of rewriting whole function bodies
-- Discovery via `list_symbols` / `get_signature` instead of reading whole files
-- Zero format failures — AST edits never fail on whitespace drift, eliminating retry loops that plague other formats.
+- **Output tokens:** Using `prepend_to_body` / `append_to_body` for small additions instead of rewriting whole function bodies
+- **Input tokens:** Using `read_symbol` / `read_interface` / `read_imports` to read only what's needed instead of entire files (~10-20x fewer input tokens per read)
+- **Discovery:** `list_symbols` / `get_signature` instead of reading whole files
+- **Zero format failures:** AST edits never fail on whitespace drift, eliminating retry loops that plague other formats.
 
 ## Supported Languages & Capabilities
 
@@ -127,13 +128,16 @@ All tools require `file_path` to be an **absolute path** to an existing file.
 | `append_to_array` | `file_path`, `target`, `value` | Append a literal value to a list/array/sequence. For Python, `target` is the list variable name; for config, a dotted path. |
 | `remove_from_array` | `file_path`, `target`, `value_match` | Remove the first matching element from a list/array/sequence. |
 
-### Navigation (read-only)
+### Navigation & reading (read-only)
 
 | Tool | Parameters | Description |
 | :--- | :--- | :--- |
 | `list_symbols` | `file_path` | Formatted outline of all top-level functions, classes, and methods with line numbers. |
 | `get_signature` | `file_path`, `target` | Return the signature of a function as plain text. |
 | `find_references` | `file_path`, `target` | Syntactic search for all occurrences of an identifier (no scope awareness). |
+| `read_symbol` | `file_path`, `target` | Return the full source text of a single named symbol (function, class, method, config key). Typically **10-20x fewer tokens** than reading the whole file. |
+| `read_imports` | `file_path` | Return all import/include statements in the file. |
+| `read_interface` | `file_path`, `target` | Return a stub view of a class: header, field declarations, and method signatures with bodies replaced by `...`. For Go, includes receiver method signatures. For a function target, returns just its signature. |
 
 **Target format:** Use the exact function name (e.g., `get`) or dotted `Class.method` path (e.g., `LRUCache.get`). Decorated Python functions are fully supported — decorators are preserved when replacing bodies or signatures, and included when deleting or replacing the full function.
 
@@ -147,6 +151,9 @@ A decision guide grouped by intent. Start at the top and pick the narrowest matc
 
 - **Don't know what symbols exist?** → `list_symbols`
 - **Need just a function's signature?** → `get_signature`
+- **Need one specific function's full source?** → `read_symbol` (10-20x cheaper than reading the whole file)
+- **Need a class's public API (methods + fields, no bodies)?** → `read_interface`
+- **Need to see a file's imports/dependencies?** → `read_imports`
 - **Where is a symbol used?** → `find_references`
 
 ### Adding new content
@@ -318,11 +325,11 @@ Coding agents are heavily biased toward their default tools. You **must** explic
 
 Add the following block to `CLAUDE.md`, `~/.claude/CLAUDE.md`, or **Custom Instructions**:
 
-> **When editing `.py`, `.js`, `.ts`, `.c`, `.cpp`, `.rb`, `.go`, `.java`, `.json`, `.yaml`, or `.toml` files, do NOT use the `edit` tool. Use the `ast-editor` MCP server instead. It exposes 29 surgical tools for structural code and config edits.**
+> **When editing `.py`, `.js`, `.ts`, `.c`, `.cpp`, `.rb`, `.go`, `.java`, `.json`, `.yaml`, or `.toml` files, do NOT use the `edit` tool. Use the `ast-editor` MCP server instead. It exposes 32 surgical tools for structural code and config edits.**
 >
 > **Picking a tool — always start here:**
 >
-> 1. **Unsure of the file layout?** Call `list_symbols` first. Call `get_signature` if you only need an interface. Call `find_references` before renaming anything.
+> 1. **Unsure of the file layout?** Call `list_symbols` first. Call `get_signature` if you only need a signature. Call `read_symbol` to read one function/class without reading the whole file. Call `read_interface` to see a class's API (methods + fields, no bodies). Call `read_imports` to see dependencies. Call `find_references` before renaming anything.
 > 2. **Adding new content** — choose the narrowest tool:
 >    - Top-level (function, class, constant, type alias): `add_top_level`
 >    - In a class: `add_method`, `add_field`
@@ -370,4 +377,4 @@ Add the following block to `CLAUDE.md`, `~/.claude/CLAUDE.md`, or **Custom Instr
 
 Add to rules or system prompt:
 
-> *When editing `.py`, `.js`, `.ts`, `.c`, `.cpp`, `.rb`, `.go`, or `.java` files, do NOT use your default editing tools (diff, whole, etc.). Instead, use the `ast-editor` MCP server, which exposes 29 surgical tools for adding/modifying/removing functions, classes, methods, fields, parameters, imports, comments, and docstrings. Start any edit session by calling `list_symbols` to discover exact target names. **For small additions to a function body (logging, validation, cleanup), use `prepend_to_body` / `append_to_body` — these are the single biggest token-saving tools in the suite, giving ~20x fewer output tokens than rewriting the whole body.** For `.json`, `.yaml`, or `.toml` files, use `replace_value`/`add_key`/`append_to_array`/`delete_key` instead of freeform edits.*
+> *When editing `.py`, `.js`, `.ts`, `.c`, `.cpp`, `.rb`, `.go`, or `.java` files, do NOT use your default editing tools (diff, whole, etc.). Instead, use the `ast-editor` MCP server, which exposes 32 surgical tools for adding/modifying/removing functions, classes, methods, fields, parameters, imports, comments, and docstrings. Start any edit session by calling `list_symbols` to discover exact target names. **For reading, use `read_symbol` to read one function/class (~10-20x fewer input tokens than reading the whole file), `read_interface` for a class's API (signatures only, no bodies), or `read_imports` for dependencies.** For small additions to a function body (logging, validation, cleanup), use `prepend_to_body` / `append_to_body` — these are the single biggest output-token-saving tools in the suite, giving ~20x fewer output tokens than rewriting the whole body. For `.json`, `.yaml`, or `.toml` files, use `replace_value`/`add_key`/`append_to_array`/`delete_key` instead of freeform edits.*

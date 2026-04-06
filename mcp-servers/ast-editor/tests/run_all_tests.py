@@ -1441,6 +1441,165 @@ def test_java():
 
 
 # ──────────────────────────────────────────────
+# AST Reader tests (read_symbol, read_imports, read_interface)
+# ──────────────────────────────────────────────
+
+def test_ast_reader():
+    print("\n═══ AST Reader (read_symbol, read_imports, read_interface) ═══")
+
+    # ── read_symbol ──
+
+    # Python: read a method
+    path = reset_fixture("py")
+    app = Applier(path)
+    result = app.read_symbol("LRUCache.get")
+    check("read_symbol py method: has def", result, "def get(self, key):")
+    check("read_symbol py method: has body", result, "return self.items.get(key)")
+
+    # Python: read a class
+    result = app.read_symbol("LRUCache")
+    check("read_symbol py class: has class", result, "class LRUCache:")
+    check("read_symbol py class: has init", result, "def __init__")
+    check("read_symbol py class: has get", result, "def get")
+
+    # JS: read a method
+    path = reset_fixture("js")
+    app = Applier(path)
+    result = app.read_symbol("LRUCache.get")
+    check("read_symbol js method: has get", result, "get(key)")
+    check("read_symbol js method: has body", result, "return this.items.get(key)")
+
+    # Go: read a receiver method
+    path = reset_fixture("go")
+    app = Applier(path)
+    result = app.read_symbol("Cache.Get")
+    check("read_symbol go method: has func", result, "func (c *Cache) Get")
+    check("read_symbol go method: has body", result, "return c.items[key]")
+
+    # Java: read a method
+    path = reset_fixture("java")
+    app = Applier(path)
+    result = app.read_symbol("LRUCache.get")
+    check("read_symbol java method: has get", result, "public String get")
+    check("read_symbol java method: has body", result, "return items.get(key)")
+
+    # JSON: read a config key
+    path = reset_fixture("json")
+    app = Applier(path)
+    result = app.read_symbol("project.version")
+    check("read_symbol json: value", result, "1.0.0")
+
+    # Ruby: read a method
+    path = reset_fixture("rb")
+    app = Applier(path)
+    result = app.read_symbol("LRUCache.get")
+    check("read_symbol rb method: has def", result, "def get")
+    check("read_symbol rb method: has body", result, "@items[key]")
+
+    # ── read_imports ──
+
+    # Python
+    path = reset_fixture("py")
+    # The py fixture has no imports, let's test with a file that does
+    path = reset_fixture("java")
+    app = Applier(path)
+    result = app.read_imports()
+    check("read_imports java: has HashMap", result, "java.util.HashMap")
+    check("read_imports java: has Map", result, "java.util.Map")
+
+    # Go
+    path = reset_fixture("go")
+    app = Applier(path)
+    result = app.read_imports()
+    check("read_imports go: has fmt", result, "fmt")
+    check("read_imports go: has strings", result, "strings")
+
+    # Ruby
+    path = reset_fixture("rb")
+    app = Applier(path)
+    result = app.read_imports()
+    check("read_imports rb: has json", result, "require 'json'")
+
+    # C
+    path = reset_fixture("c")
+    app = Applier(path)
+    result = app.read_imports()
+    check("read_imports c: has stdio", result, "#include <stdio.h>")
+
+    # ── read_interface ──
+
+    # Python class: should show signatures without bodies
+    path = reset_fixture("py")
+    app = Applier(path)
+    result = app.read_interface("LRUCache")
+    check("read_interface py: has class header", result, "class LRUCache:")
+    check("read_interface py: has init sig", result, "def __init__(self)")
+    check("read_interface py: has get sig", result, "def get(self, key)")
+    check("read_interface py: has ellipsis", result, "...")
+    check("read_interface py: no body detail",
+          "PASS" if "self.items.get(key)" not in result else "FAIL", "PASS")
+
+    # JS class
+    path = reset_fixture("js")
+    app = Applier(path)
+    result = app.read_interface("LRUCache")
+    check("read_interface js: has class header", result, "class LRUCache")
+    check("read_interface js: has constructor sig", result, "constructor()")
+    check("read_interface js: has get sig", result, "get(key)")
+    check("read_interface js: has ellipsis", result, "...")
+
+    # Java class
+    path = reset_fixture("java")
+    app = Applier(path)
+    result = app.read_interface("LRUCache")
+    check("read_interface java: has class header", result, "class LRUCache")
+    check("read_interface java: has fields", result, "private int capacity")
+    check("read_interface java: has get sig", result, "public String get")
+    check("read_interface java: has ellipsis", result, "...")
+    check("read_interface java: no body detail",
+          "PASS" if "return items.get(key)" not in result else "FAIL", "PASS")
+
+    # Go struct: struct definition + receiver method signatures
+    path = reset_fixture("go")
+    app = Applier(path)
+    result = app.read_interface("Cache")
+    check("read_interface go: has struct", result, "type Cache struct")
+    check("read_interface go: has fields", result, "capacity int")
+    check("read_interface go: has Get sig", result, "func (c *Cache) Get")
+    check("read_interface go: has Set sig", result, "func (c *Cache) Set")
+    check("read_interface go: has ellipsis", result, "...")
+    check("read_interface go: no body detail",
+          "PASS" if "return c.items[key]" not in result else "FAIL", "PASS")
+
+    # C++ class
+    path = reset_fixture("cpp")
+    app = Applier(path)
+    result = app.read_interface("Calculator")
+    check("read_interface cpp: has class header", result, "class Calculator")
+    check("read_interface cpp: has add sig", result, "int add")
+    check("read_interface cpp: has subtract sig", result, "int subtract")
+    check("read_interface cpp: has ellipsis", result, "...")
+
+    # Ruby class
+    path = reset_fixture("rb")
+    app = Applier(path)
+    result = app.read_interface("LRUCache")
+    check("read_interface rb: has class header", result, "class LRUCache")
+    check("read_interface rb: has init sig", result, "def initialize")
+    check("read_interface rb: has get sig", result, "def get")
+    check("read_interface rb: has end", result, "end")
+    check("read_interface rb: has ellipsis", result, "...")
+
+    # Function target: should return just its signature
+    path = reset_fixture("py")
+    app = Applier(path)
+    result = app.read_interface("LRUCache.get")
+    check("read_interface py func: returns signature", result, "def get(self, key)")
+    check("read_interface py func: no body",
+          "PASS" if "return self.items" not in result else "FAIL", "PASS")
+
+
+# ──────────────────────────────────────────────
 # Main
 # ──────────────────────────────────────────────
 
@@ -1473,6 +1632,8 @@ if __name__ == "__main__":
     test_ruby()
     test_go()
     test_java()
+
+    test_ast_reader()
 
     # Reset all fixtures to clean state after tests
     for lang in FIXTURES:
