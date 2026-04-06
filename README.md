@@ -22,7 +22,7 @@ A personal collection of Claude Code agent skills and MCP servers, can be used w
 
 | Server | Description |
 | ------ | ----------- |
-| [ast-editor](./mcp-servers/ast-editor/README.md) | AST-targeted code editing MCP server with **29 surgical tools**: functions, classes, methods, fields, parameters, imports, comments, docstrings, and dict/list editing (JSON/YAML/TOML config AND Python module-level literals in unified tools). Built on tree-sitter. Supports **11 languages**: Python, JavaScript, TypeScript, C, C++, Ruby, Go, Java, JSON, YAML, and TOML. |
+| [ast-editor](./mcp-servers/ast-editor/README.md) | AST-targeted code editing MCP server with **32 surgical tools**: functions, classes, methods, fields, parameters, imports, comments, docstrings, dict/list editing (JSON/YAML/TOML config AND Python module-level literals), plus **AST reader tools** (`read_symbol`, `read_interface`, `read_imports`) for 10-20x input token savings. Built on tree-sitter. Supports **11 languages**: Python, JavaScript, TypeScript, C, C++, Ruby, Go, Java, JSON, YAML, and TOML. |
 | [notebook-editor](./mcp-servers/notebook-editor/README.md) | Jupyter notebook editing MCP server with **22 cell-level tools**: cell structure (add/delete/move/split/merge), content editing (replace/prepend/append), outputs & metadata management, notebook-wide symbol discovery, and **kernel execution** (execute_cell, execute_all_cells, restart/interrupt/shutdown kernel). Complements `ast-editor` — use this for `.ipynb` files, `ast-editor` for everything else. |
 
 ## Skills installation via [skills.sh](https://skills.sh)

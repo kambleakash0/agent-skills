@@ -1641,6 +1641,201 @@ class Applier:
             return f"(no references to '{target}' found in {self.filepath})"
         return "\n".join(f"line {ln}: {ctx}" for ln, ctx in results)
 
+    # ──────────────────────────────────────────────
+    # AST Reader tools (read-only, token-efficient)
+    # ──────────────────────────────────────────────
+
+    def read_symbol(self, target: str) -> str:
+        """
+        Return the full source text of a named symbol (function, class, method,
+        config key). Read-only. Supports dotted paths (e.g. 'ClassName.method').
+        """
+        node = self.parser.find_node_by_name(target)
+        if not node:
+            raise ApplierError(f"Target '{target}' not found in {self.filepath}")
+        return self.parser.node_text(node)
+
+    def read_imports(self) -> str:
+        """
+        Return all import statements in the file as a multi-line string. Read-only.
+        """
+        valid_types = self._import_node_types()
+        if not valid_types:
+            raise ApplierError(f"read_imports is not supported for {self.parser.ext}")
+
+        import_lines = []
+        for child in self.parser.tree.root_node.named_children:
+            if child.type not in valid_types:
+                continue
+            if self.parser.ext in (".rb",) and child.type == "call":
+                if not self._is_ruby_require_call(child):
+                    continue
+            import_lines.append(self.parser.node_text(child))
+
+        if not import_lines:
+            return "(no imports found)"
+        return "\n".join(import_lines)
+
+    def read_interface(self, target: str) -> str:
+        """
+        Return a stub view of a class: its header, field declarations, and method
+        signatures (with bodies replaced by ' ...'). For a function target, returns
+        just its signature. Read-only.
+        """
+        node = self.parser.find_node_by_name(target)
+        if not node:
+            raise ApplierError(f"Target '{target}' not found in {self.filepath}")
+
+        ext = self.parser.ext
+        if ext in (".json", ".yml", ".yaml", ".toml"):
+            raise ApplierError(f"read_interface is not supported for {ext}")
+
+        func_types = self._interface_func_types()
+
+        inner = node
+        if node.type == "decorated_definition":
+            for c in node.named_children:
+                if c.type in ("function_definition", "class_definition"):
+                    inner = c
+                    break
+
+        # Function target -- return signature only
+        if inner.type in func_types:
+            return self.get_signature(target)
+
+        # Go: struct/interface definition + top-level receiver methods
+        # (checked before body lookup because type_spec has no 'body' field)
+        if ext in (".go",) and inner.type == "type_spec":
+            return self._read_interface_go(node, inner)
+
+        body = inner.child_by_field_name("body")
+        if body is None:
+            return self.parser.node_text(node)
+
+        source = self.parser.source_bytes
+
+        # Header: everything from node start up to body content
+        if ext in (".py", ".rb"):
+            header = source[node.start_byte:body.start_byte].decode("utf-8").rstrip()
+        else:
+            # Brace-delimited: body node starts with {, include it in header
+            header = source[node.start_byte:body.start_byte + 1].decode("utf-8").rstrip()
+
+        parts = [header]
+
+        # Walk body members: signatures for methods, full text for fields
+        self._collect_interface_members(body, func_types, parts)
+
+        # Closing token
+        if ext in (".rb",):
+            tail = source[body.end_byte:node.end_byte].decode("utf-8").strip()
+            if tail:
+                indent = self._get_indent(self.lines[inner.start_point[0]])
+                parts.append(indent + tail)
+        elif ext not in (".py",):
+            # Brace-delimited: closing } (or }; for C++)
+            indent = self._get_indent(self.lines[inner.start_point[0]])
+            closing = source[body.end_byte - 1:node.end_byte].decode("utf-8").rstrip()
+            parts.append(indent + closing)
+
+        return "\n".join(parts)
+
+    def _interface_func_types(self) -> set:
+        """Return the set of AST node types that represent functions/methods for this language."""
+        ext = self.parser.ext
+        if ext == ".py":
+            return {"function_definition", "decorated_definition"}
+        if ext in (".ts", ".tsx"):
+            return {"function_declaration", "method_definition"}
+        if ext in (".js", ".jsx", ".mjs", ".cjs"):
+            return {"function_declaration", "method_definition"}
+        if ext in (".c", ".h", ".cpp", ".cc", ".cxx", ".hpp", ".hxx", ".hh"):
+            return {"function_definition"}
+        if ext in (".rb",):
+            return {"method", "singleton_method"}
+        if ext in (".go",):
+            return {"function_declaration", "method_declaration"}
+        if ext == ".java":
+            return {"method_declaration", "constructor_declaration"}
+        return set()
+
+    def _extract_method_sig(self, child, func_types) -> str | None:
+        """Extract the signature of a method node with ' ...' appended, or None if not a method."""
+        c_inner = child
+        if child.type == "decorated_definition":
+            for cc in child.named_children:
+                if cc.type == "function_definition":
+                    c_inner = cc
+                    break
+
+        if c_inner.type not in func_types:
+            return None
+
+        c_body = c_inner.child_by_field_name("body")
+        if c_body is None:
+            for cc in c_inner.children:
+                if cc.type in ("block", "statement_block", "compound_statement",
+                              "body_statement", "constructor_body"):
+                    c_body = cc
+                    break
+
+        if c_body is None:
+            # Abstract/interface method with no body -- include full text
+            return self.parser.node_text(child)
+
+        sig_end = c_inner.start_byte
+        for fc in c_inner.children:
+            if fc == c_body:
+                break
+            sig_end = fc.end_byte
+
+        sig = self.parser.source_bytes[child.start_byte:sig_end].decode("utf-8").rstrip()
+        return sig + " ..."
+
+    def _collect_interface_members(self, container, func_types, parts):
+        """Walk a class body, appending signatures for methods and full text for fields."""
+        for child in container.named_children:
+            sig = self._extract_method_sig(child, func_types)
+            if sig is not None:
+                parts.append(sig)
+            elif child.type in ("enum_body_declarations", "class_body", "interface_body"):
+                self._collect_interface_members(child, func_types, parts)
+            else:
+                parts.append(self.parser.node_text(child))
+
+    def _read_interface_go(self, node, inner) -> str:
+        """Go-specific: struct/interface definition + all receiver method signatures."""
+        # Use parent type_declaration for full text including 'type' keyword
+        decl = node.parent if node.parent and node.parent.type == "type_declaration" else node
+        parts = [self.parser.node_text(decl)]
+        name_node = inner.child_by_field_name("name")
+        if name_node is None:
+            return parts[0]
+        type_name = self.parser.node_text(name_node)
+
+        for child in self.parser.tree.root_node.named_children:
+            if child.type != "method_declaration":
+                continue
+            recv = child.child_by_field_name("receiver")
+            if recv is None:
+                continue
+            recv_type = self.parser._extract_go_receiver_type(recv)
+            if recv_type != type_name:
+                continue
+            m_body = child.child_by_field_name("body")
+            if m_body:
+                sig_end = child.start_byte
+                for fc in child.children:
+                    if fc == m_body:
+                        break
+                    sig_end = fc.end_byte
+                sig = self.parser.source_bytes[child.start_byte:sig_end].decode("utf-8").rstrip()
+                parts.append(sig + " ...")
+            else:
+                parts.append(self.parser.node_text(child))
+
+        return "\n\n".join(parts)
+
     def add_top_level(self, content: str) -> str:
         """
         Append arbitrary top-level content to the end of the file: a function,
