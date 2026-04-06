@@ -27,7 +27,18 @@ Per-edit output token savings versus other common edit formats:
 | Function body rewrite | 4,000 LoC | **15–20x** | 3–5x | 3–5x |
 | Add 2 lines to a function | any size | **~20x** (via `prepend_to_body` / `append_to_body`) | 5–10x | 3–5x |
 
-**For daily agent users, a realistic 40–60% reduction in total tokens per session is achievable, on average** (combining output savings from surgical edits with input savings from targeted reads).
+Per-read input token savings versus reading the entire file:
+
+| Read task | File size | AST reader tool | vs full file read |
+| :--- | :--- | :--- | :--- |
+| One function's source | 500 LoC | `read_symbol` | **~20x fewer tokens** |
+| One function's source | 2,000 LoC | `read_symbol` | **~50-100x fewer tokens** |
+| Class API (10 methods, no bodies) | 500 LoC | `read_interface` | **~10x fewer tokens** |
+| Import block only | any size | `read_imports` | **~20-50x fewer tokens** |
+| Structural overview (names + line numbers) | any size | `list_symbols` | **~15-30x fewer tokens** |
+| One function's signature | any size | `get_signature` | **~50-200x fewer tokens** |
+
+**For daily agent users, a realistic 40-60% reduction in total tokens per session is achievable, on average** (combining output savings from surgical edits with input savings from targeted reads).
 
 The savings come from four compounding effects:
 
