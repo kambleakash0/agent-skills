@@ -172,13 +172,20 @@ gemini mcp add --transport stdio --scope user notebook-editor -- uv --directory 
 
 ### Method 2: JSON Configuration
 
-For tools that use a `mcp_config.json` or `settings.json` file, add the following block:
+For tools that use a `mcp_config.json` or `settings.json` file, add the following block.
+
+> **Important:** Use the **absolute path** to `uv` for `"command"`, not just `"uv"`. GUI-based MCP clients (Claude Desktop, Cursor, Antigravity) don't always inherit your shell `PATH`, so a bare `"uv"` will fail with a "command not found" error. Get your absolute path with:
+>
+> ```bash
+> which uv
+> # e.g. /Users/you/.local/bin/uv  or  /opt/homebrew/bin/uv
+> ```
 
 ```json
 {
   "mcpServers": {
     "notebook-editor": {
-      "command": "uv",
+      "command": "/absolute/path/to/uv",
       "args": [
         "--directory",
         "/absolute/path/to/mcp-servers/notebook-editor",
