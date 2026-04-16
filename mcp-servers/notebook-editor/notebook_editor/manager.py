@@ -10,12 +10,50 @@ import os
 from typing import Any
 
 import nbformat
-from nbformat.v4 import new_code_cell, new_markdown_cell, new_raw_cell
+from nbformat.v4 import new_code_cell, new_markdown_cell, new_notebook, new_raw_cell
 
 
 class NotebookManagerError(Exception):
     """Raised for user-facing errors: invalid index, wrong cell type, schema errors."""
     pass
+
+
+def create_notebook(
+    filepath: str,
+    kernel_name: str = "python3",
+    kernel_display_name: str | None = None,
+    language: str = "python",
+    overwrite: bool = False,
+) -> str:
+    """
+    Create a new empty .ipynb file with a valid nbformat schema. Uses
+    nbformat.new_notebook() to guarantee a correct structure (right nbformat
+    version, valid kernelspec, etc.). Refuses to overwrite an existing file
+    unless overwrite=True.
+    """
+    if os.path.exists(filepath) and not overwrite:
+        raise NotebookManagerError(
+            f"File already exists: {filepath} (pass overwrite=True to replace)"
+        )
+
+    parent = os.path.dirname(filepath)
+    if parent and not os.path.isdir(parent):
+        raise NotebookManagerError(f"Parent directory does not exist: {parent}")
+
+    nb = new_notebook()
+    nb.metadata["kernelspec"] = {
+        "name": kernel_name,
+        "display_name": kernel_display_name or kernel_name,
+        "language": language,
+    }
+    nb.metadata["language_info"] = {"name": language}
+
+    try:
+        nbformat.write(nb, filepath)
+    except Exception as e:
+        raise NotebookManagerError(f"Failed to write notebook: {e}") from e
+
+    return f"Created empty notebook: {filepath}"
 
 
 class NotebookManager:

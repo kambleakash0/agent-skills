@@ -12,7 +12,7 @@ sys.path.insert(0, os.path.abspath(os.path.join(os.path.dirname(__file__), '..')
 import nbformat
 from nbformat.v4 import new_notebook, new_code_cell, new_markdown_cell
 
-from notebook_editor.manager import NotebookManager, NotebookManagerError
+from notebook_editor.manager import NotebookManager, NotebookManagerError, create_notebook
 
 TESTS_DIR = os.path.dirname(__file__)
 FIXTURE_PATH = os.path.join(TESTS_DIR, "test_fixture.ipynb")
@@ -452,6 +452,71 @@ def test_find_in_notebook():
 
 
 # ──────────────────────────────────────────────
+# create_notebook tests
+# ──────────────────────────────────────────────
+
+def test_create_notebook():
+    print("\n═══ create_notebook ═══")
+    new_path = os.path.join(TESTS_DIR, "test_created.ipynb")
+    if os.path.exists(new_path):
+        os.remove(new_path)
+
+    # Default kernel
+    result = create_notebook(new_path)
+    check("create_notebook: returns success message", result, "Created empty notebook")
+    check("create_notebook: file exists on disk", "PASS" if os.path.isfile(new_path) else "FAIL", "PASS")
+
+    # Read it back and verify structure
+    nb = read_notebook(new_path)
+    check("create_notebook: nbformat version is 4", str(nb.nbformat), "4")
+    check("create_notebook: has empty cells list", "PASS" if nb.cells == [] else "FAIL", "PASS")
+    check("create_notebook: has kernelspec metadata", str(nb.metadata.get("kernelspec", {}).get("name")), "python3")
+    check("create_notebook: has language_info", str(nb.metadata.get("language_info", {}).get("name")), "python")
+
+    # Refuses overwrite by default
+    try:
+        create_notebook(new_path)
+        check("create_notebook: refuses overwrite", "FAIL", "PASS")
+    except NotebookManagerError as e:
+        check("create_notebook: refuses overwrite (error raised)", str(e), "already exists")
+
+    # Overwrite=True works
+    result = create_notebook(new_path, overwrite=True)
+    check("create_notebook: overwrite=True succeeds", result, "Created empty notebook")
+
+    # Custom kernel
+    os.remove(new_path)
+    result = create_notebook(
+        new_path,
+        kernel_name="fabric-venv",
+        kernel_display_name="Python (fabric venv)",
+        language="python",
+    )
+    nb = read_notebook(new_path)
+    check("create_notebook: custom kernel name", str(nb.metadata["kernelspec"]["name"]), "fabric-venv")
+    check("create_notebook: custom display name", str(nb.metadata["kernelspec"]["display_name"]), "Python (fabric venv)")
+
+    # NotebookManager can open the created file
+    mgr = NotebookManager(new_path)
+    check("create_notebook: created file opens with NotebookManager", mgr.list_cells(), "(notebook has no cells)")
+
+    # Cell operations work on it
+    mgr.add_cell(0, cell_type="code", source="print('hello')")
+    mgr2 = NotebookManager(new_path)
+    check("create_notebook: supports subsequent add_cell", mgr2.list_cells(), "[0] code")
+
+    # Rejects missing parent directory
+    try:
+        create_notebook("/nonexistent/dir/foo.ipynb")
+        check("create_notebook: rejects missing parent dir", "FAIL", "PASS")
+    except NotebookManagerError as e:
+        check("create_notebook: rejects missing parent dir (error)", str(e), "Parent directory does not exist")
+
+    if os.path.exists(new_path):
+        os.remove(new_path)
+
+
+# ──────────────────────────────────────────────
 # Main
 # ──────────────────────────────────────────────
 
@@ -476,6 +541,7 @@ if __name__ == "__main__":
     test_execute_all_cells()
     test_execute_all_cells_stop_on_error()
     test_kernel_lifecycle()
+    test_create_notebook()
 
     if os.path.exists(FIXTURE_PATH):
         os.remove(FIXTURE_PATH)

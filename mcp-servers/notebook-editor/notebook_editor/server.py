@@ -6,7 +6,7 @@ import os
 
 from mcp.server.fastmcp import FastMCP
 
-from notebook_editor.manager import NotebookManager, NotebookManagerError
+from notebook_editor.manager import NotebookManager, NotebookManagerError, create_notebook as _create_notebook
 
 logging.basicConfig(level=logging.INFO, format="%(asctime)s [%(levelname)s] %(message)s")
 logger = logging.getLogger("notebook-editor")
@@ -106,7 +106,7 @@ def add_cell(file_path: str, index: int, source: str = "", cell_type: str = "cod
         logger.info("add_cell: file='%s' index=%d type=%s", file_path, index, cell_type)
         mgr = NotebookManager(file_path)
         mgr.add_cell(index, source, cell_type)
-        return f"Successfully added {cell_type} cell at index {index} in {file_path}."
+        return "Added"
     except NotebookManagerError as e:
         logger.warning("add_cell: %s", e)
         return f"Cannot add cell: {e}"
@@ -134,7 +134,7 @@ def delete_cell(file_path: str, index: int) -> str:
         logger.info("delete_cell: file='%s' index=%d", file_path, index)
         mgr = NotebookManager(file_path)
         mgr.delete_cell(index)
-        return f"Successfully deleted cell at index {index} in {file_path}."
+        return "Deleted"
     except NotebookManagerError as e:
         logger.warning("delete_cell: %s", e)
         return f"Cannot delete cell: {e}"
@@ -161,7 +161,7 @@ def move_cell(file_path: str, from_index: int, to_index: int) -> str:
         logger.info("move_cell: file='%s' from=%d to=%d", file_path, from_index, to_index)
         mgr = NotebookManager(file_path)
         mgr.move_cell(from_index, to_index)
-        return f"Successfully moved cell from index {from_index} to {to_index}."
+        return "Moved"
     except NotebookManagerError as e:
         logger.warning("move_cell: %s", e)
         return f"Cannot move cell: {e}"
@@ -190,7 +190,7 @@ def split_cell(file_path: str, index: int, line_offset: int) -> str:
         logger.info("split_cell: file='%s' index=%d line_offset=%d", file_path, index, line_offset)
         mgr = NotebookManager(file_path)
         mgr.split_cell(index, line_offset)
-        return f"Successfully split cell {index} at line {line_offset}."
+        return "Split"
     except NotebookManagerError as e:
         logger.warning("split_cell: %s", e)
         return f"Cannot split cell: {e}"
@@ -220,7 +220,7 @@ def merge_cells(file_path: str, start_index: int, end_index: int) -> str:
         logger.info("merge_cells: file='%s' start=%d end=%d", file_path, start_index, end_index)
         mgr = NotebookManager(file_path)
         mgr.merge_cells(start_index, end_index)
-        return f"Successfully merged cells {start_index}..{end_index}."
+        return "Merged"
     except NotebookManagerError as e:
         logger.warning("merge_cells: %s", e)
         return f"Cannot merge cells: {e}"
@@ -254,7 +254,7 @@ def replace_cell_source(file_path: str, index: int, new_source: str) -> str:
         logger.info("replace_cell_source: file='%s' index=%d", file_path, index)
         mgr = NotebookManager(file_path)
         mgr.replace_cell_source(index, new_source)
-        return f"Successfully replaced source of cell {index} in {file_path}."
+        return "Updated"
     except NotebookManagerError as e:
         logger.warning("replace_cell_source: %s", e)
         return f"Cannot replace cell source: {e}"
@@ -282,7 +282,7 @@ def prepend_to_cell(file_path: str, index: int, source: str) -> str:
         logger.info("prepend_to_cell: file='%s' index=%d", file_path, index)
         mgr = NotebookManager(file_path)
         mgr.prepend_to_cell(index, source)
-        return f"Successfully prepended to cell {index} in {file_path}."
+        return "Added"
     except NotebookManagerError as e:
         logger.warning("prepend_to_cell: %s", e)
         return f"Cannot prepend to cell: {e}"
@@ -310,7 +310,7 @@ def append_to_cell(file_path: str, index: int, source: str) -> str:
         logger.info("append_to_cell: file='%s' index=%d", file_path, index)
         mgr = NotebookManager(file_path)
         mgr.append_to_cell(index, source)
-        return f"Successfully appended to cell {index} in {file_path}."
+        return "Added"
     except NotebookManagerError as e:
         logger.warning("append_to_cell: %s", e)
         return f"Cannot append to cell: {e}"
@@ -342,8 +342,7 @@ def clear_outputs(file_path: str, index: int = -1) -> str:
         logger.info("clear_outputs: file='%s' index=%d", file_path, index)
         mgr = NotebookManager(file_path)
         mgr.clear_outputs(None if index == -1 else index)
-        scope = "all code cells" if index == -1 else f"cell {index}"
-        return f"Successfully cleared outputs of {scope} in {file_path}."
+        return "Cleared"
     except NotebookManagerError as e:
         logger.warning("clear_outputs: %s", e)
         return f"Cannot clear outputs: {e}"
@@ -370,7 +369,7 @@ def clear_execution_counts(file_path: str) -> str:
         logger.info("clear_execution_counts: file='%s'", file_path)
         mgr = NotebookManager(file_path)
         mgr.clear_execution_counts()
-        return f"Successfully cleared execution counts in {file_path}."
+        return "Cleared"
     except NotebookManagerError as e:
         logger.warning("clear_execution_counts: %s", e)
         return f"Cannot clear execution counts: {e}"
@@ -429,7 +428,7 @@ def set_cell_metadata(file_path: str, index: int, key: str, value: str) -> str:
         logger.info("set_cell_metadata: file='%s' index=%d key='%s'", file_path, index, key)
         mgr = NotebookManager(file_path)
         mgr.set_cell_metadata(index, key, value)
-        return f"Successfully set metadata '{key}' on cell {index}."
+        return "Updated"
     except NotebookManagerError as e:
         logger.warning("set_cell_metadata: %s", e)
         return f"Cannot set metadata: {e}"
@@ -604,9 +603,9 @@ def restart_kernel(file_path: str) -> str:
         from notebook_editor import kernel as _kernel
         logger.info("restart_kernel: file='%s'", file_path)
         if _kernel.get_kernel(file_path) is None:
-            return f"No kernel running for {file_path} -- nothing to restart."
+            return "Skipped (no kernel running)"
         _kernel.restart_kernel(file_path)
-        return f"Kernel restarted for {file_path}."
+        return "Restarted"
     except Exception as e:
         logger.exception("restart_kernel crashed")
         return f"Internal error in restart_kernel: {type(e).__name__}: {e}"
@@ -631,9 +630,9 @@ def interrupt_kernel(file_path: str) -> str:
         from notebook_editor import kernel as _kernel
         logger.info("interrupt_kernel: file='%s'", file_path)
         if _kernel.get_kernel(file_path) is None:
-            return f"No kernel running for {file_path} -- nothing to interrupt."
+            return "Skipped (no kernel running)"
         _kernel.interrupt_kernel(file_path)
-        return f"Interrupt signal sent to kernel for {file_path}."
+        return "Interrupted"
     except Exception as e:
         logger.exception("interrupt_kernel crashed")
         return f"Internal error in interrupt_kernel: {type(e).__name__}: {e}"
@@ -658,12 +657,59 @@ def shutdown_kernel(file_path: str) -> str:
         from notebook_editor import kernel as _kernel
         logger.info("shutdown_kernel: file='%s'", file_path)
         if _kernel.get_kernel(file_path) is None:
-            return f"No kernel running for {file_path} -- nothing to shut down."
+            return "Skipped (no kernel running)"
         _kernel.shutdown_kernel(file_path)
-        return f"Kernel shut down for {file_path}."
+        return "Shut down"
     except Exception as e:
         logger.exception("shutdown_kernel crashed")
         return f"Internal error in shutdown_kernel: {type(e).__name__}: {e}"
+
+
+@mcp.tool()
+def create_notebook(
+    file_path: str,
+    kernel_name: str = "python3",
+    kernel_display_name: str = "",
+    language: str = "python",
+    overwrite: bool = False,
+) -> str:
+    """
+    Create a new empty .ipynb file with a valid nbformat schema and a kernelspec
+    wired up. Use this instead of writing notebook JSON by hand -- it guarantees
+    correct nbformat version, metadata structure, and cell list.
+
+    Use this when: You need to create a new Jupyter notebook at a specific path.
+    Don't use this when: The notebook already exists -- use add_cell/other edit
+    tools instead. Pass overwrite=True only if you explicitly intend to replace
+    an existing file.
+
+    Example:
+        file_path="/abs/path/to/new_notebook.ipynb"
+        # optional:
+        kernel_name="python3"                    # matches installed kernel
+        kernel_display_name="Python (my-venv)"   # shown in Jupyter UI
+        language="python"
+    """
+    if not os.path.isabs(file_path):
+        return f"file_path must be an absolute path, got: {file_path}"
+    if not file_path.endswith(".ipynb"):
+        return f"File is not a .ipynb notebook: {file_path}"
+    try:
+        logger.info("create_notebook: file='%s' kernel='%s'", file_path, kernel_name)
+        _create_notebook(
+            file_path,
+            kernel_name=kernel_name,
+            kernel_display_name=kernel_display_name or None,
+            language=language,
+            overwrite=overwrite,
+        )
+        return "Created"
+    except NotebookManagerError as e:
+        logger.warning("create_notebook: %s", e)
+        return f"Cannot create notebook: {e}"
+    except Exception as e:
+        logger.exception("create_notebook crashed")
+        return f"Internal error in create_notebook: {type(e).__name__}: {e}"
 
 
 def main():

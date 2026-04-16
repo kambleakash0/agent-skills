@@ -1,6 +1,6 @@
 # Notebook Editor MCP Server
 
-A Model Context Protocol (MCP) server for editing Jupyter notebooks (`.ipynb`) with **cell-level primitives** and **kernel execution**. Provides 22 native tools for working with notebooks the way data scientists actually use them: cells as first-class citizens, outputs and execution state as managed data, and a real Python kernel for running code and capturing results.
+A Model Context Protocol (MCP) server for editing Jupyter notebooks (`.ipynb`) with **cell-level primitives** and **kernel execution**. Provides 23 native tools for working with notebooks the way data scientists actually use them: cells as first-class citizens, outputs and execution state as managed data, and a real Python kernel for running code and capturing results.
 
 ## Why a cell-native server?
 
@@ -15,7 +15,13 @@ This server provides all of these as dedicated tools with clear semantics, built
 
 ## Tools Exposed
 
-All tools require `file_path` to be an **absolute path** to an existing `.ipynb` file.
+All tools require `file_path` to be an **absolute path**. Every tool except `create_notebook` additionally requires the `.ipynb` file to already exist.
+
+### Notebook creation
+
+| Tool | Parameters | Description |
+| :--- | :--- | :--- |
+| `create_notebook` | `file_path`, `kernel_name` (default `"python3"`), `kernel_display_name`, `language` (default `"python"`), `overwrite` (default `False`) | Create a new empty `.ipynb` with a valid nbformat schema and kernelspec. Refuses to overwrite unless `overwrite=True`. |
 
 ### Cell structure & navigation
 
@@ -80,6 +86,10 @@ All tools require `file_path` to be an **absolute path** to an existing `.ipynb`
 - **Need to see Python symbols defined across cells?** → `list_notebook_symbols`
 - **Searching for a name or string?** → `find_in_notebook`
 - **Need to read a specific cell?** → `get_cell`
+
+### Creating notebooks
+
+- **Need to create a new empty notebook?** → `create_notebook` (do NOT hand-write `.ipynb` JSON with a generic `Write` tool — `create_notebook` guarantees valid nbformat structure and kernelspec)
 
 ### Editing cells
 
@@ -232,7 +242,7 @@ Coding agents are heavily biased toward their default tools. You **must** explic
 
 Add the following block to `CLAUDE.md`, `~/.claude/CLAUDE.md`, or **Custom Instructions**:
 
-> **When working with `.ipynb` Jupyter notebook files, do NOT use the generic `edit` tool. Use the `notebook-editor` MCP server instead. It exposes 22 cell-level tools for editing notebooks and executing cells.**
+> **When working with `.ipynb` Jupyter notebook files, do NOT use the generic `edit` or `write` tool. Use the `notebook-editor` MCP server instead. It exposes 23 cell-level tools for creating, editing, and executing notebooks. Use `create_notebook` to create a new `.ipynb` (never hand-write notebook JSON).**
 >
 > **Picking a tool — always start here:**
 >
@@ -281,7 +291,7 @@ Add the following block to `CLAUDE.md`, `~/.claude/CLAUDE.md`, or **Custom Instr
 
 Add to rules or system prompt:
 
-> *When working with `.ipynb` Jupyter notebook files, do NOT hand-edit the JSON directly and do NOT use default diff/whole-file edit tools. Instead, use the `notebook-editor` MCP server, which exposes 22 cell-level tools for adding/deleting/moving/splitting/merging cells, editing cell content, clearing and reading outputs, managing metadata, and executing cells via a real Python kernel. Start any notebook session by calling `list_cells` to discover the structure and cell indices.*
+> *When working with `.ipynb` Jupyter notebook files, do NOT hand-edit the JSON directly and do NOT use default diff/whole-file edit tools. Instead, use the `notebook-editor` MCP server, which exposes 23 cell-level tools for creating notebooks (`create_notebook`), adding/deleting/moving/splitting/merging cells, editing cell content, clearing and reading outputs, managing metadata, and executing cells via a real Python kernel. Use `create_notebook` to create a new `.ipynb` file with correct schema — do not write notebook JSON by hand. Start any existing-notebook session by calling `list_cells` to discover the structure and cell indices.*
 
 ## Logging & Debugging
 
