@@ -41,7 +41,7 @@ def replace_function(file_path: str, target: str, content: str) -> str:
         logger.info("replace_function: target='%s' file='%s'", target, file_path)
         applier = Applier(file_path)
         applier.replace_function(target, content)
-        return f"Successfully replaced function '{target}' in {file_path}."
+        return "Updated"
     except ApplierError as e:
         logger.warning("replace_function: %s", e)
         return f"Cannot perform edit: {e}"
@@ -69,7 +69,7 @@ def replace_function_body(file_path: str, target: str, content: str) -> str:
         logger.info("replace_function_body: target='%s' file='%s'", target, file_path)
         applier = Applier(file_path)
         applier.replace_function_body(target, content)
-        return f"Successfully replaced body of '{target}' in {file_path}."
+        return "Updated"
     except ApplierError as e:
         logger.warning("replace_function_body: %s", e)
         return f"Cannot perform edit: {e}"
@@ -97,7 +97,7 @@ def add_method(file_path: str, class_target: str, content: str) -> str:
         logger.info("add_method: class='%s' file='%s'", class_target, file_path)
         applier = Applier(file_path)
         applier.add_method(class_target, content)
-        return f"Successfully added method to class '{class_target}' in {file_path}."
+        return "Added"
     except ApplierError as e:
         logger.warning("add_method: %s", e)
         return f"Cannot perform edit: {e}"
@@ -128,7 +128,7 @@ def delete_symbol(file_path: str, target: str) -> str:
         logger.info("delete_symbol: target='%s' file='%s'", target, file_path)
         applier = Applier(file_path)
         applier.delete_symbol(target)
-        return f"Successfully deleted '{target}' in {file_path}."
+        return "Deleted"
     except ApplierError as e:
         logger.warning("delete_symbol: %s", e)
         return f"Cannot perform edit: {e}"
@@ -156,7 +156,7 @@ def replace_value(file_path: str, target: str, content: str) -> str:
         logger.info("replace_value: target='%s' file='%s'", target, file_path)
         applier = Applier(file_path)
         applier.replace_value(target, content)
-        return f"Successfully replaced value at '{target}' in {file_path}."
+        return "Updated"
     except ApplierError as e:
         logger.warning("replace_value: %s", e)
         return f"Cannot perform edit: {e}"
@@ -186,7 +186,7 @@ def add_import(file_path: str, import_text: str) -> str:
         logger.info("add_import: file='%s' import='%s'", file_path, import_text)
         applier = Applier(file_path)
         result = applier.add_import(import_text)
-        return f"{result} ({file_path})"
+        return "Skipped (duplicate)" if "already exists" in result else "Added"
     except ApplierError as e:
         logger.warning("add_import: %s", e)
         return f"Cannot perform edit: {e}"
@@ -214,7 +214,7 @@ def remove_import(file_path: str, import_text: str) -> str:
         logger.info("remove_import: file='%s' import='%s'", file_path, import_text)
         applier = Applier(file_path)
         applier.remove_import(import_text)
-        return f"Successfully removed import from {file_path}."
+        return "Removed"
     except ApplierError as e:
         logger.warning("remove_import: %s", e)
         return f"Cannot perform edit: {e}"
@@ -255,7 +255,7 @@ def add_key(file_path: str, parent_target: str, key: str, value: str) -> str:
         )
         applier = Applier(file_path)
         applier.add_key(parent_target, key, value)
-        return f"Successfully added key '{key}' under '{parent_target or '<root>'}' in {file_path}."
+        return "Added"
     except ApplierError as e:
         logger.warning("add_key: %s", e)
         return f"Cannot perform edit: {e}"
@@ -290,7 +290,7 @@ def delete_key(file_path: str, target: str) -> str:
         logger.info("delete_key: file='%s' target='%s'", file_path, target)
         applier = Applier(file_path)
         applier.delete_key(target)
-        return f"Successfully deleted key '{target}' in {file_path}."
+        return "Deleted"
     except ApplierError as e:
         logger.warning("delete_key: %s", e)
         return f"Cannot perform edit: {e}"
@@ -325,7 +325,7 @@ def append_to_array(file_path: str, target: str, value: str) -> str:
         logger.info("append_to_array: file='%s' target='%s'", file_path, target)
         applier = Applier(file_path)
         applier.append_to_array(target, value)
-        return f"Successfully appended to array '{target}' in {file_path}."
+        return "Added"
     except ApplierError as e:
         logger.warning("append_to_array: %s", e)
         return f"Cannot perform edit: {e}"
@@ -365,7 +365,7 @@ def remove_from_array(file_path: str, target: str, value_match: str) -> str:
         )
         applier = Applier(file_path)
         applier.remove_from_array(target, value_match)
-        return f"Successfully removed '{value_match}' from array '{target}' in {file_path}."
+        return "Removed"
     except ApplierError as e:
         logger.warning("remove_from_array: %s", e)
         return f"Cannot perform edit: {e}"
@@ -394,7 +394,7 @@ def add_field(file_path: str, class_target: str, content: str) -> str:
         logger.info("add_field: class='%s' file='%s'", class_target, file_path)
         applier = Applier(file_path)
         applier.add_field(class_target, content)
-        return f"Successfully added field to class '{class_target}' in {file_path}."
+        return "Added"
     except ApplierError as e:
         logger.warning("add_field: %s", e)
         return f"Cannot perform edit: {e}"
@@ -423,7 +423,7 @@ def replace_signature(file_path: str, target: str, new_signature: str) -> str:
         logger.info("replace_signature: target='%s' file='%s'", target, file_path)
         applier = Applier(file_path)
         applier.replace_signature(target, new_signature)
-        return f"Successfully replaced signature of '{target}' in {file_path}."
+        return "Updated"
     except ApplierError as e:
         logger.warning("replace_signature: %s", e)
         return f"Cannot perform edit: {e}"
@@ -508,7 +508,7 @@ def prepend_to_body(file_path: str, target: str, content: str) -> str:
         logger.info("prepend_to_body: target='%s' file='%s'", target, file_path)
         applier = Applier(file_path)
         applier.prepend_to_body(target, content)
-        return f"Successfully prepended to body of '{target}' in {file_path}."
+        return "Added"
     except ApplierError as e:
         logger.warning("prepend_to_body: %s", e)
         return f"Cannot perform edit: {e}"
@@ -537,7 +537,7 @@ def append_to_body(file_path: str, target: str, content: str) -> str:
         logger.info("append_to_body: target='%s' file='%s'", target, file_path)
         applier = Applier(file_path)
         applier.append_to_body(target, content)
-        return f"Successfully appended to body of '{target}' in {file_path}."
+        return "Added"
     except ApplierError as e:
         logger.warning("append_to_body: %s", e)
         return f"Cannot perform edit: {e}"
@@ -568,7 +568,7 @@ def insert_before(file_path: str, target: str, content: str) -> str:
         logger.info("insert_before: target='%s' file='%s'", target, file_path)
         applier = Applier(file_path)
         applier.insert_before(target, content)
-        return f"Successfully inserted before '{target}' in {file_path}."
+        return "Added"
     except ApplierError as e:
         logger.warning("insert_before: %s", e)
         return f"Cannot perform edit: {e}"
@@ -598,7 +598,7 @@ def insert_after(file_path: str, target: str, content: str) -> str:
         logger.info("insert_after: target='%s' file='%s'", target, file_path)
         applier = Applier(file_path)
         applier.insert_after(target, content)
-        return f"Successfully inserted after '{target}' in {file_path}."
+        return "Added"
     except ApplierError as e:
         logger.warning("insert_after: %s", e)
         return f"Cannot perform edit: {e}"
@@ -629,9 +629,7 @@ def add_import_name(file_path: str, module: str, name: str) -> str:
         )
         applier = Applier(file_path)
         applier.add_import_name(module, name)
-        return (
-            f"Successfully added '{name}' to 'from {module} import ...' in {file_path}."
-        )
+        return "Added"
     except ApplierError as e:
         logger.warning("add_import_name: %s", e)
         return f"Cannot perform edit: {e}"
@@ -664,7 +662,7 @@ def remove_import_name(file_path: str, module: str, name: str) -> str:
         )
         applier = Applier(file_path)
         applier.remove_import_name(module, name)
-        return f"Successfully removed '{name}' from 'from {module} import ...' in {file_path}."
+        return "Removed"
     except ApplierError as e:
         logger.warning("remove_import_name: %s", e)
         return f"Cannot perform edit: {e}"
@@ -702,7 +700,7 @@ def add_parameter(
         )
         applier = Applier(file_path)
         applier.add_parameter(target, parameter, position)
-        return f"Successfully added parameter to '{target}' in {file_path}."
+        return "Added"
     except ApplierError as e:
         logger.warning("add_parameter: %s", e)
         return f"Cannot perform edit: {e}"
@@ -736,7 +734,7 @@ def remove_parameter(file_path: str, target: str, parameter_name: str) -> str:
         )
         applier = Applier(file_path)
         applier.remove_parameter(target, parameter_name)
-        return f"Successfully removed parameter from '{target}' in {file_path}."
+        return "Removed"
     except ApplierError as e:
         logger.warning("remove_parameter: %s", e)
         return f"Cannot perform edit: {e}"
@@ -767,7 +765,7 @@ def add_comment_before(file_path: str, target: str, comment: str) -> str:
         logger.info("add_comment_before: target='%s' file='%s'", target, file_path)
         applier = Applier(file_path)
         applier.add_comment_before(target, comment)
-        return f"Successfully added comment before '{target}' in {file_path}."
+        return "Added"
     except ApplierError as e:
         logger.warning("add_comment_before: %s", e)
         return f"Cannot perform edit: {e}"
@@ -795,7 +793,7 @@ def remove_leading_comment(file_path: str, target: str) -> str:
         logger.info("remove_leading_comment: target='%s' file='%s'", target, file_path)
         applier = Applier(file_path)
         applier.remove_leading_comment(target)
-        return f"Successfully removed leading comment from '{target}' in {file_path}."
+        return "Removed"
     except ApplierError as e:
         logger.warning("remove_leading_comment: %s", e)
         return f"Cannot perform edit: {e}"
@@ -824,7 +822,7 @@ def replace_leading_comment(file_path: str, target: str, new_comment: str) -> st
         logger.info("replace_leading_comment: target='%s' file='%s'", target, file_path)
         applier = Applier(file_path)
         applier.replace_leading_comment(target, new_comment)
-        return f"Successfully replaced leading comment on '{target}' in {file_path}."
+        return "Updated"
     except ApplierError as e:
         logger.warning("replace_leading_comment: %s", e)
         return f"Cannot perform edit: {e}"
@@ -855,7 +853,7 @@ def replace_docstring(file_path: str, target: str, new_docstring: str) -> str:
         logger.info("replace_docstring: target='%s' file='%s'", target, file_path)
         applier = Applier(file_path)
         applier.replace_docstring(target, new_docstring)
-        return f"Successfully updated docstring of '{target}' in {file_path}."
+        return "Updated"
     except ApplierError as e:
         logger.warning("replace_docstring: %s", e)
         return f"Cannot perform edit: {e}"
@@ -916,7 +914,7 @@ def add_top_level(file_path: str, content: str) -> str:
         logger.info("add_top_level: file='%s'", file_path)
         applier = Applier(file_path)
         applier.add_top_level(content)
-        return f"Successfully appended top-level content to {file_path}."
+        return "Added"
     except ApplierError as e:
         logger.warning("add_top_level: %s", e)
         return f"Cannot perform edit: {e}"
