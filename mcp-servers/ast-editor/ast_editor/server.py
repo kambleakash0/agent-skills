@@ -272,22 +272,31 @@ def add_key(file_path: str, parent_target: str, key: str, value: str) -> str:
 @mcp.tool()
 def delete_key(file_path: str, target: str) -> str:
     """
-    Delete a key-value pair from a dict-like container. Works for JSON/YAML/TOML
-    AND Python module-level dict literals. For JSON, also removes the adjacent
-    comma to keep the file valid.
+    Delete a key-value pair from a dict-like container.
+      - JSON / YAML / TOML: dotted path to the key.
+      - Python (.py) module-level dict literals: target is 'DictName.keyExpr'
+        (e.g. 'CONFIG."timeout"').
+      - JS / TS module-level `const` / `let` / `var` object literals
+        (including `export const ... = { ... }`): target is 'VarName.keyName'
+        or 'VarName."quoted-key"'. Handles both regular `{ key: value }` pairs
+        and shorthand `{ key }` properties.
 
-    For JSON/YAML/TOML: target is the dotted path to the key (e.g. 'dependencies.mcp').
-    For Python (.py): target is 'DictName.keyExpr' where keyExpr is the literal key
-    as it appears in source (e.g. 'CONFIG."timeout"').
+    For JSON and JS/TS, the adjacent comma is also removed to keep the file valid.
 
-    Use this when: You want to remove an entire dict entry.
+    Use this when: You want to remove an entire entry.
     Don't use this when: You want to remove an item from a list/array -> use
-    `remove_from_array`.
+    `remove_from_array`. You need to edit an inline object literal passed as a
+    function argument (`foo({ x })`) -- use `delete_in_body` (Phase 3) scoped
+    to the enclosing function instead.
 
     Example (JSON):
         target="dependencies.tree-sitter"
     Example (Python):
         target='CONFIG."timeout"'
+    Example (TS):
+        target="CONFIG.port"             # regular pair
+        target="CONFIG.name"              # shorthand `{ name }`
+        target='CONFIG."complex-key"'     # quoted key
     """
     if err := _validate_file(file_path):
         return err
@@ -615,16 +624,24 @@ def insert_after(file_path: str, target: str, content: str) -> str:
 @mcp.tool()
 def add_import_name(file_path: str, module: str, name: str) -> str:
     """
-    Add a name to an existing Python `from <module> import a, b` statement.
-    Python-only. Skips duplicates.
+    Add a name to an existing named-import statement. Idempotent: skips if
+    the name is already present.
 
-    Use this when: The module is already imported via `from X import ...` and you
-    want to add another name to that existing line.
-    Don't use this when: The import statement doesn't exist yet -> use `add_import`.
+      - Python (.py): `from <module> import a, b`
+      - JS/TS:        `import { a, b } from "<module>"`
 
-    Example:
+    Use this when: The module is already imported via a named-import form and
+    you want to add another name to that existing statement.
+    Don't use this when: The import statement doesn't exist yet -> use
+    `add_import`. You want a default or namespace import (`import Foo from ...`
+    or `import * as ns from ...`) -> use `add_import` with the full line.
+
+    Example (Python):
         module="typing"
         name="Optional"
+    Example (TS):
+        module="./utils"
+        name="baz"
     """
     if err := _validate_file(file_path):
         return err
@@ -646,15 +663,26 @@ def add_import_name(file_path: str, module: str, name: str) -> str:
 @mcp.tool()
 def remove_import_name(file_path: str, module: str, name: str) -> str:
     """
-    Remove a name from a Python `from <module> import a, b, c` statement. If removing
-    the only remaining name, removes the entire import statement. Python-only.
+    Remove a name from a named-import statement.
+
+      - Python (.py): `from <module> import a, b, c`
+      - JS/TS:        `import { a, b, c } from "<module>"`
+
+    If the name removed is the only remaining one AND there are no other
+    bindings (default / namespace) in the same statement, the entire import
+    line is removed. Raises an error if removing the last name would leave
+    an invalid `import Default, {} from "mod"` fragment.
 
     Use this when: You want to remove a single name from a multi-name import.
-    Don't use this when: You want to remove the entire import line -> use `remove_import`.
+    Don't use this when: You want to remove the entire import line -> use
+    `remove_import`.
 
-    Example:
+    Example (Python):
         module="typing"
         name="List"
+    Example (TS):
+        module="./utils"
+        name="bar"
     """
     if err := _validate_file(file_path):
         return err

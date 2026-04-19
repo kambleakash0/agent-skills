@@ -510,16 +510,18 @@ class Applier:
     def delete_key(self, target: str) -> str:
         """
         Delete a key-value pair from a container:
-          - JSON / YAML / TOML config files (dotted path to key)
+          - JSON / YAML / TOML config files (dotted path to key).
           - Python module-level dict literals (target is 'DictName' + '.' + key-literal,
-            e.g. 'CONFIG."foo"'). For simplicity, Python callers should pass the dict
-            variable name as target and provide the key through the separate path.
+            e.g. 'CONFIG."foo"').
+          - JS / TS module-level const/let/var object literals (target is
+            'VarName.keyName' or 'VarName."quoted-key"'). Handles both regular
+            `{ key: value }` pairs and shorthand `{ key }` properties, inside
+            `export const` too.
 
-        For JSON, also removes the adjacent comma to keep the file valid.
+        For JSON and JS/TS, also removes the adjacent comma to keep the file valid.
         """
         ext = self.parser.ext
         if ext == ".py":
-            # Expect target to be 'DictName.keyExpr' -- split on last '.'
             if "." not in target:
                 raise ApplierError(
                     f"For Python dicts, target must be 'DictName.keyExpr' (e.g. 'CONFIG.\"foo\"'), got '{target}'"
@@ -527,9 +529,12 @@ class Applier:
             dict_name, key_part = target.rsplit(".", 1)
             return self.delete_dict_entry(dict_name, key_part)
 
+        if ext in (".js", ".jsx", ".mjs", ".cjs", ".ts", ".tsx"):
+            return self._delete_key_js(target)
+
         if ext not in (".json", ".yml", ".yaml", ".toml"):
             raise ApplierError(
-                f"delete_key is only supported for config files or .py, not {ext}"
+                f"delete_key is only supported for config files, .py, or JS/TS, not {ext}"
             )
 
         pair = self._find_config_pair_by_path(target)
@@ -561,6 +566,105 @@ class Applier:
         end_line = pair.end_point[0] + 1
         self.lines = self.lines[:start_line] + self.lines[end_line:]
         return self._save()
+
+    def _delete_key_js(self, target: str) -> str:
+        """Delete a key from a JS/TS object literal assigned at module level.
+        Target format: 'VarName.keyName' or 'VarName."quoted-key"'."""
+        if "." not in target:
+            raise ApplierError(
+                f"For JS/TS objects, target must be 'VarName.keyName' (e.g. 'CONFIG.port'), got '{target}'"
+            )
+        var_name, key = target.rsplit(".", 1)
+
+        obj_node = self._find_js_object_literal(var_name)
+        if obj_node is None:
+            raise ApplierError(
+                f"'{var_name}' not found as a module-level const/let/var assigned to an object literal"
+            )
+
+        entries = [
+            c
+            for c in obj_node.named_children
+            if c.type in ("pair", "shorthand_property_identifier")
+        ]
+
+        key_stripped = key.strip()
+        # Normalize: strip matching quotes so 'port' matches 'port' and '"complex-key"' matches '"complex-key"'.
+        def _unquote(s: str) -> str:
+            if len(s) >= 2 and s[0] in "\"'`" and s[-1] in "\"'`":
+                return s[1:-1]
+            return s
+        target_unquoted = _unquote(key_stripped)
+
+        target_idx = None
+        for i, entry in enumerate(entries):
+            if entry.type == "shorthand_property_identifier":
+                if self.parser.node_text(entry) == key_stripped:
+                    target_idx = i
+                    break
+                continue
+            # pair node: check its key
+            key_node = entry.child_by_field_name("key")
+            if key_node is None and entry.named_children:
+                key_node = entry.named_children[0]
+            if key_node is None:
+                continue
+            k_text = self.parser.node_text(key_node).strip()
+            if k_text == key_stripped or _unquote(k_text) == target_unquoted:
+                target_idx = i
+                break
+
+        if target_idx is None:
+            raise ApplierError(f"Key '{key}' not found in {var_name}")
+
+        target_node = entries[target_idx]
+        source_bytes = self.parser.source_bytes
+        start = target_node.start_byte
+        end = target_node.end_byte
+
+        if target_idx > 0:
+            start = entries[target_idx - 1].end_byte
+        elif target_idx + 1 < len(entries):
+            end = entries[target_idx + 1].start_byte
+
+        new_bytes = source_bytes[:start] + source_bytes[end:]
+        self._write_bytes(new_bytes)
+        return "Update successful"
+
+    def _find_js_object_literal(self, var_name: str):
+        """Find a module-level const/let/var assigned an object literal.
+        Handles plain declarations and ones nested inside `export` statements.
+        Returns the `object` node or None."""
+        def walk(parent):
+            for child in parent.named_children:
+                if child.type in ("lexical_declaration", "variable_declaration"):
+                    for decl in child.named_children:
+                        if decl.type != "variable_declarator":
+                            continue
+                        name_node = decl.child_by_field_name("name")
+                        if name_node is None:
+                            for c in decl.named_children:
+                                if c.type == "identifier":
+                                    name_node = c
+                                    break
+                        if name_node is None:
+                            continue
+                        if self.parser.node_text(name_node) != var_name:
+                            continue
+                        value = decl.child_by_field_name("value")
+                        if value is None:
+                            for c in decl.named_children:
+                                if c.type == "object":
+                                    value = c
+                                    break
+                        if value is not None and value.type == "object":
+                            return value
+                elif child.type == "export_statement":
+                    result = walk(child)
+                    if result is not None:
+                        return result
+            return None
+        return walk(self.parser.tree.root_node)
 
     def _resolve_yaml_value(self, value_node):
         """Unwrap a YAML block_node/flow_node to get the underlying collection (block_sequence, flow_sequence, block_mapping, flow_mapping)."""
@@ -1333,15 +1437,22 @@ class Applier:
 
     def add_import_name(self, module: str, name: str) -> str:
         """
-        Add a name to an existing Python `from <module> import a, b` statement.
-        If the name is already present, returns without changes. If the statement
-        doesn't exist, raises an error.
+        Add a name to an existing named-import statement:
+          - Python:  `from <module> import a, b`  -> adds as a new name
+          - JS/TS:   `import { a, b } from "module"`  -> adds as a new specifier
+        Idempotent: if the name is already present, returns without changes.
+        Raises if no matching import statement exists.
         """
-        if self.parser.ext != ".py":
-            raise ApplierError(
-                f"add_import_name only supports .py files (got {self.parser.ext})"
-            )
+        ext = self.parser.ext
+        if ext == ".py":
+            return self._add_import_name_python(module, name)
+        if ext in (".js", ".jsx", ".mjs", ".cjs", ".ts", ".tsx"):
+            return self._add_import_name_js(module, name)
+        raise ApplierError(
+            f"add_import_name is supported for Python and JS/TS, not {ext}"
+        )
 
+    def _add_import_name_python(self, module: str, name: str) -> str:
         stmt = self._find_python_from_import(module)
         if stmt is None:
             raise ApplierError(
@@ -1355,7 +1466,6 @@ class Applier:
         if not name_nodes:
             raise ApplierError("Cannot add to an empty import list")
 
-        # Insert after the last name_node: ", <name>"
         last = name_nodes[-1]
         insertion = f", {name}"
         source_bytes = self.parser.source_bytes
@@ -1367,16 +1477,89 @@ class Applier:
         self._write_bytes(new_bytes)
         return "Update successful"
 
-    def remove_import_name(self, module: str, name: str) -> str:
-        """
-        Remove a name from a Python `from <module> import a, b, c` statement.
-        If removing the only remaining name, removes the entire import statement.
-        """
-        if self.parser.ext != ".py":
+    def _add_import_name_js(self, module: str, name: str) -> str:
+        stmt, named_imports, specs = self._find_js_named_import(module)
+        if stmt is None:
             raise ApplierError(
-                f"remove_import_name only supports .py files (got {self.parser.ext})"
+                f"Named import from '{module}' not found in {self.filepath}"
+            )
+        if not specs:
+            raise ApplierError(
+                "Cannot add to an empty named import list -- use add_import instead"
             )
 
+        # Dedupe against existing specifier names (not aliases)
+        for spec in specs:
+            name_node = spec.child_by_field_name("name")
+            if name_node and self.parser.node_text(name_node) == name:
+                return "Name already present -- no change made"
+
+        last = specs[-1]
+        insertion = f", {name}"
+        source_bytes = self.parser.source_bytes
+        new_bytes = (
+            source_bytes[: last.end_byte]
+            + insertion.encode("utf-8")
+            + source_bytes[last.end_byte :]
+        )
+        self._write_bytes(new_bytes)
+        return "Update successful"
+
+    def _find_js_named_import(self, module: str):
+        """For JS/TS: find `import { ... } from "module"` matching the module.
+        Returns (import_statement_node, named_imports_node, list of import_specifier nodes)
+        or (None, None, []) if no match."""
+        for child in self.parser.tree.root_node.named_children:
+            if child.type != "import_statement":
+                continue
+            # Find source string (direct child of import_statement)
+            source_text = None
+            for c in child.named_children:
+                if c.type == "string":
+                    text = self.parser.node_text(c).strip()
+                    # Strip surrounding quotes (single/double/backtick)
+                    if len(text) >= 2 and text[0] in "\"'`" and text[-1] in "\"'`":
+                        text = text[1:-1]
+                    source_text = text
+                    break
+            if source_text != module:
+                continue
+            # Find named_imports node (typically inside import_clause)
+            named_imports = self._find_js_named_imports_clause(child)
+            if named_imports is None:
+                continue
+            specs = [c for c in named_imports.named_children if c.type == "import_specifier"]
+            return child, named_imports, specs
+        return None, None, []
+
+    def _find_js_named_imports_clause(self, import_stmt):
+        """Locate the named_imports node anywhere inside an import_statement."""
+        queue = list(import_stmt.named_children)
+        while queue:
+            curr = queue.pop(0)
+            if curr.type == "named_imports":
+                return curr
+            queue.extend(curr.named_children)
+        return None
+
+    def remove_import_name(self, module: str, name: str) -> str:
+        """
+        Remove a name from a named-import statement:
+          - Python:  `from <module> import a, b, c`
+          - JS/TS:   `import { a, b, c } from "module"`
+        If removing the only remaining name, removes the entire import statement
+        (when the statement consists of only named imports).
+        """
+        ext = self.parser.ext
+        if ext == ".py":
+            return self._remove_import_name_python(module, name)
+        if ext in (".js", ".jsx", ".mjs", ".cjs", ".ts", ".tsx"):
+            return self._remove_import_name_js(module, name)
+        raise ApplierError(
+            f"remove_import_name is supported for Python and JS/TS, not {ext}"
+        )
+
+    def _remove_import_name_python(self, module: str, name: str) -> str:
         stmt = self._find_python_from_import(module)
         if stmt is None:
             raise ApplierError(
@@ -1392,14 +1575,12 @@ class Applier:
         if idx is None:
             raise ApplierError(f"Name '{name}' not found in 'from {module} import ...'")
 
-        # If it's the only name, remove the whole statement line
         if len(name_nodes) == 1:
             start_line = stmt.start_point[0]
             end_line = stmt.end_point[0] + 1
             self.lines = self.lines[:start_line] + self.lines[end_line:]
             return self._save()
 
-        # Otherwise remove just this name + adjacent comma
         source_bytes = self.parser.source_bytes
         start = name_nodes[idx].start_byte
         end = name_nodes[idx].end_byte
@@ -1407,6 +1588,55 @@ class Applier:
             start = name_nodes[idx - 1].end_byte
         elif idx + 1 < len(name_nodes):
             end = name_nodes[idx + 1].start_byte
+
+        new_bytes = source_bytes[:start] + source_bytes[end:]
+        self._write_bytes(new_bytes)
+        return "Update successful"
+
+    def _remove_import_name_js(self, module: str, name: str) -> str:
+        stmt, named_imports, specs = self._find_js_named_import(module)
+        if stmt is None:
+            raise ApplierError(
+                f"Named import from '{module}' not found in {self.filepath}"
+            )
+
+        idx = None
+        for i, spec in enumerate(specs):
+            name_node = spec.child_by_field_name("name")
+            if name_node and self.parser.node_text(name_node) == name:
+                idx = i
+                break
+        if idx is None:
+            raise ApplierError(
+                f"Name '{name}' not found in named import from '{module}'"
+            )
+
+        # If removing the only named import, and there are no other bindings
+        # (default / namespace imports) on the same statement, remove the whole
+        # statement. Otherwise removing the last named import would leave a
+        # mixed `import Default, {} from "mod"` fragment that's invalid.
+        if len(specs) == 1:
+            import_clause = named_imports.parent
+            siblings = [c for c in import_clause.named_children if c.type != "named_imports"] if import_clause else []
+            if not siblings:
+                start_line = stmt.start_point[0]
+                end_line = stmt.end_point[0] + 1
+                self.lines = self.lines[:start_line] + self.lines[end_line:]
+                return self._save()
+            raise ApplierError(
+                f"Removing the last name from `import Default, {{ {name} }} from \"{module}\"` "
+                "would leave an invalid empty braces fragment. Use `remove_import` to remove the whole "
+                "statement, then re-add the default binding with `add_import`."
+            )
+
+        # Multiple specs: remove this one + adjacent comma
+        source_bytes = self.parser.source_bytes
+        start = specs[idx].start_byte
+        end = specs[idx].end_byte
+        if idx > 0:
+            start = specs[idx - 1].end_byte
+        elif idx + 1 < len(specs):
+            end = specs[idx + 1].start_byte
 
         new_bytes = source_bytes[:start] + source_bytes[end:]
         self._write_bytes(new_bytes)

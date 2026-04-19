@@ -1782,6 +1782,245 @@ def test_java():
 
 
 # ──────────────────────────────────────────────
+# JS/TS delete_key support (Phase 2.B.4)
+# ──────────────────────────────────────────────
+
+def test_delete_key_jsts():
+    print("\n═══ delete_key (JS/TS object literals) ═══")
+    import os as _os
+
+    ts_path = _os.path.join(TESTS_DIR, "test_delkey.ts")
+    with open(ts_path, "w") as f:
+        f.write('''const CONFIG = {
+  port: 3000,
+  debug: true,
+  "complex-key": "v",
+  name,
+};
+
+export const EXPORTED = {
+  a: 1,
+  b: 2,
+};
+''')
+
+    # Delete a regular pair by bare name
+    app = Applier(ts_path)
+    app.delete_key("CONFIG.debug")
+    result = read_file(ts_path)
+    check("ts delete_key: regular pair removed",
+          "PASS" if "debug: true" not in result else "FAIL", "PASS")
+    check("ts delete_key: other pairs intact", result, "port: 3000")
+
+    # Delete a shorthand property
+    app = Applier(ts_path)
+    app.delete_key("CONFIG.name")
+    result = read_file(ts_path)
+    check("ts delete_key: shorthand removed",
+          "PASS" if "  name,\n" not in result else "FAIL", "PASS")
+
+    # Delete a quoted key
+    app = Applier(ts_path)
+    app.delete_key('CONFIG."complex-key"')
+    result = read_file(ts_path)
+    check("ts delete_key: quoted key removed",
+          "PASS" if '"complex-key"' not in result else "FAIL", "PASS")
+    # Only `port` should remain in CONFIG
+    check("ts delete_key: remaining key intact", result, "port: 3000")
+
+    # Delete from an exported const
+    app = Applier(ts_path)
+    app.delete_key("EXPORTED.a")
+    result = read_file(ts_path)
+    check("ts delete_key: works on `export const`",
+          "PASS" if "a: 1" not in result else "FAIL", "PASS")
+    check("ts delete_key: sibling preserved in export const", result, "b: 2")
+
+    # Missing key -> error
+    bad_raised = False
+    app = Applier(ts_path)
+    try:
+        app.delete_key("CONFIG.nothere")
+    except Exception as e:
+        bad_raised = "not found" in str(e)
+    check("ts delete_key: missing key raises",
+          "PASS" if bad_raised else "FAIL", "PASS")
+
+    # Missing variable -> error
+    bad_raised = False
+    app = Applier(ts_path)
+    try:
+        app.delete_key("MISSING.a")
+    except Exception as e:
+        bad_raised = "not found" in str(e).lower() or "not found" in str(e)
+    check("ts delete_key: missing variable raises",
+          "PASS" if bad_raised else "FAIL", "PASS")
+
+    # Bad target format -> error
+    bad_raised = False
+    app = Applier(ts_path)
+    try:
+        app.delete_key("noDot")
+    except Exception as e:
+        bad_raised = "VarName.keyName" in str(e) or "must be" in str(e)
+    check("ts delete_key: bad target format raises",
+          "PASS" if bad_raised else "FAIL", "PASS")
+    _os.remove(ts_path)
+
+    # JS variant (same grammar shape)
+    js_path = _os.path.join(TESTS_DIR, "test_delkey.js")
+    with open(js_path, "w") as f:
+        f.write('const SETTINGS = { host: "localhost", timeout: 30 };\n')
+    app = Applier(js_path)
+    app.delete_key("SETTINGS.timeout")
+    result = read_file(js_path)
+    check("js delete_key: regular pair removed",
+          "PASS" if "timeout" not in result else "FAIL", "PASS")
+    check("js delete_key: other pair intact", result, 'host: "localhost"')
+    _os.remove(js_path)
+
+
+# ──────────────────────────────────────────────
+# JS/TS named-import support (Phase 2.B.2 / B.3)
+# ──────────────────────────────────────────────
+
+def test_import_names_jsts():
+    print("\n═══ add_import_name / remove_import_name (JS/TS) ═══")
+    import os as _os
+
+    # TypeScript add_import_name -- add to existing { a, b }
+    ts_path = _os.path.join(TESTS_DIR, "test_imp_names.ts")
+    with open(ts_path, "w") as f:
+        f.write('''import { foo, bar } from "./utils";
+import Default, { named } from "other";
+import { alone } from "solo";
+
+export function use() {
+  return foo + bar + named + alone;
+}
+''')
+    app = Applier(ts_path)
+    app.add_import_name("./utils", "baz")
+    result = read_file(ts_path)
+    check("ts add_import_name: added to named imports", result, "foo, bar, baz")
+
+    # Dedupe: adding same name again is a no-op
+    app = Applier(ts_path)
+    msg = app.add_import_name("./utils", "baz")
+    check("ts add_import_name: duplicate detected", msg, "already present")
+
+    # Add to the mixed-binding form `import Default, { named } from ...`
+    app = Applier(ts_path)
+    app.add_import_name("other", "extra")
+    result = read_file(ts_path)
+    check(
+        "ts add_import_name: works with default+named import",
+        result,
+        "{ named, extra }",
+    )
+    check(
+        "ts add_import_name: default binding preserved",
+        result,
+        "import Default",
+    )
+
+    # remove_import_name: remove bar from utils
+    app = Applier(ts_path)
+    app.remove_import_name("./utils", "bar")
+    result = read_file(ts_path)
+    check(
+        "ts remove_import_name: name removed",
+        "PASS" if "bar" not in result.split("\n")[0] else "FAIL",
+        "PASS",
+    )
+    check("ts remove_import_name: other names intact", result, "foo, baz")
+
+    # Remove the only named import (no other bindings) -> whole statement removed
+    app = Applier(ts_path)
+    app.remove_import_name("solo", "alone")
+    result = read_file(ts_path)
+    check(
+        "ts remove_import_name: last named (no default) removes whole line",
+        "PASS" if '"solo"' not in result else "FAIL",
+        "PASS",
+    )
+
+    # Remove the last named from `import Default, { x } from ...` -> error, not destructive
+    bad_raised = False
+    app = Applier(ts_path)
+    try:
+        # `other` has `import Default, { named, extra } from "other"` now
+        app.remove_import_name("other", "named")
+        app.remove_import_name("other", "extra")
+    except Exception as e:
+        bad_raised = "empty braces fragment" in str(e) or "Removing the last name" in str(e)
+    check(
+        "ts remove_import_name: refuses to leave `Default, {}`",
+        "PASS" if bad_raised else "FAIL",
+        "PASS",
+    )
+    # File should still be valid -- `import Default, { extra } from "other"` remains
+    result = read_file(ts_path)
+    check(
+        "ts remove_import_name (refusal): file unchanged for that attempt",
+        "PASS" if "import Default" in result else "FAIL",
+        "PASS",
+    )
+
+    # Name not found -> error
+    bad_raised = False
+    app = Applier(ts_path)
+    try:
+        app.remove_import_name("./utils", "nonexistent")
+    except Exception as e:
+        bad_raised = "not found" in str(e)
+    check(
+        "ts remove_import_name: missing name raises",
+        "PASS" if bad_raised else "FAIL",
+        "PASS",
+    )
+
+    # Module not found -> error
+    bad_raised = False
+    app = Applier(ts_path)
+    try:
+        app.add_import_name("nope", "anything")
+    except Exception as e:
+        bad_raised = "not found" in str(e)
+    check(
+        "ts add_import_name: missing module raises",
+        "PASS" if bad_raised else "FAIL",
+        "PASS",
+    )
+
+    _os.remove(ts_path)
+
+    # JavaScript form (same grammar shape)
+    js_path = _os.path.join(TESTS_DIR, "test_imp_names.js")
+    with open(js_path, "w") as f:
+        f.write('import { readFile } from "fs";\n\nexport const x = readFile;\n')
+    app = Applier(js_path)
+    app.add_import_name("fs", "writeFile")
+    result = read_file(js_path)
+    check("js add_import_name: added", result, "readFile, writeFile")
+    _os.remove(js_path)
+
+    # Aliased specifier: `import { foo as bar } from "mod"` -- duplicate check
+    # should match on the imported name, not the alias.
+    ts_path = _os.path.join(TESTS_DIR, "test_imp_alias.ts")
+    with open(ts_path, "w") as f:
+        f.write('import { foo as bar } from "mod";\n')
+    app = Applier(ts_path)
+    msg = app.add_import_name("mod", "foo")
+    check(
+        "ts add_import_name: dedupe matches imported name, not alias",
+        msg,
+        "already present",
+    )
+    _os.remove(ts_path)
+
+
+# ──────────────────────────────────────────────
 # add_top_level: position parameter (Phase 1.B.6)
 # ──────────────────────────────────────────────
 
@@ -2303,6 +2542,8 @@ if __name__ == "__main__":
 
     test_delete_symbol_leading_comments()
     test_add_top_level_position()
+    test_import_names_jsts()
+    test_delete_key_jsts()
     test_ast_reader()
 
     # Reset all fixtures to clean state after tests

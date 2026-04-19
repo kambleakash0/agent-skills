@@ -118,8 +118,8 @@ All tools require `file_path` to be an **absolute path** to an existing file.
 | :--- | :--- | :--- |
 | `add_import` | `file_path`, `import_text` | Add an `import`/`from`/`#include` line. Skips duplicates. For Go, if a parenthesized `import ( ... )` block already exists, the spec is inserted inside that block (accepts either `import "foo"` or just `"foo"` / `alias "foo"` as input). |
 | `remove_import` | `file_path`, `import_text` | Remove a matching import line. |
-| `add_import_name` | `file_path`, `module`, `name` | Add one name to an existing `from <module> import a, b`. Python-only. |
-| `remove_import_name` | `file_path`, `module`, `name` | Remove one name from a multi-name Python from-import. |
+| `add_import_name` | `file_path`, `module`, `name` | Add one name to an existing named-import statement: `from <module> import a, b` (Python) or `import { a, b } from "<module>"` (JS/TS). Idempotent. |
+| `remove_import_name` | `file_path`, `module`, `name` | Remove one name from a multi-name named-import statement (Python and JS/TS). If the last named import is removed and no default/namespace binding remains, the whole line is removed. |
 
 ### Comments & docstrings
 
@@ -136,7 +136,7 @@ All tools require `file_path` to be an **absolute path** to an existing file.
 | :--- | :--- | :--- |
 | `replace_value` | `file_path`, `target`, `content` | Replace the value of an existing config key. `target` is the dotted key path. |
 | `add_key` | `file_path`, `parent_target`, `key`, `value` | Add a key-value pair to a dict/object/mapping/table. For Python, `parent_target` is the dict variable name; for config, a dotted path (use `""` for root). |
-| `delete_key` | `file_path`, `target` | Delete a key-value pair. For Python, target is `DictName.keyExpr`. For JSON, also removes the adjacent comma. |
+| `delete_key` | `file_path`, `target` | Delete a key-value pair. Targets: JSON/YAML/TOML dotted path; Python `DictName.keyExpr`; JS/TS `VarName.keyName` on `const`/`let`/`var` or `export const` object literals (handles regular pairs, `{ key }` shorthand, and quoted `"complex-key"`). For JSON and JS/TS, adjacent comma is also removed. |
 | `append_to_array` | `file_path`, `target`, `value` | Append a literal value to a list/array/sequence. For Python, `target` is the list variable name; for config, a dotted path. |
 | `remove_from_array` | `file_path`, `target`, `value_match` | Remove the first matching element from a list/array/sequence. |
 
