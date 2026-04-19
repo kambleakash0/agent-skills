@@ -107,27 +107,32 @@ def add_method(file_path: str, class_target: str, content: str) -> str:
 
 
 @mcp.tool()
-def delete_symbol(file_path: str, target: str) -> str:
+def delete_symbol(file_path: str, target: str, include_leading_comments: bool = True) -> str:
     """
     Delete an entire function or class definition, including its decorators.
+    By default, also removes the contiguous leading comment block above the
+    symbol (Godoc, Javadoc `/** ... */`, `#` or `//` comment runs) so the
+    doc doesn't become orphaned floating text. Pass
+    `include_leading_comments=False` to leave that comment in place.
 
     Use this when: You want to remove a function, method, or class entirely from a
-    source file.
+    source file -- along with its doc comment by default.
     Don't use this when: You want to remove a config key -> use `delete_key`. You
     want to remove an import -> use `remove_import`. You want to remove lines
-    inside a function -> no dedicated tool yet; use `replace_function_body` to
-    rewrite the body without the unwanted lines.
+    inside a function -> use `delete_in_body` (or `replace_function_body` to
+    rewrite the whole body without the unwanted lines).
 
     Example:
-        target="LRUCache.old_method"   # deletes a method
-        target="DeprecatedClass"        # deletes a whole class (and all its methods)
+        target="LRUCache.old_method"              # deletes a method + its leading comment
+        target="DeprecatedClass"                  # deletes class, all methods, and preceding Javadoc
+        target="Foo", include_leading_comments=False   # keep the comment, delete only the symbol
     """
     if err := _validate_file(file_path):
         return err
     try:
         logger.info("delete_symbol: target='%s' file='%s'", target, file_path)
         applier = Applier(file_path)
-        applier.delete_symbol(target)
+        applier.delete_symbol(target, include_leading_comments=include_leading_comments)
         return "Deleted"
     except ApplierError as e:
         logger.warning("delete_symbol: %s", e)
@@ -892,28 +897,35 @@ def find_references(file_path: str, target: str) -> str:
 
 
 @mcp.tool()
-def add_top_level(file_path: str, content: str) -> str:
+def add_top_level(file_path: str, content: str, position: str = "bottom") -> str:
     """
-    Append arbitrary top-level content to the end of the file: a function, class,
-    constant, type alias, or any other top-level statement.
+    Insert top-level content into the file: a function, class, constant, type
+    alias, or any other top-level statement. `position` controls placement:
 
-    Use this when: You're adding any kind of top-level code at the end of a module.
-    Don't use this when: You need placement relative to another symbol -> use
-    `insert_before`/`insert_after`. You're adding to a class body -> use
-    `add_method`/`add_field`. You're adding a line inside an existing function
-    body -> use `prepend_to_body`/`append_to_body`.
+      - "bottom" (default): append to end of file.
+      - "top": insert after the preamble (package/imports/includes/leading
+               comments, plus the Python module docstring if present) and
+               before the first real declaration.
+
+    Use this when: You're adding any kind of top-level code. Use position="top"
+    when inserting multiple declarations at the top of a file without the
+    `insert_before <target>` reverse-order problem.
+    Don't use this when: You need placement relative to a specific symbol ->
+    use `insert_before` / `insert_after`. You're adding to a class body -> use
+    `add_method` / `add_field`. You're adding a line inside an existing
+    function body -> use `prepend_to_body` / `append_to_body`.
 
     Example:
         content="def parse_version(text):\\n    return tuple(int(x) for x in text.split('.'))"
-        content="class Logger:\\n    pass"
-        content="MAX_CONNECTIONS = 10"
+        content="class Logger:\\n    pass", position="top"
+        content="MAX_CONNECTIONS = 10", position="top"
     """
     if err := _validate_file(file_path):
         return err
     try:
-        logger.info("add_top_level: file='%s'", file_path)
+        logger.info("add_top_level: file='%s' position='%s'", file_path, position)
         applier = Applier(file_path)
-        applier.add_top_level(content)
+        applier.add_top_level(content, position=position)
         return "Added"
     except ApplierError as e:
         logger.warning("add_top_level: %s", e)

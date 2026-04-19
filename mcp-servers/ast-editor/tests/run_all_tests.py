@@ -1522,13 +1522,65 @@ def test_go():
     )
     check("go delete_symbol: struct intact", result, "type Cache struct")
 
-    # add_import (new single import)
+    # add_import: full `import "io"` form -- should strip the keyword and
+    # insert inside the existing parenthesized block
     path = reset_fixture("go")
     app = Applier(path)
     app.add_import('import "io"')
     result = read_file(path)
-    check("go add_import: new import present", result, 'import "io"')
-    check("go add_import: existing imports intact", result, '"fmt"')
+    check("go add_import (full form): spec inside block", result, '\t"io"')
+    check("go add_import (full form): existing fmt intact", result, '"fmt"')
+    check("go add_import (full form): block preserved", result, "import (")
+    check(
+        "go add_import (full form): no bare `import \"io\"` line outside block",
+        "PASS" if '\nimport "io"' not in result else "FAIL",
+        "PASS",
+    )
+
+    # add_import: spec-only `"path/filepath"` form -- the original bug case.
+    # Previously produced a bare `"path/filepath"` line after `)` (syntax error).
+    # Now inserts as a spec inside the block.
+    path = reset_fixture("go")
+    app = Applier(path)
+    app.add_import('"path/filepath"')
+    result = read_file(path)
+    check("go add_import (spec-only): spec inside block", result, '\t"path/filepath"')
+    check(
+        "go add_import (spec-only): no orphan line after `)`",
+        "PASS" if ')\n"path/filepath"' not in result else "FAIL",
+        "PASS",
+    )
+    check("go add_import (spec-only): block still closed properly", result, "\n)\n")
+
+    # add_import: duplicate detection inside the block
+    app2 = Applier(path)
+    msg = app2.add_import('"path/filepath"')
+    check("go add_import (duplicate): detected", msg, "already exists")
+    # File unchanged -- no second `"path/filepath"` line
+    result = read_file(path)
+    check(
+        "go add_import (duplicate): not added twice",
+        "PASS" if result.count('"path/filepath"') == 1 else "FAIL",
+        "PASS",
+    )
+
+    # add_import: aliased spec form
+    path = reset_fixture("go")
+    app = Applier(path)
+    app.add_import('f "path/filepath"')
+    result = read_file(path)
+    check("go add_import (aliased): alias preserved", result, '\tf "path/filepath"')
+
+    # add_import: file with no existing imports at all -- falls through to generic path
+    import os as _os
+    noimp_path = _os.path.join(TESTS_DIR, "test_target_noimp.go")
+    with open(noimp_path, "w") as f:
+        f.write("package main\n\nfunc Hello() {}\n")
+    app = Applier(noimp_path)
+    app.add_import('import "fmt"')
+    result = read_file(noimp_path)
+    check("go add_import (no prior imports): top-level line added", result, 'import "fmt"')
+    _os.remove(noimp_path)
 
     # list_symbols
     path = reset_fixture("go")
@@ -1727,6 +1779,316 @@ def test_java():
     check("java list_symbols: enum listed", outline, "enum Status")
     check("java list_symbols: enum method listed", outline, "method Status.isOk")
     os.remove(path)
+
+
+# ──────────────────────────────────────────────
+# add_top_level: position parameter (Phase 1.B.6)
+# ──────────────────────────────────────────────
+
+def test_add_top_level_position():
+    print("\n═══ add_top_level position ═══")
+    import os as _os
+
+    # Python: position="top" inserts after imports and module docstring
+    py_path = _os.path.join(TESTS_DIR, "test_pos.py")
+    with open(py_path, "w") as f:
+        f.write('''"""Module docstring."""
+import os
+import sys
+
+
+def existing():
+    return 1
+''')
+    app = Applier(py_path)
+    app.add_top_level("CACHE_SIZE = 100", position="top")
+    result = read_file(py_path)
+    # CACHE_SIZE must appear AFTER imports but BEFORE existing()
+    cache_pos = result.find("CACHE_SIZE = 100")
+    import_pos = result.find("import sys")
+    existing_pos = result.find("def existing")
+    check("py add_top_level top: inserted", result, "CACHE_SIZE = 100")
+    check(
+        "py add_top_level top: after imports",
+        "PASS" if import_pos < cache_pos else "FAIL",
+        "PASS",
+    )
+    check(
+        "py add_top_level top: before existing symbol",
+        "PASS" if cache_pos < existing_pos else "FAIL",
+        "PASS",
+    )
+    check("py add_top_level top: docstring intact", result, '"""Module docstring."""')
+    _os.remove(py_path)
+
+    # Python: position="bottom" (default) behavior unchanged
+    py_path = _os.path.join(TESTS_DIR, "test_pos_bottom.py")
+    with open(py_path, "w") as f:
+        f.write("import os\n\n\ndef existing():\n    return 1\n")
+    app = Applier(py_path)
+    app.add_top_level("TAIL = True")  # default position
+    result = read_file(py_path)
+    check(
+        "py add_top_level bottom: at end",
+        "PASS" if result.rstrip().endswith("TAIL = True") else "FAIL",
+        "PASS",
+    )
+    _os.remove(py_path)
+
+    # Go: position="top" inserts after package + import block
+    go_path = _os.path.join(TESTS_DIR, "test_pos.go")
+    with open(go_path, "w") as f:
+        f.write('''package main
+
+import (
+\t"fmt"
+)
+
+func Existing() { fmt.Println("hi") }
+''')
+    app = Applier(go_path)
+    app.add_top_level("const MaxConnections = 10", position="top")
+    result = read_file(go_path)
+    const_pos = result.find("const MaxConnections")
+    import_pos = result.find('"fmt"')
+    existing_pos = result.find("func Existing")
+    check("go add_top_level top: inserted", result, "const MaxConnections = 10")
+    check(
+        "go add_top_level top: after import block",
+        "PASS" if import_pos < const_pos else "FAIL",
+        "PASS",
+    )
+    check(
+        "go add_top_level top: before existing function",
+        "PASS" if const_pos < existing_pos else "FAIL",
+        "PASS",
+    )
+    _os.remove(go_path)
+
+    # Java: position="top" inserts after package + imports
+    java_path = _os.path.join(TESTS_DIR, "test_pos.java")
+    with open(java_path, "w") as f:
+        f.write('''package com.example;
+
+import java.util.List;
+
+public class Foo {
+}
+''')
+    app = Applier(java_path)
+    app.add_top_level("import java.util.Map;", position="top")
+    result = read_file(java_path)
+    new_pos = result.find("import java.util.Map;")
+    existing_import_pos = result.find("import java.util.List;")
+    class_pos = result.find("public class Foo")
+    check("java add_top_level top: inserted", result, "import java.util.Map;")
+    check(
+        "java add_top_level top: after package+imports",
+        "PASS" if existing_import_pos < new_pos else "FAIL",
+        "PASS",
+    )
+    check(
+        "java add_top_level top: before class",
+        "PASS" if new_pos < class_pos else "FAIL",
+        "PASS",
+    )
+    _os.remove(java_path)
+
+    # File with no preamble: position="top" inserts at line 0
+    py_path = _os.path.join(TESTS_DIR, "test_pos_empty.py")
+    with open(py_path, "w") as f:
+        f.write("def only():\n    return 1\n")
+    app = Applier(py_path)
+    app.add_top_level("FIRST = 1", position="top")
+    result = read_file(py_path)
+    check(
+        "py add_top_level top (no preamble): at file start",
+        "PASS" if result.startswith("FIRST = 1") else "FAIL",
+        "PASS",
+    )
+    _os.remove(py_path)
+
+    # Invalid position raises ApplierError
+    py_path = _os.path.join(TESTS_DIR, "test_pos_bad.py")
+    with open(py_path, "w") as f:
+        f.write("x = 1\n")
+    app = Applier(py_path)
+    bad_raised = False
+    try:
+        app.add_top_level("y = 2", position="middle")
+    except Exception as e:
+        bad_raised = "middle" in str(e)
+    check(
+        "py add_top_level: invalid position rejected",
+        "PASS" if bad_raised else "FAIL",
+        "PASS",
+    )
+    _os.remove(py_path)
+
+
+# ──────────────────────────────────────────────
+# delete_symbol: leading-comment consumption (Phase 1.B.5)
+# ──────────────────────────────────────────────
+
+def test_delete_symbol_leading_comments():
+    print("\n═══ delete_symbol: leading comments ═══")
+
+    import os as _os
+
+    # Python: `#` comment above function -- consumed by default
+    py_path = _os.path.join(TESTS_DIR, "test_delcmt.py")
+    with open(py_path, "w") as f:
+        f.write('''# Helper used by downstream code.
+# Uses quadratic time but that is fine for small inputs.
+def legacy_calc(xs):
+    total = 0
+    for x in xs:
+        total += x
+    return total
+
+
+def keep_me():
+    return 1
+''')
+    app = Applier(py_path)
+    app.delete_symbol("legacy_calc")
+    result = read_file(py_path)
+    check(
+        "py delete_symbol: function removed",
+        "PASS" if "def legacy_calc" not in result else "FAIL",
+        "PASS",
+    )
+    check(
+        "py delete_symbol: leading # comment removed",
+        "PASS" if "Helper used by downstream code" not in result else "FAIL",
+        "PASS",
+    )
+    check(
+        "py delete_symbol: second comment line removed",
+        "PASS" if "quadratic time" not in result else "FAIL",
+        "PASS",
+    )
+    check("py delete_symbol: other symbols intact", result, "def keep_me")
+    _os.remove(py_path)
+
+    # Python: opt-out keeps the comment
+    py_path = _os.path.join(TESTS_DIR, "test_delcmt_keep.py")
+    with open(py_path, "w") as f:
+        f.write('''# Important notice: do not remove.
+def legacy_calc():
+    return 0
+
+
+def keep_me():
+    return 1
+''')
+    app = Applier(py_path)
+    app.delete_symbol("legacy_calc", include_leading_comments=False)
+    result = read_file(py_path)
+    check("py delete_symbol (keep): function removed",
+          "PASS" if "def legacy_calc" not in result else "FAIL", "PASS")
+    check("py delete_symbol (keep): leading comment preserved", result,
+          "# Important notice: do not remove.")
+    _os.remove(py_path)
+
+    # Go: godoc comment above function
+    go_path = _os.path.join(TESTS_DIR, "test_delcmt.go")
+    with open(go_path, "w") as f:
+        f.write('''package main
+
+// LegacyCalc is the old implementation.
+// It is kept here only for reference and will be removed.
+func LegacyCalc(xs []int) int {
+\ttotal := 0
+\tfor _, x := range xs {
+\t\ttotal += x
+\t}
+\treturn total
+}
+
+// KeepMe stays.
+func KeepMe() int { return 1 }
+''')
+    app = Applier(go_path)
+    app.delete_symbol("LegacyCalc")
+    result = read_file(go_path)
+    check("go delete_symbol: function removed",
+          "PASS" if "func LegacyCalc" not in result else "FAIL", "PASS")
+    check("go delete_symbol: godoc line 1 removed",
+          "PASS" if "LegacyCalc is the old implementation" not in result else "FAIL", "PASS")
+    check("go delete_symbol: godoc line 2 removed",
+          "PASS" if "kept here only for reference" not in result else "FAIL", "PASS")
+    check("go delete_symbol: KeepMe godoc intact", result, "// KeepMe stays.")
+    check("go delete_symbol: KeepMe function intact", result, "func KeepMe")
+    _os.remove(go_path)
+
+    # Java: Javadoc /** ... */ block above method
+    java_path = _os.path.join(TESTS_DIR, "test_delcmt.java")
+    with open(java_path, "w") as f:
+        f.write('''package com.example;
+
+public class Util {
+    /**
+     * Legacy implementation.
+     * Do not use in new code.
+     */
+    public int legacy(int n) {
+        return n * 2;
+    }
+
+    public int keep(int n) {
+        return n;
+    }
+}
+''')
+    app = Applier(java_path)
+    app.delete_symbol("Util.legacy")
+    result = read_file(java_path)
+    check("java delete_symbol: method removed",
+          "PASS" if "public int legacy" not in result else "FAIL", "PASS")
+    check("java delete_symbol: Javadoc removed",
+          "PASS" if "Legacy implementation." not in result else "FAIL", "PASS")
+    check("java delete_symbol: Javadoc closing removed",
+          "PASS" if "Do not use in new code" not in result else "FAIL", "PASS")
+    check("java delete_symbol: other method intact", result, "public int keep")
+    _os.remove(java_path)
+
+    # C++: C-style /* ... */ block comment above function
+    cpp_path = _os.path.join(TESTS_DIR, "test_delcmt.cpp")
+    with open(cpp_path, "w") as f:
+        f.write('''#include <iostream>
+
+/* Old behavior, no longer used.
+ * Replaced by newBehavior(). */
+int oldBehavior(int x) {
+    return x * 2;
+}
+
+int keep(int x) {
+    return x;
+}
+''')
+    app = Applier(cpp_path)
+    app.delete_symbol("oldBehavior")
+    result = read_file(cpp_path)
+    check("cpp delete_symbol: function removed",
+          "PASS" if "int oldBehavior" not in result else "FAIL", "PASS")
+    check("cpp delete_symbol: block comment removed",
+          "PASS" if "Old behavior, no longer used" not in result else "FAIL", "PASS")
+    check("cpp delete_symbol: keep intact", result, "int keep")
+    _os.remove(cpp_path)
+
+    # No leading comment present -- should still work (no-op on comment side)
+    py_path = _os.path.join(TESTS_DIR, "test_delcmt_nocmt.py")
+    with open(py_path, "w") as f:
+        f.write("def foo():\n    return 1\n\n\ndef bar():\n    return 2\n")
+    app = Applier(py_path)
+    app.delete_symbol("foo")
+    result = read_file(py_path)
+    check("py delete_symbol (no comment): function removed",
+          "PASS" if "def foo" not in result else "FAIL", "PASS")
+    check("py delete_symbol (no comment): bar intact", result, "def bar")
+    _os.remove(py_path)
 
 
 # ──────────────────────────────────────────────
@@ -1939,6 +2301,8 @@ if __name__ == "__main__":
     test_go()
     test_java()
 
+    test_delete_symbol_leading_comments()
+    test_add_top_level_position()
     test_ast_reader()
 
     # Reset all fixtures to clean state after tests

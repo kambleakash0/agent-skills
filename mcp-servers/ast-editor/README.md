@@ -67,7 +67,8 @@ The savings come from four compounding effects:
 
 - **Decorated functions** (Python `@decorator`): decorators are preserved on body/signature edits and included on delete.
 - **Byte-correct slicing**: multi-byte characters (emoji, `═`, `→`) handled safely in source text.
-- **Idempotent imports**: `add_import` skips exact duplicates automatically.
+- **Idempotent imports**: `add_import` skips exact duplicates automatically. For Go specifically, when a parenthesized `import ( ... )` block already exists, new specs are inserted inside the block rather than as a bare top-level line (which would be a syntax error for spec-only input like `"path/filepath"`).
+- **Doc-comment-aware deletion**: `delete_symbol` by default removes the contiguous leading comment block above the symbol (Godoc, Javadoc, `#`/`//` comment runs) so docs don't become orphaned. Opt out with `include_leading_comments=False`.
 
 ### Language-specific design decisions
 
@@ -97,12 +98,12 @@ All tools require `file_path` to be an **absolute path** to an existing file.
 | `replace_signature` | `file_path`, `target`, `new_signature` | Replace only the signature, preserving body and decorators. |
 | `prepend_to_body` | `file_path`, `target`, `content` | Insert content at the top of a function body. |
 | `append_to_body` | `file_path`, `target`, `content` | Insert content at the bottom of a function body. |
-| `add_top_level` | `file_path`, `content` | Append any top-level content (function, class, constant, type alias) to the end of the file. |
+| `add_top_level` | `file_path`, `content`, `position="bottom"` | Insert top-level content. `position="bottom"` appends at end of file (default); `position="top"` inserts after preamble (package/imports/includes/leading comments, plus Python module docstring) and before the first real declaration. |
 | `add_method` | `file_path`, `class_target`, `content` | Add a method at the end of a class body. |
 | `add_field` | `file_path`, `class_target`, `content` | Add a field/attribute/member at the top of a class body. |
 | `insert_before` | `file_path`, `target`, `content` | Insert a sibling immediately before a named symbol. |
 | `insert_after` | `file_path`, `target`, `content` | Insert a sibling immediately after a named symbol. |
-| `delete_symbol` | `file_path`, `target` | Delete a function or class definition block (including decorators). |
+| `delete_symbol` | `file_path`, `target`, `include_leading_comments=True` | Delete a function or class definition block (including decorators). By default also consumes the contiguous leading comment block above the symbol (Godoc, Javadoc `/** ... */`, `#` or `//` comments); pass `include_leading_comments=False` to keep it. |
 
 ### Parameters & signatures
 
@@ -115,7 +116,7 @@ All tools require `file_path` to be an **absolute path** to an existing file.
 
 | Tool | Parameters | Description |
 | :--- | :--- | :--- |
-| `add_import` | `file_path`, `import_text` | Add an `import`/`from`/`#include` line. Skips duplicates. |
+| `add_import` | `file_path`, `import_text` | Add an `import`/`from`/`#include` line. Skips duplicates. For Go, if a parenthesized `import ( ... )` block already exists, the spec is inserted inside that block (accepts either `import "foo"` or just `"foo"` / `alias "foo"` as input). |
 | `remove_import` | `file_path`, `import_text` | Remove a matching import line. |
 | `add_import_name` | `file_path`, `module`, `name` | Add one name to an existing `from <module> import a, b`. Python-only. |
 | `remove_import_name` | `file_path`, `module`, `name` | Remove one name from a multi-name Python from-import. |
@@ -171,7 +172,7 @@ A decision guide grouped by intent. Start at the top and pick the narrowest matc
 
 | Intent | Tool |
 | :--- | :--- |
-| New top-level function, class, constant, or type alias | `add_top_level` |
+| New top-level function, class, constant, or type alias | `add_top_level` (use `position="top"` to prepend after preamble) |
 | New method in an existing class | `add_method` |
 | New field/attribute/member in a class | `add_field` |
 | New content at a specific position relative to an existing symbol | `insert_before` / `insert_after` |

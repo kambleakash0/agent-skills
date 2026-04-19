@@ -168,13 +168,24 @@ class Applier:
             self.lines = self.lines[:insert_line] + [""] + content_lines + self.lines[insert_line:]
         return self._save()
 
-    def delete_symbol(self, target: str) -> str:
+    def delete_symbol(self, target: str, include_leading_comments: bool = True) -> str:
+        """
+        Delete a function/class/method definition. By default also removes the
+        contiguous leading comment block (Godoc, Javadoc, `#` comments, `//`
+        comments, or C-style `/* ... */` blocks) directly above the symbol --
+        pass `include_leading_comments=False` to keep that comment in place.
+        """
         node = self.parser.find_node_by_name(target)
         if not node:
             raise ApplierError(f"Target '{target}' not found")
 
         start_line = node.start_point[0]
         end_line = node.end_point[0] + 1
+
+        if include_leading_comments:
+            comment_range = self._find_leading_comment_range(start_line)
+            if comment_range is not None:
+                start_line = comment_range[0]
 
         self.lines = self.lines[:start_line] + self.lines[end_line:]
         return self._save()
@@ -210,14 +221,26 @@ class Applier:
           - Python: "import foo" or "from foo import bar"
           - JS/TS:  "import { foo } from 'bar';"
           - C/C++:  "#include <foo.h>"
-          - Go:     "import \"fmt\"" or insert into existing import blocks
+          - Go:     Either a full `import "fmt"` line, or just `"fmt"` /
+                    `alias "pkg/path"` as a spec. When a parenthesized
+                    `import ( ... )` block already exists, the spec is
+                    inserted inside that block (idiomatic Go).
           - Ruby:   "require 'foo'" or "require_relative 'bar'"
+          - Java:   "import java.util.List;"
         Skips insertion if an identical import already exists.
         Places the new import after existing imports, or at the top of the file if none exist.
         """
         valid_types = self._import_node_types()
         if not valid_types:
             raise ApplierError(f"add_import is not supported for file type {self.parser.ext}")
+
+        # Go-specific: if there's a parenthesized import block, insert INSIDE it
+        # rather than as a new bare line after `)` (which would be a syntax error
+        # for spec-only input like `"path/filepath"`).
+        if self.parser.ext == ".go":
+            go_block = self._find_go_import_block()
+            if go_block is not None:
+                return self._add_import_to_go_block(go_block, import_text)
 
         stripped = import_text.strip()
         for line in self.lines:
@@ -241,6 +264,39 @@ class Applier:
             insert_line = 0
 
         self.lines = self.lines[:insert_line] + [import_text] + self.lines[insert_line:]
+        return self._save()
+
+    def _find_go_import_block(self):
+        """Return the first Go `import_spec_list` node (parenthesized block content) if one exists, else None."""
+        for child in self.parser.tree.root_node.named_children:
+            if child.type != "import_declaration":
+                continue
+            for sub in child.named_children:
+                if sub.type == "import_spec_list":
+                    return sub
+        return None
+
+    def _add_import_to_go_block(self, spec_list_node, import_text: str) -> str:
+        """Insert an import spec into an existing Go parenthesized import block.
+        Accepts either a full `import "foo"` line or just `"foo"` / `alias "foo"`."""
+        stripped = import_text.strip()
+        # Callers may pass either `import "foo"` or just `"foo"`; strip the keyword.
+        if stripped.startswith("import "):
+            spec_text = stripped[len("import "):].strip()
+        else:
+            spec_text = stripped
+
+        # Dedupe against existing specs in the block
+        for child in spec_list_node.named_children:
+            if child.type != "import_spec":
+                continue
+            existing = self.parser.node_text(child).strip()
+            if existing == spec_text:
+                return "Import already exists -- no change made"
+
+        # Insert on a new tab-indented line immediately before the closing `)`
+        end_line = spec_list_node.end_point[0]
+        self.lines = self.lines[:end_line] + ["\t" + spec_text] + self.lines[end_line:]
         return self._save()
 
     def remove_import(self, import_text: str) -> str:
@@ -1836,19 +1892,75 @@ class Applier:
 
         return "\n\n".join(parts)
 
-    def add_top_level(self, content: str) -> str:
+    def add_top_level(self, content: str, position: str = "bottom") -> str:
         """
-        Append arbitrary top-level content to the end of the file: a function,
-        class, constant, type alias, module-level call, or any other top-level
-        statement. Unified replacement for add_function / add_class / add_statement.
+        Insert top-level content into the file. Position controls placement:
+          - "bottom" (default): append to end of file.
+          - "top": insert after the preamble (package/imports/includes/leading
+                   comments and, for Python, the module docstring) and before
+                   the first non-preamble declaration. For files with no
+                   preamble, inserts at line 0.
         """
+        if position not in ("bottom", "top"):
+            raise ApplierError(f"position must be 'bottom' or 'top', got: {position}")
+
         content_lines = content.splitlines()
-        while self.lines and not self.lines[-1].strip():
-            self.lines.pop()
-        if self.lines:
-            self.lines.append("")
-        self.lines.extend(content_lines)
+
+        if position == "bottom":
+            while self.lines and not self.lines[-1].strip():
+                self.lines.pop()
+            if self.lines:
+                self.lines.append("")
+            self.lines.extend(content_lines)
+            return self._save()
+
+        # position == "top": find preamble end and insert there
+        insert_line = self._find_preamble_end()
+        if insert_line == 0:
+            # Prepend at file start; add a trailing blank so downstream code is separated
+            self.lines = content_lines + [""] + self.lines
+        else:
+            # Insert after preamble with a blank separator before the new content
+            self.lines = self.lines[:insert_line] + [""] + content_lines + self.lines[insert_line:]
         return self._save()
+
+    def _find_preamble_end(self) -> int:
+        """Return the line number at which non-preamble code starts.
+        Preamble includes: package declarations (Go/Java), import/include
+        statements, leading comments, and (Python only) the module docstring.
+        Returns 0 if there is no preamble."""
+        ext = self.parser.ext
+        preamble_types = set(self._import_node_types())
+        if ext == ".go":
+            preamble_types.add("package_clause")
+        if ext == ".java":
+            preamble_types.add("package_declaration")
+
+        last_preamble_end = -1
+        seen_docstring = False
+
+        for child in self.parser.tree.root_node.named_children:
+            if child.type == "comment":
+                last_preamble_end = child.end_point[0]
+                continue
+            if child.type in preamble_types:
+                # Ruby: only `require`-like calls count as imports
+                if ext == ".rb" and child.type == "call":
+                    if not self._is_ruby_require_call(child):
+                        break
+                last_preamble_end = child.end_point[0]
+                continue
+            # Python module docstring: first expression_statement with a string
+            if ext == ".py" and child.type == "expression_statement" and not seen_docstring:
+                inner = child.named_children[0] if child.named_children else None
+                if inner is not None and inner.type == "string":
+                    last_preamble_end = child.end_point[0]
+                    seen_docstring = True
+                    continue
+            # Non-preamble node reached
+            break
+
+        return last_preamble_end + 1 if last_preamble_end >= 0 else 0
 
     def _supports_block_comments(self) -> bool:
         """Languages that support C-style /* ... */ block comments."""
