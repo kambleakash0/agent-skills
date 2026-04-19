@@ -1134,6 +1134,131 @@ class Applier:
             raise ApplierError(f"Could not find body block for target '{target}'")
         return func_node, body
 
+    def replace_in_body(self, target: str, old_snippet: str, new_snippet: str) -> str:
+        """
+        Replace a byte-identical snippet inside a function body with new_snippet.
+        The match is scoped to the target's body so accidental matches elsewhere
+        in the file are impossible.
+
+        Raises if the snippet is not found, or if it appears more than once
+        (include more surrounding context to disambiguate).
+        """
+        func_node, body = self._get_function_body_node(target)
+        return self._replace_in_body_bytes(body, old_snippet, new_snippet, target)
+
+    def delete_in_body(self, target: str, snippet: str) -> str:
+        """
+        Delete a byte-identical snippet inside a function body. Scoped to the
+        target's body. Raises if not found or if the snippet appears more than
+        once -- include more context to disambiguate.
+        """
+        func_node, body = self._get_function_body_node(target)
+        return self._replace_in_body_bytes(body, snippet, "", target)
+
+    def insert_in_body(
+        self,
+        target: str,
+        new_snippet: str,
+        after: str | None = None,
+        before: str | None = None,
+    ) -> str:
+        """
+        Insert new_snippet inside a function body, anchored relative to an
+        existing snippet. Pass exactly one of `after` or `before`.
+
+        The anchor match is scoped to the target's body and must be unique
+        (multiple matches raise an error). The caller is responsible for
+        including any needed leading/trailing newlines and indentation in
+        new_snippet.
+
+        To insert at the top or bottom of the body with no anchor, use
+        prepend_to_body / append_to_body instead.
+        """
+        after_val = after or None
+        before_val = before or None
+        if (after_val is None) == (before_val is None):
+            raise ApplierError(
+                "insert_in_body: pass exactly one of `after` or `before`"
+            )
+
+        func_node, body = self._get_function_body_node(target)
+        anchor = after_val if after_val is not None else before_val
+        place = "after" if after_val is not None else "before"
+        return self._insert_in_body_bytes(body, anchor, new_snippet, place, target)
+
+    def _replace_in_body_bytes(self, body_node, old_snippet, new_snippet, target):
+        """Byte-level replace within a body. Empty new_snippet = delete."""
+        body_start, body_end = self._body_search_range(body_node)
+        source_bytes = self.parser.source_bytes
+        body_bytes = source_bytes[body_start:body_end]
+        old_bytes = old_snippet.encode("utf-8")
+        if not old_bytes:
+            raise ApplierError("Empty snippet cannot be matched")
+
+        count = body_bytes.count(old_bytes)
+        if count == 0:
+            raise ApplierError(
+                f"Snippet not found in body of '{target}'. Check whitespace and indentation."
+            )
+        if count > 1:
+            raise ApplierError(
+                f"Snippet matches {count} places in body of '{target}'. Include more "
+                "surrounding context to make the match unique."
+            )
+
+        idx = body_bytes.index(old_bytes)
+        abs_start = body_start + idx
+        abs_end = abs_start + len(old_bytes)
+
+        new_bytes_data = new_snippet.encode("utf-8")
+        new_bytes = source_bytes[:abs_start] + new_bytes_data + source_bytes[abs_end:]
+        self._write_bytes(new_bytes)
+        return "Update successful"
+
+    def _insert_in_body_bytes(self, body_node, anchor_snippet, new_snippet, place, target):
+        """Byte-level insert anchored to a snippet within a body."""
+        body_start, body_end = self._body_search_range(body_node)
+        source_bytes = self.parser.source_bytes
+        body_bytes = source_bytes[body_start:body_end]
+        anchor_bytes = anchor_snippet.encode("utf-8")
+        if not anchor_bytes:
+            raise ApplierError("Empty anchor cannot be matched")
+
+        count = body_bytes.count(anchor_bytes)
+        if count == 0:
+            raise ApplierError(
+                f"Anchor snippet not found in body of '{target}'. Check whitespace and indentation."
+            )
+        if count > 1:
+            raise ApplierError(
+                f"Anchor matches {count} places in body of '{target}'. Include more "
+                "surrounding context to make the match unique."
+            )
+
+        idx = body_bytes.index(anchor_bytes)
+        abs_start = body_start + idx
+        abs_end = abs_start + len(anchor_bytes)
+        insert_point = abs_end if place == "after" else abs_start
+
+        new_bytes_data = new_snippet.encode("utf-8")
+        new_bytes = source_bytes[:insert_point] + new_bytes_data + source_bytes[insert_point:]
+        self._write_bytes(new_bytes)
+        return "Update successful"
+
+    def _body_search_range(self, body_node) -> tuple[int, int]:
+        """Return (start_byte, end_byte) byte range within which to search for
+        a snippet inside a function body. For Python/Ruby, extends the start
+        back to the beginning of the first body line so leading indentation is
+        part of the searchable text. For brace-delimited languages, returns
+        the body node's native byte range (which includes `{` and `}`)."""
+        start_byte = body_node.start_byte
+        end_byte = body_node.end_byte
+        if self.parser.ext in (".py", ".rb"):
+            source_bytes = self.parser.source_bytes
+            while start_byte > 0 and source_bytes[start_byte - 1:start_byte] != b"\n":
+                start_byte -= 1
+        return start_byte, end_byte
+
     def prepend_to_body(self, target: str, content: str) -> str:
         """
         Insert content at the top of a function body, preserving existing statements.

@@ -1782,6 +1782,281 @@ def test_java():
 
 
 # ──────────────────────────────────────────────
+# replace_in_body / delete_in_body / insert_in_body (Phase 3.C)
+# ──────────────────────────────────────────────
+
+def test_in_body_family():
+    print("\n═══ replace_in_body / delete_in_body / insert_in_body ═══")
+    import os as _os
+
+    # Python
+    py_path = _os.path.join(TESTS_DIR, "test_inbody.py")
+    with open(py_path, "w") as f:
+        f.write('''def handle(request):
+    log("start")
+    validate(request)
+    result = compute(request)
+    log("end")
+    return result
+
+
+def other():
+    return 42
+''')
+
+    # replace_in_body: swap one statement
+    app = Applier(py_path)
+    app.replace_in_body("handle", "result = compute(request)", "result = compute_v2(request)")
+    result = read_file(py_path)
+    check("py replace_in_body: new snippet present", result, "compute_v2(request)")
+    check("py replace_in_body: old snippet removed",
+          "PASS" if "compute(request)" not in result else "FAIL", "PASS")
+    check("py replace_in_body: surrounding lines intact", result, 'log("start")')
+    check("py replace_in_body: other function untouched", result, "def other")
+
+    # delete_in_body: remove a line (with leading indent + trailing newline)
+    app = Applier(py_path)
+    app.delete_in_body("handle", '    log("start")\n')
+    result = read_file(py_path)
+    check("py delete_in_body: line removed",
+          "PASS" if 'log("start")' not in result else "FAIL", "PASS")
+    check("py delete_in_body: other statements intact", result, "validate(request)")
+
+    # insert_in_body: after anchor
+    app = Applier(py_path)
+    app.insert_in_body(
+        "handle",
+        '    metrics.incr("calls")\n',
+        after='    validate(request)\n',
+    )
+    result = read_file(py_path)
+    check("py insert_in_body (after): new line present", result, 'metrics.incr("calls")')
+    # Should be after validate, before compute
+    v_idx = result.find("validate(request)")
+    m_idx = result.find('metrics.incr("calls")')
+    c_idx = result.find("compute_v2")
+    check("py insert_in_body (after): ordered correctly",
+          "PASS" if v_idx < m_idx < c_idx else "FAIL", "PASS")
+
+    # insert_in_body: before anchor
+    app = Applier(py_path)
+    app.insert_in_body(
+        "handle",
+        '    auth_check(request)\n',
+        before='    validate(request)\n',
+    )
+    result = read_file(py_path)
+    a_idx = result.find("auth_check(request)")
+    v_idx = result.find("validate(request)")
+    check("py insert_in_body (before): new line present", result, "auth_check(request)")
+    check("py insert_in_body (before): placed before anchor",
+          "PASS" if 0 < a_idx < v_idx else "FAIL", "PASS")
+
+    # Error: snippet not found
+    bad = False
+    app = Applier(py_path)
+    try:
+        app.replace_in_body("handle", "nonexistent_snippet", "new")
+    except Exception as e:
+        bad = "not found" in str(e)
+    check("py replace_in_body: missing snippet raises", "PASS" if bad else "FAIL", "PASS")
+
+    # Error: ambiguous match (multiple occurrences)
+    app = Applier(py_path)
+    bad = False
+    try:
+        # "return" appears twice (handle's return, other's return). But those
+        # are in different bodies so scoping should prevent cross-body matches.
+        # Let's test within-body ambiguity: the word "request" appears many times.
+        app.replace_in_body("handle", "request", "req")
+    except Exception as e:
+        bad = "matches" in str(e) and "more" in str(e)
+    check("py replace_in_body: ambiguous match raises", "PASS" if bad else "FAIL", "PASS")
+
+    # Scope check: match in one body does NOT match text in sibling body
+    # (`other`'s body is "    return 42\n" -- try replacing "return" inside `other`
+    # while `handle` also has a return statement)
+    app = Applier(py_path)
+    app.replace_in_body("other", "return 42", "return 999")
+    result = read_file(py_path)
+    check("py replace_in_body: scoped to target body (other updated)", result, "return 999")
+    check("py replace_in_body: scoped (handle's return untouched)", result, "return result")
+
+    # insert_in_body: no anchor raises
+    bad = False
+    app = Applier(py_path)
+    try:
+        app.insert_in_body("handle", "x = 1")
+    except Exception as e:
+        bad = "exactly one" in str(e)
+    check("py insert_in_body: no anchor raises", "PASS" if bad else "FAIL", "PASS")
+
+    # insert_in_body: both anchors raises
+    bad = False
+    app = Applier(py_path)
+    try:
+        app.insert_in_body("handle", "x = 1", after="a", before="b")
+    except Exception as e:
+        bad = "exactly one" in str(e)
+    check("py insert_in_body: both anchors raises", "PASS" if bad else "FAIL", "PASS")
+
+    _os.remove(py_path)
+
+    # Go (braces language)
+    go_path = _os.path.join(TESTS_DIR, "test_inbody.go")
+    with open(go_path, "w") as f:
+        f.write('''package main
+
+import "fmt"
+
+func Process(items []string) error {
+\tif len(items) == 0 {
+\t\treturn nil
+\t}
+\tfor _, item := range items {
+\t\tfmt.Println(item)
+\t}
+\treturn nil
+}
+''')
+
+    app = Applier(go_path)
+    app.replace_in_body("Process", "fmt.Println(item)", "fmt.Printf(\"%s\\n\", item)")
+    result = read_file(go_path)
+    check("go replace_in_body: new call present", result, 'fmt.Printf("%s\\n", item)')
+    check("go replace_in_body: other structure intact", result, "for _, item := range items")
+
+    # Delete the entire if block
+    app = Applier(go_path)
+    app.delete_in_body("Process", "\tif len(items) == 0 {\n\t\treturn nil\n\t}\n")
+    result = read_file(go_path)
+    check("go delete_in_body: if block removed",
+          "PASS" if "if len(items) == 0" not in result else "FAIL", "PASS")
+    check("go delete_in_body: for loop intact", result, "for _, item")
+
+    _os.remove(go_path)
+
+
+# ──────────────────────────────────────────────
+# Closure addressing (Phase 3.B.7)
+# ──────────────────────────────────────────────
+
+def test_closure_addressing():
+    print("\n═══ closure addressing (Go + JS/TS) ═══")
+    import os as _os
+
+    # Go: var ( stdioCmd = &cobra.Command{ RunE: func(...) {...} } )
+    go_path = _os.path.join(TESTS_DIR, "test_closure.go")
+    with open(go_path, "w") as f:
+        f.write('''package main
+
+import "fmt"
+
+var (
+\tstdioCmd = &cobra.Command{
+\t\tUse:   "stdio",
+\t\tShort: "Run stdio server",
+\t\tRunE: func(cmd *cobra.Command, args []string) error {
+\t\t\tfmt.Println("running")
+\t\t\treturn nil
+\t\t},
+\t}
+)
+
+var single = &Foo{
+\tHandler: func(x int) int {
+\t\treturn x * 2
+\t},
+}
+''')
+
+    # Resolution: find the func_literal inside stdioCmd.RunE
+    app = Applier(go_path)
+    node = app.parser.find_node_by_name("stdioCmd.RunE")
+    check("go find stdioCmd.RunE: resolves",
+          "PASS" if node is not None and node.type == "func_literal" else "FAIL", "PASS")
+
+    # replace_function_body on a Go closure
+    app = Applier(go_path)
+    app.replace_function_body("stdioCmd.RunE", "\t\t\treturn fmt.Errorf(\"not impl\")")
+    result = read_file(go_path)
+    check("go closure replace_function_body: new body present", result, 'return fmt.Errorf("not impl")')
+    check("go closure replace_function_body: old body removed",
+          "PASS" if 'fmt.Println("running")' not in result else "FAIL", "PASS")
+    check("go closure replace_function_body: surrounding struct intact", result, "Use:   \"stdio\"")
+
+    # get_signature on a Go closure
+    app = Applier(go_path)
+    sig = app.get_signature("stdioCmd.RunE")
+    check("go closure get_signature: returns func signature", sig, "func(cmd *cobra.Command, args []string) error")
+
+    # Plain (non-block) var_spec closure
+    app = Applier(go_path)
+    node = app.parser.find_node_by_name("single.Handler")
+    check("go plain var closure: resolves",
+          "PASS" if node is not None and node.type == "func_literal" else "FAIL", "PASS")
+    app.replace_function_body("single.Handler", "\t\treturn x + 1")
+    result = read_file(go_path)
+    check("go plain closure replace_function_body: new body present", result, "return x + 1")
+    _os.remove(go_path)
+
+    # TS: arrow_function as object property value
+    ts_path = _os.path.join(TESTS_DIR, "test_closure.ts")
+    with open(ts_path, "w") as f:
+        f.write('''const app = {
+  handler: (req: Request, res: Response) => {
+    res.send("ok");
+  },
+  middleware: function(req: Request) {
+    return req;
+  },
+};
+
+export const config = {
+  onStart: async () => {
+    console.log("started");
+  },
+};
+''')
+
+    app = Applier(ts_path)
+    node = app.parser.find_node_by_name("app.handler")
+    check("ts find app.handler: resolves to arrow_function",
+          "PASS" if node is not None and node.type == "arrow_function" else "FAIL", "PASS")
+
+    app = Applier(ts_path)
+    app.replace_function_body("app.handler", "    res.status(500).send(\"err\");")
+    result = read_file(ts_path)
+    check("ts arrow_function replace_function_body: new body present", result, 'res.status(500).send("err")')
+    check("ts arrow_function replace_function_body: old body removed",
+          "PASS" if 'res.send("ok")' not in result else "FAIL", "PASS")
+    check("ts arrow_function replace_function_body: sibling property intact", result, "middleware: function")
+
+    # function_expression form
+    app = Applier(ts_path)
+    node = app.parser.find_node_by_name("app.middleware")
+    check("ts find app.middleware: resolves to function_expression",
+          "PASS" if node is not None and node.type == "function_expression" else "FAIL", "PASS")
+
+    # export const form with async arrow
+    app = Applier(ts_path)
+    node = app.parser.find_node_by_name("config.onStart")
+    check("ts find config.onStart (export const + async): resolves",
+          "PASS" if node is not None and node.type == "arrow_function" else "FAIL", "PASS")
+    _os.remove(ts_path)
+
+    # Missing var -> returns None (no raise)
+    ts_path = _os.path.join(TESTS_DIR, "test_closure_nope.ts")
+    with open(ts_path, "w") as f:
+        f.write("const a = 1;\n")
+    app = Applier(ts_path)
+    node = app.parser.find_node_by_name("missing.field")
+    check("ts closure: missing var returns None",
+          "PASS" if node is None else "FAIL", "PASS")
+    _os.remove(ts_path)
+
+
+# ──────────────────────────────────────────────
 # JS/TS delete_key support (Phase 2.B.4)
 # ──────────────────────────────────────────────
 
@@ -2544,6 +2819,8 @@ if __name__ == "__main__":
     test_add_top_level_position()
     test_import_names_jsts()
     test_delete_key_jsts()
+    test_closure_addressing()
+    test_in_body_family()
     test_ast_reader()
 
     # Reset all fixtures to clean state after tests

@@ -77,6 +77,139 @@ def replace_function_body(file_path: str, target: str, content: str) -> str:
         logger.exception("replace_function_body crashed")
         return f"Internal error in replace_function_body: {type(e).__name__}: {e}"
 
+@mcp.tool()
+def replace_in_body(file_path: str, target: str, old_snippet: str, new_snippet: str) -> str:
+    """
+    Replace a byte-identical snippet inside a named function/method body,
+    without touching the surrounding code. The match is scoped to the target's
+    body so accidental matches elsewhere in the file cannot happen.
+
+    Raises if the snippet is not found, or if it appears more than once in the
+    body (include more surrounding context to disambiguate).
+
+    Use this when: You need to change a specific statement or block inside a
+    large function body without rewriting the whole body. The single biggest
+    token-saver for long functions with ~30 similar lines where you only want
+    to change one of them.
+    Don't use this when: You're replacing the entire body -> use
+    `replace_function_body`. You need to change a sub-expression inside a
+    method chain that string matching can't uniquely locate -> use the default
+    `Edit` tool instead.
+
+    Example:
+        target="init"
+        old_snippet="viper.BindPFlag(\\"port\\", cmd.Flags().Lookup(\\"port\\"))"
+        new_snippet="viper.BindPFlag(\\"port\\", cmd.PersistentFlags().Lookup(\\"port\\"))"
+    """
+    if err := _validate_file(file_path):
+        return err
+    try:
+        logger.info("replace_in_body: target='%s' file='%s'", target, file_path)
+        applier = Applier(file_path)
+        applier.replace_in_body(target, old_snippet, new_snippet)
+        return "Updated"
+    except ApplierError as e:
+        logger.warning("replace_in_body: %s", e)
+        return f"Cannot perform edit: {e}"
+    except Exception as e:
+        logger.exception("replace_in_body crashed")
+        return f"Internal error in replace_in_body: {type(e).__name__}: {e}"
+
+
+@mcp.tool()
+def delete_in_body(file_path: str, target: str, snippet: str) -> str:
+    """
+    Delete a byte-identical snippet inside a named function/method body. Scoped
+    to the target's body so global file matches don't apply.
+
+    Raises if the snippet is not found, or if it appears more than once in the
+    body (include more surrounding context to make the match unique).
+
+    Use this when: You want to remove a specific statement, block, or line
+    inside a function body without rewriting the whole body. Also useful for
+    removing a single entry from an inline object-literal passed as a function
+    argument -- target the enclosing function and delete the entry text.
+    Don't use this when: You're deleting the entire function/class -> use
+    `delete_symbol`.
+
+    Example (remove a mount call inside a function):
+        target="RegisterRoutes"
+        snippet='\\tr.Mount("/kb", kbHandler)\\n'
+
+    Example (remove a key from an inline object arg):
+        target="main"
+        snippet="\\t\\tclassification,\\n"
+    """
+    if err := _validate_file(file_path):
+        return err
+    try:
+        logger.info("delete_in_body: target='%s' file='%s'", target, file_path)
+        applier = Applier(file_path)
+        applier.delete_in_body(target, snippet)
+        return "Deleted"
+    except ApplierError as e:
+        logger.warning("delete_in_body: %s", e)
+        return f"Cannot perform edit: {e}"
+    except Exception as e:
+        logger.exception("delete_in_body crashed")
+        return f"Internal error in delete_in_body: {type(e).__name__}: {e}"
+
+
+@mcp.tool()
+def insert_in_body(
+    file_path: str,
+    target: str,
+    new_snippet: str,
+    after: str = "",
+    before: str = "",
+) -> str:
+    """
+    Insert new_snippet inside a named function/method body, anchored relative
+    to an existing snippet. Pass exactly ONE of `after` or `before`.
+
+    The anchor match is scoped to the target's body and must be unique
+    (multiple matches raise an error). The caller is responsible for including
+    any needed leading/trailing newlines and indentation in new_snippet.
+
+    Use this when: You need to insert a new line or block at a specific spot
+    inside a function body, not just at the very top or bottom.
+    Don't use this when: You want to insert at the top/bottom of the body ->
+    use `prepend_to_body` / `append_to_body` (no anchor required).
+
+    Example (insert after a validate call):
+        target="handle"
+        new_snippet="    metrics.incr(\\"calls\\")\\n"
+        after="    validate(request)\\n"
+
+    Example (insert before a log line):
+        target="handle"
+        new_snippet="    auth_check(request)\\n"
+        before="    log(\\"request received\\")\\n"
+    """
+    if err := _validate_file(file_path):
+        return err
+    try:
+        logger.info(
+            "insert_in_body: target='%s' file='%s' place=%s",
+            target,
+            file_path,
+            "after" if after else ("before" if before else "none"),
+        )
+        applier = Applier(file_path)
+        applier.insert_in_body(
+            target,
+            new_snippet,
+            after=after if after else None,
+            before=before if before else None,
+        )
+        return "Added"
+    except ApplierError as e:
+        logger.warning("insert_in_body: %s", e)
+        return f"Cannot perform edit: {e}"
+    except Exception as e:
+        logger.exception("insert_in_body crashed")
+        return f"Internal error in insert_in_body: {type(e).__name__}: {e}"
+
 
 @mcp.tool()
 def add_method(file_path: str, class_target: str, content: str) -> str:

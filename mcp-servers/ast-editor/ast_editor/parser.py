@@ -75,17 +75,33 @@ class TreeSitterParser:
     def find_node_by_name(self, target_name: str) -> Node | None:
         """
         Locates an AST node by its semantic name.
-        Supports dotted paths (e.g., ClassName.methodName).
+        Supports dotted paths:
+          - Class.method: descend into class body.
+          - Go: Struct.Method (via receiver), or Var.Field for func_literals
+            stored in composite-literal fields (`cmd.RunE`).
+          - JS/TS: Var.Field for arrow_function / function_expression values
+            of object-literal properties (`app.handler`).
         """
+        parts = target_name.split(".")
+
         if self.ext == ".py":
             class_types = ["class_definition"]
             func_types = ["function_definition", "decorated_definition"]
             var_types = ["expression_statement"]
         elif self.ext in (".ts", ".tsx"):
+            # JS/TS: try closure-in-object-literal first for dotted paths
+            if len(parts) == 2:
+                closure = self._find_js_closure_by_var(parts[0], parts[1])
+                if closure is not None:
+                    return closure
             class_types = ["class_declaration", "interface_declaration"]
             func_types = ["function_declaration", "method_definition", "arrow_function", "variable_declaration"]
             var_types = ["variable_declaration", "lexical_declaration"]
         elif self.ext in (".js", ".jsx", ".mjs", ".cjs"):
+            if len(parts) == 2:
+                closure = self._find_js_closure_by_var(parts[0], parts[1])
+                if closure is not None:
+                    return closure
             class_types = ["class_declaration"]
             func_types = ["function_declaration", "method_definition", "arrow_function", "variable_declaration", "lexical_declaration"]
             var_types = ["variable_declaration", "lexical_declaration"]
@@ -102,11 +118,15 @@ class TreeSitterParser:
             func_types = ["method", "singleton_method"]
             var_types = ["assignment"]
         elif self.ext in GO_EXTS:
-            parts = target_name.split(".")
             if len(parts) == 2:
+                # Try: receiver-based method (Cache.Get)
                 go_method = self._find_go_method_by_receiver(parts[0], parts[1])
                 if go_method is not None:
                     return go_method
+                # Try: func_literal stored in a composite-literal field (stdioCmd.RunE)
+                go_closure = self._find_go_closure_in_var(parts[0], parts[1])
+                if go_closure is not None:
+                    return go_closure
             class_types = ["type_spec"]
             func_types = ["function_declaration", "method_declaration"]
             var_types = ["const_spec", "var_spec"]
@@ -342,3 +362,142 @@ class TreeSitterParser:
             if recv_type == receiver_type:
                 return child
         return None
+
+    def _find_go_closure_in_var(self, var_name: str, field_name: str) -> Node | None:
+        """
+        Go: find a `func_literal` stored as the value of a keyed_element
+        matching `field_name`, inside a composite_literal assigned to a
+        top-level var_spec named `var_name`. Handles plain `var x = ...`,
+        `var ( x = ... )` blocks, and `&T{...}` pointer wrappers.
+        """
+        for child in self.tree.root_node.named_children:
+            if child.type not in ("var_declaration", "const_declaration"):
+                continue
+            specs = []
+            for sub in child.named_children:
+                if sub.type in ("var_spec", "const_spec"):
+                    specs.append(sub)
+                elif sub.type in ("var_spec_list", "const_spec_list"):
+                    for inner in sub.named_children:
+                        if inner.type in ("var_spec", "const_spec"):
+                            specs.append(inner)
+            for spec in specs:
+                name_node = None
+                for c in spec.named_children:
+                    if c.type == "identifier":
+                        name_node = c
+                        break
+                if name_node is None or self.node_text(name_node) != var_name:
+                    continue
+                # Find the value: usually wrapped in an expression_list
+                for c in spec.named_children:
+                    if c.type == "identifier":
+                        continue
+                    closure = self._walk_for_keyed_func_literal(c, field_name)
+                    if closure is not None:
+                        return closure
+        return None
+
+    def _walk_for_keyed_func_literal(self, node: Node, field_name: str) -> Node | None:
+        """Walk through expression_list / unary_expression wrappers to a
+        composite_literal, then locate a keyed_element with matching key and
+        return its func_literal value."""
+        if node is None:
+            return None
+        if node.type == "composite_literal":
+            body = node.child_by_field_name("body")
+            if body is None:
+                for c in node.named_children:
+                    if c.type == "literal_value":
+                        body = c
+                        break
+            if body is None:
+                return None
+            for elem in body.named_children:
+                if elem.type != "keyed_element":
+                    continue
+                # First named child is the key (wrapped in literal_element);
+                # last named child is the value (wrapped in literal_element).
+                if len(elem.named_children) < 2:
+                    continue
+                key_wrapper = elem.named_children[0]
+                val_wrapper = elem.named_children[-1]
+                key_inner = key_wrapper
+                if key_wrapper.type == "literal_element" and key_wrapper.named_children:
+                    key_inner = key_wrapper.named_children[0]
+                if key_inner.type not in ("identifier", "field_identifier"):
+                    continue
+                if self.node_text(key_inner) != field_name:
+                    continue
+                val_inner = val_wrapper
+                if val_wrapper.type == "literal_element" and val_wrapper.named_children:
+                    val_inner = val_wrapper.named_children[0]
+                if val_inner.type == "func_literal":
+                    return val_inner
+            return None
+        # Unwrap common wrappers: expression_list, unary_expression, parenthesized_expression
+        if node.type in ("expression_list", "unary_expression", "parenthesized_expression"):
+            for c in node.named_children:
+                result = self._walk_for_keyed_func_literal(c, field_name)
+                if result is not None:
+                    return result
+        return None
+
+    def _find_js_closure_by_var(self, var_name: str, field_name: str) -> Node | None:
+        """
+        JS/TS: find an arrow_function / function_expression / function value of
+        a pair whose key matches `field_name`, inside an object literal assigned
+        to `var_name`. Works for plain `const/let/var` declarations and ones
+        wrapped in `export`.
+        """
+        def walk(parent):
+            for child in parent.named_children:
+                if child.type in ("lexical_declaration", "variable_declaration"):
+                    for decl in child.named_children:
+                        if decl.type != "variable_declarator":
+                            continue
+                        name_node = decl.child_by_field_name("name")
+                        if name_node is None:
+                            for c in decl.named_children:
+                                if c.type == "identifier":
+                                    name_node = c
+                                    break
+                        if name_node is None or self.node_text(name_node) != var_name:
+                            continue
+                        value = decl.child_by_field_name("value")
+                        if value is None:
+                            for c in decl.named_children:
+                                if c.type == "object":
+                                    value = c
+                                    break
+                        if value is None or value.type != "object":
+                            continue
+                        for entry in value.named_children:
+                            if entry.type != "pair":
+                                continue
+                            key_node = entry.child_by_field_name("key")
+                            if key_node is None and entry.named_children:
+                                key_node = entry.named_children[0]
+                            if key_node is None:
+                                continue
+                            k_text = self.node_text(key_node).strip()
+                            # Strip quotes for string keys
+                            if len(k_text) >= 2 and k_text[0] in "\"'`" and k_text[-1] in "\"'`":
+                                k_text = k_text[1:-1]
+                            if k_text != field_name:
+                                continue
+                            val_node = entry.child_by_field_name("value")
+                            if val_node is None and len(entry.named_children) >= 2:
+                                val_node = entry.named_children[-1]
+                            if val_node is not None and val_node.type in (
+                                "arrow_function",
+                                "function_expression",
+                                "function",
+                            ):
+                                return val_node
+                elif child.type == "export_statement":
+                    result = walk(child)
+                    if result is not None:
+                        return result
+            return None
+        return walk(self.tree.root_node)
