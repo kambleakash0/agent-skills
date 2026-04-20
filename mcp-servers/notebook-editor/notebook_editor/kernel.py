@@ -1,12 +1,14 @@
 """
-Python kernel execution for notebook cells using jupyter_client.
+Kernel execution for notebook cells using jupyter_client.
 
 Design:
   - One kernel per notebook file path, cached in memory for the process lifetime
   - Lazy kernel start on first execute_cell
+  - Kernel selection is driven by the notebook's metadata.kernelspec.name
+    (falls back to "python3" if unreadable). Works with any Jupyter kernel
+    installed on the host (IRkernel for R, IJulia for Julia, etc.).
   - Blocking execution with a configurable timeout
   - Outputs captured from iopub channel and serialized back into nbformat output cells
-  - Python kernel only (no multi-kernel support in v1)
 """
 import queue
 import time
@@ -159,14 +161,37 @@ class _KernelSession:
 _kernels: dict[str, _KernelSession] = {}
 
 
-def get_or_start_kernel(file_path: str) -> _KernelSession:
+def get_or_start_kernel(file_path: str, kernel_name: str | None = None) -> _KernelSession:
+    """
+    Return an alive kernel session for this notebook, starting one if needed.
+
+    If no session exists yet, the kernel_name is determined by (in priority order):
+      1. The explicit `kernel_name` argument, if given.
+      2. The notebook's `metadata.kernelspec.name` read from disk.
+      3. Fallback to "python3".
+
+    Once a session is registered for a file_path, subsequent calls reuse it and
+    the kernel_name argument is ignored. Use shutdown_kernel() to reset.
+    """
     sess = _kernels.get(file_path)
     if sess is None:
-        sess = _KernelSession()
+        name = kernel_name or _read_notebook_kernel_name(file_path) or "python3"
+        sess = _KernelSession(kernel_name=name)
         _kernels[file_path] = sess
     if not sess.is_alive():
         sess.start()
     return sess
+
+
+def _read_notebook_kernel_name(file_path: str) -> str | None:
+    """Best-effort read of metadata.kernelspec.name from a notebook file. Never raises."""
+    try:
+        nb = nbformat.read(file_path, as_version=4)
+    except Exception:
+        return None
+    kspec = nb.metadata.get("kernelspec", {}) if nb.metadata else {}
+    name = kspec.get("name")
+    return name if isinstance(name, str) and name else None
 
 
 def get_kernel(file_path: str) -> _KernelSession | None:

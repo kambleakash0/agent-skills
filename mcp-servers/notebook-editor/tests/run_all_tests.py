@@ -516,6 +516,60 @@ def test_create_notebook():
         os.remove(new_path)
 
 
+def test_non_python_kernel():
+    print("\n═══ non-Python kernel (R) support ═══")
+    r_path = os.path.join(TESTS_DIR, "test_r_notebook.ipynb")
+    if os.path.exists(r_path):
+        os.remove(r_path)
+
+    # create_notebook with R kernelspec
+    create_notebook(
+        r_path,
+        kernel_name="ir",
+        kernel_display_name="R",
+        language="R",
+    )
+    nb = read_notebook(r_path)
+    check("non-python: kernelspec.name is 'ir'", str(nb.metadata["kernelspec"]["name"]), "ir")
+    check("non-python: language_info.name is 'R'", str(nb.metadata["language_info"]["name"]), "R")
+
+    # Add an R code cell and try list_notebook_symbols -- should gracefully refuse
+    mgr = NotebookManager(r_path)
+    mgr.add_cell(0, cell_type="code", source="x <- function(n) { n * 2 }")
+    mgr2 = NotebookManager(r_path)
+    symbols = mgr2.list_notebook_symbols()
+    check("non-python: list_notebook_symbols refuses for R", symbols, "only supported for Python notebooks")
+    check("non-python: refusal message names the language", symbols, "'r'")
+    check("non-python: refusal message suggests find_in_notebook", symbols, "find_in_notebook")
+
+    # find_in_notebook still works on R cells (substring search is language-agnostic)
+    hits = mgr2.find_in_notebook("function")
+    check("non-python: find_in_notebook works on R cells", hits, "function")
+
+    # Kernel dispatch -- verify get_or_start_kernel reads the kernelspec from disk.
+    # Don't actually start the kernel (IRkernel may not be installed in CI); just
+    # instantiate the session via the private path to check kernel_name resolution.
+    from notebook_editor import kernel as _k
+    name = _k._read_notebook_kernel_name(r_path)
+    check("non-python: _read_notebook_kernel_name resolves 'ir'", name, "ir")
+
+    # _notebook_language mapping
+    check("non-python: _notebook_language returns 'r'", mgr2._notebook_language(), "r")
+
+    # Missing kernelspec -- falls back to python behavior for backward compat
+    blank_path = os.path.join(TESTS_DIR, "test_blank_kernel.ipynb")
+    nb_blank = new_notebook()
+    nb_blank.metadata = {}
+    nb_blank.cells = [new_code_cell("x = 1")]
+    nbformat.write(nb_blank, blank_path)
+    mgr_blank = NotebookManager(blank_path)
+    check("non-python: missing kernelspec defaults to python", mgr_blank._notebook_language(), "python")
+    check("non-python: missing kernelspec -> list_notebook_symbols runs", mgr_blank.list_notebook_symbols(), "variable x")
+    os.remove(blank_path)
+
+    os.remove(r_path)
+
+
 # ──────────────────────────────────────────────
 # Main
 # ──────────────────────────────────────────────
@@ -542,6 +596,7 @@ if __name__ == "__main__":
     test_execute_all_cells_stop_on_error()
     test_kernel_lifecycle()
     test_create_notebook()
+    test_non_python_kernel()
 
     if os.path.exists(FIXTURE_PATH):
         os.remove(FIXTURE_PATH)

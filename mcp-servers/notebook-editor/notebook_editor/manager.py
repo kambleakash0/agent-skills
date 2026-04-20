@@ -343,10 +343,22 @@ class NotebookManager:
 
     def list_notebook_symbols(self) -> str:
         """
-        Walk all code cells and list Python symbols (functions, classes, methods)
-        with the cell index and line number. Uses the stdlib `ast` module so works
-        only for Python code cells. Cells with syntax errors are reported but skipped.
+        Walk all code cells and list source-language symbols with the cell index
+        and line number. Symbol extraction is Python-only (via the stdlib `ast`
+        module); for other kernels this returns a clear "not supported" message
+        pointing the caller at `find_in_notebook` as a fallback.
+
+        Language detection reads `metadata.kernelspec.language`, falling back to
+        `metadata.kernelspec.name` (e.g. `"python3"`, `"ir"`). Missing metadata is
+        treated as Python for backward compatibility with older notebooks.
         """
+        lang = self._notebook_language()
+        if lang != "python":
+            return (
+                f"Symbol discovery is only supported for Python notebooks "
+                f"(this notebook's kernel language is {lang!r}). "
+                f"Use find_in_notebook for text search."
+            )
         lines_out: list[str] = []
         for i, cell in enumerate(self.nb.cells):
             if cell.cell_type != "code":
@@ -370,7 +382,6 @@ class NotebookManager:
                                 f"cell[{i}]   method {node.name}.{sub.name} (line {sub.lineno})"
                             )
                 elif isinstance(node, pyast.Assign):
-                    # Top-level assignments: show target names if simple
                     for tgt in node.targets:
                         if isinstance(tgt, pyast.Name):
                             lines_out.append(f"cell[{i}] variable {tgt.id} (line {node.lineno})")
@@ -384,6 +395,31 @@ class NotebookManager:
         if not lines_out:
             return "(no symbols found in code cells)"
         return "\n".join(lines_out)
+
+    def _notebook_language(self) -> str:
+        """
+        Return the notebook's source language from metadata.kernelspec.
+
+        Checks `metadata.kernelspec.language` first, then falls back to mapping
+        the kernel `name` (e.g. `"python3"` → `"python"`, `"ir"` → `"r"`). Missing
+        metadata returns `"python"` so older notebooks without kernelspec behave
+        as they did before.
+        """
+        kspec = self.nb.metadata.get("kernelspec", {}) if self.nb.metadata else {}
+        lang = kspec.get("language")
+        if isinstance(lang, str) and lang:
+            return lang.lower()
+        name = kspec.get("name")
+        if isinstance(name, str) and name:
+            name_lower = name.lower()
+            if name_lower.startswith("python"):
+                return "python"
+            if name_lower in ("ir", "r"):
+                return "r"
+            if name_lower.startswith("julia"):
+                return "julia"
+            return name_lower
+        return "python"
 
     def find_in_notebook(self, pattern: str) -> str:
         """
@@ -404,8 +440,10 @@ class NotebookManager:
 
     def execute_cell(self, index: int, timeout: float = 60.0) -> str:
         """
-        Execute a single code cell using the notebook's Python kernel. Updates the
-        cell's outputs and execution_count with the results, then saves the notebook.
+        Execute a single code cell using the notebook's Jupyter kernel. The kernel
+        language follows `metadata.kernelspec.name` (python3, ir, julia-1.x, ...) —
+        works with any installed Jupyter kernel, not just Python. Updates the cell's
+        outputs and execution_count with the results, then saves the notebook.
         Non-code cells are rejected.
         """
         from notebook_editor import kernel as _kernel
@@ -427,9 +465,11 @@ class NotebookManager:
 
     def execute_all_cells(self, timeout: float = 60.0, stop_on_error: bool = True) -> str:
         """
-        Execute all code cells in order, updating outputs and execution_count on each.
-        Non-code cells are skipped. If stop_on_error is True, execution stops at the
-        first cell that raises an error. Returns a summary string.
+        Execute all code cells in order using the notebook's Jupyter kernel
+        (language driven by metadata.kernelspec.name — works with any installed
+        kernel). Updates outputs and execution_count on each. Non-code cells are
+        skipped. If stop_on_error is True, execution stops at the first cell that
+        raises an error. Returns a summary string.
         """
         from notebook_editor import kernel as _kernel
         sess = _kernel.get_or_start_kernel(self.filepath)
