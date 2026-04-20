@@ -74,7 +74,8 @@ All tools require `file_path` to be an **absolute path**. Every tool except `cre
 
 - The kernel is **started lazily** on the first `execute_cell` / `execute_all_cells` call.
 - **One kernel per notebook file path**, cached in memory for the server's lifetime. Different notebooks get different kernels (isolated namespaces).
-- **Python kernel only** (`python3`) — multi-kernel support (R, Julia, etc.) is not in v1.
+- **Kernel-agnostic.** The kernel language is read from `metadata.kernelspec.name` in the notebook itself — works with any Jupyter kernel installed on the host: `python3`, `ir` (R via [IRkernel](https://irkernel.github.io/)), `julia-1.x` ([IJulia](https://github.com/JuliaLang/IJulia.jl)), etc. Falls back to `python3` if the notebook has no kernelspec. Set the kernel at creation time with `create_notebook(file_path, kernel_name="ir", language="R", ...)`.
+- **Symbol discovery is Python-only.** `list_notebook_symbols` uses Python's `ast` module and returns a clear "not supported for <language>" message for non-Python notebooks. Use `find_in_notebook` for text search in any language.
 - Kernels survive across tool calls, so state accumulates: `execute_cell(0)` then `execute_cell(1)` in a later call sees the variables from cell 0.
 - Use `shutdown_kernel` to free resources when done with a notebook.
 
