@@ -338,62 +338,37 @@ cd mcp-servers/ast-editor && python3 -m venv .venv && source .venv/bin/activate 
 
 ## Agent Configuration (Important)
 
-Coding agents are heavily biased toward their default tools. You **must** explicitly instruct them to use AST tools.
+Coding agents are heavily biased toward their default tools. You **must** explicitly instruct them to use AST tools. The agent prompt lives in [`AST-EDITOR.md`](./AST-EDITOR.md) — a standalone file you wire into your agent's system instructions.
 
-### Claude (Code & Desktop)
+### Claude Code / Claude Desktop (via `@`-include)
 
-Add the following block to `CLAUDE.md`, `~/.claude/CLAUDE.md`, or **Custom Instructions**:
+Claude Code supports `@filename` includes in `CLAUDE.md`. Copy the prompt file into your global config directory and add one include line:
 
-> **When editing `.py`, `.js`, `.ts`, `.c`, `.cpp`, `.rb`, `.go`, `.java`, `.json`, `.yaml`, or `.toml` files, do NOT use the `edit` tool. Use the `ast-editor` MCP server instead. It exposes 28 surgical tools for structural code and config edits.**
->
-> **Picking a tool — always start here:**
->
-> 1. **Unsure of the file layout?** Call `list_symbols` first. Call `read_symbol(target)` to read one function/class's full source without reading the whole file. `read_symbol(target, depth="interface")` gives a class stub (methods + fields, no bodies). `read_symbol(target, depth="signature")` gives just the signature. Call `read_imports` to see dependencies. Call `find_references` before renaming anything. Dotted targets descend into closures: Go `stdioCmd.RunE` (func_literal in struct field), JS/TS `app.handler` (arrow function in object literal).
-> 2. **Adding new content** — choose the narrowest tool:
->    - Top-level (function, class, constant, type alias): `add_top_level` (use `position="top"` to prepend after preamble)
->    - In a class: `add_method`, `add_field`
->    - At top/bottom of a function body: `insert_in_body(at="top")` / `insert_in_body(at="bottom")`
->    - **At a specific spot inside a function body (anchored to an existing snippet):** `insert_in_body(after=...)` or `insert_in_body(before=...)`
->    - Relative to an existing top-level symbol: `insert_sibling(position="before" | "after")`
->    - Imports: `add_import` (new line) or `add_import_name` (add to existing `from X import ...` or `import { a, b } from "mod"`)
->    - Parameters: `add_parameter`
->    - Leading comment: `edit_leading_comment(op="add", comment=...)`
->    - Python docstring: `replace_docstring`
->    - Any dict/object (config OR Python/JS/TS literal): `add_key`
->    - Any list/array (config OR Python literal): `append_to_array`
-> 3. **Modifying existing content:**
->    - Full function: `replace_function`
->    - Body only: `replace_function_body`
->    - **One statement/block inside a large body:** `replace_in_body(target, old_snippet, new_snippet)` — scoped match; the single biggest token-saver for long functions
->    - Signature only: `replace_signature`
->    - Config value: `replace_value`
->    - Leading comment: `edit_leading_comment(op="replace", comment=...)`
->    - Python docstring: `replace_docstring`
-> 4. **Removing content:**
->    - Function/class/method: `delete_symbol` (consumes the leading doc comment by default; pass `include_leading_comments=False` to keep it)
->    - **One statement/line inside a function body:** `delete_in_body(target, snippet)` — scoped match; use for single-line removals (route mounts, middleware calls, object-literal keys in inline args)
->    - Parameter: `remove_parameter`
->    - Import: `remove_import` (whole line) or `remove_import_name` (one name from multi-name)
->    - Leading comment: `edit_leading_comment(op="remove")`
->    - Dict/object key or list item: `delete_key`, `remove_from_array`
->
-> **Anti-patterns to avoid:**
->
-> - Don't use `replace_function` or `replace_function_body` to change a few lines — use `replace_in_body` (scoped snippet match) or `insert_in_body(at="top" | "bottom")` for prepend/append.
-> - Don't use `replace_signature` to add one parameter — use `add_parameter` / `remove_parameter`.
-> - Don't use `replace_value` to add a new key — use `add_key`.
-> - Don't use `add_import` to add a name to an existing from-import or named import — use `add_import_name`.
-> - Don't guess target names — call `list_symbols` first. Names are case-sensitive.
->
-> **Escape hatches — when to step outside ast-editor:**
->
-> - **Deleting multiple related symbols as a group?** Call `delete_symbol` once per target. There's no `delete_group` tool; the extra tool calls are cheaper than the alternative of a custom grouped primitive.
-> - **Editing a sub-expression inside a method chain** (e.g. dropping `.references(...)` from `integer("x").notNull().references(...)`) or other arbitrary expression surgery? For common cases use `replace_in_body` with the literal snippet. For truly arbitrary sub-expression edits, fall back to the default `Edit` tool — ast-editor intentionally doesn't do AST pattern matching on expression trees.
-> - **Rewriting a whole file where the structure changes substantially?** Use the default `Write` tool. ast-editor is for targeted edits; duplicating `Write` as a tool here would add no value.
+```bash
+cp /absolute/path/to/mcp-servers/ast-editor/AST-EDITOR.md ~/.claude/
+echo '@AST-EDITOR.md' >> ~/.claude/CLAUDE.md
+```
 
-### Migration from v1.x tool names (v2.0.0 consolidation)
+Or for a single project, place it next to the project's `CLAUDE.md` and add `@AST-EDITOR.md` there.
 
-v2.0.0 consolidated 10 closely-related tools into 4 parametrized tools. If you have old instructions referencing the v1.x names, the mapping is:
+### Other agents (Cursor, Codex CLI, Windsurf, Antigravity, Aider, Gemini CLI, etc.)
+
+Copy the **contents** of [`AST-EDITOR.md`](./AST-EDITOR.md) into your agent's instruction file (`AGENTS.md`, `.cursor/rules/*.mdc`, `.windsurfrules`, `.github/copilot-instructions.md`, system prompt, etc.). Most non-Claude agents don't support `@`-include — paste the prompt body directly.
+
+| Agent | Instruction file |
+| :--- | :--- |
+| **Any agent that reads `AGENTS.md`** (Codex CLI, Windsurf, Zed, Cursor secondary) | `AGENTS.md` at repo root |
+| **Cursor** | `.cursor/rules/*.mdc` (current) — legacy: `.cursorrules` |
+| **GitHub Copilot** | `.github/copilot-instructions.md` |
+| **Windsurf** | `.windsurfrules` or `AGENTS.md` |
+| **Antigravity** | `_agents/rules/` |
+| **Aider / Gemini CLI / generic** | Rules file or system prompt |
+
+### Migrating from v1.x / pre-`AST-EDITOR.md` instructions
+
+**If your `CLAUDE.md` (or other rules file) contains an inline quoted "When editing ... use ast-editor" block from an older README version, delete that block and replace it with the `@AST-EDITOR.md` include (or paste the current file's contents).** The old block will reference tool names removed in v2.0.0 consolidation (`prepend_to_body`, `append_to_body`, `insert_before`, `insert_after`, `add_comment_before`, `replace_leading_comment`, `remove_leading_comment`, `read_interface`, `get_signature`) — keeping it will cause agents to call tools that no longer exist.
+
+v2.0.0 consolidated 10 closely-related tools into 4 parametrized tools. Mapping:
 
 | v1.x tool | v2.0.0 equivalent |
 | :--- | :--- |
@@ -408,21 +383,4 @@ v2.0.0 consolidated 10 closely-related tools into 4 parametrized tools. If you h
 | `insert_before(target, content)` | `insert_sibling(target, content, position="before")` |
 | `insert_after(target, content)` | `insert_sibling(target, content, position="after")` |
 
-The old tools are **hard-removed** — calling them will fail with "unknown tool". Old behavior is preserved 1:1 by the new calls.
-
-### Specific Tool Overrides
-
-| Agent | Target Instructions / File | Instruction |
-| :--- | :--- | :--- |
-| **Any agent that reads `AGENTS.md`** (recommended universal option) | `AGENTS.md` at repo root | Drop the Claude instruction block above into `AGENTS.md`. Read by Codex CLI, Windsurf, Zed, Cursor (as secondary), and a growing list of others. |
-| **Cursor** | `.cursor/rules/*.mdc` (current) or `AGENTS.md` — legacy: `.cursorrules` | ...do NOT use `edit_file`. Use AST tools (`replace_function_body`, etc.) instead. |
-| **Codex CLI** (OpenAI) | `AGENTS.md` at repo root | ...do NOT use `apply-patch`. Use AST tools instead. |
-| **GitHub Copilot** (VS Code / JetBrains) | `.github/copilot-instructions.md` | ...do NOT use inline suggestions for structural edits. Use AST tools from the `ast-editor` MCP server. |
-| **Windsurf** | `.windsurfrules` or `AGENTS.md` | ...do NOT use Cascade's built-in write mode. Use AST tools instead. |
-| **Antigravity** | `_agents/rules/` | ...do NOT use `write_to_file`, `replace_file_content`, or `multi_replace_file_content`. Use AST tools instead. |
-
-### Generic / Aider / Gemini CLI
-
-Add to rules or system prompt:
-
-> *When editing `.py`, `.js`, `.ts`, `.c`, `.cpp`, `.rb`, `.go`, or `.java` files, do NOT use your default editing tools (diff, whole, etc.). Instead, use the `ast-editor` MCP server, which exposes 28 surgical tools for adding/modifying/removing functions, classes, methods, fields, parameters, imports, comments, and docstrings. Start any edit session by calling `list_symbols` to discover exact target names. Dotted targets descend into closures (`stdioCmd.RunE`, `app.handler`). For reading, use `read_symbol(target, depth="full"|"interface"|"signature")` and `read_imports` (~10-20x fewer input tokens than reading the whole file). For targeted body edits, use `replace_in_body` / `delete_in_body` / `insert_in_body(at=... | after=... | before=...)` to change ONE line or block inside a function without rewriting the whole body. Use `edit_leading_comment(op="add"|"replace"|"remove")` for leading comments. Use `insert_sibling(position="before"|"after")` to place content next to a top-level symbol. For `.json`, `.yaml`, or `.toml` files, use `replace_value` / `add_key` / `append_to_array` / `delete_key` instead of freeform edits. Escape hatches: for arbitrary sub-expression edits that string matching can't handle, fall back to `Edit`. For whole-file structural rewrites, use `Write`.*
+The old tools are **hard-removed** — calling them will fail with "unknown tool". Behavior is preserved 1:1 by the new calls.

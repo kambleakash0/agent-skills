@@ -236,62 +236,35 @@ cd mcp-servers/notebook-editor && python3 -m venv .venv && source .venv/bin/acti
 
 ## Agent Configuration (Important)
 
-Coding agents are heavily biased toward their default tools. You **must** explicitly instruct them to use `notebook-editor` when working with notebooks.
+Coding agents are heavily biased toward their default tools. You **must** explicitly instruct them to use `notebook-editor` when working with notebooks. The agent prompt lives in [`NOTEBOOK-EDITOR.md`](./NOTEBOOK-EDITOR.md) — a standalone file you wire into your agent's system instructions.
 
-### Claude (Code & Desktop)
+### Claude Code / Claude Desktop (via `@`-include)
 
-Add the following block to `CLAUDE.md`, `~/.claude/CLAUDE.md`, or **Custom Instructions**:
+Claude Code supports `@filename` includes in `CLAUDE.md`. Copy the prompt file into your global config directory and add one include line:
 
-> **When working with `.ipynb` Jupyter notebook files, do NOT use the generic `edit` or `write` tool. Use the `notebook-editor` MCP server instead. It exposes 23 cell-level tools for creating, editing, and executing notebooks. Use `create_notebook` to create a new `.ipynb` (never hand-write notebook JSON).**
->
-> **Picking a tool — always start here:**
->
-> 1. **Start by calling `list_cells`** to see the notebook's structure (cell types, line counts, previews). Call `list_notebook_symbols` if you need to find Python symbols (functions, classes) across cells. Call `find_in_notebook` for text search.
-> 2. **Editing cells:**
->    - New cell at a position: `add_cell` (default type is `code`)
->    - Rewrite a cell: `replace_cell_source`
->    - Add lines to an existing cell: `prepend_to_cell` / `append_to_cell`
->    - Reorder: `move_cell`
->    - Split a large cell: `split_cell`
->    - Merge cells: `merge_cells`
->    - Delete: `delete_cell`
-> 3. **Outputs & metadata:**
->    - Read outputs: `get_outputs`
->    - Clear stale outputs: `clear_outputs`
->    - Clear numbering: `clear_execution_counts`
->    - Tag with metadata: `set_cell_metadata`
-> 4. **Running cells:**
->    - One cell: `execute_cell`
->    - Whole notebook: `execute_all_cells`
->    - Stop a runaway cell: `interrupt_kernel`
->    - Fresh namespace: `restart_kernel`
->    - Check if kernel is alive: `get_kernel_state`
->    - Release resources: `shutdown_kernel`
->
-> **Anti-patterns to avoid:**
->
-> - Don't use `replace_cell_source` to add a couple of lines — use `prepend_to_cell` / `append_to_cell`.
-> - Don't use `add_cell` to replace an existing cell — use `replace_cell_source`.
-> - Don't forget to call `list_cells` first to know which indices exist.
-> - Don't use `execute_cell` on a markdown cell (it will error).
-> - Don't guess cell indices — they're zero-based and shift when you add/delete cells.
+```bash
+cp /absolute/path/to/mcp-servers/notebook-editor/NOTEBOOK-EDITOR.md ~/.claude/
+echo '@NOTEBOOK-EDITOR.md' >> ~/.claude/CLAUDE.md
+```
 
-### Specific Tool Overrides
+Or for a single project, place it next to the project's `CLAUDE.md` and add `@NOTEBOOK-EDITOR.md` there.
 
-| Agent | Target Instructions / File | Instruction |
-| :--- | :--- | :--- |
-| **Any agent that reads `AGENTS.md`** (recommended universal option) | `AGENTS.md` at repo root | Drop the Claude instruction block above into `AGENTS.md`. Read by Codex CLI, Windsurf, Zed, Cursor (as secondary), and a growing list of others. |
-| **Cursor** | `.cursor/rules/*.mdc` (current) or `AGENTS.md` — legacy: `.cursorrules` | ...do NOT use `edit_file` on `.ipynb` files. Use `notebook-editor` MCP tools instead. |
-| **Codex CLI** (OpenAI) | `AGENTS.md` at repo root | ...do NOT use `apply-patch` on `.ipynb` files. Use `notebook-editor` MCP tools instead. |
-| **GitHub Copilot** (VS Code / JetBrains) | `.github/copilot-instructions.md` | ...do NOT use inline suggestions to hand-edit `.ipynb` JSON. Use `notebook-editor` MCP tools instead. |
-| **Windsurf** | `.windsurfrules` or `AGENTS.md` | ...do NOT use Cascade's built-in write mode on `.ipynb` files. Use `notebook-editor` MCP tools instead. |
-| **Antigravity** | `_agents/rules/` | ...do NOT use `write_to_file`, `replace_file_content`, or `multi_replace_file_content` on `.ipynb` files. Use `notebook-editor` MCP tools instead. |
+### Other agents (Cursor, Codex CLI, Windsurf, Antigravity, Aider, Gemini CLI, etc.)
 
-### Generic / Aider / Gemini CLI
+Copy the **contents** of [`NOTEBOOK-EDITOR.md`](./NOTEBOOK-EDITOR.md) into your agent's instruction file (`AGENTS.md`, `.cursor/rules/*.mdc`, `.windsurfrules`, `.github/copilot-instructions.md`, system prompt, etc.). Most non-Claude agents don't support `@`-include — paste the prompt body directly.
 
-Add to rules or system prompt:
+| Agent | Instruction file |
+| :--- | :--- |
+| **Any agent that reads `AGENTS.md`** (Codex CLI, Windsurf, Zed, Cursor secondary) | `AGENTS.md` at repo root |
+| **Cursor** | `.cursor/rules/*.mdc` (current) — legacy: `.cursorrules` |
+| **GitHub Copilot** | `.github/copilot-instructions.md` |
+| **Windsurf** | `.windsurfrules` or `AGENTS.md` |
+| **Antigravity** | `_agents/rules/` |
+| **Aider / Gemini CLI / generic** | Rules file or system prompt |
 
-> *When working with `.ipynb` Jupyter notebook files, do NOT hand-edit the JSON directly and do NOT use default diff/whole-file edit tools. Instead, use the `notebook-editor` MCP server, which exposes 23 cell-level tools for creating notebooks (`create_notebook`), adding/deleting/moving/splitting/merging cells, editing cell content, clearing and reading outputs, managing metadata, and executing cells via a real Python kernel. Use `create_notebook` to create a new `.ipynb` file with correct schema — do not write notebook JSON by hand. Start any existing-notebook session by calling `list_cells` to discover the structure and cell indices.*
+### Migrating from pre-`NOTEBOOK-EDITOR.md` instructions
+
+**If your `CLAUDE.md` (or other rules file) contains an inline quoted "When working with `.ipynb` files... use notebook-editor" block from an older README version, delete that block and replace it with the `@NOTEBOOK-EDITOR.md` include (or paste the current file's contents).** The new file stays in sync with the current tool set (including `create_notebook`) — an outdated inline copy will drift as tools are added or renamed.
 
 ## Logging & Debugging
 
@@ -313,8 +286,9 @@ For interactive testing, use the [MCP Inspector](https://modelcontextprotocol.io
 
 ## Tool count
 
-**22 tools** total:
+**23 tools** total:
 
+- 1 notebook creation (`create_notebook`)
 - 7 cell structure & navigation (`list_cells`, `get_cell`, `add_cell`, `delete_cell`, `move_cell`, `split_cell`, `merge_cells`)
 - 3 cell content editing (`replace_cell_source`, `prepend_to_cell`, `append_to_cell`)
 - 4 outputs & metadata (`clear_outputs`, `clear_execution_counts`, `get_outputs`, `set_cell_metadata`)
