@@ -1782,6 +1782,197 @@ def test_java():
 
 
 # ──────────────────────────────────────────────
+# Merged-API tests (merge pass -- v2.0.0)
+# ──────────────────────────────────────────────
+
+def test_merged_apis():
+    print("\n═══ merged APIs (edit_leading_comment, read_symbol depth, insert_in_body at, insert_sibling) ═══")
+    import os as _os
+
+    # -- edit_leading_comment: add / replace / remove dispatch --
+    py_path = _os.path.join(TESTS_DIR, "test_merged_elc.py")
+    with open(py_path, "w") as f:
+        f.write("def foo():\n    return 1\n")
+    Applier(py_path).edit_leading_comment("foo", "add", "# Does a thing")
+    check("edit_leading_comment (add): inserted", read_file(py_path), "# Does a thing")
+
+    Applier(py_path).edit_leading_comment("foo", "replace", "# Updated doc")
+    result = read_file(py_path)
+    check("edit_leading_comment (replace): new comment",
+          "PASS" if "# Updated doc" in result and "Does a thing" not in result else "FAIL", "PASS")
+
+    Applier(py_path).edit_leading_comment("foo", "remove")
+    result = read_file(py_path)
+    check("edit_leading_comment (remove): comment gone",
+          "PASS" if "# Updated doc" not in result else "FAIL", "PASS")
+    check("edit_leading_comment (remove): function intact", result, "def foo():")
+
+    # Error: missing `comment` for add/replace
+    bad = False
+    try:
+        Applier(py_path).edit_leading_comment("foo", "add")
+    except Exception as e:
+        bad = "required" in str(e) and "add" in str(e)
+    check("edit_leading_comment: missing comment on add raises",
+          "PASS" if bad else "FAIL", "PASS")
+
+    bad = False
+    try:
+        Applier(py_path).edit_leading_comment("foo", "replace", "")
+    except Exception as e:
+        bad = "required" in str(e) and "replace" in str(e)
+    check("edit_leading_comment: missing comment on replace raises",
+          "PASS" if bad else "FAIL", "PASS")
+
+    # Error: unknown op
+    bad = False
+    try:
+        Applier(py_path).edit_leading_comment("foo", "bogus", "# x")
+    except Exception as e:
+        bad = "unknown op" in str(e)
+    check("edit_leading_comment: unknown op raises",
+          "PASS" if bad else "FAIL", "PASS")
+    _os.remove(py_path)
+
+    # -- read_symbol with depth --
+    py_path = _os.path.join(TESTS_DIR, "test_merged_read.py")
+    with open(py_path, "w") as f:
+        f.write("class A:\n    def x(self, n):\n        return n + 1\n    def y(self):\n        return 2\n")
+
+    app = Applier(py_path)
+    # depth="full" (default)
+    full = app.read_symbol("A.x")
+    check("read_symbol depth=full: has body", full, "return n + 1")
+
+    # depth="signature"
+    sig = app.read_symbol("A.x", depth="signature")
+    check("read_symbol depth=signature: has def line", sig, "def x(self, n):")
+    check("read_symbol depth=signature: no body",
+          "PASS" if "return n + 1" not in sig else "FAIL", "PASS")
+
+    # depth="interface" on a class
+    iface = app.read_symbol("A", depth="interface")
+    check("read_symbol depth=interface: has class header", iface, "class A:")
+    check("read_symbol depth=interface: has method stubs", iface, "def x(self, n)")
+    check("read_symbol depth=interface: stub uses ...", iface, "...")
+    check("read_symbol depth=interface: no body details",
+          "PASS" if "return n + 1" not in iface else "FAIL", "PASS")
+
+    # Default matches depth="full"
+    check("read_symbol (no depth): matches depth=full", full, app.read_symbol("A.x"))
+
+    # Error: unknown depth
+    bad = False
+    try:
+        app.read_symbol("A.x", depth="bogus")
+    except Exception as e:
+        bad = "unknown depth" in str(e)
+    check("read_symbol: unknown depth raises",
+          "PASS" if bad else "FAIL", "PASS")
+    _os.remove(py_path)
+
+    # -- insert_in_body: at="top" / at="bottom" / after / before, exactly-one rule --
+    py_path = _os.path.join(TESTS_DIR, "test_merged_iib.py")
+    with open(py_path, "w") as f:
+        f.write("def f(x):\n    validate(x)\n    return x\n")
+
+    Applier(py_path).insert_in_body("f", "    log('start')", at="top")
+    result = read_file(py_path)
+    # "log('start')" should appear BEFORE "validate(x)"
+    log_idx = result.find("log('start')")
+    val_idx = result.find("validate(x)")
+    check("insert_in_body at=top: prepended",
+          "PASS" if 0 < log_idx < val_idx else "FAIL", "PASS")
+
+    Applier(py_path).insert_in_body("f", "    log('end')", at="bottom")
+    result = read_file(py_path)
+    ret_idx = result.find("return x")
+    end_idx = result.find("log('end')")
+    check("insert_in_body at=bottom: appended",
+          "PASS" if ret_idx < end_idx else "FAIL", "PASS")
+
+    Applier(py_path).insert_in_body("f", "    audit(x)\n", after="    validate(x)\n")
+    result = read_file(py_path)
+    val_idx = result.find("validate(x)")
+    aud_idx = result.find("audit(x)")
+    check("insert_in_body after anchor: placed correctly",
+          "PASS" if val_idx < aud_idx else "FAIL", "PASS")
+
+    Applier(py_path).insert_in_body("f", "    auth(x)\n", before="    validate(x)\n")
+    result = read_file(py_path)
+    auth_idx = result.find("auth(x)")
+    val_idx = result.find("validate(x)")
+    check("insert_in_body before anchor: placed correctly",
+          "PASS" if auth_idx < val_idx else "FAIL", "PASS")
+
+    # Error: zero anchors
+    bad = False
+    try:
+        Applier(py_path).insert_in_body("f", "x = 1")
+    except Exception as e:
+        bad = "exactly one" in str(e)
+    check("insert_in_body: zero anchors raises",
+          "PASS" if bad else "FAIL", "PASS")
+
+    # Error: two anchors (at + after)
+    bad = False
+    try:
+        Applier(py_path).insert_in_body("f", "x = 1", at="top", after="y")
+    except Exception as e:
+        bad = "exactly one" in str(e)
+    check("insert_in_body: two anchors raises",
+          "PASS" if bad else "FAIL", "PASS")
+
+    # Error: three anchors
+    bad = False
+    try:
+        Applier(py_path).insert_in_body("f", "x = 1", at="top", after="a", before="b")
+    except Exception as e:
+        bad = "exactly one" in str(e)
+    check("insert_in_body: three anchors raises",
+          "PASS" if bad else "FAIL", "PASS")
+
+    # Error: bad at value
+    bad = False
+    try:
+        Applier(py_path).insert_in_body("f", "x = 1", at="middle")
+    except Exception as e:
+        bad = "top" in str(e) and "bottom" in str(e)
+    check("insert_in_body: bad at raises",
+          "PASS" if bad else "FAIL", "PASS")
+    _os.remove(py_path)
+
+    # -- insert_sibling: before / after --
+    py_path = _os.path.join(TESTS_DIR, "test_merged_sib.py")
+    with open(py_path, "w") as f:
+        f.write("class Foo:\n    pass\n")
+
+    Applier(py_path).insert_sibling("Foo", "X = 1", "before")
+    result = read_file(py_path)
+    x_idx = result.find("X = 1")
+    foo_idx = result.find("class Foo")
+    check("insert_sibling before: placed before",
+          "PASS" if 0 <= x_idx < foo_idx else "FAIL", "PASS")
+
+    Applier(py_path).insert_sibling("Foo", "Y = 2", "after")
+    result = read_file(py_path)
+    foo_idx = result.find("class Foo")
+    y_idx = result.find("Y = 2")
+    check("insert_sibling after: placed after",
+          "PASS" if foo_idx < y_idx else "FAIL", "PASS")
+
+    # Error: bad position
+    bad = False
+    try:
+        Applier(py_path).insert_sibling("Foo", "Z = 3", "middle")
+    except Exception as e:
+        bad = "before" in str(e) and "after" in str(e)
+    check("insert_sibling: bad position raises",
+          "PASS" if bad else "FAIL", "PASS")
+    _os.remove(py_path)
+
+
+# ──────────────────────────────────────────────
 # replace_in_body / delete_in_body / insert_in_body (Phase 3.C)
 # ──────────────────────────────────────────────
 
@@ -2821,6 +3012,7 @@ if __name__ == "__main__":
     test_delete_key_jsts()
     test_closure_addressing()
     test_in_body_family()
+    test_merged_apis()
     test_ast_reader()
 
     # Reset all fixtures to clean state after tests

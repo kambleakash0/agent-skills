@@ -161,44 +161,65 @@ def insert_in_body(
     target: str,
     new_snippet: str,
     after: str = "",
-    before: str = "",
+    before: str = "", at: str = "",
 ) -> str:
     """
-    Insert new_snippet inside a named function/method body, anchored relative
-    to an existing snippet. Pass exactly ONE of `after` or `before`.
+    Insert new_snippet inside a named function/method body. Pass EXACTLY ONE
+    of `at`, `after`, or `before` -- this one tool covers four placement
+    modes that used to be spread across three separate tools.
 
-    The anchor match is scoped to the target's body and must be unique
-    (multiple matches raise an error). The caller is responsible for including
-    any needed leading/trailing newlines and indentation in new_snippet.
+      - at="top":    insert at the top of the body.
+      - at="bottom": insert at the bottom of the body.
+      - after=<snippet>:  insert immediately after a byte-identical anchor.
+      - before=<snippet>: insert immediately before a byte-identical anchor.
 
-    Use this when: You need to insert a new line or block at a specific spot
-    inside a function body, not just at the very top or bottom.
-    Don't use this when: You want to insert at the top/bottom of the body ->
-    use `prepend_to_body` / `append_to_body` (no anchor required).
+    The anchor match (for `after`/`before`) is scoped to the target's body
+    and must be unique -- multiple matches raise an error telling you to
+    include more surrounding context. Caller is responsible for any
+    leading/trailing newlines and indentation in new_snippet.
 
-    Example (insert after a validate call):
+    Use this when: You're inserting new lines into a function body. Use
+    `at="top"`/`at="bottom"` for simple prepend/append, or `after`/`before`
+    for anchored insertion.
+    Don't use this when: You're replacing the whole body -> use
+    `replace_function_body`. You're adding a top-level symbol -> use
+    `add_top_level`. You're changing an existing snippet in the body ->
+    use `replace_in_body`.
+
+    Example (prepend):
         target="handle"
-        new_snippet="    metrics.incr(\\"calls\\")\\n"
-        after="    validate(request)\\n"
+        new_snippet='    log("start")\\n'
+        at="top"
 
-    Example (insert before a log line):
+    Example (append):
         target="handle"
-        new_snippet="    auth_check(request)\\n"
-        before="    log(\\"request received\\")\\n"
+        new_snippet='    log("end")\\n'
+        at="bottom"
+
+    Example (after anchor):
+        target="handle"
+        new_snippet='    metrics.incr("calls")\\n'
+        after='    validate(request)\\n'
+
+    Example (before anchor):
+        target="handle"
+        new_snippet='    auth_check(request)\\n'
+        before='    validate(request)\\n'
     """
     if err := _validate_file(file_path):
         return err
     try:
         logger.info(
-            "insert_in_body: target='%s' file='%s' place=%s",
+            "insert_in_body: target='%s' file='%s' mode=%s",
             target,
             file_path,
-            "after" if after else ("before" if before else "none"),
+            "at=" + at if at else ("after" if after else ("before" if before else "none")),
         )
         applier = Applier(file_path)
         applier.insert_in_body(
             target,
             new_snippet,
+            at=at if at else None,
             after=after if after else None,
             before=before if before else None,
         )
@@ -607,151 +628,14 @@ def list_symbols(file_path: str) -> str:
         return f"Internal error in list_symbols: {type(e).__name__}: {e}"
 
 
-@mcp.tool()
-def get_signature(file_path: str, target: str) -> str:
-    """
-    Return the signature of a function (everything before its body) as plain text.
-    Read-only. Works for Python, JS, TS, C, and C++.
-
-    Use this when: You need a function's exact signature for documentation,
-    refactoring, or to verify the interface before editing.
-    Don't use this when: You need to see the whole function body -> read the file
-    directly.
-
-    Example:
-        target="LRUCache.get"
-    """
-    if err := _validate_file(file_path):
-        return err
-    try:
-        logger.info("get_signature: target='%s' file='%s'", target, file_path)
-        applier = Applier(file_path)
-        return applier.get_signature(target)
-    except ApplierError as e:
-        logger.warning("get_signature: %s", e)
-        return f"Cannot get signature: {e}"
-    except Exception as e:
-        logger.exception("get_signature crashed")
-        return f"Internal error in get_signature: {type(e).__name__}: {e}"
 
 
-@mcp.tool()
-def prepend_to_body(file_path: str, target: str, content: str) -> str:
-    """
-    Insert content at the top of a function body, preserving existing statements.
-
-    Use this when: You're adding one or two lines at the START of a function (logging,
-    input validation, early-return guards, debug prints).
-    Don't use this when: You're replacing the whole body -> use `replace_function_body`.
-    You're adding to the bottom -> use `append_to_body`.
-
-    Example:
-        target="LRUCache.get"
-        content="        print(f'get called with {key}')"
-    """
-    if err := _validate_file(file_path):
-        return err
-    try:
-        logger.info("prepend_to_body: target='%s' file='%s'", target, file_path)
-        applier = Applier(file_path)
-        applier.prepend_to_body(target, content)
-        return "Added"
-    except ApplierError as e:
-        logger.warning("prepend_to_body: %s", e)
-        return f"Cannot perform edit: {e}"
-    except Exception as e:
-        logger.exception("prepend_to_body crashed")
-        return f"Internal error in prepend_to_body: {type(e).__name__}: {e}"
 
 
-@mcp.tool()
-def append_to_body(file_path: str, target: str, content: str) -> str:
-    """
-    Insert content at the bottom of a function body, preserving existing statements.
-
-    Use this when: You're adding one or two lines at the END of a function (cleanup,
-    telemetry, final return statements, logging after work is done).
-    Don't use this when: You're replacing the whole body -> use `replace_function_body`.
-    You're adding to the top -> use `prepend_to_body`.
-
-    Example:
-        target="LRUCache.get"
-        content="        # end"
-    """
-    if err := _validate_file(file_path):
-        return err
-    try:
-        logger.info("append_to_body: target='%s' file='%s'", target, file_path)
-        applier = Applier(file_path)
-        applier.append_to_body(target, content)
-        return "Added"
-    except ApplierError as e:
-        logger.warning("append_to_body: %s", e)
-        return f"Cannot perform edit: {e}"
-    except Exception as e:
-        logger.exception("append_to_body crashed")
-        return f"Internal error in append_to_body: {type(e).__name__}: {e}"
 
 
-@mcp.tool()
-def insert_before(file_path: str, target: str, content: str) -> str:
-    """
-    Insert content as a sibling immediately before a named symbol (function, class,
-    method, or top-level assignment).
-
-    Use this when: You need precise placement relative to another symbol (e.g.
-    inserting a helper function just before its caller, or a constant above a class
-    that uses it).
-    Don't use this when: You just want to append to the end of the file -> use
-    `add_top_level`.
-
-    Example:
-        target="LRUCache"
-        content="CACHE_SIZE = 100"
-    """
-    if err := _validate_file(file_path):
-        return err
-    try:
-        logger.info("insert_before: target='%s' file='%s'", target, file_path)
-        applier = Applier(file_path)
-        applier.insert_before(target, content)
-        return "Added"
-    except ApplierError as e:
-        logger.warning("insert_before: %s", e)
-        return f"Cannot perform edit: {e}"
-    except Exception as e:
-        logger.exception("insert_before crashed")
-        return f"Internal error in insert_before: {type(e).__name__}: {e}"
 
 
-@mcp.tool()
-def insert_after(file_path: str, target: str, content: str) -> str:
-    """
-    Insert content as a sibling immediately after a named symbol (function, class,
-    method, or top-level assignment).
-
-    Use this when: You need precise placement right after a symbol (e.g. a helper
-    just after the function that uses it, or a new function between two existing ones).
-    Don't use this when: You just want to append to the end of the file -> use
-    `add_top_level`.
-
-    Example:
-        target="LRUCache"
-        content="RELATED_CONSTANT = 42"
-    """
-    if err := _validate_file(file_path):
-        return err
-    try:
-        logger.info("insert_after: target='%s' file='%s'", target, file_path)
-        applier = Applier(file_path)
-        applier.insert_after(target, content)
-        return "Added"
-    except ApplierError as e:
-        logger.warning("insert_after: %s", e)
-        return f"Cannot perform edit: {e}"
-    except Exception as e:
-        logger.exception("insert_after crashed")
-        return f"Internal error in insert_after: {type(e).__name__}: {e}"
 
 
 @mcp.tool()
@@ -909,92 +793,10 @@ def remove_parameter(file_path: str, target: str, parameter_name: str) -> str:
         return f"Internal error in remove_parameter: {type(e).__name__}: {e}"
 
 
-@mcp.tool()
-def add_comment_before(file_path: str, target: str, comment: str) -> str:
-    """
-    Insert comment line(s) immediately before a named symbol. The comment must
-    include its own comment marker (e.g. '# foo' for Python, '// foo' for JS/C/C++).
-
-    Use this when: You want to document a function, class, or statement by adding
-    an inline comment above it.
-    Don't use this when: You want a Python function/class docstring -> use
-    `replace_docstring`. You want to replace an existing leading comment -> use
-    `replace_leading_comment`.
-
-    Example:
-        target="LRUCache.get"
-        comment="    # Retrieve an item by key, returning None if absent"
-    """
-    if err := _validate_file(file_path):
-        return err
-    try:
-        logger.info("add_comment_before: target='%s' file='%s'", target, file_path)
-        applier = Applier(file_path)
-        applier.add_comment_before(target, comment)
-        return "Added"
-    except ApplierError as e:
-        logger.warning("add_comment_before: %s", e)
-        return f"Cannot perform edit: {e}"
-    except Exception as e:
-        logger.exception("add_comment_before crashed")
-        return f"Internal error in add_comment_before: {type(e).__name__}: {e}"
 
 
-@mcp.tool()
-def remove_leading_comment(file_path: str, target: str) -> str:
-    """
-    Remove the contiguous block of comment lines immediately above a named symbol.
-    Stops at the first blank line or non-comment line.
-
-    Use this when: You want to delete an outdated or wrong comment above a symbol.
-    Don't use this when: You want to update the comment text -> use
-    `replace_leading_comment`.
-
-    Example:
-        target="LRUCache.get"
-    """
-    if err := _validate_file(file_path):
-        return err
-    try:
-        logger.info("remove_leading_comment: target='%s' file='%s'", target, file_path)
-        applier = Applier(file_path)
-        applier.remove_leading_comment(target)
-        return "Removed"
-    except ApplierError as e:
-        logger.warning("remove_leading_comment: %s", e)
-        return f"Cannot perform edit: {e}"
-    except Exception as e:
-        logger.exception("remove_leading_comment crashed")
-        return f"Internal error in remove_leading_comment: {type(e).__name__}: {e}"
 
 
-@mcp.tool()
-def replace_leading_comment(file_path: str, target: str, new_comment: str) -> str:
-    """
-    Replace the contiguous leading comment block above a named symbol with new_comment.
-    If no leading comment exists, inserts new_comment.
-
-    Use this when: You want to update the comment text above a function/class.
-    Don't use this when: You only want to add a comment where none exists -> use
-    `add_comment_before`.
-
-    Example:
-        target="LRUCache.get"
-        new_comment="    # Retrieve an item from the cache"
-    """
-    if err := _validate_file(file_path):
-        return err
-    try:
-        logger.info("replace_leading_comment: target='%s' file='%s'", target, file_path)
-        applier = Applier(file_path)
-        applier.replace_leading_comment(target, new_comment)
-        return "Updated"
-    except ApplierError as e:
-        logger.warning("replace_leading_comment: %s", e)
-        return f"Cannot perform edit: {e}"
-    except Exception as e:
-        logger.exception("replace_leading_comment crashed")
-        return f"Internal error in replace_leading_comment: {type(e).__name__}: {e}"
 
 
 @mcp.tool()
@@ -1097,27 +899,41 @@ def add_top_level(file_path: str, content: str, position: str = "bottom") -> str
 
 
 @mcp.tool()
-def read_symbol(file_path: str, target: str) -> str:
+def read_symbol(file_path: str, target: str, depth: str = "full") -> str:
     """
-    Return the full source text of a single named symbol (function, class, method,
+    Return source text for a single named symbol (function, class, method,
     config key) without reading the entire file. Read-only.
 
-    Use this when: You need to see the implementation of ONE specific function or
-    class. Far cheaper than reading the whole file -- typically 10-20x fewer tokens.
-    Don't use this when: You need a structural overview of the file -> use
-    `list_symbols`. You only need the signature -> use `get_signature`.
+    `depth` controls how much is returned:
+
+      - "full" (default): Entire source of the symbol. Typical savings:
+        10-20x fewer tokens than reading the whole file.
+      - "interface": For a class -> header + field declarations + method
+        signatures with bodies replaced by ' ...'. For a function ->
+        just the signature.
+      - "signature": Signature-only. For a function -> the line(s) before
+        the body. For a class -> the class header.
+
+    Use this when: You need to read a specific symbol without reading the
+    whole file. Pick the narrowest depth that contains what you need.
+    Don't use this when: You need a structural overview of the whole file
+    -> use `list_symbols`. You need to see the file's imports -> use
+    `read_imports`.
 
     Example:
-        target="LRUCache.get"   # returns just the get method's source
-        target="LRUCache"       # returns the entire class source
-        target="project.version" # returns the value node for a config key
+        target="LRUCache.get"                       # full method source
+        target="LRUCache", depth="interface"         # class skeleton
+        target="LRUCache.get", depth="signature"     # just the def line
+        target="project.version"                     # config value
     """
     if err := _validate_file(file_path):
         return err
     try:
-        logger.info("read_symbol: target='%s' file='%s'", target, file_path)
+        logger.info(
+            "read_symbol: target='%s' depth='%s' file='%s'", target, depth, file_path
+        )
         applier = Applier(file_path)
-        return applier.read_symbol(target)
+        return applier.read_symbol(target, depth)
     except ApplierError as e:
         logger.warning("read_symbol: %s", e)
         return f"Cannot read symbol: {e}"
@@ -1153,35 +969,112 @@ def read_imports(file_path: str) -> str:
         return f"Internal error in read_imports: {type(e).__name__}: {e}"
 
 
-@mcp.tool()
-def read_interface(file_path: str, target: str) -> str:
-    """
-    Return a stub view of a class: its header, field declarations, and method
-    signatures -- with all method bodies replaced by ' ...'. For a function target,
-    returns just its signature. Read-only.
 
-    Use this when: You need to understand a class's public API (what methods and
-    fields it has) without reading every line of implementation. Typically 5-10x
-    fewer tokens than reading the full class.
-    Don't use this when: You need the full implementation -> use `read_symbol`.
-    You only need one method's signature -> use `get_signature`.
+
+@mcp.tool()
+def edit_leading_comment(
+    file_path: str,
+    target: str,
+    op: str,
+    comment: str = "",
+) -> str:
+    """
+    Edit the contiguous leading-comment block above a named symbol. One tool
+    covering three operations on the same comment block.
+
+    Supported values for `op`:
+      - "add":     Insert a new comment block above the symbol. Requires
+                   `comment`. Raises if a leading comment already exists and
+                   would be pushed down as a separate block.
+      - "replace": Replace the existing leading comment block with `comment`;
+                   if no leading comment exists, inserts one. Requires
+                   `comment`.
+      - "remove":  Delete the existing leading comment block. `comment` is
+                   ignored.
+
+    The comment must include the language's comment marker (`#` for
+    Python/Ruby/YAML/TOML, `//` or `/* ... */` for JS/TS/C/C++/Go/Java,
+    `/** ... */` Javadoc for Java). Supports multi-line C-style block
+    comments as a single contiguous run.
+
+    Use this when: You want to document, update, or delete a leading
+    comment on a function/class/method.
+    Don't use this when: You want a Python docstring (which lives inside
+    the function body) -> use `replace_docstring`. You want to edit text
+    inside the function body itself -> use `replace_in_body`.
 
     Example:
-        target="LRUCache"   # returns class header + method sigs + fields
-        target="process"     # returns function signature (no class)
+        target="LRUCache.get", op="add",
+        comment="    # Retrieve an item by key, returning None if absent"
+
+        target="LRUCache.get", op="replace",
+        comment="    # Retrieve an item from the cache"
+
+        target="LRUCache.get", op="remove"
     """
     if err := _validate_file(file_path):
         return err
     try:
-        logger.info("read_interface: target='%s' file='%s'", target, file_path)
+        logger.info(
+            "edit_leading_comment: op='%s' target='%s' file='%s'",
+            op,
+            target,
+            file_path,
+        )
         applier = Applier(file_path)
-        return applier.read_interface(target)
+        applier.edit_leading_comment(target, op, comment)
+        verb_map = {"add": "Added", "replace": "Updated", "remove": "Removed"}
+        return verb_map.get(op, "Updated")
     except ApplierError as e:
-        logger.warning("read_interface: %s", e)
-        return f"Cannot read interface: {e}"
+        logger.warning("edit_leading_comment: %s", e)
+        return f"Cannot perform edit: {e}"
     except Exception as e:
-        logger.exception("read_interface crashed")
-        return f"Internal error in read_interface: {type(e).__name__}: {e}"
+        logger.exception("edit_leading_comment crashed")
+        return f"Internal error in edit_leading_comment: {type(e).__name__}: {e}"
+
+
+
+@mcp.tool()
+def insert_sibling(file_path: str, target: str, content: str, position: str) -> str:
+    """
+    Insert content as a sibling of a named symbol (function, class, method,
+    or top-level assignment). Pass `position="before"` or `position="after"`.
+
+    Use this when: You need precise placement relative to another top-level
+    symbol -- e.g. a helper function immediately before its caller, a
+    constant immediately above the class that uses it.
+    Don't use this when: You just want to append to the end of the file ->
+    use `add_top_level`. You're inserting inside a function body ->
+    use `insert_in_body` (with `at`, `after`, or `before`).
+
+    Example:
+        target="LRUCache"
+        content="CACHE_SIZE = 100"
+        position="before"
+
+        target="LRUCache"
+        content="RELATED_CONSTANT = 42"
+        position="after"
+    """
+    if err := _validate_file(file_path):
+        return err
+    try:
+        logger.info(
+            "insert_sibling: target='%s' position='%s' file='%s'",
+            target,
+            position,
+            file_path,
+        )
+        applier = Applier(file_path)
+        applier.insert_sibling(target, content, position)
+        return "Added"
+    except ApplierError as e:
+        logger.warning("insert_sibling: %s", e)
+        return f"Cannot perform edit: {e}"
+    except Exception as e:
+        logger.exception("insert_sibling crashed")
+        return f"Internal error in insert_sibling: {type(e).__name__}: {e}"
+
 
 
 def main():

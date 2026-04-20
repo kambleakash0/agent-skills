@@ -96,16 +96,13 @@ All tools require `file_path` to be an **absolute path** to an existing file.
 | `replace_function` | `file_path`, `target`, `content` | Replace a full function definition (signature + body + decorators). |
 | `replace_function_body` | `file_path`, `target`, `content` | Replace only the body of a function, preserving signature and decorators. |
 | `replace_signature` | `file_path`, `target`, `new_signature` | Replace only the signature, preserving body and decorators. |
-| `prepend_to_body` | `file_path`, `target`, `content` | Insert content at the top of a function body. |
-| `append_to_body` | `file_path`, `target`, `content` | Insert content at the bottom of a function body. |
 | `replace_in_body` | `file_path`, `target`, `old_snippet`, `new_snippet` | Replace a byte-identical snippet inside a function body. Scoped to target's body; raises on multiple matches. |
 | `delete_in_body` | `file_path`, `target`, `snippet` | Delete a byte-identical snippet inside a function body. Scoped to target's body; raises on multiple matches. |
-| `insert_in_body` | `file_path`, `target`, `new_snippet`, `after` *or* `before` | Insert a snippet inside a function body, anchored relative to an existing snippet. |
+| `insert_in_body` | `file_path`, `target`, `new_snippet`, `at` \| `after` \| `before` | Insert a snippet inside a function body. Pass exactly ONE of: `at="top"` (prepend), `at="bottom"` (append), `after=<snippet>` (anchored), `before=<snippet>` (anchored). |
 | `add_top_level` | `file_path`, `content`, `position="bottom"` | Insert top-level content. `position="bottom"` appends at end of file (default); `position="top"` inserts after preamble (package/imports/includes/leading comments, plus Python module docstring) and before the first real declaration. |
 | `add_method` | `file_path`, `class_target`, `content` | Add a method at the end of a class body. |
 | `add_field` | `file_path`, `class_target`, `content` | Add a field/attribute/member at the top of a class body. |
-| `insert_before` | `file_path`, `target`, `content` | Insert a sibling immediately before a named symbol. |
-| `insert_after` | `file_path`, `target`, `content` | Insert a sibling immediately after a named symbol. |
+| `insert_sibling` | `file_path`, `target`, `content`, `position` | Insert content as a sibling of a named symbol. `position="before"` or `"after"`. |
 | `delete_symbol` | `file_path`, `target`, `include_leading_comments=True` | Delete a function or class definition block (including decorators). By default also consumes the contiguous leading comment block above the symbol (Godoc, Javadoc `/** ... */`, `#` or `//` comments); pass `include_leading_comments=False` to keep it. |
 
 ### Parameters & signatures
@@ -128,9 +125,7 @@ All tools require `file_path` to be an **absolute path** to an existing file.
 
 | Tool | Parameters | Description |
 | :--- | :--- | :--- |
-| `add_comment_before` | `file_path`, `target`, `comment` | Insert a comment block immediately before a named symbol. Works for Python/Ruby/YAML/TOML (`#`), JS/TS/C/C++/Go/Java (`//` or `/* */`; Java Javadoc `/** */` supported). |
-| `remove_leading_comment` | `file_path`, `target` | Remove the contiguous comment block above a symbol. Recognizes both line comments and C-style single-line or multi-line `/* ... */` blocks. |
-| `replace_leading_comment` | `file_path`, `target`, `new_comment` | Replace the leading comment block above a symbol (or insert one if none exists). |
+| `edit_leading_comment` | `file_path`, `target`, `op`, `comment=""` | Edit the contiguous leading-comment block above a named symbol. `op="add"` inserts; `op="replace"` replaces (or inserts if none); `op="remove"` deletes. Works for `#` / `//` / `/* ... */` / Javadoc `/** ... */`. |
 | `replace_docstring` | `file_path`, `target`, `new_docstring` | Replace or insert a Python function/class docstring. Python-only. |
 
 ### Dict/list editing (JSON, YAML, TOML, AND Python module-level dict/list literals)
@@ -148,11 +143,9 @@ All tools require `file_path` to be an **absolute path** to an existing file.
 | Tool | Parameters | Description |
 | :--- | :--- | :--- |
 | `list_symbols` | `file_path` | Formatted outline of all top-level functions, classes, and methods with line numbers. |
-| `get_signature` | `file_path`, `target` | Return the signature of a function as plain text. |
 | `find_references` | `file_path`, `target` | Syntactic search for all occurrences of an identifier (no scope awareness). |
-| `read_symbol` | `file_path`, `target` | Return the full source text of a single named symbol (function, class, method, config key). Typically **10-20x fewer tokens** than reading the whole file. |
+| `read_symbol` | `file_path`, `target`, `depth="full"` | Return source text of a single named symbol. `depth` controls how much: `"full"` returns the entire source (typically **10-20x fewer tokens** than the whole file); `"interface"` returns a class stub (header + fields + method sigs with `...`) or a function's signature; `"signature"` returns signature-only. |
 | `read_imports` | `file_path` | Return all import/include statements in the file. |
-| `read_interface` | `file_path`, `target` | Return a stub view of a class: header, field declarations, and method signatures with bodies replaced by `...`. For Go, includes receiver method signatures. For a function target, returns just its signature. |
 
 **Target format:** Use the exact function name (e.g., `get`) or dotted `Class.method` path (e.g., `LRUCache.get`). Decorated Python functions are fully supported — decorators are preserved when replacing bodies or signatures, and included when deleting or replacing the full function.
 
@@ -165,11 +158,13 @@ A decision guide grouped by intent. Start at the top and pick the narrowest matc
 ### Discovering what's in a file (do this first)
 
 - **Don't know what symbols exist?** → `list_symbols`
-- **Need just a function's signature?** → `get_signature`
-- **Need one specific function's full source?** → `read_symbol` (10-20x cheaper than reading the whole file)
-- **Need a class's public API (methods + fields, no bodies)?** → `read_interface`
+- **Need one specific function's full source?** → `read_symbol` (`depth="full"`, the default — 10-20x cheaper than reading the whole file)
+- **Need a class's public API (methods + fields, no bodies)?** → `read_symbol(target, depth="interface")`
+- **Need just a function's signature?** → `read_symbol(target, depth="signature")`
 - **Need to see a file's imports/dependencies?** → `read_imports`
 - **Where is a symbol used?** → `find_references`
+
+Dotted targets descend into closures: Go `stdioCmd.RunE` (func_literal in struct field), TS `app.handler` (arrow function in object literal).
 
 ### Adding new content
 
@@ -178,14 +173,14 @@ A decision guide grouped by intent. Start at the top and pick the narrowest matc
 | New top-level function, class, constant, or type alias | `add_top_level` (use `position="top"` to prepend after preamble) |
 | New method in an existing class | `add_method` |
 | New field/attribute/member in a class | `add_field` |
-| New content at a specific position relative to an existing symbol | `insert_before` / `insert_after` |
-| New lines at the top of an existing function body | `prepend_to_body` |
-| New lines at the bottom of an existing function body | `append_to_body` |
+| New content before or after a top-level symbol | `insert_sibling(position="before" \| "after")` |
+| New lines at the top of an existing function body | `insert_in_body(at="top")` |
+| New lines at the bottom of an existing function body | `insert_in_body(at="bottom")` |
 | **New lines at a specific spot inside a function body (anchored to existing text)** | `insert_in_body(after=…)` or `insert_in_body(before=…)` |
 | New parameter on an existing function | `add_parameter` |
 | New import or `#include` | `add_import` |
-| New name in an existing `from X import …` | `add_import_name` |
-| New comment above a symbol | `add_comment_before` |
+| New name in an existing `from X import …` or `import { a, b } from "mod"` | `add_import_name` |
+| New comment above a symbol | `edit_leading_comment(op="add")` |
 | New Python docstring on a function/class | `replace_docstring` |
 | New key in a dict/object/mapping/table (any lang) | `add_key` |
 | New item in a list/array/sequence (any lang) | `append_to_array` |
@@ -198,7 +193,7 @@ A decision guide grouped by intent. Start at the top and pick the narrowest matc
 | Rewrite only the body, keep the signature | `replace_function_body` |
 | **Change one statement/block inside a large body** | `replace_in_body` (scoped snippet match) |
 | Change only the signature, keep the body | `replace_signature` |
-| Change only the leading comment above a symbol | `replace_leading_comment` |
+| Change only the leading comment above a symbol | `edit_leading_comment(op="replace")` |
 | Change only the Python docstring | `replace_docstring` |
 | Change the value of an existing config key | `replace_value` |
 
@@ -211,17 +206,16 @@ A decision guide grouped by intent. Start at the top and pick the narrowest matc
 | Remove a parameter from a function | `remove_parameter` |
 | Remove an import or `#include` | `remove_import` |
 | Remove one name from a multi-name named-import (Python or JS/TS) | `remove_import_name` |
-| Remove a leading comment above a symbol | `remove_leading_comment` |
+| Remove a leading comment above a symbol | `edit_leading_comment(op="remove")` |
 | Remove a key from a dict / config / JS-TS object literal | `delete_key` |
 | Remove an item from a list/array | `remove_from_array` |
 
 ### Anti-patterns to avoid
 
-- **Don't use `replace_function` to add a few lines** — use `prepend_to_body` or `append_to_body` instead. Rewriting the whole function is wasteful and error-prone.
-- **Don't use `replace_function_body` to add a few lines** either — same reasoning. Use `prepend_to_body`/`append_to_body`.
+- **Don't use `replace_function` or `replace_function_body` to change a few lines** — use `replace_in_body` (scoped snippet match) or `insert_in_body(at="top" \| "bottom")` for appending/prepending. Rewriting the whole function is wasteful and error-prone.
 - **Don't use `replace_signature` to add or remove one parameter** — use `add_parameter`/`remove_parameter`.
 - **Don't use `replace_value` to add a new key** — use `add_key`. `replace_value` only updates existing keys.
-- **Don't use `add_import` to add a name to an existing `from X import …`** — use `add_import_name`.
+- **Don't use `add_import` to add a name to an existing `from X import …` or named import** — use `add_import_name`.
 - **Don't guess at target names.** Call `list_symbols` first. Names are case-sensitive and must match exactly.
 
 ## Logging & Debugging
@@ -350,20 +344,21 @@ Coding agents are heavily biased toward their default tools. You **must** explic
 
 Add the following block to `CLAUDE.md`, `~/.claude/CLAUDE.md`, or **Custom Instructions**:
 
-> **When editing `.py`, `.js`, `.ts`, `.c`, `.cpp`, `.rb`, `.go`, `.java`, `.json`, `.yaml`, or `.toml` files, do NOT use the `edit` tool. Use the `ast-editor` MCP server instead. It exposes 35 surgical tools for structural code and config edits.**
+> **When editing `.py`, `.js`, `.ts`, `.c`, `.cpp`, `.rb`, `.go`, `.java`, `.json`, `.yaml`, or `.toml` files, do NOT use the `edit` tool. Use the `ast-editor` MCP server instead. It exposes 28 surgical tools for structural code and config edits.**
 >
 > **Picking a tool — always start here:**
 >
-> 1. **Unsure of the file layout?** Call `list_symbols` first. Call `get_signature` if you only need a signature. Call `read_symbol` to read one function/class without reading the whole file. Call `read_interface` to see a class's API (methods + fields, no bodies). Call `read_imports` to see dependencies. Call `find_references` before renaming anything. Dotted targets descend into closures: Go `stdioCmd.RunE` (func_literal in struct field), JS/TS `app.handler` (arrow function in object literal).
+> 1. **Unsure of the file layout?** Call `list_symbols` first. Call `read_symbol(target)` to read one function/class's full source without reading the whole file. `read_symbol(target, depth="interface")` gives a class stub (methods + fields, no bodies). `read_symbol(target, depth="signature")` gives just the signature. Call `read_imports` to see dependencies. Call `find_references` before renaming anything. Dotted targets descend into closures: Go `stdioCmd.RunE` (func_literal in struct field), JS/TS `app.handler` (arrow function in object literal).
 > 2. **Adding new content** — choose the narrowest tool:
 >    - Top-level (function, class, constant, type alias): `add_top_level` (use `position="top"` to prepend after preamble)
 >    - In a class: `add_method`, `add_field`
->    - At top/bottom of a function body: `prepend_to_body`, `append_to_body`
+>    - At top/bottom of a function body: `insert_in_body(at="top")` / `insert_in_body(at="bottom")`
 >    - **At a specific spot inside a function body (anchored to an existing snippet):** `insert_in_body(after=...)` or `insert_in_body(before=...)`
->    - Relative to an existing top-level symbol: `insert_before`, `insert_after`
+>    - Relative to an existing top-level symbol: `insert_sibling(position="before" | "after")`
 >    - Imports: `add_import` (new line) or `add_import_name` (add to existing `from X import ...` or `import { a, b } from "mod"`)
 >    - Parameters: `add_parameter`
->    - Comments/docstrings: `add_comment_before`, `replace_docstring`
+>    - Leading comment: `edit_leading_comment(op="add", comment=...)`
+>    - Python docstring: `replace_docstring`
 >    - Any dict/object (config OR Python/JS/TS literal): `add_key`
 >    - Any list/array (config OR Python literal): `append_to_array`
 > 3. **Modifying existing content:**
@@ -372,19 +367,19 @@ Add the following block to `CLAUDE.md`, `~/.claude/CLAUDE.md`, or **Custom Instr
 >    - **One statement/block inside a large body:** `replace_in_body(target, old_snippet, new_snippet)` — scoped match; the single biggest token-saver for long functions
 >    - Signature only: `replace_signature`
 >    - Config value: `replace_value`
->    - Leading comment: `replace_leading_comment`
+>    - Leading comment: `edit_leading_comment(op="replace", comment=...)`
 >    - Python docstring: `replace_docstring`
 > 4. **Removing content:**
 >    - Function/class/method: `delete_symbol` (consumes the leading doc comment by default; pass `include_leading_comments=False` to keep it)
 >    - **One statement/line inside a function body:** `delete_in_body(target, snippet)` — scoped match; use for single-line removals (route mounts, middleware calls, object-literal keys in inline args)
 >    - Parameter: `remove_parameter`
 >    - Import: `remove_import` (whole line) or `remove_import_name` (one name from multi-name)
->    - Leading comment: `remove_leading_comment`
+>    - Leading comment: `edit_leading_comment(op="remove")`
 >    - Dict/object key or list item: `delete_key`, `remove_from_array`
 >
 > **Anti-patterns to avoid:**
 >
-> - Don't use `replace_function` or `replace_function_body` to change a few lines — use `replace_in_body` (scoped snippet match) or `prepend_to_body` / `append_to_body`.
+> - Don't use `replace_function` or `replace_function_body` to change a few lines — use `replace_in_body` (scoped snippet match) or `insert_in_body(at="top" | "bottom")` for prepend/append.
 > - Don't use `replace_signature` to add one parameter — use `add_parameter` / `remove_parameter`.
 > - Don't use `replace_value` to add a new key — use `add_key`.
 > - Don't use `add_import` to add a name to an existing from-import or named import — use `add_import_name`.
@@ -395,6 +390,25 @@ Add the following block to `CLAUDE.md`, `~/.claude/CLAUDE.md`, or **Custom Instr
 > - **Deleting multiple related symbols as a group?** Call `delete_symbol` once per target. There's no `delete_group` tool; the extra tool calls are cheaper than the alternative of a custom grouped primitive.
 > - **Editing a sub-expression inside a method chain** (e.g. dropping `.references(...)` from `integer("x").notNull().references(...)`) or other arbitrary expression surgery? For common cases use `replace_in_body` with the literal snippet. For truly arbitrary sub-expression edits, fall back to the default `Edit` tool — ast-editor intentionally doesn't do AST pattern matching on expression trees.
 > - **Rewriting a whole file where the structure changes substantially?** Use the default `Write` tool. ast-editor is for targeted edits; duplicating `Write` as a tool here would add no value.
+
+### Migration from v1.x tool names (v2.0.0 consolidation)
+
+v2.0.0 consolidated 10 closely-related tools into 4 parametrized tools. If you have old instructions referencing the v1.x names, the mapping is:
+
+| v1.x tool | v2.0.0 equivalent |
+| :--- | :--- |
+| `add_comment_before(target, comment)` | `edit_leading_comment(target, op="add", comment=...)` |
+| `replace_leading_comment(target, new_comment)` | `edit_leading_comment(target, op="replace", comment=...)` |
+| `remove_leading_comment(target)` | `edit_leading_comment(target, op="remove")` |
+| `read_symbol(target)` | `read_symbol(target)` *(or explicit `depth="full"`)* |
+| `read_interface(target)` | `read_symbol(target, depth="interface")` |
+| `get_signature(target)` | `read_symbol(target, depth="signature")` |
+| `prepend_to_body(target, content)` | `insert_in_body(target, content, at="top")` |
+| `append_to_body(target, content)` | `insert_in_body(target, content, at="bottom")` |
+| `insert_before(target, content)` | `insert_sibling(target, content, position="before")` |
+| `insert_after(target, content)` | `insert_sibling(target, content, position="after")` |
+
+The old tools are **hard-removed** — calling them will fail with "unknown tool". Old behavior is preserved 1:1 by the new calls.
 
 ### Specific Tool Overrides
 
@@ -411,4 +425,4 @@ Add the following block to `CLAUDE.md`, `~/.claude/CLAUDE.md`, or **Custom Instr
 
 Add to rules or system prompt:
 
-> *When editing `.py`, `.js`, `.ts`, `.c`, `.cpp`, `.rb`, `.go`, or `.java` files, do NOT use your default editing tools (diff, whole, etc.). Instead, use the `ast-editor` MCP server, which exposes 35 surgical tools for adding/modifying/removing functions, classes, methods, fields, parameters, imports, comments, and docstrings. Start any edit session by calling `list_symbols` to discover exact target names. Dotted targets descend into closures (`stdioCmd.RunE`, `app.handler`).* *For reading, use `read_symbol` / `read_interface` / `read_imports` (~10-20x fewer input tokens than reading the whole file). For targeted body edits, use `replace_in_body` / `delete_in_body` / `insert_in_body` to change ONE line or block inside a function without rewriting the whole body. For small additions at the top or bottom of a function body, use `prepend_to_body` / `append_to_body`. For `.json`, `.yaml`, or `.toml` files, use `replace_value` / `add_key` / `append_to_array` / `delete_key` instead of freeform edits. Escape hatches: for arbitrary sub-expression edits that string matching can't handle, fall back to `Edit`. For whole-file structural rewrites, use `Write`.*
+> *When editing `.py`, `.js`, `.ts`, `.c`, `.cpp`, `.rb`, `.go`, or `.java` files, do NOT use your default editing tools (diff, whole, etc.). Instead, use the `ast-editor` MCP server, which exposes 28 surgical tools for adding/modifying/removing functions, classes, methods, fields, parameters, imports, comments, and docstrings. Start any edit session by calling `list_symbols` to discover exact target names. Dotted targets descend into closures (`stdioCmd.RunE`, `app.handler`). For reading, use `read_symbol(target, depth="full"|"interface"|"signature")` and `read_imports` (~10-20x fewer input tokens than reading the whole file). For targeted body edits, use `replace_in_body` / `delete_in_body` / `insert_in_body(at=... | after=... | before=...)` to change ONE line or block inside a function without rewriting the whole body. Use `edit_leading_comment(op="add"|"replace"|"remove")` for leading comments. Use `insert_sibling(position="before"|"after")` to place content next to a top-level symbol. For `.json`, `.yaml`, or `.toml` files, use `replace_value` / `add_key` / `append_to_array` / `delete_key` instead of freeform edits. Escape hatches: for arbitrary sub-expression edits that string matching can't handle, fall back to `Edit`. For whole-file structural rewrites, use `Write`.*

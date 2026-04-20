@@ -1159,26 +1159,37 @@ class Applier:
         self,
         target: str,
         new_snippet: str,
+        at: str | None = None,
         after: str | None = None,
         before: str | None = None,
     ) -> str:
         """
-        Insert new_snippet inside a function body, anchored relative to an
-        existing snippet. Pass exactly one of `after` or `before`.
+        Insert new_snippet inside a function/method body. Pass exactly ONE of:
+          - at="top":    insert at the top of the body (was: prepend_to_body).
+          - at="bottom": insert at the bottom of the body (was: append_to_body).
+          - after=<snippet>:  insert immediately after a byte-identical anchor.
+          - before=<snippet>: insert immediately before a byte-identical anchor.
 
-        The anchor match is scoped to the target's body and must be unique
-        (multiple matches raise an error). The caller is responsible for
-        including any needed leading/trailing newlines and indentation in
-        new_snippet.
-
-        To insert at the top or bottom of the body with no anchor, use
-        prepend_to_body / append_to_body instead.
+        The anchor match (for `after`/`before`) is scoped to the target's body
+        and must be unique; multiple matches raise. Caller is responsible for
+        any leading/trailing newlines and indentation in new_snippet.
         """
+        at_val = at or None
         after_val = after or None
         before_val = before or None
-        if (after_val is None) == (before_val is None):
+        provided = [x for x in (at_val, after_val, before_val) if x is not None]
+        if len(provided) != 1:
             raise ApplierError(
-                "insert_in_body: pass exactly one of `after` or `before`"
+                "insert_in_body: pass exactly one of `at`, `after`, or `before`"
+            )
+
+        if at_val is not None:
+            if at_val == "top":
+                return self.prepend_to_body(target, new_snippet)
+            if at_val == "bottom":
+                return self.append_to_body(target, new_snippet)
+            raise ApplierError(
+                f"insert_in_body: `at` must be 'top' or 'bottom', got '{at_val}'"
             )
 
         func_node, body = self._get_function_body_node(target)
@@ -1393,6 +1404,19 @@ class Applier:
             + self.lines[insert_line:]
         )
         return self._save()
+
+    def insert_sibling(self, target: str, content: str, position: str) -> str:
+        """
+        Insert `content` as a sibling of the named symbol. `position` must be
+        'before' or 'after'. Dispatches to insert_before / insert_after.
+        """
+        if position == "before":
+            return self.insert_before(target, content)
+        if position == "after":
+            return self.insert_after(target, content)
+        raise ApplierError(
+            f"insert_sibling: position must be 'before' or 'after', got '{position}'"
+        )
 
     def _find_python_literal(self, target: str, expected_type: str):
         """Resolve target (module-level assignment name) to its right-hand dictionary/list literal."""
@@ -1965,6 +1989,40 @@ class Applier:
             self.lines = self.lines[:first] + comment_lines + self.lines[stop:]
         return self._save()
 
+    def edit_leading_comment(
+        self,
+        target: str,
+        op: str,
+        comment: str = "",
+    ) -> str:
+        """
+        Unified entry point for editing the contiguous leading-comment block
+        above a named symbol. Dispatches by op:
+          - "add"     -> add_comment_before(target, comment)
+          - "replace" -> replace_leading_comment(target, comment)
+          - "remove"  -> remove_leading_comment(target)
+        For "add" and "replace", `comment` must be a non-empty string including
+        the language's comment marker (e.g. "# foo", "// bar", "/** ... */").
+        For "remove", `comment` is ignored.
+        """
+        if op == "add":
+            if not comment:
+                raise ApplierError(
+                    "edit_leading_comment: `comment` is required when op='add'"
+                )
+            return self.add_comment_before(target, comment)
+        if op == "replace":
+            if not comment:
+                raise ApplierError(
+                    "edit_leading_comment: `comment` is required when op='replace'"
+                )
+            return self.replace_leading_comment(target, comment)
+        if op == "remove":
+            return self.remove_leading_comment(target)
+        raise ApplierError(
+            f"edit_leading_comment: unknown op '{op}'. Use 'add', 'replace', or 'remove'."
+        )
+
     def replace_docstring(self, target: str, new_docstring: str) -> str:
         """
         Replace or insert a Python docstring on a function or class. The new_docstring
@@ -2056,15 +2114,34 @@ class Applier:
     # AST Reader tools (read-only, token-efficient)
     # ──────────────────────────────────────────────
 
-    def read_symbol(self, target: str) -> str:
+    def read_symbol(self, target: str, depth: str = "full") -> str:
         """
-        Return the full source text of a named symbol (function, class, method,
-        config key). Read-only. Supports dotted paths (e.g. 'ClassName.method').
+        Return source text for a named symbol. `depth` controls how much is
+        returned:
+          - "full" (default): entire source of the symbol (function body,
+            class body, etc.). Equivalent to the old `read_symbol`.
+          - "interface": for a class -> header + field declarations + method
+            signatures with bodies replaced by ' ...'. For a function ->
+            just the signature. Equivalent to the old `read_interface`.
+          - "signature": signature-only. For a function -> the line(s)
+            before the body. For a class -> the class header. Equivalent to
+            the old `get_signature`.
+
+        For config files (JSON/YAML/TOML), "full" returns the value node's
+        source and the other depths raise.
         """
-        node = self.parser.find_node_by_name(target)
-        if not node:
-            raise ApplierError(f"Target '{target}' not found in {self.filepath}")
-        return self.parser.node_text(node)
+        if depth == "full":
+            node = self.parser.find_node_by_name(target)
+            if not node:
+                raise ApplierError(f"Target '{target}' not found in {self.filepath}")
+            return self.parser.node_text(node)
+        if depth == "interface":
+            return self.read_interface(target)
+        if depth == "signature":
+            return self.get_signature(target)
+        raise ApplierError(
+            f"read_symbol: unknown depth '{depth}'. Use 'full', 'interface', or 'signature'."
+        )
 
     def read_imports(self) -> str:
         """
