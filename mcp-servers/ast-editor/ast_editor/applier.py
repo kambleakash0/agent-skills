@@ -1080,7 +1080,7 @@ class Applier:
             return "(no top-level symbols found)"
         return "\n".join(lines_out)
 
-    def get_signature(self, target: str) -> str:
+    def _get_signature(self, target: str) -> str:
         """
         Return the signature text of a function (everything before its body),
         with surrounding whitespace stripped. Read-only.
@@ -1185,9 +1185,9 @@ class Applier:
 
         if at_val is not None:
             if at_val == "top":
-                return self.prepend_to_body(target, new_snippet)
+                return self._prepend_to_body(target, new_snippet)
             if at_val == "bottom":
-                return self.append_to_body(target, new_snippet)
+                return self._append_to_body(target, new_snippet)
             raise ApplierError(
                 f"insert_in_body: `at` must be 'top' or 'bottom', got '{at_val}'"
             )
@@ -1270,7 +1270,7 @@ class Applier:
                 start_byte -= 1
         return start_byte, end_byte
 
-    def prepend_to_body(self, target: str, content: str) -> str:
+    def _prepend_to_body(self, target: str, content: str) -> str:
         """
         Insert content at the top of a function body, preserving existing statements.
         """
@@ -1305,7 +1305,7 @@ class Applier:
         self.lines = self.lines[:insert_line] + content_lines + self.lines[insert_line:]
         return self._save()
 
-    def append_to_body(self, target: str, content: str) -> str:
+    def _append_to_body(self, target: str, content: str) -> str:
         """
         Insert content at the bottom of a function body, preserving existing statements.
         """
@@ -1343,7 +1343,7 @@ class Applier:
         self.lines = self.lines[:insert_line] + content_lines + self.lines[insert_line:]
         return self._save()
 
-    def insert_before(self, target: str, content: str) -> str:
+    def _insert_before(self, target: str, content: str) -> str:
         """
         Insert content as a sibling immediately before a named symbol (function, class,
         method, or top-level assignment).
@@ -1375,7 +1375,7 @@ class Applier:
         )
         return self._save()
 
-    def insert_after(self, target: str, content: str) -> str:
+    def _insert_after(self, target: str, content: str) -> str:
         """
         Insert content as a sibling immediately after a named symbol (function, class,
         method, or top-level assignment).
@@ -1411,9 +1411,9 @@ class Applier:
         'before' or 'after'. Dispatches to insert_before / insert_after.
         """
         if position == "before":
-            return self.insert_before(target, content)
+            return self._insert_before(target, content)
         if position == "after":
-            return self.insert_after(target, content)
+            return self._insert_after(target, content)
         raise ApplierError(
             f"insert_sibling: position must be 'before' or 'after', got '{position}'"
         )
@@ -1923,7 +1923,7 @@ class Applier:
         stripped = line.lstrip()
         return any(stripped.startswith(p) for p in self._comment_prefixes())
 
-    def add_comment_before(self, target: str, comment: str) -> str:
+    def _add_comment_before(self, target: str, comment: str) -> str:
         """
         Insert comment line(s) immediately before a named symbol. The comment must
         include its own comment marker (e.g. '# foo' for Python/YAML/TOML, '// foo'
@@ -1942,7 +1942,7 @@ class Applier:
         self.lines = self.lines[:insert_line] + comment_lines + self.lines[insert_line:]
         return self._save()
 
-    def remove_leading_comment(self, target: str) -> str:
+    def _remove_leading_comment(self, target: str) -> str:
         """
         Remove the contiguous block of comment lines immediately above a named symbol.
         Handles both line comments and C-style /* ... */ block comments. Stops at
@@ -1964,7 +1964,7 @@ class Applier:
         self.lines = self.lines[:first] + self.lines[stop:]
         return self._save()
 
-    def replace_leading_comment(self, target: str, new_comment: str) -> str:
+    def _replace_leading_comment(self, target: str, new_comment: str) -> str:
         """
         Replace the contiguous leading comment block above a named symbol with
         new_comment. Handles line comments and C-style /* ... */ block comments.
@@ -2010,15 +2010,15 @@ class Applier:
                 raise ApplierError(
                     "edit_leading_comment: `comment` is required when op='add'"
                 )
-            return self.add_comment_before(target, comment)
+            return self._add_comment_before(target, comment)
         if op == "replace":
             if not comment:
                 raise ApplierError(
                     "edit_leading_comment: `comment` is required when op='replace'"
                 )
-            return self.replace_leading_comment(target, comment)
+            return self._replace_leading_comment(target, comment)
         if op == "remove":
-            return self.remove_leading_comment(target)
+            return self._remove_leading_comment(target)
         raise ApplierError(
             f"edit_leading_comment: unknown op '{op}'. Use 'add', 'replace', or 'remove'."
         )
@@ -2136,9 +2136,9 @@ class Applier:
                 raise ApplierError(f"Target '{target}' not found in {self.filepath}")
             return self.parser.node_text(node)
         if depth == "interface":
-            return self.read_interface(target)
+            return self._read_interface(target)
         if depth == "signature":
-            return self.get_signature(target)
+            return self._get_signature(target)
         raise ApplierError(
             f"read_symbol: unknown depth '{depth}'. Use 'full', 'interface', or 'signature'."
         )
@@ -2164,7 +2164,7 @@ class Applier:
             return "(no imports found)"
         return "\n".join(import_lines)
 
-    def read_interface(self, target: str) -> str:
+    def _read_interface(self, target: str) -> str:
         """
         Return a stub view of a class: its header, field declarations, and method
         signatures (with bodies replaced by ' ...'). For a function target, returns
@@ -2189,7 +2189,7 @@ class Applier:
 
         # Function target -- return signature only
         if inner.type in func_types:
-            return self.get_signature(target)
+            return self._get_signature(target)
 
         # Go: struct/interface definition + top-level receiver methods
         # (checked before body lookup because type_spec has no 'body' field)
