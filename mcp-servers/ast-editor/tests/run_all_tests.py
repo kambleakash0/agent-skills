@@ -846,17 +846,17 @@ def test_get_signature():
 
     path = reset_fixture("py")
     app = Applier(path)
-    sig = app.get_signature("LRUCache.get")
+    sig = app.read_symbol("LRUCache.get", depth="signature")
     check("py get_signature: correct sig returned", sig, "def get(self, key):")
 
     path = reset_fixture("cpp")
     app = Applier(path)
-    sig = app.get_signature("Calculator.add")
+    sig = app.read_symbol("Calculator.add", depth="signature")
     check("cpp get_signature: correct sig returned", sig, "int add(int a, int b)")
 
     path = reset_fixture("c")
     app = Applier(path)
-    sig = app.get_signature("multiply")
+    sig = app.read_symbol("multiply", depth="signature")
     check("c get_signature: correct sig returned", sig, "int multiply(int a, int b)")
 
 
@@ -871,7 +871,7 @@ def test_body_insertions():
     # Python: prepend a log line to a function body
     path = reset_fixture("py")
     app = Applier(path)
-    app.prepend_to_body("LRUCache.get", "        print(f'getting {key}')")
+    app.insert_in_body("LRUCache.get", "        print(f'getting {key}')", at="top")
     result = read_file(path)
     check("py prepend_to_body: new line at top", result, "print(f'getting {key}')")
     check(
@@ -883,7 +883,7 @@ def test_body_insertions():
     # Python: append a log line
     path = reset_fixture("py")
     app = Applier(path)
-    app.append_to_body("LRUCache.get", "        # end")
+    app.insert_in_body("LRUCache.get", "        # end", at="bottom")
     result = read_file(path)
     check("py append_to_body: new line at bottom", result, "# end")
     check(
@@ -895,7 +895,7 @@ def test_body_insertions():
     # JS: prepend and append
     path = reset_fixture("js")
     app = Applier(path)
-    app.prepend_to_body("LRUCache.get", "        console.log('get');")
+    app.insert_in_body("LRUCache.get", "        console.log('get');", at="top")
     result = read_file(path)
     check("js prepend_to_body: new line at top", result, "console.log('get');")
     check(
@@ -907,7 +907,7 @@ def test_body_insertions():
     # C: append to a free function
     path = reset_fixture("c")
     app = Applier(path)
-    app.append_to_body("add", "    /* end marker */")
+    app.insert_in_body("add", "    /* end marker */", at="bottom")
     result = read_file(path)
     check("c append_to_body: marker present", result, "/* end marker */")
     check("c append_to_body: original return preserved", result, "return a + b;")
@@ -924,7 +924,7 @@ def test_sibling_placement():
     # Python: insert_before a class
     path = reset_fixture("py")
     app = Applier(path)
-    app.insert_before("LRUCache", "CONST = 42")
+    app.insert_sibling("LRUCache", "CONST = 42", "before")
     result = read_file(path)
     lines = result.splitlines()
     const_idx = next(i for i, l in enumerate(lines) if "CONST = 42" in l)
@@ -938,7 +938,7 @@ def test_sibling_placement():
     # Python: insert_after a class
     path = reset_fixture("py")
     app = Applier(path)
-    app.insert_after("LRUCache", "OTHER = 1")
+    app.insert_sibling("LRUCache", "OTHER = 1", "after")
     result = read_file(path)
     lines = result.splitlines()
     class_idx = next(i for i, l in enumerate(lines) if "class LRUCache" in l)
@@ -952,7 +952,7 @@ def test_sibling_placement():
     # C: insert_after a function
     path = reset_fixture("c")
     app = Applier(path)
-    app.insert_after("add", "int middle() { return 0; }")
+    app.insert_sibling("add", "int middle() { return 0; }", "after")
     result = read_file(path)
     lines = result.splitlines()
     add_end = max(i for i, l in enumerate(lines) if "return a + b;" in l)
@@ -1144,7 +1144,7 @@ def test_comment_ops():
     # Python: add a comment before a function
     path = reset_fixture("py")
     app = Applier(path)
-    app.add_comment_before("LRUCache.get", "    # Get an item by key")
+    app.edit_leading_comment("LRUCache.get", "add", "    # Get an item by key")
     result = read_file(path)
     check("py add_comment_before: comment present", result, "# Get an item by key")
     check("py add_comment_before: function intact", result, "def get(self, key):")
@@ -1160,7 +1160,7 @@ def test_comment_ops():
 
     # Python: remove the leading comment we just added
     app2 = Applier(path)
-    app2.remove_leading_comment("LRUCache.get")
+    app2.edit_leading_comment("LRUCache.get", "remove")
     result2 = read_file(path)
     check(
         "py remove_leading_comment: comment removed",
@@ -1172,9 +1172,9 @@ def test_comment_ops():
     # Python: replace_leading_comment
     path = reset_fixture("py")
     app = Applier(path)
-    app.add_comment_before("LRUCache.get", "    # Old comment")
+    app.edit_leading_comment("LRUCache.get", "add", "    # Old comment")
     app2 = Applier(path)
-    app2.replace_leading_comment("LRUCache.get", "    # New comment")
+    app2.edit_leading_comment("LRUCache.get", "replace", "    # New comment")
     result = read_file(path)
     check("py replace_leading_comment: new comment present", result, "# New comment")
     check(
@@ -1186,11 +1186,11 @@ def test_comment_ops():
     # JS: add and remove a line comment
     path = reset_fixture("js")
     app = Applier(path)
-    app.add_comment_before("LRUCache.get", "    // Get item by key")
+    app.edit_leading_comment("LRUCache.get", "add", "    // Get item by key")
     result = read_file(path)
     check("js add_comment_before: comment present", result, "// Get item by key")
     app2 = Applier(path)
-    app2.remove_leading_comment("LRUCache.get")
+    app2.edit_leading_comment("LRUCache.get", "remove")
     result2 = read_file(path)
     check(
         "js remove_leading_comment: comment removed",
@@ -1201,18 +1201,18 @@ def test_comment_ops():
     # TypeScript: add and remove
     path = reset_fixture("ts")
     app = Applier(path)
-    app.add_comment_before("LRUCache.get", "    // TS doc comment")
+    app.edit_leading_comment("LRUCache.get", "add", "    // TS doc comment")
     result = read_file(path)
     check("ts add_comment_before: comment present", result, "// TS doc comment")
 
     # C: line comment add + remove
     path = reset_fixture("c")
     app = Applier(path)
-    app.add_comment_before("add", "// Adds two integers")
+    app.edit_leading_comment("add", "add", "// Adds two integers")
     result = read_file(path)
     check("c add_comment_before: comment present", result, "// Adds two integers")
     app2 = Applier(path)
-    app2.remove_leading_comment("add")
+    app2.edit_leading_comment("add", "remove")
     result2 = read_file(path)
     check(
         "c remove_leading_comment: line comment removed",
@@ -1225,7 +1225,7 @@ def test_comment_ops():
     with open(path, "w") as f:
         f.write("/* Doubles an integer */\nint dbl(int x) {\n    return x * 2;\n}\n")
     app = Applier(path)
-    app.remove_leading_comment("dbl")
+    app.edit_leading_comment("dbl", "remove")
     result = read_file(path)
     check(
         "c remove_leading_comment: single-line block removed",
@@ -1242,7 +1242,7 @@ def test_comment_ops():
             "/*\n * Multi-line block\n * comment\n */\nint foo(int x) {\n    return x;\n}\n"
         )
     app = Applier(path)
-    app.remove_leading_comment("foo")
+    app.edit_leading_comment("foo", "remove")
     result = read_file(path)
     check(
         "c remove_leading_comment: multi-line block removed",
@@ -1262,7 +1262,7 @@ def test_comment_ops():
     with open(path, "w") as f:
         f.write("// line comment\n/* block */\nint bar() {\n    return 0;\n}\n")
     app = Applier(path)
-    app.remove_leading_comment("bar")
+    app.edit_leading_comment("bar", "remove")
     result = read_file(path)
     check(
         "cpp remove_leading_comment: line comment removed",
@@ -1279,11 +1279,11 @@ def test_comment_ops():
     # YAML: add and remove comment
     path = reset_fixture("yaml")
     app = Applier(path)
-    app.add_comment_before("project", "# Project section")
+    app.edit_leading_comment("project", "add", "# Project section")
     result = read_file(path)
     check("yaml add_comment_before: comment present", result, "# Project section")
     app2 = Applier(path)
-    app2.remove_leading_comment("project")
+    app2.edit_leading_comment("project", "remove")
     result2 = read_file(path)
     check(
         "yaml remove_leading_comment: comment removed",
@@ -1294,11 +1294,11 @@ def test_comment_ops():
     # TOML: add and remove comment
     path = reset_fixture("toml")
     app = Applier(path)
-    app.add_comment_before("project", "# Project table")
+    app.edit_leading_comment("project", "add", "# Project table")
     result = read_file(path)
     check("toml add_comment_before: comment present", result, "# Project table")
     app2 = Applier(path)
-    app2.remove_leading_comment("project")
+    app2.edit_leading_comment("project", "remove")
     result2 = read_file(path)
     check(
         "toml remove_leading_comment: comment removed",
@@ -1430,13 +1430,13 @@ def test_ruby():
     # get_signature
     path = reset_fixture("rb")
     app = Applier(path)
-    sig = app.get_signature("LRUCache.get")
+    sig = app.read_symbol("LRUCache.get", depth="signature")
     check("rb get_signature: correct sig returned", sig, "def get(key)")
 
     # add_comment_before
     path = reset_fixture("rb")
     app = Applier(path)
-    app.add_comment_before("LRUCache.get", "  # Fetch an item by key")
+    app.edit_leading_comment("LRUCache.get", "add", "  # Fetch an item by key")
     result = read_file(path)
     check("rb add_comment_before: comment present", result, "# Fetch an item by key")
 
@@ -1593,7 +1593,7 @@ def test_go():
     # get_signature on a method
     path = reset_fixture("go")
     app = Applier(path)
-    sig = app.get_signature("Cache.Get")
+    sig = app.read_symbol("Cache.Get", depth="signature")
     check(
         "go get_signature: correct sig returned",
         sig,
@@ -1603,7 +1603,7 @@ def test_go():
     # add_comment_before (// style)
     path = reset_fixture("go")
     app = Applier(path)
-    app.add_comment_before("Cache.Get", "// Retrieves an item by key")
+    app.edit_leading_comment("Cache.Get", "add", "// Retrieves an item by key")
     result = read_file(path)
     check(
         "go add_comment_before: comment present", result, "// Retrieves an item by key"
@@ -1711,7 +1711,7 @@ def test_java():
     # get_signature on a method
     path = reset_fixture("java")
     app = Applier(path)
-    sig = app.get_signature("LRUCache.get")
+    sig = app.read_symbol("LRUCache.get", depth="signature")
     check(
         "java get_signature: correct sig returned", sig, "public String get(String key)"
     )
@@ -1719,7 +1719,7 @@ def test_java():
     # add_comment_before (// style)
     path = reset_fixture("java")
     app = Applier(path)
-    app.add_comment_before("LRUCache.get", "    // Retrieves an item by key")
+    app.edit_leading_comment("LRUCache.get", "add", "    // Retrieves an item by key")
     result = read_file(path)
     check(
         "java add_comment_before: comment present",
@@ -1739,7 +1739,7 @@ def test_java():
 }
 """)
     app = Applier(path)
-    app.remove_leading_comment("Foo.bar")
+    app.edit_leading_comment("Foo.bar", "remove")
     result = read_file(path)
     check(
         "java remove_leading_comment: Javadoc block removed",
@@ -2178,7 +2178,7 @@ var single = &Foo{
 
     # get_signature on a Go closure
     app = Applier(go_path)
-    sig = app.get_signature("stdioCmd.RunE")
+    sig = app.read_symbol("stdioCmd.RunE", depth="signature")
     check("go closure get_signature: returns func signature", sig, "func(cmd *cobra.Command, args []string) error")
 
     # Plain (non-block) var_spec closure
@@ -2892,7 +2892,7 @@ def test_ast_reader():
     # Python class: should show signatures without bodies
     path = reset_fixture("py")
     app = Applier(path)
-    result = app.read_interface("LRUCache")
+    result = app.read_symbol("LRUCache", depth="interface")
     check("read_interface py: has class header", result, "class LRUCache:")
     check("read_interface py: has init sig", result, "def __init__(self)")
     check("read_interface py: has get sig", result, "def get(self, key)")
@@ -2906,7 +2906,7 @@ def test_ast_reader():
     # JS class
     path = reset_fixture("js")
     app = Applier(path)
-    result = app.read_interface("LRUCache")
+    result = app.read_symbol("LRUCache", depth="interface")
     check("read_interface js: has class header", result, "class LRUCache")
     check("read_interface js: has constructor sig", result, "constructor()")
     check("read_interface js: has get sig", result, "get(key)")
@@ -2915,7 +2915,7 @@ def test_ast_reader():
     # Java class
     path = reset_fixture("java")
     app = Applier(path)
-    result = app.read_interface("LRUCache")
+    result = app.read_symbol("LRUCache", depth="interface")
     check("read_interface java: has class header", result, "class LRUCache")
     check("read_interface java: has fields", result, "private int capacity")
     check("read_interface java: has get sig", result, "public String get")
@@ -2929,7 +2929,7 @@ def test_ast_reader():
     # Go struct: struct definition + receiver method signatures
     path = reset_fixture("go")
     app = Applier(path)
-    result = app.read_interface("Cache")
+    result = app.read_symbol("Cache", depth="interface")
     check("read_interface go: has struct", result, "type Cache struct")
     check("read_interface go: has fields", result, "capacity int")
     check("read_interface go: has Get sig", result, "func (c *Cache) Get")
@@ -2944,7 +2944,7 @@ def test_ast_reader():
     # C++ class
     path = reset_fixture("cpp")
     app = Applier(path)
-    result = app.read_interface("Calculator")
+    result = app.read_symbol("Calculator", depth="interface")
     check("read_interface cpp: has class header", result, "class Calculator")
     check("read_interface cpp: has add sig", result, "int add")
     check("read_interface cpp: has subtract sig", result, "int subtract")
@@ -2953,7 +2953,7 @@ def test_ast_reader():
     # Ruby class
     path = reset_fixture("rb")
     app = Applier(path)
-    result = app.read_interface("LRUCache")
+    result = app.read_symbol("LRUCache", depth="interface")
     check("read_interface rb: has class header", result, "class LRUCache")
     check("read_interface rb: has init sig", result, "def initialize")
     check("read_interface rb: has get sig", result, "def get")
@@ -2963,7 +2963,7 @@ def test_ast_reader():
     # Function target: should return just its signature
     path = reset_fixture("py")
     app = Applier(path)
-    result = app.read_interface("LRUCache.get")
+    result = app.read_symbol("LRUCache.get", depth="interface")
     check("read_interface py func: returns signature", result, "def get(self, key)")
     check(
         "read_interface py func: no body",
