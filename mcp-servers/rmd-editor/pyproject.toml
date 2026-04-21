@@ -1,0 +1,20 @@
+[project]
+name = "rmd-editor-mcp"
+version = "1.0.0"
+description = "MCP Server for editing R Markdown (.rmd) documents with chunk-level operations and R kernel execution"
+requires-python = ">=3.10"
+dependencies = [
+    "mcp>=1.10.0",
+    "pyyaml>=6.0",
+    "jupyter-client>=8.6.0",
+]
+
+[build-system]
+requires = ["hatchling"]
+build-backend = "hatchling.build"
+
+[project.scripts]
+rmd-editor-mcp = "rmd_editor.server:main"
+
+[tool.hatch.build.targets.wheel]
+packages = ["rmd_editor"]
