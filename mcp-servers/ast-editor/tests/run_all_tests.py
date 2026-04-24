@@ -426,6 +426,85 @@ def test_yaml():
     check("replace_value: name untouched", result, 'name: "ast-editor"')
     check("replace_value: dependencies untouched", result, 'tree-sitter: "^0.21.0"')
 
+def test_yaml_sequence_fixes():
+    """
+    Regression tests for the three YAML-sequence bugs that previously forced
+    callers to fall back to the plain Edit tool for structured edits.
+    """
+    print("\n═══ YAML sequence fixes (replace_value + append_to_array) ═══")
+
+    # 1. replace_value on a block_sequence with bare items (no leading indent)
+    path = os.path.join(TESTS_DIR, "test_seq.yaml")
+    with open(path, "w") as f:
+        f.write("superpowers:\n    - old1\n    - old2\n")
+    app = Applier(path)
+    app.replace_value("superpowers", '- "new1"\n- "new2"')
+    result = read_file(path)
+    check("bare items: new1 present", result, '- "new1"')
+    check("bare items: new2 present", result, '- "new2"')
+    check("bare items: old gone", "PASS" if "old1" not in result else "FAIL", "PASS")
+    # Each item sits at the original 4-space column
+    check("bare items: first item indented correctly", result, '    - "new1"')
+    check("bare items: second item indented correctly", result, '    - "new2"')
+    check("bare items: no double-indent on first item", "PASS" if '        - "new1"' not in result else "FAIL", "PASS")
+    # No blank line between key and first item
+    check("bare items: no blank line after key", "PASS" if "superpowers:\n\n" not in result else "FAIL", "PASS")
+    os.remove(path)
+
+    # 2. replace_value on a block_sequence WITH pre-indented content
+    # (this was the "indentation doubling" case: passing '    - x' used to
+    # produce 8 spaces on the first item while the rest stayed at 4).
+    with open(path, "w") as f:
+        f.write("superpowers:\n    - old1\n    - old2\n")
+    app = Applier(path)
+    app.replace_value("superpowers", '    - "A"\n    - "B"\n    - "C"')
+    result = read_file(path)
+    check("pre-indented: no doubling on first item", "PASS" if '        - "A"' not in result else "FAIL", "PASS")
+    check("pre-indented: all items at same column", result, '    - "A"\n    - "B"\n    - "C"')
+    os.remove(path)
+
+    # 3. replace_value on a block_sequence with a LEADING \n in content
+    # (used to produce a gratuitous blank line after the key).
+    with open(path, "w") as f:
+        f.write("superpowers:\n    - old1\n    - old2\n")
+    app = Applier(path)
+    app.replace_value("superpowers", '\n- "X"\n- "Y"')
+    result = read_file(path)
+    check("leading-newline: no blank line after key", "PASS" if "superpowers:\n\n" not in result else "FAIL", "PASS")
+    check("leading-newline: X present", result, '- "X"')
+    check("leading-newline: Y present", result, '- "Y"')
+    os.remove(path)
+
+    # 4. append_to_array with a multi-line mapping value (lists-of-mappings)
+    # -- previously the `-` landed on its own line and the continuation keys
+    # were emitted at column 0.
+    with open(path, "w") as f:
+        f.write('proof_points:\n  - name: "First"\n    url: "https://a"\n')
+    app = Applier(path)
+    app.append_to_array("proof_points", 'name: "Second"\nurl: "https://b"\nmetric: "fast"')
+    result = read_file(path)
+    check("multi-line: first line carries `-` marker", result, '  - name: "Second"')
+    check("multi-line: url continuation indented under `-`", result, '    url: "https://b"')
+    check("multi-line: metric continuation indented under `-`", result, '    metric: "fast"')
+    check("multi-line: original item intact", result, '  - name: "First"')
+    # Regression sanity: keys should NOT end up at column 0
+    check("multi-line: continuation NOT at column 0", "PASS" if "\nurl: " not in result else "FAIL", "PASS")
+    os.remove(path)
+
+    # 5. append_to_array with a simple scalar value (regression check -- the
+    # single-line path must still work exactly as before).
+    with open(path, "w") as f:
+        f.write("deps:\n  - a\n  - b\n")
+    app = Applier(path)
+    app.append_to_array("deps", "c")
+    result = read_file(path)
+    check("scalar append: element present", result, "- c")
+    check("scalar append: previous items intact", result, "- a")
+    check("scalar append: no multi-line artifacts", result, "deps:\n  - a\n  - b\n  - c")
+    os.remove(path)
+
+
+
 
 # ──────────────────────────────────────────────
 # TOML tests
@@ -2983,6 +3062,7 @@ if __name__ == "__main__":
     test_typescript()
     test_json()
     test_yaml()
+    test_yaml_sequence_fixes()
     test_toml()
     test_c()
     test_cpp()

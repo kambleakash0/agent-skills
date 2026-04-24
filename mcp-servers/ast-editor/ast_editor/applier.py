@@ -58,6 +58,27 @@ class Applier:
         if not node:
             raise ApplierError(f"Target '{target}' not found")
 
+        # Strip a leading newline from content. replace_value substitutes the
+        # AST value node, which starts AT the value character itself (not at
+        # column 0), so the key's trailing whitespace is already contained in
+        # source[:start_byte]. A leading \n in content would produce a
+        # gratuitous blank line between the key and its value in any supported
+        # format (JSON / YAML / TOML / Python literal).
+        if content.startswith("\n"):
+            content = content.lstrip("\n")
+
+        # YAML block sequences need line-based replacement with reindenting:
+        # the sequence's AST range starts at the first `-` character (not at
+        # column 0), so a byte-level substitution of caller content that
+        # already has leading indent would double the indent on the first
+        # item. Snap to whole-line boundaries and reindent against the
+        # existing column of the first `-`.
+        ext = self.parser.ext
+        if ext in (".yml", ".yaml"):
+            resolved = self._resolve_yaml_value(node)
+            if resolved is not None and resolved.type == "block_sequence":
+                return self._replace_yaml_block_sequence(resolved, content)
+
         source_bytes = self.parser.source_bytes
         content_bytes = content.encode("utf-8")
 
@@ -786,9 +807,16 @@ class Applier:
             last = items[-1]
             indent = self._get_indent(self.lines[last.start_point[0]])
             insert_line = last.end_point[0] + 1
+            # Multi-line values (e.g. a mapping with several keys) get the
+            # `-` marker on the first line and a 2-space hanging indent on
+            # continuation lines so they nest under the sequence item.
+            value_lines = value.splitlines() or [""]
+            new_item_lines = [f"{indent}- {value_lines[0]}"]
+            for cont in value_lines[1:]:
+                new_item_lines.append(f"{indent}  {cont}")
             self.lines = (
                 self.lines[:insert_line]
-                + [f"{indent}- {value}"]
+                + new_item_lines
                 + self.lines[insert_line:]
             )
             return self._save()
@@ -2551,3 +2579,44 @@ class Applier:
         if not lines_out:
             return "(no top-level symbols found)"
         return "\n".join(lines_out)
+
+    def _replace_yaml_block_sequence(self, seq_node, content: str) -> str:
+        """
+        Replace a YAML block_sequence node with new content, snapping to whole
+        lines and reindenting content to the column of the existing first `-`.
+
+        Handles these caller styles cleanly:
+          - Bare items ("- a\\n- b") -- indented to match the existing sequence.
+          - Pre-indented items ("    - a\\n    - b") -- dedented then reindented
+            so the existing column is preserved and no doubling occurs.
+          - Multi-line mapping items with hanging indent preserved relative
+            to the first `-` column.
+        """
+        start_line = seq_node.start_point[0]
+        end_line = seq_node.end_point[0] + 1
+        target_indent = " " * seq_node.start_point[1]
+
+        lines = content.splitlines()
+        non_blank = [ln for ln in lines if ln.strip()]
+        if not non_blank:
+            raise ApplierError("Cannot replace YAML sequence with empty content")
+
+        def _leading_spaces(s: str) -> int:
+            n = 0
+            for c in s:
+                if c == " ":
+                    n += 1
+                else:
+                    return n
+            return n
+
+        min_indent = min(_leading_spaces(ln) for ln in non_blank)
+        reindented: list[str] = []
+        for ln in lines:
+            if not ln.strip():
+                reindented.append("")
+            else:
+                reindented.append(target_indent + ln[min_indent:])
+
+        self.lines = self.lines[:start_line] + reindented + self.lines[end_line:]
+        return self._save()
