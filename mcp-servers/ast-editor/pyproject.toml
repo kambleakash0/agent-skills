@@ -18,6 +18,9 @@ dependencies = [
     "tree-sitter-go>=0.25.0",
     "tree-sitter-java>=0.23.0"
 ]
+authors = [{ name = "Akash Kamble", email = "kambleakash0@gmail.com" }]
+license = { text = "MIT" }
+readme = "README.md"
 
 [build-system]
 requires = ["hatchling"]
@@ -28,3 +31,9 @@ ast-editor-mcp = "ast_editor.server:main"
 
 [tool.hatch.build.targets.wheel]
 packages = ["ast_editor"]
+
+
+[project.urls]
+Homepage = "https://github.com/kambleakash0/agent-skills/tree/main/mcp-servers"
+Repository = "https://github.com/kambleakash0/agent-skills"
+Issues = "https://github.com/kambleakash0/agent-skills/issues"

@@ -276,10 +276,10 @@ If your agent supports adding servers via CLI, run the following:
 
 ```bash
 # Claude Code / Codex
-[claude|codex] mcp add ast-editor --scope user -- uv --directory /absolute/path/to/mcp-servers/ast-editor run ast-editor-mcp
+[claude|codex] mcp add ast-editor --scope user -- uv --directory /absolute/path/to/ast-editor run ast-editor-mcp
 
 # Gemini CLI
-gemini mcp add --transport stdio --scope user ast-editor -- uv --directory /absolute/path/to/mcp-servers/ast-editor run ast-editor-mcp
+gemini mcp add --transport stdio --scope user ast-editor -- uv --directory /absolute/path/to/ast-editor run ast-editor-mcp
 ```
 
 ### Method 2: JSON Configuration
@@ -300,7 +300,7 @@ For tools that use a `mcp_config.json` or `settings.json` file, add the followin
       "command": "/absolute/path/to/uv",
       "args": [
         "--directory",
-        "/absolute/path/to/mcp-servers/ast-editor",
+        "/absolute/path/to/ast-editor",
         "run",
         "ast-editor-mcp"
       ]
@@ -319,17 +319,17 @@ For tools that use a `mcp_config.json` or `settings.json` file, add the followin
 
 ### Using Standard Python (Fallback)
 
-If you prefer not to use `uv`, install manually and point to the `.venv` executable:
+If you prefer not to use `uv`, install manually and point to the `.venv` executable in ast-editor directory:
 
 ```bash
-cd mcp-servers/ast-editor && python3 -m venv .venv && source .venv/bin/activate && pip install .
+python3 -m venv .venv && source .venv/bin/activate && pip install .
 ```
 
 ```json
 {
   "mcpServers": {
     "ast-editor": {
-      "command": "/absolute/path/to/mcp-servers/ast-editor/.venv/bin/python",
+      "command": "/absolute/path/to/ast-editor/.venv/bin/python",
       "args": ["-m", "ast_editor.server"]
     }
   }
@@ -345,7 +345,7 @@ Coding agents are heavily biased toward their default tools. You **must** explic
 Claude Code supports `@filename` includes in `CLAUDE.md`. Copy the prompt file into your global config directory and add one include line:
 
 ```bash
-cp /absolute/path/to/mcp-servers/ast-editor/AST-EDITOR.md ~/.claude/
+cp /absolute/path/to/ast-editor/AST-EDITOR.md ~/.claude/
 echo '@AST-EDITOR.md' >> ~/.claude/CLAUDE.md
 ```
 
