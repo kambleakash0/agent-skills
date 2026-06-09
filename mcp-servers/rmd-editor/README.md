@@ -189,7 +189,7 @@ gemini mcp add --transport stdio --scope user rmd-editor -- uv --directory /abso
 
 For tools that use a `mcp_config.json` or `settings.json` file, add the following block.
 
-> **Important:** Use the **absolute path** to `uv` for `"command"`, not just `"uv"`. GUI-based MCP clients (Claude Desktop, Cursor, Antigravity) don't always inherit your shell `PATH`, so a bare `"uv"` will fail with a "command not found" error. Get your absolute path with:
+> **Important:** Use the **absolute path** to `uv` for `"command"`, not just `"uv"`. GUI-based MCP clients (Claude Desktop, Cursor) don't always inherit your shell `PATH`, so a bare `"uv"` will fail with a "command not found" error. Get your absolute path with:
 >
 > ```bash
 > which uv
@@ -217,8 +217,29 @@ For tools that use a `mcp_config.json` or `settings.json` file, add the followin
 | **Claude Desktop** | `~/Library/Application Support/Claude/claude_desktop_config.json` (macOS); `%APPDATA%\Claude\claude_desktop_config.json` (Windows) |
 | **Cursor** | `.cursor/mcp.json` (Project) or `~/.cursor/mcp.json` (Global) |
 | **Windsurf** | Agent Panel → "..." → MCP Servers → View raw config |
-| **Antigravity** | `~/.gemini/antigravity/mcp_config.json` (or via Agent Panel) |
+| **Antigravity** | `~/.gemini/config/mcp_config.json` — see [Antigravity IDE](#antigravity-ide) (uses `uvx --from`) |
 | **Gemini CLI** | `~/.gemini/settings.json` (Global) or `.gemini/settings.json` (Project) |
+
+### Antigravity IDE
+
+The Antigravity IDE uses its own MCP config file and a `uvx`-based command — **not** the `uv --directory … run` form shown above. Add the server to `~/.gemini/config/mcp_config.json`:
+
+> **Important:** Use the **absolute path** to `uvx` for `"command"`, not a bare `"uvx"` — Antigravity doesn't inherit your shell `PATH`. Find it with `which uvx` (e.g. `/opt/homebrew/bin/uvx`).
+
+```json
+{
+  "mcpServers": {
+    "rmd-editor": {
+      "command": "/absolute/path/to/uvx",
+      "args": [
+        "--from",
+        "/absolute/path/to/mcp-servers/rmd-editor",
+        "rmd-editor-mcp"
+      ]
+    }
+  }
+}
+```
 
 ### Using Standard Python (Fallback)
 
