@@ -17,6 +17,7 @@ A personal collection of Claude Code agent skills and MCP servers, can be used w
 | [spec-to-plan](./skills/spec-to-plan/SKILL.md) | `/spec-plan`, `/spec-to-plan` | Turn a PRD into a multi-phase implementation plan using tracer-bullet vertical slices. |
 | [domain-glossary](./skills/domain-glossary/SKILL.md) | `/domain-glossary`, `/glossary` | Turn an ongoing conversation into a **DDD-style ubiquitous language** document. It scans for domain terms, resolves ambiguities, proposes canonical names, and writes a living glossary to `DOMAIN_GLOSSARY.md` in the working directory. |
 | [script-writer](./skills/script-writer/SKILL.md) | `/script-writer`, `/write-a-script` | Script-writer that drafts presentations, essays, emails, and slides using only the cognitive and persuasive heuristics from Patrick Winston's "How to Speak" lecture. |
+| [teach-me](./skills/teach-me/SKILL.md) | `/teach-me` | Teach the user a new skill or concept within this workspace. Stateful — the user's learning state persists across sessions and is tracked in workspace files. |
 
 ## MCP Servers
 
@@ -48,6 +49,7 @@ npx skills@latest add kambleakash0/agent-skills/skills/deep-codebase-audit
 npx skills@latest add kambleakash0/agent-skills/skills/spec-to-plan
 npx skills@latest add kambleakash0/agent-skills/skills/domain-glossary
 npx skills@latest add kambleakash0/agent-skills/skills/script-writer
+npx skills@latest add kambleakash0/agent-skills/skills/teach-me
 ```
 
 ## Skill Format
