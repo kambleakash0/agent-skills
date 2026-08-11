@@ -4,7 +4,6 @@ description: Compact the current conversation into a handoff document so a fresh
 metadata:
   author: kambleakash0
   version: 1.0.0
-disable-model-invocation: true
 triggers:
   - /context-pack
   - /handoff
