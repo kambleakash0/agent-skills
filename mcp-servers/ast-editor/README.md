@@ -384,24 +384,3 @@ Copy the **contents** of [`AST-EDITOR.md`](./AST-EDITOR.md) into your agent's in
 | **Windsurf** | `.windsurfrules` or `AGENTS.md` |
 | **Antigravity** | `_agents/rules/` |
 | **Aider / Gemini CLI / generic** | Rules file or system prompt |
-
-### Migrating from v1.x / pre-`AST-EDITOR.md` instructions
-
-**If your `CLAUDE.md` (or other rules file) contains an inline quoted "When editing ... use ast-editor" block from an older README version, delete that block and replace it with the `@AST-EDITOR.md` include (or paste the current file's contents).** The old block will reference tool names removed in v2.0.0 consolidation (`prepend_to_body`, `append_to_body`, `insert_before`, `insert_after`, `add_comment_before`, `replace_leading_comment`, `remove_leading_comment`, `read_interface`, `get_signature`) — keeping it will cause agents to call tools that no longer exist.
-
-v2.0.0 consolidated 10 closely-related tools into 4 parametrized tools. Mapping:
-
-| v1.x tool | v2.0.0 equivalent |
-| :--- | :--- |
-| `add_comment_before(target, comment)` | `edit_leading_comment(target, op="add", comment=...)` |
-| `replace_leading_comment(target, new_comment)` | `edit_leading_comment(target, op="replace", comment=...)` |
-| `remove_leading_comment(target)` | `edit_leading_comment(target, op="remove")` |
-| `read_symbol(target)` | `read_symbol(target)` *(or explicit `depth="full"`)* |
-| `read_interface(target)` | `read_symbol(target, depth="interface")` |
-| `get_signature(target)` | `read_symbol(target, depth="signature")` |
-| `prepend_to_body(target, content)` | `insert_in_body(target, content, at="top")` |
-| `append_to_body(target, content)` | `insert_in_body(target, content, at="bottom")` |
-| `insert_before(target, content)` | `insert_sibling(target, content, position="before")` |
-| `insert_after(target, content)` | `insert_sibling(target, content, position="after")` |
-
-The old tools are **hard-removed** — calling them will fail with "unknown tool". Behavior is preserved 1:1 by the new calls.
