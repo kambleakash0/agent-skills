@@ -1,12 +1,12 @@
 """
-MCP server exposing rmd-editor tools via FastMCP.
+MCP server exposing rmd-editor tools via the MCP SDK's MCPServer (mcp>=2.0.0).
 """
 from __future__ import annotations
 
 import logging
 import sys
 
-from mcp.server.fastmcp import FastMCP
+from mcp.server import MCPServer
 
 from rmd_editor import kernel as _kernel
 from rmd_editor.manager import (
@@ -22,7 +22,7 @@ logging.basicConfig(
 )
 logger = logging.getLogger("rmd-editor")
 
-mcp = FastMCP("rmd-editor")
+mcp = MCPServer("rmd-editor")
 
 
 def _err(e: Exception) -> str:

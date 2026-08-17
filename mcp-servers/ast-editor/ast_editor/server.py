@@ -1,7 +1,7 @@
 import logging
 import os
 
-from mcp.server.fastmcp import FastMCP
+from mcp.server import MCPServer
 from ast_editor.applier import Applier, ApplierError
 
 logging.basicConfig(
@@ -9,7 +9,7 @@ logging.basicConfig(
 )
 logger = logging.getLogger("ast-editor")
 
-mcp = FastMCP("AST-Code-Editor")
+mcp = MCPServer("AST-Code-Editor")
 
 
 def _validate_file(file_path: str) -> str | None:

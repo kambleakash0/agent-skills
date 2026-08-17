@@ -4,14 +4,14 @@ Notebook Editor MCP Server -- cell-level operations for Jupyter .ipynb files.
 import logging
 import os
 
-from mcp.server.fastmcp import FastMCP
+from mcp.server import MCPServer
 
 from notebook_editor.manager import NotebookManager, NotebookManagerError, create_notebook as _create_notebook
 
 logging.basicConfig(level=logging.INFO, format="%(asctime)s [%(levelname)s] %(message)s")
 logger = logging.getLogger("notebook-editor")
 
-mcp = FastMCP("Notebook-Editor")
+mcp = MCPServer("Notebook-Editor")
 
 
 def _validate_file(file_path: str) -> str | None:
