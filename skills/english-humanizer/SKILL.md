@@ -5,7 +5,7 @@ license: MIT
 allowed-tools: Read Write Edit Glob Grep AskUserQuestion
 metadata:
   author: kambleakash0
-  version: 1.2.0
+  version: 1.2.1
 triggers:
   - /humanize
 ---

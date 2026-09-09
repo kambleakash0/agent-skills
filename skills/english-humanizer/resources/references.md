@@ -8,7 +8,7 @@ Three principles matter more than any single pattern:
 
 1. **Clustering is the signal, not single occurrences.** A human can legitimately write "delve" once. Three of these tropes in the same paragraph is AI. Always ask "how many tells, how close together?" before flagging text.
 2. **Regression to the mean is the root cause.** LLMs launder specific facts into statistically common generic descriptions. The deepest diagnostic is not "does this sound fancy?" but "has concrete information been replaced with generic gravitas?" If specific names, numbers, dates, or places were available and the text went abstract, that's the real tell.
-3. **Watch lists age — track model eras.** The GPT-4 era (2023–2024) favored *delve, tapestry, testament, intricate, meticulous*. The GPT-4o era (2024–2025) shifted to *align with, fostering, bolstered*. The GPT-5 era (2025+) favors *emphasizing, enhance, highlighting, showcasing*. "Delve" in particular has receded sharply. Expect vocabulary to drift; the structural patterns below are more stable than the word lists.
+3. **Watch lists age — track model eras.** The GPT-4 era (2023–2024) favored *delve, tapestry, testament, intricate, meticulous*. The GPT-4o era (2024–2025) shifted to *align with, fostering, bolstered*. The GPT-5 era (2025+) favors *emphasizing, enhance, highlighting, showcasing*. "Delve" in particular has receded sharply. Beyond OpenAI, other model families drift too and leave distinguishable fingerprints — Gemini, Grok, DeepSeek, and Perplexity each carry their own vocabulary quirks and, more tellingly, their own citation-scaffold artifacts (see #34). Expect vocabulary to drift; the structural patterns below are more stable than the word lists.
 
 ## Table of Contents
 
@@ -69,6 +69,7 @@ AI attributes claims to unnamed authorities to sound credible without citing sou
 AI avoids simple verbs like *is, are, has*, replacing them with clunky phrases. Corpus studies have measured a noticeable drop in "is/are" frequency in online text since LLMs became mainstream.
 
 - **Watch verbs:** *serves as, stands as, marks, features, offers, represents, boasts, ventured into.*
+- **Vague relational variant:** the same instinct replaces a plain relationship with a hedged one — *associated with, in connection with, connected to, linked to, identified as being associated with* — where a direct verb ("founded", "owns", "caused", "married") is available. Name the actual relationship.
 - **Before:** The building *serves as* a headquarters and *boasts* three floors.
 - **After:** The building *is* the headquarters and *has* three floors.
 
@@ -123,10 +124,11 @@ Adding an "-ing" phrase at the end of a sentence to force a profound conclusion.
 
 ### 13. Negative Parallelism
 
-Overusing "Not only X, but also Y" or "It's not just about X, it's about Y" — plus two related variants that appear frequently:
+Overusing "Not only X, but also Y" or "It's not just about X, it's about Y" — plus three related variants that appear frequently:
 
 - **Staccato reveal:** "Not a bug. Not a feature. A fundamental design flaw."
 - **Causal inversion:** "Not because it's easy, but because it's hard."
+- **Corrective substitution ("X rather than Y"):** a contrast framed as a correction — "It reflects strategy rather than luck." "The change was gradual rather than sudden."
 - **Before:** It's not just about writing code; it's about crafting a digital experience.
 - **After:** Good code creates a better user experience.
 
@@ -274,13 +276,20 @@ Outputting bulleted lists where every item starts with a bolded word followed by
 
 Using 🚀, 💡, or ✅ as bullet points in professional text. Also: emoji-prefixed section headers.
 
-### 34. Knowledge Cutoff Disclaimers & Prompt Leakage
+### 34. Knowledge Cutoff Disclaimers, Prompt Leakage & Citation-Scaffold Artifacts
 
 Leaving in chatbot apologies or generation artifacts that no human would write in a finished document.
 
 - **Watch phrases:** *As of my last knowledge update, As of my last update, There may be recent developments not captured here, I cannot provide, As a large language model, [insert X here], [add content here].*
 - **Also watch:** abrupt mid-sentence cutoffs (token exhaustion) and unfilled bracket placeholders left behind.
-- **Fix:** Delete the disclaimer and state the fact directly.
+- **Citation-scaffold artifacts (paste provenance):** vendor-specific tokens that leak from a chatbot's cited-answer UI. A single one is near-conclusive evidence of paste-from-chatbot origin.
+  - **ChatGPT:** *contentReference, oaicite, oai_citation, turn0search0* (and `turn0newsN` etc.), *attributableIndex*
+  - **Gemini:** *[cite: 1], [span_1](start_span)*
+  - **Grok:** *grok_card, grok_render_citation_card_json*
+  - **DeepSeek:** lenticular brackets 【 】 and dagger † markers around citations
+  - **Perplexity:** *attached_file, ppl-ai-file-upload*
+  - **Unclassified:** *:::writing* and similar stray fence markers
+- **Fix:** Delete the disclaimer or artifact entirely and state the fact directly; if a citation scaffold is present, find and attach the real source it was standing in for only if the user wants or the context requires it. Otherwise, delete the scaffold entirely.
 
 ### 35. Title Case Headings
 
