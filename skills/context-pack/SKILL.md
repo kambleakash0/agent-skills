@@ -3,7 +3,7 @@ name: context-pack
 description: Compact the current conversation into a handoff document so a fresh agent can continue the work in the next session.
 metadata:
   author: kambleakash0
-  version: 1.0.0
+  version: 1.0.1
 triggers:
   - /context-pack
   - /handoff
@@ -26,7 +26,7 @@ Do **not** use this skill to create project documentation or permanent records �
 
 ## Behavior and Rules
 
-1. **Save to the OS temp directory**, not the current workspace. Use `$TMPDIR`, `/tmp`, or the equivalent for the user's OS. Name the file descriptively: `context-pack-<dash-case-topic>-<YYYYMMDD>.md`.
+1. **Save to the OS temp directory**, not the current workspace. Use `/tmp`, `/var/tmp`, or the equivalent for the user's OS. Name the file descriptively: `context-pack-<dash-case-topic>-<YYYYMMDD>.md`.
 2. **Don't duplicate existing artifacts.** If a PRD, ADR, plan, spec, issue, commit, or diff already captures something, reference it by file path or URL — don't re-summarise it inline.
 3. **Redact sensitive information.** Strip any API keys, passwords, tokens, secrets, or personally identifiable information before writing.
 4. **Tailor to the next session.** If the user passed an argument describing what the next session will focus on, use it to weight what you include — surface the most relevant context for that goal and trim what won't matter.
