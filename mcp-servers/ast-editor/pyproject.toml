@@ -32,6 +32,8 @@ ast-editor-mcp = "ast_editor.server:main"
 [tool.hatch.build.targets.wheel]
 packages = ["ast_editor"]
 
+[tool.uv]
+exclude-newer = "7 days"
 
 [project.urls]
 Homepage = "https://github.com/kambleakash0/agent-skills/tree/main/mcp-servers"

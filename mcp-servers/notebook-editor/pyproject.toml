@@ -9,6 +9,9 @@ dependencies = [
     "jupyter-client>=8.6.0",
     "ipykernel>=6.29.0",
 ]
+authors = [{ name = "Akash Kamble", email = "kambleakash0@gmail.com" }]
+license = { text = "MIT" }
+readme = "README.md"
 
 [build-system]
 requires = ["hatchling"]
@@ -19,3 +22,11 @@ notebook-editor-mcp = "notebook_editor.server:main"
 
 [tool.hatch.build.targets.wheel]
 packages = ["notebook_editor"]
+
+[tool.uv]
+exclude-newer = "7 days"
+
+[project.urls]
+Homepage = "https://github.com/kambleakash0/agent-skills/tree/main/mcp-servers"
+Repository = "https://github.com/kambleakash0/agent-skills"
+Issues = "https://github.com/kambleakash0/agent-skills/issues"
