@@ -262,6 +262,8 @@ uv --version
 
 > For more options (Docker, Cargo, WinGet, etc.), see the [official uv installation docs](https://docs.astral.sh/uv/getting-started/installation/).
 
+**uv 0.9.17 or newer is required.** This server's `pyproject.toml` sets a 7-day dependency cooldown (`[tool.uv] exclude-newer = "7 days"`). Older uv versions can't parse that relative duration: they print only a warning, ignore the setting, and may install packages published in the last 7 days. Upgrade with `uv self update`, `brew upgrade uv`, or `pip install -U uv`, depending on how you installed it.
+
 ## Installation
 
 > **Note:** Replace `/absolute/path/to` below with the actual path to this repository on your machine.
@@ -323,12 +325,16 @@ The Antigravity IDE uses its own MCP config file and a `uvx`-based command — *
 
 > **Important:** Use the **absolute path** to `uvx` for `"command"`, not a bare `"uvx"` — Antigravity doesn't inherit your shell `PATH`. Find it with `which uvx` (e.g. `/opt/homebrew/bin/uvx`).
 
+> **Note:** `uvx` ignores the `[tool.uv]` settings in this server's `pyproject.toml`, so the 7-day dependency cooldown is passed explicitly as `--exclude-newer "7 days"` in `args`. This requires uv 0.9.17 or newer: older versions reject the value (`invalid value '7 days' for '--exclude-newer'`) and the server fails to start.
+
 ```json
 {
   "mcpServers": {
     "ast-editor": {
       "command": "/absolute/path/to/uvx",
       "args": [
+        "--exclude-newer",
+        "7 days",
         "--from",
         "/absolute/path/to/ast-editor",
         "ast-editor-mcp"
@@ -345,6 +351,8 @@ If you prefer not to use `uv`, install manually and point to the `.venv` executa
 ```bash
 python3 -m venv .venv && source .venv/bin/activate && pip install .
 ```
+
+This path doesn't use uv, so the `[tool.uv]` 7-day dependency cooldown doesn't apply. With pip 26.1 or newer, add `--uploaded-prior-to P7D` to the `pip install` command to apply the same cooldown.
 
 ```json
 {
