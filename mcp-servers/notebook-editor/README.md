@@ -161,26 +161,26 @@ uv --version
 
 > For more options (Docker, Cargo, WinGet, etc.), see the [official uv installation docs](https://docs.astral.sh/uv/getting-started/installation/).
 
-**uv 0.9.17 or newer is required.** This server's `pyproject.toml` sets a 7-day dependency cooldown (`[tool.uv] exclude-newer = "7 days"`). Older uv versions can't parse that relative duration: they print only a warning, ignore the setting, and may install packages published in the last 7 days. Upgrade with `uv self update`, `brew upgrade uv`, or `pip install -U uv`, depending on how you installed it.
+**uv 0.9.17 or newer is required.** This server's `pyproject.toml` sets a 7-day dependency cooldown (`[tool.uv] exclude-newer = "7 days"`). Older uv versions can't parse that relative duration. They print a warning and ignore the setting. A plain `uv sync` or `uv run`, including the `uv --directory … run` launch commands below, then discards the committed `uv.lock`, re-resolves to the newest compatible versions (even ones published in the last 7 days), and rewrites the file. Upgrade with `uv self update`, `brew upgrade uv`, or `pip install -U uv`, depending on how you installed it. Upgrading doesn't undo an earlier rewrite: restore the original `uv.lock` with `git checkout HEAD -- uv.lock` in this folder, or copy it again from the archive you downloaded.
 
-The server depends on `mcp`, `nbformat`, `jupyter_client`, and `ipykernel`. `uv` handles all of these automatically on first run.
+The server depends on `mcp`, `nbformat`, `jupyter-client`, and `ipykernel`. `uv` handles all of these automatically on first run.
 
 ## Installation
 
-> **Note:** Replace `/absolute/path/to` below with the actual path to this repository on your machine.
+> **Note:** Replace `/absolute/path/to/notebook-editor` below with the absolute path to the `notebook-editor` folder on your machine (the folder that contains its `pyproject.toml`).
 
 ### Method 1: CLI Configuration (Claude Code, Codex, Gemini)
 
-If your agent supports adding servers via CLI:
+If your agent supports adding servers via CLI, run the following:
 
 `--scope user` installs the server globally so it's available in every project on your machine. Drop it if you only want the server active in the current project.
 
 ```bash
 # Claude Code / Codex
-[claude|codex] mcp add notebook-editor --scope user -- uv --directory /absolute/path/to/mcp-servers/notebook-editor run notebook-editor-mcp
+[claude|codex] mcp add notebook-editor --scope user -- uv --directory /absolute/path/to/notebook-editor run notebook-editor-mcp
 
 # Gemini CLI
-gemini mcp add --transport stdio --scope user notebook-editor -- uv --directory /absolute/path/to/mcp-servers/notebook-editor run notebook-editor-mcp
+gemini mcp add --transport stdio --scope user notebook-editor -- uv --directory /absolute/path/to/notebook-editor run notebook-editor-mcp
 ```
 
 ### Method 2: JSON Configuration
@@ -201,7 +201,7 @@ For tools that use a `mcp_config.json` or `settings.json` file, add the followin
       "command": "/absolute/path/to/uv",
       "args": [
         "--directory",
-        "/absolute/path/to/mcp-servers/notebook-editor",
+        "/absolute/path/to/notebook-editor",
         "run",
         "notebook-editor-mcp"
       ]
@@ -224,7 +224,7 @@ The Antigravity IDE uses its own MCP config file and a `uvx`-based command — *
 
 > **Important:** Use the **absolute path** to `uvx` for `"command"`, not a bare `"uvx"` — Antigravity doesn't inherit your shell `PATH`. Find it with `which uvx` (e.g. `/opt/homebrew/bin/uvx`).
 
-> **Note:** `uvx` ignores the `[tool.uv]` settings in this server's `pyproject.toml`, so the 7-day dependency cooldown is passed explicitly as `--exclude-newer "7 days"` in `args`. This requires uv 0.9.17 or newer: older versions reject the value (`invalid value '7 days' for '--exclude-newer'`) and the server fails to start.
+> **Note:** `uvx` ignores both this server's `uv.lock` and the `[tool.uv]` settings in its `pyproject.toml`. It re-resolves dependencies on each launch instead of using the locked versions, and the 7-day cooldown is passed explicitly as `--exclude-newer "7 days"` in `args`, so you get the newest compatible releases that are at least 7 days old. This requires uv 0.9.17 or newer: older versions reject the value (`invalid value '7 days' for '--exclude-newer <EXCLUDE_NEWER>'`) and the server fails to start.
 
 ```json
 {
@@ -235,7 +235,7 @@ The Antigravity IDE uses its own MCP config file and a `uvx`-based command — *
         "--exclude-newer",
         "7 days",
         "--from",
-        "/absolute/path/to/mcp-servers/notebook-editor",
+        "/absolute/path/to/notebook-editor",
         "notebook-editor-mcp"
       ]
     }
@@ -245,10 +245,10 @@ The Antigravity IDE uses its own MCP config file and a `uvx`-based command — *
 
 ### Using Standard Python (Fallback)
 
-If you prefer not to use `uv`, install manually and point to the `.venv` executable:
+If you prefer not to use `uv`, run the following from the `notebook-editor` folder (the one that contains its `pyproject.toml`), then point to the `.venv` executable it creates. `python3` must be Python 3.10 or newer.
 
 ```bash
-cd mcp-servers/notebook-editor && python3 -m venv .venv && source .venv/bin/activate && pip install .
+python3 -m venv .venv && source .venv/bin/activate && pip install .
 ```
 
 This path doesn't use uv, so the `[tool.uv]` 7-day dependency cooldown doesn't apply. With pip 26.1 or newer, add `--uploaded-prior-to P7D` to the `pip install` command to apply the same cooldown.
@@ -257,7 +257,7 @@ This path doesn't use uv, so the `[tool.uv]` 7-day dependency cooldown doesn't a
 {
   "mcpServers": {
     "notebook-editor": {
-      "command": "/absolute/path/to/mcp-servers/notebook-editor/.venv/bin/python",
+      "command": "/absolute/path/to/notebook-editor/.venv/bin/python",
       "args": ["-m", "notebook_editor.server"]
     }
   }
@@ -273,7 +273,7 @@ Coding agents are heavily biased toward their default tools. You **must** explic
 Claude Code supports `@filename` includes in `CLAUDE.md`. Copy the prompt file into your global config directory and add one include line:
 
 ```bash
-cp /absolute/path/to/mcp-servers/notebook-editor/NOTEBOOK-EDITOR.md ~/.claude/
+cp /absolute/path/to/notebook-editor/NOTEBOOK-EDITOR.md ~/.claude/
 echo '@NOTEBOOK-EDITOR.md' >> ~/.claude/CLAUDE.md
 ```
 
@@ -309,7 +309,8 @@ For interactive testing, use the [MCP Inspector](https://modelcontextprotocol.io
 
 ### Common issues
 
-- **"Cannot execute cell: Kernel failed to start"** — usually means `ipykernel` isn't installed in the server's environment. `uv sync` should handle this; if not, run `uv sync` in the `notebook-editor` directory.
+- **`No such kernel named <name>`** — the kernel named in the notebook's `metadata.kernelspec.name` isn't installed on this machine. `ipykernel` ships with the server, so `python3` notebooks normally work out of the box; for other languages, install the matching Jupyter kernel (for example IRkernel for R).
+- **"Kernel failed to start"** — the kernel process started but died or didn't become ready within 30 seconds. Check that the kernel's own runtime works (for example, that R starts and loads IRkernel), then retry.
 - **"File is not a .ipynb notebook"** — every tool validates the extension. Rename your file to `.ipynb` or use a conversion tool like [`jupytext`](https://jupytext.readthedocs.io/) to convert `.py` ↔ `.ipynb`.
 - **Kernel state carries across calls** — this is intentional. If you need a clean namespace, call `restart_kernel` or `shutdown_kernel`.
 - **`execute_cell` timeouts on long-running code** — pass a larger `timeout` (in seconds) or interrupt with `interrupt_kernel`.

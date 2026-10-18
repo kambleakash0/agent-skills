@@ -218,14 +218,6 @@ Dotted targets descend into closures: Go `stdioCmd.RunE` (func_literal in struct
 - **Don't use `add_import` to add a name to an existing `from X import …` or named import** — use `add_import_name`.
 - **Don't guess at target names.** Call `list_symbols` first. Names are case-sensitive and must match exactly.
 
-## Logging & Debugging
-
-The server logs all tool invocations and errors to **stderr** (safe for stdio transport — does not interfere with JSON-RPC). Logs include timestamps and severity levels.
-
-To inspect logs when running under Claude Desktop, check `~/Library/Logs/Claude/mcp*.log` (macOS) or `%APPDATA%\Claude\logs\mcp*.log` (Windows).
-
-For interactive testing, use the [MCP Inspector](https://modelcontextprotocol.io/docs/tools/inspector).
-
 ## Prerequisites
 
 This MCP server uses [`uv`](https://docs.astral.sh/uv/) to manage its Python environment and dependencies automatically. Install `uv` if you don't have it already:
@@ -262,17 +254,17 @@ uv --version
 
 > For more options (Docker, Cargo, WinGet, etc.), see the [official uv installation docs](https://docs.astral.sh/uv/getting-started/installation/).
 
-**uv 0.9.17 or newer is required.** This server's `pyproject.toml` sets a 7-day dependency cooldown (`[tool.uv] exclude-newer = "7 days"`). Older uv versions can't parse that relative duration: they print only a warning, ignore the setting, and may install packages published in the last 7 days. Upgrade with `uv self update`, `brew upgrade uv`, or `pip install -U uv`, depending on how you installed it.
+**uv 0.9.17 or newer is required.** This server's `pyproject.toml` sets a 7-day dependency cooldown (`[tool.uv] exclude-newer = "7 days"`). Older uv versions can't parse that relative duration. They print a warning and ignore the setting. A plain `uv sync` or `uv run`, including the `uv --directory … run` launch commands below, then discards the committed `uv.lock`, re-resolves to the newest compatible versions (even ones published in the last 7 days), and rewrites the file. Upgrade with `uv self update`, `brew upgrade uv`, or `pip install -U uv`, depending on how you installed it. Upgrading doesn't undo an earlier rewrite: restore the original `uv.lock` with `git checkout HEAD -- uv.lock` in this folder, or copy it again from the archive you downloaded.
+
+The server depends on `mcp`, `tree-sitter`, and a tree-sitter grammar package for each supported language. `uv` handles all of these automatically on first run.
 
 ## Installation
 
-> **Note:** Replace `/absolute/path/to` below with the actual path to this repository on your machine.
+> **Note:** Replace `/absolute/path/to/ast-editor` below with the absolute path to the `ast-editor` folder on your machine (the folder that contains its `pyproject.toml`).
 
 ### Method 1: CLI Configuration (Claude Code, Codex, Gemini)
 
 If your agent supports adding servers via CLI, run the following:
-
-**Claude Code / Codex CLI / Gemini CLI:**
 
 `--scope user` installs the server globally so it's available in every project on your machine. Drop it if you only want the server active in the current project.
 
@@ -286,7 +278,7 @@ gemini mcp add --transport stdio --scope user ast-editor -- uv --directory /abso
 
 ### Method 2: JSON Configuration
 
-For tools that use a `mcp_config.json` or `settings.json` file, add the following block to the appropriate file path.
+For tools that use a `mcp_config.json` or `settings.json` file, add the following block.
 
 > **Important:** Use the **absolute path** to `uv` for `"command"`, not just `"uv"`. GUI-based MCP clients (Claude Desktop, Cursor) don't always inherit your shell `PATH`, so a bare `"uv"` will fail with a "command not found" error. Get your absolute path with:
 >
@@ -325,7 +317,7 @@ The Antigravity IDE uses its own MCP config file and a `uvx`-based command — *
 
 > **Important:** Use the **absolute path** to `uvx` for `"command"`, not a bare `"uvx"` — Antigravity doesn't inherit your shell `PATH`. Find it with `which uvx` (e.g. `/opt/homebrew/bin/uvx`).
 
-> **Note:** `uvx` ignores the `[tool.uv]` settings in this server's `pyproject.toml`, so the 7-day dependency cooldown is passed explicitly as `--exclude-newer "7 days"` in `args`. This requires uv 0.9.17 or newer: older versions reject the value (`invalid value '7 days' for '--exclude-newer'`) and the server fails to start.
+> **Note:** `uvx` ignores both this server's `uv.lock` and the `[tool.uv]` settings in its `pyproject.toml`. It re-resolves dependencies on each launch instead of using the locked versions, and the 7-day cooldown is passed explicitly as `--exclude-newer "7 days"` in `args`, so you get the newest compatible releases that are at least 7 days old. This requires uv 0.9.17 or newer: older versions reject the value (`invalid value '7 days' for '--exclude-newer <EXCLUDE_NEWER>'`) and the server fails to start.
 
 ```json
 {
@@ -346,7 +338,7 @@ The Antigravity IDE uses its own MCP config file and a `uvx`-based command — *
 
 ### Using Standard Python (Fallback)
 
-If you prefer not to use `uv`, install manually and point to the `.venv` executable in ast-editor directory:
+If you prefer not to use `uv`, run the following from the `ast-editor` folder (the one that contains its `pyproject.toml`), then point to the `.venv` executable it creates. `python3` must be Python 3.10 or newer.
 
 ```bash
 python3 -m venv .venv && source .venv/bin/activate && pip install .
@@ -367,7 +359,7 @@ This path doesn't use uv, so the `[tool.uv]` 7-day dependency cooldown doesn't a
 
 ## Agent Configuration (Important)
 
-Coding agents are heavily biased toward their default tools. You **must** explicitly instruct them to use AST tools. The agent prompt lives in [`AST-EDITOR.md`](./AST-EDITOR.md) — a standalone file you wire into your agent's system instructions.
+Coding agents are heavily biased toward their default tools. You **must** explicitly instruct them to use `ast-editor` when editing code and config files. The agent prompt lives in [`AST-EDITOR.md`](./AST-EDITOR.md) — a standalone file you wire into your agent's system instructions.
 
 ### Claude Code / Claude Desktop (via `@`-include)
 
@@ -392,3 +384,14 @@ Copy the **contents** of [`AST-EDITOR.md`](./AST-EDITOR.md) into your agent's in
 | **Windsurf** | `.windsurfrules` or `AGENTS.md` |
 | **Antigravity** | `_agents/rules/` |
 | **Aider / Gemini CLI / generic** | Rules file or system prompt |
+
+## Logging & Debugging
+
+The server logs all tool invocations and errors to **stderr** (safe for stdio transport — does not interfere with JSON-RPC). Logs include timestamps and severity levels.
+
+To inspect logs when running under Claude Desktop, check:
+
+- **macOS:** `~/Library/Logs/Claude/mcp*.log`
+- **Windows:** `%APPDATA%\Claude\logs\mcp*.log`
+
+For interactive testing, use the [MCP Inspector](https://modelcontextprotocol.io/docs/tools/inspector), which provides a UI for exercising each tool with custom parameters and inspecting responses.

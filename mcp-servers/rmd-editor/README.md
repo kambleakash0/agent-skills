@@ -155,13 +155,21 @@ powershell -ExecutionPolicy ByPass -c "irm https://astral.sh/uv/install.ps1 | ie
 brew install uv
 ```
 
-Verify:
+**pip (any platform):**
+
+```bash
+pip install uv
+```
+
+Verify the installation:
 
 ```bash
 uv --version
 ```
 
-**uv 0.9.17 or newer is required.** This server's `pyproject.toml` sets a 7-day dependency cooldown (`[tool.uv] exclude-newer = "7 days"`). Older uv versions can't parse that relative duration: they print only a warning, ignore the setting, and may install packages published in the last 7 days. Upgrade with `uv self update`, `brew upgrade uv`, or `pip install -U uv`, depending on how you installed it.
+> For more options (Docker, Cargo, WinGet, etc.), see the [official uv installation docs](https://docs.astral.sh/uv/getting-started/installation/).
+
+**uv 0.9.17 or newer is required.** This server's `pyproject.toml` sets a 7-day dependency cooldown (`[tool.uv] exclude-newer = "7 days"`). Older uv versions can't parse that relative duration. They print a warning and ignore the setting. A plain `uv sync` or `uv run`, including the `uv --directory … run` launch commands below, then discards the committed `uv.lock`, re-resolves to the newest compatible versions (even ones published in the last 7 days), and rewrites the file. Upgrade with `uv self update`, `brew upgrade uv`, or `pip install -U uv`, depending on how you installed it. Upgrading doesn't undo an earlier rewrite: restore the original `uv.lock` with `git checkout HEAD -- uv.lock` in this folder, or copy it again from the archive you downloaded.
 
 For kernel execution, install the matching Jupyter kernel:
 
@@ -169,22 +177,24 @@ For kernel execution, install the matching Jupyter kernel:
 - **Python:** `pip install ipykernel` (typically installed already if `jupyter` is on the system).
 - **Julia:** in Julia, `using Pkg; Pkg.add("IJulia")`.
 
-The server itself depends on `mcp`, `pyyaml`, and `jupyter-client`. `uv` handles these automatically on first run.
+The server itself depends on `mcp`, `pyyaml`, and `jupyter-client`. `uv` handles all of these automatically on first run.
 
 ## Installation
 
-> **Note:** Replace `/absolute/path/to` below with the actual path to this repository on your machine.
+> **Note:** Replace `/absolute/path/to/rmd-editor` below with the absolute path to the `rmd-editor` folder on your machine (the folder that contains its `pyproject.toml`).
 
 ### Method 1: CLI Configuration (Claude Code, Codex, Gemini)
+
+If your agent supports adding servers via CLI, run the following:
 
 `--scope user` installs the server globally so it's available in every project on your machine. Drop it if you only want the server active in the current project.
 
 ```bash
 # Claude Code / Codex
-[claude|codex] mcp add rmd-editor --scope user -- uv --directory /absolute/path/to/mcp-servers/rmd-editor run rmd-editor-mcp
+[claude|codex] mcp add rmd-editor --scope user -- uv --directory /absolute/path/to/rmd-editor run rmd-editor-mcp
 
 # Gemini CLI
-gemini mcp add --transport stdio --scope user rmd-editor -- uv --directory /absolute/path/to/mcp-servers/rmd-editor run rmd-editor-mcp
+gemini mcp add --transport stdio --scope user rmd-editor -- uv --directory /absolute/path/to/rmd-editor run rmd-editor-mcp
 ```
 
 ### Method 2: JSON Configuration
@@ -205,7 +215,7 @@ For tools that use a `mcp_config.json` or `settings.json` file, add the followin
       "command": "/absolute/path/to/uv",
       "args": [
         "--directory",
-        "/absolute/path/to/mcp-servers/rmd-editor",
+        "/absolute/path/to/rmd-editor",
         "run",
         "rmd-editor-mcp"
       ]
@@ -228,7 +238,7 @@ The Antigravity IDE uses its own MCP config file and a `uvx`-based command — *
 
 > **Important:** Use the **absolute path** to `uvx` for `"command"`, not a bare `"uvx"` — Antigravity doesn't inherit your shell `PATH`. Find it with `which uvx` (e.g. `/opt/homebrew/bin/uvx`).
 
-> **Note:** `uvx` ignores the `[tool.uv]` settings in this server's `pyproject.toml`, so the 7-day dependency cooldown is passed explicitly as `--exclude-newer "7 days"` in `args`. This requires uv 0.9.17 or newer: older versions reject the value (`invalid value '7 days' for '--exclude-newer'`) and the server fails to start.
+> **Note:** `uvx` ignores both this server's `uv.lock` and the `[tool.uv]` settings in its `pyproject.toml`. It re-resolves dependencies on each launch instead of using the locked versions, and the 7-day cooldown is passed explicitly as `--exclude-newer "7 days"` in `args`, so you get the newest compatible releases that are at least 7 days old. This requires uv 0.9.17 or newer: older versions reject the value (`invalid value '7 days' for '--exclude-newer <EXCLUDE_NEWER>'`) and the server fails to start.
 
 ```json
 {
@@ -239,7 +249,7 @@ The Antigravity IDE uses its own MCP config file and a `uvx`-based command — *
         "--exclude-newer",
         "7 days",
         "--from",
-        "/absolute/path/to/mcp-servers/rmd-editor",
+        "/absolute/path/to/rmd-editor",
         "rmd-editor-mcp"
       ]
     }
@@ -249,10 +259,10 @@ The Antigravity IDE uses its own MCP config file and a `uvx`-based command — *
 
 ### Using Standard Python (Fallback)
 
-If you prefer not to use `uv`, install manually and point to the `.venv` executable:
+If you prefer not to use `uv`, run the following from the `rmd-editor` folder (the one that contains its `pyproject.toml`), then point to the `.venv` executable it creates. `python3` must be Python 3.10 or newer.
 
 ```bash
-cd mcp-servers/rmd-editor && python3 -m venv .venv && source .venv/bin/activate && pip install .
+python3 -m venv .venv && source .venv/bin/activate && pip install .
 ```
 
 This path doesn't use uv, so the `[tool.uv]` 7-day dependency cooldown doesn't apply. With pip 26.1 or newer, add `--uploaded-prior-to P7D` to the `pip install` command to apply the same cooldown.
@@ -261,7 +271,7 @@ This path doesn't use uv, so the `[tool.uv]` 7-day dependency cooldown doesn't a
 {
   "mcpServers": {
     "rmd-editor": {
-      "command": "/absolute/path/to/mcp-servers/rmd-editor/.venv/bin/python",
+      "command": "/absolute/path/to/rmd-editor/.venv/bin/python",
       "args": ["-m", "rmd_editor.server"]
     }
   }
@@ -277,7 +287,7 @@ Coding agents are heavily biased toward their default tools. You **must** explic
 Claude Code supports `@filename` includes in `CLAUDE.md`. Copy the prompt file into your global config directory and add one include line:
 
 ```bash
-cp /absolute/path/to/mcp-servers/rmd-editor/RMD-EDITOR.md ~/.claude/
+cp /absolute/path/to/rmd-editor/RMD-EDITOR.md ~/.claude/
 echo '@RMD-EDITOR.md' >> ~/.claude/CLAUDE.md
 ```
 
@@ -305,11 +315,12 @@ To inspect logs when running under Claude Desktop, check:
 - **macOS:** `~/Library/Logs/Claude/mcp*.log`
 - **Windows:** `%APPDATA%\Claude\logs\mcp*.log`
 
-For interactive testing, use the [MCP Inspector](https://modelcontextprotocol.io/docs/tools/inspector).
+For interactive testing, use the [MCP Inspector](https://modelcontextprotocol.io/docs/tools/inspector), which provides a UI for exercising each tool with custom parameters and inspecting responses.
 
 ### Common issues
 
-- **"Kernel failed to start"** — usually means the matching Jupyter kernel isn't installed (IRkernel for R chunks). Install per the Prerequisites section.
+- **`No such kernel named <name>`** — the Jupyter kernel for the chunk's language isn't installed (`ir` for R chunks, `python3` for Python chunks). Install it per the Prerequisites section.
+- **"Kernel failed to start"** — the kernel process started but died or didn't become ready within 30 seconds. Check that the kernel's own runtime works (for example, that R starts and loads IRkernel), then retry.
 - **"File is not a .rmd document"** — every tool validates the extension. Rename your file to `.rmd` or use [`jupytext`](https://jupytext.readthedocs.io/) to convert `.Rmd` ↔ `.ipynb`.
 - **Outputs aren't appearing in the file** — by design. Outputs are returned inline to the caller. To persist, render with `rmarkdown::render("file.rmd")`.
 - **Adjacent markdown cells merged after a save** — by design. `.rmd` has no cell-boundary markers for prose; the model collapses consecutive markdown cells on re-parse.
