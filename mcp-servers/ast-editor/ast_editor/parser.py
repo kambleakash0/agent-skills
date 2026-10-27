@@ -1,4 +1,6 @@
+import json
 import os
+import re
 import tree_sitter_python
 import tree_sitter_javascript
 import tree_sitter_typescript
@@ -17,6 +19,14 @@ CPP_EXTS = (".cpp", ".cc", ".cxx", ".hpp", ".hxx", ".hh")
 
 RUBY_EXTS = (".rb",)
 GO_EXTS = (".go",)
+JS_EXTS = (".js", ".jsx", ".mjs", ".cjs", ".ts", ".tsx")
+
+# The anonymous value of `export default function () {}` / `export default
+# class {}`, named `default`, counts as this kind of declaration.
+DEFAULT_EXPORT_KINDS = {
+    "function_expression": "function_declaration",
+    "class": "class_declaration",
+}
 
 
 def detect_newline(data: bytes) -> str:
@@ -38,6 +48,25 @@ def first_syntax_error(root: Node) -> Node | None:
         if node.has_error:
             stack.extend(reversed(node.children))
     return None
+
+
+# A JSON string, or the `+` of a number's exponent (6.02E+23).
+_JSON_STRING_OR_EXPONENT_PLUS = re.compile(rb'"(?:[^"\\\n]|\\.)*"|(?<=[0-9][eE])\+(?=[0-9])')
+
+
+def mask_json_exponents(data: bytes) -> bytes:
+    """Return JSON source with each `+` that signs a number's exponent
+    turned into `0`. tree-sitter-json has no `+` in its number rule, so it
+    parses 6.02E+23 as the number 6.02 followed by an ERROR node, and an
+    edit to that value would change only the 6.02. 6.02E023 is the same
+    length, so a tree built from the masked copy has every node where it is
+    in the real source (node text is always read from the real bytes), and
+    its number nodes cover the whole token. Strings are left alone."""
+
+    def keep_strings(match: re.Match) -> bytes:
+        return b"0" if match.group(0) == b"+" else match.group(0)
+
+    return _JSON_STRING_OR_EXPONENT_PLUS.sub(keep_strings, data)
 
 
 class TreeSitterParser:
@@ -100,7 +129,15 @@ class TreeSitterParser:
         self.newline = detect_newline(raw)
         self.source_bytes = raw.replace(b"\r\n", b"\n")
         self.source_code = self.source_bytes.decode("utf-8")
-        self.tree = self.parser.parse(self.source_bytes)
+        self.tree = self.parse(self.source_bytes)
+
+    def parse(self, data: bytes):
+        """Parse LF source with this file's grammar: the file itself, or an
+        edited version of it for the save-time syntax check. JSON is parsed
+        from a copy with its exponent signs masked (mask_json_exponents)."""
+        if self.ext == ".json":
+            data = mask_json_exponents(data)
+        return self.parser.parse(data)
 
     def find_node_by_name(self, target_name: str) -> Node | None:
         """
@@ -111,6 +148,12 @@ class TreeSitterParser:
             stored in composite-literal fields (`cmd.RunE`).
           - JS/TS: Var.Field for arrow_function / function_expression values
             of object-literal properties (`app.handler`).
+        JS/TS exported declarations are found by their own names (the
+        declaration inside the export statement is returned); an anonymous
+        `export default function/class` is named `default`.
+        In JSON, YAML and TOML files the target is a key path followed from
+        the top level, and the key's value node is returned (see
+        _search_json_dotted, find_yaml_pair and _search_toml_dotted).
         """
         parts = target_name.split(".")
 
@@ -225,6 +268,10 @@ class TreeSitterParser:
         queue = list(node.named_children)
         while queue:
             curr = queue.pop(0)
+            if name == "default" and curr.type == "export_statement":
+                value = self.anonymous_default_export(curr)
+                if value is not None and DEFAULT_EXPORT_KINDS[value.type] in valid_types:
+                    return value
             if curr.type in valid_types:
                 # For decorated definitions, preserve the wrapper node so that
                 # replace_function/delete_symbol operate on the full block (decorators
@@ -278,52 +325,146 @@ class TreeSitterParser:
             queue.extend(curr.named_children)
         return None
 
+    def anonymous_default_export(self, node: Node) -> Node | None:
+        """For a JS/TS `export default function () {}` or `export default
+        class {}` statement, the anonymous function_expression or class it
+        exports, which list_symbols lists and the tools target as `default`
+        (a reserved word, so no declaration can have that name). None for any
+        other node, including named default exports, which keep their names."""
+        if node.type != "export_statement" or self.ext not in JS_EXTS:
+            return None
+        if not any(child.type == "default" for child in node.children):
+            return None
+        value = node.child_by_field_name("value")
+        if value is None or value.type not in DEFAULT_EXPORT_KINDS:
+            return None
+        if value.child_by_field_name("name") is not None:
+            return None
+        return value
+
     def _search_json_dotted(self, root: Node, target_name: str) -> Node | None:
-        parts = target_name.split(".")
-        current_node = root
-        for part in parts:
-            found = False
-            queue = [current_node]
-            while queue and not found:
-                curr = queue.pop(0)
-                if curr.type == "pair":
-                    key_node = curr.child_by_field_name("key")
-                    if key_node and key_node.type == "string":
-                        name = ""
-                        for child in key_node.children:
-                            if child.type == "string_content":
-                                name = self.node_text(child)
-                        if name == part:
-                            current_node = curr.child_by_field_name("value")
-                            found = True
-                            break
-                queue.extend(curr.named_children)
-            if not found:
+        """
+        The value at a dotted key path in a JSON document, or None. The path
+        is followed from the top-level object one key per segment: 'a.b' is
+        key b of the object under the top-level key a, never an a.b nested
+        deeper. Keys compare by their decoded text (json_key_name).
+        """
+        node = next((c for c in root.named_children if c.type != "comment"), None)
+        for part in target_name.split("."):
+            if node is None or node.type != "object":
                 return None
-        return current_node
+            node = next(
+                (
+                    pair.child_by_field_name("value")
+                    for pair in node.named_children
+                    if pair.type == "pair" and self.json_key_name(pair) == part
+                ),
+                None,
+            )
+        return node
+
+    def json_key_name(self, pair: Node) -> str | None:
+        """The decoded key of a JSON pair, escapes resolved; None if it has
+        no key."""
+        key_node = pair.child_by_field_name("key")
+        if key_node is None:
+            return None
+        try:
+            name = json.loads(self.node_text(key_node))
+        except ValueError:
+            name = None
+        if isinstance(name, str):
+            return name
+        return "".join(
+            self.node_text(c) for c in key_node.children if c.type == "string_content"
+        )
 
     def _search_yaml_dotted(self, root: Node, target_name: str) -> Node | None:
+        """The value node of the pair find_yaml_pair finds, or None (also
+        for a key written with no value, `key:`)."""
+        pair = self.find_yaml_pair(root, target_name)
+        return pair.child_by_field_name("value") if pair is not None else None
+
+    def find_yaml_pair(self, root: Node, target_name: str) -> Node | None:
+        """
+        The block_mapping_pair at a dotted key path in a YAML stream, or
+        None. The path is followed from a document's top-level mapping one
+        key per segment: 'a.b' is key b of the mapping under the top-level
+        key a, never an a.b nested deeper. The documents of a multi-document
+        stream are tried in order. A key written in quotes matches the name
+        it spells, escapes resolved ('it''s' is it's, "caf\\u00e9" café), as
+        add_key compares keys. Keys inside flow mappings ({a: 1}) are not
+        addressable.
+        """
         parts = target_name.split(".")
-        current_node = root
-        for part in parts:
-            found = False
-            queue = [current_node]
-            while queue and not found:
-                curr = queue.pop(0)
-                if curr.type == "block_mapping_pair":
-                    key_node = curr.child_by_field_name("key")
-                    if key_node:
-                        name = self.node_text(key_node).strip()
-                        if name == part or name == f'"{part}"' or name == f"'{part}'":
-                            current_node = curr.child_by_field_name("value")
-                            found = True
-                            break
-                queue.extend(curr.named_children)
-            if not found:
-                return None
-        return current_node
+        for doc in root.named_children:
+            if doc.type != "document":
+                continue
+            pair, node = None, self.yaml_mapping(doc)
+            for part in parts:
+                pairs = node.named_children if node is not None and node.type == "block_mapping" else []
+                pair = next(
+                    (p for p in pairs if p.type == "block_mapping_pair" and self._yaml_key_is(p, part)),
+                    None,
+                )
+                if pair is None:
+                    break
+                node = self.yaml_mapping(pair.child_by_field_name("value"))
+            if pair is not None:
+                return pair
+        return None
+
+    def _yaml_key_is(self, pair: Node, name: str) -> bool:
+        """Whether a YAML pair's key is `name`: the name its source spells
+        (yaml_key_name: quotes removed, escapes resolved), or its source
+        text as written."""
+        key_node = pair.child_by_field_name("key")
+        if key_node is None:
+            return False
+        key = self.node_text(key_node).strip()
+        return key == name or self.yaml_key_name(key) == name
+
+    @staticmethod
+    def yaml_key_name(text: str) -> str:
+        """The name a YAML key's source text spells: a quoted key without
+        its quotes, its escapes resolved ('' in single quotes, JSON-style
+        ones in double quotes)."""
+        text = text.strip()
+        if len(text) >= 2 and text[0] == text[-1] == "'":
+            return text[1:-1].replace("''", "'")
+        if len(text) >= 2 and text[0] == text[-1] == '"':
+            try:
+                name = json.loads(text)
+            except ValueError:
+                name = None
+            return name if isinstance(name, str) else text[1:-1]
+        return text
+
+    def yaml_mapping(self, node: Node | None) -> Node | None:
+        """The block_mapping or flow_mapping that a YAML document or value
+        node holds (past directives, an anchor or a tag), or None if it holds
+        something else or nothing."""
+        if node is not None and node.type == "document":
+            node = next(
+                (c for c in node.named_children if c.type in ("block_node", "flow_node")), None
+            )
+        while node is not None and node.type in ("block_node", "flow_node"):
+            node = next(
+                (c for c in node.named_children if c.type not in ("anchor", "tag", "comment")),
+                None,
+            )
+        if node is not None and node.type in ("block_mapping", "flow_mapping"):
+            return node
+        return None
 
     def _search_toml_dotted(self, root: Node, target_name: str) -> Node | None:
+        """
+        The value at a dotted key path in a TOML document, or None: 'key' is
+        a top-level key and 'a.b.key' is `key` in the [a.b] table, written
+        as it is in the file (a quoted key with its quotes). Like the JSON
+        and YAML lookups, a path never resolves to a key somewhere deeper:
+        a top-level target does not match a key inside a table.
+        """
         parts = target_name.split(".")
         queue = [root]
         # In TOML, we look for table blocks like [part1.part2] or pairs part1 = ...
@@ -345,14 +486,11 @@ class TreeSitterParser:
                                     return child.children[2]  # child 1 is '='
                 queue.extend(curr.named_children)
         else:
-            # Root level pair
-            while queue:
-                curr = queue.pop(0)
-                if curr.type == "pair":
-                    k_node = curr.children[0]
-                    if self.node_text(k_node) == parts[0]:
-                        return curr.children[2]
-                queue.extend(curr.named_children)
+            # A top-level pair (one before the first [table] header); the
+            # keys of tables are not searched.
+            for curr in root.named_children:
+                if curr.type == "pair" and self.node_text(curr.children[0]) == parts[0]:
+                    return curr.children[2]
         return None
 
     def node_text(self, node) -> str:

@@ -11,7 +11,7 @@ import os
 from collections import OrderedDict
 from typing import Optional
 
-from rmd_editor.parser import Cell, Frontmatter, FrontmatterError, dump_yaml, parse, serialize, yaml_string
+from rmd_editor.parser import Cell, Frontmatter, FrontmatterError, dump_yaml, parse, serialize, yaml_string, _with_newline
 
 
 class RmdManagerError(Exception):
@@ -47,7 +47,8 @@ def create_rmd(
     if output_format:
         fm_lines.append(f"output: {yaml_string(output_format)}\n")
     fm_lines.append("---\n\n")
-    with open(file_path, "w", encoding="utf-8") as f:
+    # newline="": LF line breaks on every platform.
+    with open(file_path, "w", encoding="utf-8", newline="") as f:
         f.write("".join(fm_lines))
     return "Created"
 
@@ -71,13 +72,15 @@ class RmdManager:
     """
     Open, edit, and save a .rmd file. Mutations are written to disk on each
     successful operation. Parse state is rebuilt per-instance; create a new
-    RmdManager after any external edit.
+    RmdManager after any external edit. Cell sources use "\\n" line breaks
+    whatever the file uses; saving keeps the file's own (see parser).
     """
 
     def __init__(self, file_path: str):
         _validate_path(file_path, must_exist=True)
         self.filepath = file_path
-        with open(file_path, "r", encoding="utf-8") as f:
+        # newline="": line breaks arrive as written, so _save can keep the file's own.
+        with open(file_path, "r", encoding="utf-8", newline="") as f:
             text = f.read()
         self.frontmatter, self.cells = parse(text)
 
@@ -87,7 +90,8 @@ class RmdManager:
 
     def _save(self) -> str:
         text = serialize(self.frontmatter, self.cells)
-        with open(self.filepath, "w", encoding="utf-8") as f:
+        # Written as serialized: edited parts already use the document's line break.
+        with open(self.filepath, "w", encoding="utf-8", newline="") as f:
             f.write(text)
         return "Saved"
 
@@ -146,7 +150,7 @@ class RmdManager:
             insert_at = n
         else:
             insert_at = self._validate_index(index, allow_end=True)
-        new_cell = Cell(cell_type=cell_type, source=source)
+        new_cell = Cell(cell_type=cell_type, source=_with_newline(source, "\n"))
         new_cell.mark_dirty()
         self.cells.insert(insert_at, new_cell)
         return self._save()
@@ -220,13 +224,15 @@ class RmdManager:
     def replace_cell_source(self, index: int, new_source: str) -> str:
         idx = self._validate_index(index)
         cell = self.cells[idx]
-        cell.source = new_source
+        cell.source = _with_newline(new_source, "\n")
         cell.mark_dirty()
         return self._save()
 
     def prepend_to_cell(self, index: int, source: str) -> str:
         idx = self._validate_index(index)
         cell = self.cells[idx]
+        # As "\n" text, so the separator check sees "\r\n" and "\r" breaks too.
+        source = _with_newline(source, "\n")
         sep = "" if cell.source.startswith("\n") or not source or source.endswith("\n") else "\n"
         cell.source = source + sep + cell.source
         cell.mark_dirty()
@@ -235,6 +241,8 @@ class RmdManager:
     def append_to_cell(self, index: int, source: str) -> str:
         idx = self._validate_index(index)
         cell = self.cells[idx]
+        # As "\n" text, so the separator check sees "\r\n" and "\r" breaks too.
+        source = _with_newline(source, "\n")
         sep = "" if cell.source.endswith("\n") or not cell.source or source.startswith("\n") else "\n"
         cell.source = cell.source + sep + source
         cell.mark_dirty()
@@ -310,9 +318,10 @@ class RmdManager:
             raise RmdManagerError(str(e)) from e
         if not had_header:
             # A new header gets a blank line before the body, as create_rmd writes it.
-            body = serialize(Frontmatter(), self.cells)
-            if body and not body.startswith("\n"):
-                self.frontmatter.raw += "\n"
+            newline = self.frontmatter.newline
+            body = serialize(Frontmatter(newline=newline), self.cells)
+            if body and not body.startswith(("\n", "\r")):
+                self.frontmatter.raw += newline
         return self._save()
 
     def remove_frontmatter_key(self, key: str) -> str:

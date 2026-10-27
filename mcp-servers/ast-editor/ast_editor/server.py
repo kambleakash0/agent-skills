@@ -21,8 +21,10 @@ _INSTRUCTIONS = (
     "LRUCache.get and the server locates it, so prefer these tools over generic "
     "text edits for those files. Every file_path must be an absolute path.\n\n"
     "For source files, start with list_symbols to get exact, case-sensitive "
-    "target names (dotted for nesting, e.g. Class.method); for config files, "
-    "address keys by dotted path (e.g. project.version) in read_symbol, "
+    "target names (dotted for nesting, e.g. Class.method; JS/TS exports go by "
+    "their own names, and an anonymous export default is named default); for "
+    "config files, address keys by their full dotted path from the top level "
+    "(e.g. project.version) in read_symbol, "
     "replace_value and add_key. add_key, replace_value and delete_key also "
     "edit Python dict and JS/TS object literals named by a module-level "
     "variable (e.g. CONFIG.server). Read only what you need with read_symbol "
@@ -34,10 +36,16 @@ _INSTRUCTIONS = (
     "replace_function_body; snippets and anchors must match byte for byte and "
     "occur once in the target's body. Use add_parameter/remove_parameter rather "
     "than replace_signature for one parameter, add_key rather than replace_value "
-    "for a new key (add_key refuses a key that already exists), and "
+    "for a new key (add_key refuses a key that already exists and quotes a "
+    "config key only when it needs quotes; in TOML, dots in a key make it a "
+    "dotted key), and "
     "add_import_name rather than add_import to extend an existing named "
-    "import. delete_symbol also removes the symbol's leading doc comment "
-    "unless include_leading_comments=False.\n\n"
+    "import. A symbol's decorators and JS/TS export are part of it: "
+    "read_symbol shows them, replace_function content should include them, "
+    "leading comments sit above them, and delete_symbol removes them, along "
+    "with the leading doc comment unless include_leading_comments=False. "
+    "add_method and add_field indent the new member like the class's "
+    "existing ones.\n\n"
     "Every edit is parse-checked before it is saved: one that would introduce "
     "a syntax error into a file that parsed cleanly is refused with the "
     "error's line and column, and the file is left unchanged. If you are sure "
@@ -89,7 +97,8 @@ ClassTarget = Annotated[
     str,
     Field(
         description="Case-sensitive name of the class (or TS interface, C++ "
-        "struct, Go struct type) to add to."
+        "struct, Go struct type) to add to; an anonymous JS/TS "
+        "`export default class` is 'default'."
     ),
 ]
 BodySnippet = Annotated[
@@ -110,8 +119,9 @@ LiteralValue = Annotated[
 ArrayTarget = Annotated[
     str,
     Field(
-        description="Dotted path to the array in a JSON/YAML/TOML file (e.g. "
-        "'project.dependencies'), or the name of a Python module-level list."
+        description="Full dotted path from the top level to the array in a "
+        "JSON/YAML/TOML file (e.g. 'project.dependencies'), or the name of a "
+        "Python module-level list."
     ),
 ]
 ImportModule = Annotated[
@@ -143,13 +153,16 @@ def replace_function(
     content: Annotated[
         str,
         Field(
-            description="Complete replacement definition including decorators, "
-            "signature and body; re-indented to the original's level."
+            description="Complete replacement definition including decorators "
+            "(and a JS/TS `export`), signature and body, as read_symbol returns "
+            "it; re-indented to the original's level."
         ),
     ],
 ) -> str:
     """
     Replace an entire function definition with new content -- signature, body, and decorators.
+    The replaced span is what read_symbol returns: decorators (TS method
+    decorators too) and a JS/TS `export` included, so keep them in `content`.
 
     Use this when: You're rewriting a function top-to-bottom (e.g., renaming it,
     changing parameters AND implementation together).
@@ -419,13 +432,26 @@ def add_method(
     content: Annotated[
         str,
         Field(
-            description="Complete method source, re-indented and appended to the "
-            "class body (Go: a receiver func placed after the type declaration)."
+            description="Complete method source, added after the class's last "
+            "member and re-indented like its existing members, keeping its own "
+            "relative indentation (Go: a receiver func placed after the type "
+            "declaration)."
         ),
     ],
 ) -> str:
     """
     Add a new method at the end of a class body.
+
+    The method is indented like the class's existing members (else one indent
+    unit of the file, or the language default, deeper than the class),
+    keeping the content's relative indentation (in tabs when the members are
+    tab-indented), and follows the last member after one blank line, or none
+    if the class's methods have no blank lines between them or the last
+    member is a C++ access label. No blank line is added before the closing
+    brace; a braced body on one line (`class K {}`, `class K { a() {} }`) is
+    opened up over several lines. A Java enum gets the method after its
+    constants, with the `;` they need. A one-line Python or Ruby class is
+    refused.
 
     Use this when: You're adding a method to an existing class.
     Don't use this when: You're adding a field/attribute -> use `add_field`. You're
@@ -464,15 +490,16 @@ def delete_symbol(
         bool,
         Field(
             description="If true (default), also delete the contiguous comment "
-            "block directly above the symbol; false keeps it."
+            "block directly above the symbol and its decorators; false keeps it."
         ),
     ] = True,
 ) -> str:
     """
-    Delete an entire function or class definition, including its decorators.
+    Delete an entire function or class definition, including its decorators
+    (TS method decorators too) and a JS/TS `export`.
     By default, also removes the contiguous leading comment block above the
-    symbol (Godoc, Javadoc `/** ... */`, `#` or `//` comment runs) so the
-    doc doesn't become orphaned floating text. Pass
+    symbol and its decorators (Godoc, Javadoc `/** ... */`, `#` or `//`
+    comment runs) so the doc doesn't become orphaned floating text. Pass
     `include_leading_comments=False` to leave that comment in place.
 
     Use this when: You want to remove a function, method, or class entirely from a
@@ -508,8 +535,9 @@ def replace_value(
     target: Annotated[
         str,
         Field(
-            description="Existing key: dotted path in a JSON, YAML, or TOML file "
-            "(e.g. 'project.version'), 'DictName.keyExpr' for a Python "
+            description="Existing key: full dotted path from the top level in a "
+            "JSON, YAML, or TOML file (e.g. 'project.version'; a deeper "
+            "x.project.version never matches), 'DictName.keyExpr' for a Python "
             "module-level dict (e.g. 'CONFIG.\"timeout\"'), or 'VarName.key' for "
             "a JS/TS module-level object literal; Python and JS/TS paths may "
             "continue into nested literals."
@@ -636,20 +664,25 @@ def add_key(
     parent_target: Annotated[
         str,
         Field(
-            description="Parent container: dotted path to a JSON object or YAML "
-            "mapping, a TOML table name as in its [header], '' for a config "
-            "file's root; in source files the name of a Python module-level "
-            "dict or JS/TS module-level object literal, dotted further into "
-            "nested literals (e.g. 'CONFIG.\"db\"', 'CONFIG.server')."
+            description="Parent container: full dotted path from the top level "
+            "to a JSON object or YAML mapping (including `{}`, a flow mapping or "
+            "a YAML key with no value), a TOML table name as in its [header] or "
+            "the key of an inline table, '' for a config file's root; in source "
+            "files the name of a Python module-level dict or JS/TS module-level "
+            "object literal, dotted further into nested literals (e.g. "
+            "'CONFIG.\"db\"', 'CONFIG.server')."
         ),
     ],
     key: Annotated[
         str,
         Field(
             description="Key to add, refused if the container already has it: a "
-            "bare name for JSON (quoted for you), YAML and TOML; for JS/TS a "
-            "name, quoted for you only if it is not a valid identifier; for "
-            "Python a key expression, so quote string keys (e.g. '\"timeout\"')."
+            "bare name for JSON (quoted for you), YAML and TOML (quoted for you "
+            "only when it needs quotes; in TOML dots separate the parts of a "
+            "dotted key, so quote a name that contains one yourself, e.g. "
+            "'\"example.com\"'); for JS/TS a name, quoted for you only if it is "
+            "not a valid identifier; for Python a key expression, so quote "
+            "string keys (e.g. '\"timeout\"')."
         ),
     ],
     value: LiteralValue,
@@ -658,7 +691,11 @@ def add_key(
     Add a new key-value pair inside a dict-like container. Works for JSON objects,
     YAML mappings, TOML tables, Python dict literals, AND JS/TS object literals.
 
-    For JSON/YAML/TOML: parent_target is the dotted path to the parent (use "" for root).
+    For JSON/YAML/TOML: parent_target is the full dotted path from the top level
+    to the parent (use "" for root); for a TOML [table], its name as in the header.
+    YAML and TOML keys are quoted for you only when they need quotes (`my key`
+    stays plain in YAML; TOML dots separate the parts of a dotted key, so quote a
+    name containing one yourself: '"example.com"').
     For Python (.py): parent_target is the module-level variable name (e.g. 'CONFIG'),
     optionally followed by keys into nested dicts (e.g. 'CONFIG."db"').
     For JS/TS: parent_target names a module-level `const`/`let`/`var` (exported
@@ -669,8 +706,11 @@ def add_key(
 
     The new entry follows the container's layout: one key per line stays one
     per line, an inline object stays inline, and a trailing comma is kept. An
-    empty JS/TS `{}` becomes `{ key: value }`. A key the container already has
-    is refused.
+    empty JS/TS or YAML `{}` becomes `{ key: value }` (an empty TOML inline
+    table `{ key = value }`), and non-empty YAML flow mappings and TOML inline
+    tables (`{a: 1}`, `t = { a = 1 }`) get the entry inline too. A YAML key
+    with no value (`parent:`) gets a nested block mapping. A key the
+    container already has is refused.
 
     Use this when: The key does not exist yet and you want to add it.
     Don't use this when: The key already exists -> use `replace_value`. You're
@@ -712,11 +752,12 @@ def delete_key(
     target: Annotated[
         str,
         Field(
-            description="Key to delete: dotted path for JSON/YAML/TOML (e.g. "
-            "'dependencies.tree-sitter'), 'DictName.keyExpr' for a Python "
-            "module-level dict (e.g. 'CONFIG.\"timeout\"'), or 'VarName.key' for "
-            "a JS/TS module-level object literal; Python and JS/TS paths may "
-            "continue into nested literals (e.g. 'CONFIG.server.port')."
+            description="Key to delete: full dotted path from the top level for "
+            "JSON/YAML/TOML (e.g. 'dependencies.tree-sitter'), 'DictName.keyExpr' "
+            "for a Python module-level dict (e.g. 'CONFIG.\"timeout\"'), or "
+            "'VarName.key' for a JS/TS module-level object literal; Python and "
+            "JS/TS paths may continue into nested literals (e.g. "
+            "'CONFIG.server.port')."
         ),
     ],
 ) -> str:
@@ -862,14 +903,19 @@ def add_field(
         str,
         Field(
             description="Literal field or member declaration (e.g. 'version = "
-            "\"1.0\"' or Go 'version int'), re-indented and inserted at the top "
-            "of the class body with no auto-wrapping."
+            "\"1.0\"' or Go 'version int'), re-indented like the class's "
+            "existing members and inserted before the first of them (after a "
+            "Python class docstring or a Java enum's constants), with no "
+            "auto-wrapping."
         ),
     ],
 ) -> str:
     """
     Add a field/attribute/member at the top of a class body (fields-before-methods
-    convention).
+    convention): before the first member, after a Python class docstring or
+    a Java enum's constants (adding the `;` they need). Indented like
+    add_method, with a blank line after it when the member below is a
+    method; comments after the `{` on its line stay there.
 
     Use this when: You're adding a class attribute (Python), class field (JS/TS),
     or member variable (C++).
@@ -958,7 +1004,10 @@ def list_symbols(file_path: FilePath) -> str:
     """
     Return a formatted outline of all top-level functions, classes, and methods in
     a source file (Python, JS, TS, C, C++, Ruby, Go, Java), with line numbers.
-    Read-only.
+    Read-only. JS/TS exported declarations are listed under their own names,
+    an anonymous `export default function/class` as `default`, and every
+    listed name is a valid target for the other tools. A symbol's line is
+    that of its first decorator or `export`.
 
     Use this when: You're about to edit an unfamiliar file and want to see its
     structure and exact symbol names. ALWAYS a good first call before editing --
@@ -1326,8 +1375,8 @@ def read_symbol(
         str,
         Field(
             description="Case-sensitive symbol name, dotted for nesting (e.g. "
-            "'LRUCache.get'), or a dotted key path in a config file (e.g. "
-            "'project.version')."
+            "'LRUCache.get'), or a config key's full dotted path from the top "
+            "level (e.g. 'project.version')."
         ),
     ],
     depth: Annotated[
@@ -1345,8 +1394,9 @@ def read_symbol(
 
     `depth` controls how much is returned:
 
-      - "full" (default): Entire source of the symbol. Typical savings:
-        10-20x fewer tokens than reading the whole file.
+      - "full" (default): Entire source of the symbol, decorators and a
+        JS/TS `export` included. Typical savings: 10-20x fewer tokens than
+        reading the whole file.
       - "interface": For a class -> header + field declarations + method
         signatures with bodies replaced by ' ...'. For a function ->
         just the signature.
@@ -1441,7 +1491,9 @@ def edit_leading_comment(
 ) -> str:
     """
     Edit the contiguous leading-comment block above a named symbol. One tool
-    covering three operations on the same comment block.
+    covering three operations on the same comment block. The block sits above
+    the symbol's decorators or annotations (TS method decorators too) and a
+    JS/TS `export`, so a new comment goes above the first of them.
 
     Supported values for `op`:
       - "add":     Insert a new comment block above the symbol. Requires
@@ -1525,6 +1577,8 @@ def insert_sibling(
     """
     Insert content as a sibling of a named symbol (function, class, method,
     or top-level assignment). Pass `position="before"` or `position="after"`.
+    "before" goes above the symbol's decorators and a JS/TS `export` (below
+    its leading comment, if it has one).
 
     Use this when: You need precise placement relative to another top-level
     symbol -- e.g. a helper function immediately before its caller, a

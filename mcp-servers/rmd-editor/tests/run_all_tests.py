@@ -120,6 +120,24 @@ def read_doc(path: str) -> str:
     with open(path, encoding="utf-8") as f:
         return f.read()
 
+def write_raw(name: str, text: str) -> str:
+    """Write text to WORK_DIR/name with its line breaks exactly as given and return the path."""
+    path = os.path.join(WORK_DIR, name)
+    with open(path, "w", encoding="utf-8", newline="") as f:
+        f.write(text)
+    return path
+
+
+def read_raw(path: str) -> str:
+    """The file's text with its line breaks as written (read_doc reads "\\r\\n" as "\\n")."""
+    with open(path, encoding="utf-8", newline="") as f:
+        return f.read()
+
+
+def lone_newlines(text: str) -> int:
+    """How many "\\n" in text are not part of a "\\r\\n"."""
+    return text.replace("\r\n", "").count("\n")
+
 
 @contextlib.contextmanager
 def env_vars(**values):
@@ -310,6 +328,207 @@ def test_line_breaks():
     mgr.set_chunk_option(1, "echo", "FALSE")
     check_same("line breaks: editing the chunk leaves the prose alone", read_doc(path),
                text.replace("```{r}\n2", "```{r echo=FALSE}\n2"))
+
+def _cell_shape(cells):
+    return [(c.cell_type, c.source, c.language, c.label, dict(c.options)) for c in cells]
+
+
+def test_crlf_documents():
+    print("\n═══ CRLF documents ═══")
+    crlf = SAMPLE.replace("\n", "\r\n")
+    # Parsed like the LF document: header found, chunk fences and headers recognised, "\n" sources
+    fm, cells = parse(crlf)
+    lf_fm, lf_cells = parse(SAMPLE)
+    check("crlf parse: frontmatter found", (fm.present, fm.error, fm.data), (True, None, lf_fm.data))
+    check("crlf parse: line break detected", (fm.newline, lf_fm.newline), ("\r\n", "\n"))
+    check("crlf parse: same cells as the LF document", _cell_shape(cells), _cell_shape(lf_cells))
+    check_same("crlf parse: frontmatter text has \\n line breaks", fm.text(), lf_fm.text())
+    check("crlf parse: untouched document round-trips byte for byte", serialize(fm, cells) == crlf, True)
+
+    # Read tools see the same document as for the LF file
+    path = write_raw("crlf.rmd", crlf)
+    mgr = RmdManager(path)
+    lf_mgr = RmdManager(reset_fixture())
+    check_same("crlf: list_cells", mgr.list_cells(), lf_mgr.list_cells())
+    check_same("crlf: get_cell has \\n line breaks", mgr.get_cell(3), "x <- 1:10\nplot(x)")
+    check_same("crlf: get_frontmatter", mgr.get_frontmatter(), lf_mgr.get_frontmatter())
+    check_same("crlf: get_chunk_options", mgr.get_chunk_options(3), lf_mgr.get_chunk_options(3))
+    check_same("crlf: find_in_rmd", mgr.find_in_rmd("x"), lf_mgr.find_in_rmd("x"))
+    mgr._save()
+    check("crlf: untouched file saves back byte for byte", read_raw(path) == crlf, True)
+
+    def same_as_lf(label, lf_text, edit, name="crlf.rmd"):
+        """Apply edit to lf_text and to its CRLF copy: the CRLF result must be the LF one in CRLF."""
+        lf_path, crlf_path = write_raw("lf_" + name, lf_text), write_raw(name, lf_text.replace("\n", "\r\n"))
+        edit(RmdManager(lf_path))
+        edit(RmdManager(crlf_path))
+        out, lf_out = read_raw(crlf_path), read_raw(lf_path)
+        check_same(f"crlf {label}: same edit as on the LF file, with CRLF", out, lf_out.replace("\n", "\r\n"))
+        check(f"crlf {label}: no lone \\n written", lone_newlines(out), 0)
+        check(f"crlf {label}: reparses like the LF result",
+              (_cell_shape(RmdManager(crlf_path).cells), RmdManager(crlf_path).frontmatter.data),
+              (_cell_shape(RmdManager(lf_path).cells), RmdManager(lf_path).frontmatter.data))
+        return out
+
+    # Every tool that writes, with caller text in "\n"
+    edits = {
+        "add_cell code": lambda m: m.add_cell(2, "y <- 2\nz <- 3", "code"),
+        "add_cell markdown at the end": lambda m: m.add_cell(-1, "More\nprose\n", "markdown"),
+        "delete_cell": lambda m: m.delete_cell(2),
+        "move_cell": lambda m: m.move_cell(1, 5),
+        "move_cell to the end": lambda m: m.move_cell(0, -1),
+        "split_cell code": lambda m: m.split_cell(3, 1),
+        "split_cell markdown": lambda m: m.split_cell(0, 2),
+        "merge_cells": lambda m: (m.delete_cell(2), m.merge_cells(1, 2)),
+        "replace_cell_source": lambda m: m.replace_cell_source(1, "a <- 1\nb <- 2\n"),
+        "prepend_to_cell": lambda m: m.prepend_to_cell(0, "Top line"),
+        "append_to_cell": lambda m: m.append_to_cell(3, "lines(x)\nabline(h = 0)"),
+        "set_chunk_option": lambda m: m.set_chunk_option(1, "echo", "FALSE"),
+        "set_chunk_option label": lambda m: m.set_chunk_option(5, "label", "py"),
+        "remove_chunk_option": lambda m: m.remove_chunk_option(3, "fig.width"),
+        "remove_chunk_option label": lambda m: m.remove_chunk_option(1, "label"),
+        "set_frontmatter_key new key": lambda m: m.set_frontmatter_key("date", "2026-10-27"),
+        "set_frontmatter_key existing key": lambda m: m.set_frontmatter_key("title", '"New: title"'),
+        "set_frontmatter_key multi-line value": lambda m: m.set_frontmatter_key("params", "n: 1\nregion: EU  # default"),
+        "remove_frontmatter_key": lambda m: m.remove_frontmatter_key("author"),
+    }
+    for label, edit in edits.items():
+        same_as_lf(label, SAMPLE, edit)
+
+    # A header with comments, blank lines, tags and nested keys: the lines that stay keep their CRLF
+    header_edits = {
+        "header: set a nested key": lambda m: m.set_frontmatter_key("output", "word_document: default"),
+        "header: set a block scalar": lambda m: m.set_frontmatter_key("abstract", "|\n  One.\n\n  Two."),
+        "header: set a tagged value": lambda m: m.set_frontmatter_key("date", "!r Sys.time()"),
+        "header: add a key": lambda m: m.set_frontmatter_key("lang", "en"),
+        "header: remove a list": lambda m: m.remove_frontmatter_key("tags"),
+        "header: remove a nested key": lambda m: m.remove_frontmatter_key("params"),
+    }
+    for label, edit in header_edits.items():
+        same_as_lf(label, RICH_HEADER, edit, name="rich.rmd")
+    out = same_as_lf("header: set keeps the other lines", RICH_HEADER, lambda m: m.set_frontmatter_key("author", "B"))
+    check_same("crlf header: only the key's line changed", out,
+               RICH_HEADER.replace("author: 'A. Person'", "author: B").replace("\n", "\r\n"))
+
+    # Headers created, edited next to a document end marker, unreadable, or at the end of the file
+    out = same_as_lf("no header: created", "# Title\n\nText.\n", lambda m: m.set_frontmatter_key("title", "T"))
+    check_same("crlf no header: created in CRLF", out, "---\r\ntitle: T\r\n---\r\n\r\n# Title\r\n\r\nText.\r\n")
+    out = same_as_lf("no header: body starts with a blank line", "\n# Title\n", lambda m: m.set_frontmatter_key("title", "X"))
+    check_same("crlf no header: no second blank line", out, "---\r\ntitle: X\r\n---\r\n\r\n# Title\r\n")
+    out = same_as_lf("doc end marker", "---\ntitle: x\n...\n---\n", lambda m: m.set_frontmatter_key("z", "1"))
+    check_same("crlf doc end marker: new key goes before it", out, "---\r\ntitle: x\r\nz: 1\r\n...\r\n---\r\n")
+    unreadable = "---\ntitle: x\n\tbad: 1\n---\nBody\n"
+    path = write_raw("crlf.rmd", unreadable.replace("\n", "\r\n"))
+    check_same("crlf unreadable header: raw text with \\n line breaks",
+               RmdManager(path).get_frontmatter(), RmdManager(write_raw("lf.rmd", unreadable)).get_frontmatter())
+    same_as_lf("unreadable header: set a key", unreadable, lambda m: m.set_frontmatter_key("title", "y"))
+    out = same_as_lf("header at the end of the file", "---\ntitle: x\n---", lambda m: m.add_cell(-1, "y"))
+    check_same("crlf header at the end of the file: cell added in CRLF", out, "---\r\ntitle: x\r\n---\r\n```{r}\r\ny\r\n```\r\n")
+
+    # Caller text with "\r\n" or "\r" is written in the document's line break, like "\n" text
+    path = write_raw("crlf.rmd", crlf)
+    RmdManager(path).replace_cell_source(1, "a <- 1\r\nb <- 2\rc <- 3")
+    RmdManager(path).set_frontmatter_key("params", "n: 1\r\nregion: EU")
+    lf_path = reset_fixture()
+    RmdManager(lf_path).replace_cell_source(1, "a <- 1\nb <- 2\nc <- 3")
+    RmdManager(lf_path).set_frontmatter_key("params", "n: 1\nregion: EU")
+    check_same("crlf: caller \\r\\n and \\r text written as CRLF", read_raw(path), read_raw(lf_path).replace("\n", "\r\n"))
+    path = reset_fixture()
+    RmdManager(path).replace_cell_source(1, "a <- 1\r\nb <- 2\rc <- 3")
+    RmdManager(path).set_frontmatter_key("params", "n: 1\r\nregion: EU")
+    check_same("lf: caller \\r\\n and \\r text written as LF", read_raw(path), read_raw(lf_path))
+    mgr = RmdManager(write_raw("crlf.rmd", crlf))
+    mgr.replace_cell_source(1, "a <- 1\r\nb <- 2")
+    mgr.add_cell(-1, "c <- 3\rd <- 4", "code")
+    check("crlf: caller \\r\\n and \\r text read back with \\n",
+          (mgr.get_cell(1), mgr.get_cell(len(mgr.cells) - 1)), ("a <- 1\nb <- 2", "c <- 3\nd <- 4"))
+    # append_to_cell and prepend_to_cell add the same separator for "\r\n" and "\r" text as for "\n" text
+    separator_edits = {
+        "append_to_cell text starting with \\r\\n": ("\r\nb <- 2", "\nb <- 2", lambda m, s: m.append_to_cell(1, s)),
+        "append_to_cell text starting with \\r": ("\rb <- 2", "\nb <- 2", lambda m, s: m.append_to_cell(1, s)),
+        "prepend_to_cell text ending with \\r": ("Top\r", "Top\n", lambda m, s: m.prepend_to_cell(2, s)),
+    }
+    for doc, text in (("lf", SAMPLE), ("crlf", crlf)):
+        for label, (given, plain, edit) in separator_edits.items():
+            path, plain_path = write_raw(doc + ".rmd", text), write_raw(doc + "_plain.rmd", text)
+            edit(RmdManager(path), given)
+            edit(RmdManager(plain_path), plain)
+            check_same(f"{doc}: {label}, same as with \\n", read_raw(path), read_raw(plain_path))
+
+    # create_rmd always writes LF
+    new_path = os.path.join(WORK_DIR, "created_lf.rmd")
+    create_rmd(new_path, title="T", author="A")
+    check("create_rmd: LF line breaks only", "\r" in read_raw(new_path), False)
+
+
+def test_mixed_line_endings():
+    print("\n═══ mixed line endings ═══")
+    # Mostly CRLF, with some LF lines: parsed like LF, edits written in CRLF, other lines kept
+    text = ("---\r\ntitle: x\n# note\r\n---\r\n\r\nIntro\n\n"
+            "```{r one}\r\nx <- 1\n```\r\n\r\n```{r two}\nb\r\n```\nTail\r\n")
+    fm, cells = parse(text)
+    check("mixed: frontmatter found", (fm.present, fm.data), (True, {"title": "x"}))
+    check("mixed: the most common line break is the document's", fm.newline, "\r\n")
+    check("mixed: cells", [(c.cell_type, c.source, c.label) for c in cells],
+          [("markdown", "\nIntro\n\n", None), ("code", "x <- 1", "one"), ("markdown", "\n", None),
+           ("code", "b", "two"), ("markdown", "Tail\n", None)])
+    check("mixed: untouched document round-trips byte for byte", serialize(fm, cells) == text, True)
+    path = write_raw("mixed.rmd", text)
+    RmdManager(path)._save()
+    check("mixed: untouched file saves back byte for byte", read_raw(path) == text, True)
+    RmdManager(path).set_chunk_option(3, "echo", "FALSE")
+    check_same("mixed: an edited chunk uses CRLF, the rest is kept", read_raw(path),
+               text.replace("```{r two}\nb\r\n```\n", "```{r two, echo=FALSE}\r\nb\r\n```\r\n"))
+    path = write_raw("mixed.rmd", text)
+    RmdManager(path).set_frontmatter_key("date", "2026")
+    check_same("mixed: a new header key uses CRLF, the other header lines are kept", read_raw(path),
+               text.replace("# note\r\n", "# note\r\ndate: 2026\r\n"))
+    path = write_raw("mixed.rmd", text)
+    RmdManager(path).set_frontmatter_key("title", "y")
+    check_same("mixed: a rewritten header key uses CRLF", read_raw(path), text.replace("title: x\n", "title: y\r\n"))
+    path = write_raw("mixed.rmd", text)
+    RmdManager(path).remove_frontmatter_key("title")
+    check_same("mixed: removing a key keeps the other header lines", read_raw(path), text.replace("title: x\n", ""))
+
+    # Mostly LF, with a CRLF line: edits are written in LF
+    text = "a\nb\r\n```{r}\nx\n```\n"
+    path = write_raw("mixed.rmd", text)
+    check("mixed LF: the document's line break", RmdManager(path).frontmatter.newline == "\n", True)
+    RmdManager(path).replace_cell_source(1, "y\nz")
+    check_same("mixed LF: edited chunk in LF, prose kept", read_raw(path), "a\nb\r\n```{r}\ny\nz\n```\n")
+    # A tie goes to the line break used first
+    check("mixed: tie goes to the first line break", (parse("a\r\nb\nc")[0].newline, parse("a\nb\r\nc")[0].newline), ("\r\n", "\n"))
+
+    # A lone "\r" ends a line too (old Mac files), as for knitr
+    text = "---\rtitle: x\r---\r\rIntro\r```{r}\rx <- 1\r```\r"
+    fm, cells = parse(text)
+    check("cr: frontmatter found", (fm.present, fm.data, fm.newline), (True, {"title": "x"}, "\r"))
+    check("cr: cells with \\n line breaks", [(c.cell_type, c.source) for c in cells], [("markdown", "\nIntro\n"), ("code", "x <- 1")])
+    check("cr: untouched document round-trips byte for byte", serialize(fm, cells) == text, True)
+    path = write_raw("cr.rmd", text)
+    RmdManager(path).set_chunk_option(1, "echo", "FALSE")
+    RmdManager(path).set_frontmatter_key("date", "2026")
+    check_same("cr: edits written with \\r", read_raw(path),
+               "---\rtitle: x\rdate: 2026\r---\r\rIntro\r```{r echo=FALSE}\rx <- 1\r```\r")
+
+    # A part ending in a lone "\r" moved before one starting with "\n": the two breaks stay two
+    text = "```{r}\na\n```\r# P\n```{r}\nb\n```\n\nEnd\n"
+    path = write_raw("mixed.rmd", text)
+    RmdManager(path).move_cell(0, 2)
+    check_same("mixed: lone \\r before \\n written as one LF", read_raw(path), "# P\n```{r}\nb\n```\n```{r}\na\n```\n\nEnd\n")
+    check("mixed: blank line kept after the move", [(c.cell_type, c.source) for c in RmdManager(path).cells],
+          [("markdown", "# P\n"), ("code", "b"), ("code", "a"), ("markdown", "\nEnd\n")])
+    # The same for header edits: a key line ending in a lone "\r" next to a "\n" blank line
+    path = write_raw("mixed.rmd", "---\r\na: 1\rb: 2\r\n\nc: 3\r\n---\r\nx\r\ny\r\n")
+    RmdManager(path).remove_frontmatter_key("b")
+    check_same("mixed header: remove keeps the blank line after a lone \\r", read_raw(path),
+               "---\r\na: 1\r\n\nc: 3\r\n---\r\nx\r\ny\r\n")
+    check_same("mixed header: blank line still read after the remove", RmdManager(path).frontmatter.text(), "a: 1\n\nc: 3\n")
+    path = write_raw("mixed.rmd", "---\rtitle: x\n\nz: 1\r---\rA\rB\rC\r")
+    RmdManager(path).set_frontmatter_key("title", "y")
+    check_same("cr header: set keeps the blank line after the rewritten key", read_raw(path),
+               "---\rtitle: y\r\n\nz: 1\r---\rA\rB\rC\r")
+    check_same("cr header: blank line still read after the set", RmdManager(path).frontmatter.text(), "title: y\n\nz: 1\n")
 
 
 # ──────────────────────────────────────────────
@@ -818,6 +1037,15 @@ def test_frontmatter_unreadable():
     check("bad date: get_frontmatter says why", server.get_frontmatter(path), "month must be in 1..12")
     check("bad date: set works", server.set_frontmatter_key(path, "title", "y"), "Saved")
     check_same("bad date: set changes only that line", read_doc(path), "---\ndate: 2026-13-45\ntitle: y\n---\n\n```{r}\n1\n```\n")
+    # A control character such as a form feed: the YAML reader refuses the header before parsing
+    text = '---\ntitle: "a\fb"\n---\n\n```{r}\nx\n```\n'
+    path = write_doc("broken.rmd", text)
+    check("form feed: other tools still work", server.list_cells(path), "[1] code (r)")
+    shown = server.get_frontmatter(path)
+    check("form feed: get_frontmatter says why", shown, "(the YAML header could not be parsed: unacceptable character #x000c")
+    check("form feed: get_frontmatter returns the raw text", shown, 'its raw text follows)\ntitle: "a\fb"')
+    check("form feed: set works", server.set_frontmatter_key(path, "author", "B"), "Saved")
+    check_same("form feed: set adds only that line", read_doc(path), text.replace('"\n---', '"\nauthor: B\n---'))
     # Not a mapping: shown raw, and edits are refused without touching the file
     text = "---\n- a\n- b\n---\n\nBody\n"
     path = write_doc("broken.rmd", text)
@@ -1664,6 +1892,8 @@ if __name__ == "__main__":
         test_parser_complex_options()
         test_no_trailing_newline()
         test_line_breaks()
+        test_crlf_documents()
+        test_mixed_line_endings()
         test_create_rmd()
         test_create_rmd_quoting()
         test_extension_case()

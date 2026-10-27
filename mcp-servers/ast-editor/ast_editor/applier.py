@@ -3,7 +3,7 @@ import json
 import os
 import re
 import warnings
-from ast_editor.parser import TreeSitterParser, first_syntax_error
+from ast_editor.parser import TreeSitterParser, first_syntax_error, DEFAULT_EXPORT_KINDS
 
 
 class ApplierError(Exception):
@@ -18,6 +18,14 @@ def _split_lines(text: str) -> list[str]:
     if lines[-1] == "":
         lines.pop()
     return lines
+
+
+def _content_lines(text: str) -> list[str]:
+    """Split caller content (code, comments, values) into lines the same
+    way: on "\\n" only, after turning CRLF into LF, so a form feed, U+2028
+    or other separator inside a string literal stays where it was written.
+    A final line break ends the last line rather than adding an empty one."""
+    return _split_lines(text.replace("\r\n", "\n"))
 
 
 def _trailing_blank_lines(lines: list[str]) -> int:
@@ -64,6 +72,17 @@ def _json_syntax_error(source: bytes) -> ValueError | None:
 
 
 _JS_EXTS = (".js", ".jsx", ".mjs", ".cjs", ".ts", ".tsx")
+
+# YAML keys that may stay plain scalars (see Applier._yaml_key_source),
+# and the plain scalars YAML 1.1 (PyYAML) or 1.2 reads as booleans or null.
+_YAML_PLAIN_KEY = re.compile(r"[^\W\d][\w\-./ ]*")
+_YAML_RESERVED = re.compile(
+    r"y|Y|yes|Yes|YES|n|N|no|No|NO|true|True|TRUE|false|False|FALSE"
+    r"|on|On|ON|off|Off|OFF|null|Null|NULL"
+)
+# What a double-quoted YAML scalar has to escape beyond what json.dumps
+# escapes: the other non-printable characters and the Unicode line breaks.
+_YAML_ESCAPE = re.compile(r"[\x7f-\x9f\u2028\u2029\ufeff\ufffe\uffff]")
 
 
 def _split_key_path(path: str) -> list[str]:
@@ -148,17 +167,46 @@ class Applier:
                 result.append(target_indent + line.lstrip())
         return result
 
+    def _symbol_span(self, node):
+        """
+        The first and last nodes of a symbol's source as written, for the
+        edits that take a whole symbol (read_symbol, replace_function,
+        delete_symbol, insert_sibling, edit_leading_comment). That is the
+        node itself, except that a JS/TS exported declaration spans its whole
+        `export` statement (with any decorators written before `export`), a
+        decorated Python class its decorated_definition, and a TS class
+        member starts at the first of the decorators the grammar places
+        beside it in the class body, comments between them included.
+        Decorated Python functions are found as their decorated_definition,
+        and JS method decorators and Java annotations are inside the node,
+        already.
+        """
+        parent = node.parent
+        if parent is not None and parent.type in ("export_statement", "decorated_definition"):
+            return parent, parent
+        if self.parser.ext not in _JS_EXTS:
+            return node, node
+        first = node
+        prev = node.prev_named_sibling
+        while prev is not None and (prev.type == "decorator" or "comment" in prev.type):
+            if prev.type == "decorator":
+                first = prev
+            prev = prev.prev_named_sibling
+        return first, node
+
     def replace_function(self, target: str, content: str) -> str:
         node = self.parser.find_node_by_name(target)
         if not node:
             raise ApplierError(f"Target '{target}' not found in {self.filepath}")
 
-        # line indexing is 0-based
-        start_line = node.start_point[0]
-        end_line = node.end_point[0] + 1
+        # line indexing is 0-based; decorators and a JS/TS `export` are part
+        # of the definition (see _symbol_span).
+        first, last = self._symbol_span(node)
+        start_line = first.start_point[0]
+        end_line = last.end_point[0] + 1
 
         original_indent = self._get_indent(self.lines[start_line])
-        content_lines = content.splitlines()
+        content_lines = _content_lines(content)
         if content_lines and self._get_indent(content_lines[0]) != original_indent:
             content_lines = self._reindent(content_lines, original_indent)
 
@@ -280,7 +328,7 @@ class Applier:
              default_indent = "    " if self.parser.ext in (".py", ".rb", ".java") else "  "
              target_indent = sig_indent + default_indent
 
-        content_lines = self._reindent(content.splitlines(), target_indent)
+        content_lines = self._reindent(_content_lines(content), target_indent)
 
         self.lines = self.lines[:start_line] + content_lines + self.lines[end_line:]
         return self._save()
@@ -288,7 +336,9 @@ class Applier:
     def add_method(self, class_target: str, content: str) -> str:
         """
         Add a new method to a class. Placement varies by language:
-          - Python/JS/TS/C++/Ruby: inside the class body at the end.
+          - Python/JS/TS/Java/C++/Ruby: inside the class body, after its
+                last member (see _insert_member for indentation and spacing;
+                a Java enum gets the `;` its constants need before it).
           - Go: as a top-level sibling immediately after the type declaration
                 (Go methods are not lexically inside struct definitions).
         """
@@ -307,37 +357,16 @@ class Applier:
                 target_node = parent
 
             insert_line = target_node.end_point[0] + 1
-            content_lines = content.splitlines()
+            content_lines = _content_lines(content)
             # Add a blank separator before and the method content (and a trailing blank for readability)
             sep_before = [""] if insert_line - 1 >= 0 and insert_line - 1 < len(self.lines) and self.lines[insert_line - 1].strip() else []
             self.lines = self.lines[:insert_line] + sep_before + content_lines + self.lines[insert_line:]
             return self._save()
 
-        if self.parser.ext != ".py" and self.parser.ext not in (".rb",):
-             # For non-Python/Ruby, insert before the closing `}` of the class body.
-             body = node.child_by_field_name("body")
-             insert_line = body.end_point[0] if body else node.end_point[0]
-             indent = self._get_indent(self.lines[node.start_point[0]]) + "  "
-        else:
-             # Python and Ruby: body is an indented block; insert at end of body
-             if self.parser.ext == ".rb":
-                 # Ruby's class body ends at `end` keyword; insert just before the `end` line
-                 body = node.child_by_field_name("body")
-                 if body is not None:
-                     insert_line = body.end_point[0] + 1
-                 else:
-                     insert_line = node.end_point[0]
-                 indent = self._get_indent(self.lines[node.start_point[0]]) + "  "
-             else:
-                 insert_line = node.end_point[0] + 1
-                 indent = self._get_indent(self.lines[node.start_point[0]]) + "    "
-
-        content_lines = self._reindent(content.splitlines(), indent)
-        if self.parser.ext not in (".py", ".rb"):
-            self.lines = self.lines[:insert_line] + [""] + content_lines + [""] + self.lines[insert_line:]
-        else:
-            self.lines = self.lines[:insert_line] + [""] + content_lines + self.lines[insert_line:]
-        return self._save()
+        body = node.child_by_field_name("body")
+        if body is None and self.parser.ext != ".rb":
+            raise ApplierError(f"Could not find class body for '{class_target}'")
+        return self._insert_member(class_target, node, body, content, at_end=True)
 
     def delete_symbol(self, target: str, include_leading_comments: bool = True) -> str:
         """
@@ -350,8 +379,11 @@ class Applier:
         if not node:
             raise ApplierError(f"Target '{target}' not found")
 
-        start_line = node.start_point[0]
-        end_line = node.end_point[0] + 1
+        # Decorators and a JS/TS `export` go with the symbol, and its
+        # leading comment is the one above them (see _symbol_span).
+        first, last = self._symbol_span(node)
+        start_line = first.start_point[0]
+        end_line = last.end_point[0] + 1
 
         if include_leading_comments:
             comment_range = self._find_leading_comment_range(start_line)
@@ -413,8 +445,11 @@ class Applier:
         tree-sitter grammars lag behind their languages, so for .py and .json
         the standard library's parser (_stdlib_syntax_error) has the last
         word: content it accepts is never refused, even where tree-sitter
-        cannot parse it (PEP 696 type parameter defaults, JSON exponents such
-        as 1e+2). For Python it is also the judge on its own: it decides
+        cannot parse it (PEP 696 type parameter defaults). JSON exponents
+        written with a `+` (1e+2), which tree-sitter-json cannot parse, are
+        masked before parsing (TreeSitterParser.parse), here as for the
+        file itself, so json is only a safety net there. For Python it is
+        also the judge on its own: it decides
         whether the file was already broken, and it rejects inconsistent
         indentation that tree-sitter accepts. json only ever lifts a refusal
         (and lets a file tree-sitter misparses still count as clean), because
@@ -431,7 +466,7 @@ class Applier:
         elif not ts_was_clean:
             return
 
-        bad = first_syntax_error(self.parser.parser.parse(new_bytes).root_node)
+        bad = first_syntax_error(self.parser.parse(new_bytes).root_node)
         stdlib = None
         if ext == ".py" or (ext == ".json" and bad is not None):
             stdlib = self._stdlib_syntax_error(new_bytes)
@@ -843,18 +878,7 @@ class Applier:
 
     def _json_key_name(self, pair) -> str | None:
         """Decoded key of a JSON pair."""
-        key_node = pair.child_by_field_name("key")
-        if key_node is None:
-            return None
-        try:
-            name = json.loads(self.parser.node_text(key_node))
-        except ValueError:
-            name = None
-        if isinstance(name, str):
-            return name
-        return "".join(
-            self.parser.node_text(c) for c in key_node.children if c.type == "string_content"
-        )
+        return self.parser.json_key_name(pair)
 
     def _add_key_json(self, parent_target: str, key: str, value: str) -> str:
         parent = self._find_json_object_at_path(parent_target)
@@ -892,55 +916,142 @@ class Applier:
         return "Update successful"
 
     def _add_key_yaml(self, parent_target: str, key: str, value: str) -> str:
+        """
+        Add `key: value` to a YAML mapping: the top-level mapping of the
+        first document with content (parent_target ''), or the value of the key
+        parent_target names (TreeSitterParser.find_yaml_pair). A block
+        mapping gets a new line at its keys' indentation and a flow mapping
+        ({a: 1} or {}) an inline entry, as _insert_entry writes it. A key with no value
+        (`parent:`) gets a nested block mapping on the line below, one
+        indentation unit deeper, and a file with nothing in it yet (empty or
+        only comments) the new line at its end. The key is quoted only when
+        it has to be (_yaml_key_source).
+        """
         root = self.parser.tree.root_node
+        key_text = self._yaml_key_source(key)
+        name = self.parser.yaml_key_name(key_text)
+        pair = None
         if parent_target:
-            parent_value = self.parser._search_yaml_dotted(root, parent_target)
-            if parent_value is None:
+            pair = self.parser.find_yaml_pair(root, parent_target)
+            if pair is None:
                 raise ApplierError(f"YAML key '{parent_target}' not found")
-            # parent_value should be a block_node containing a block_mapping
-            block_mapping = None
-            if parent_value.type == "block_node":
-                for child in parent_value.named_children:
-                    if child.type == "block_mapping":
-                        block_mapping = child
-                        break
-            elif parent_value.type == "block_mapping":
-                block_mapping = parent_value
-            if block_mapping is None:
-                raise ApplierError(f"YAML value at '{parent_target}' is not a mapping")
+            content = pair.child_by_field_name("value")
         else:
-            # Root: find top-level block_mapping
-            block_mapping = None
-            stack = [root]
-            while stack:
-                curr = stack.pop()
-                if curr.type == "block_mapping":
-                    block_mapping = curr
-                    break
-                stack.extend(curr.named_children)
-            if block_mapping is None:
-                raise ApplierError("No YAML mapping found at root")
-
-        pairs = [
-            c for c in block_mapping.named_children if c.type == "block_mapping_pair"
-        ]
-        if not pairs:
-            raise ApplierError(
-                "Cannot add key to empty YAML mapping (unsupported in v1)"
+            # The first document with content: a stream may start with an
+            # empty one (`---` straight after `---`).
+            doc = next(
+                (
+                    c
+                    for c in root.named_children
+                    if c.type == "document"
+                    and any(ch.type in ("block_node", "flow_node") for ch in c.named_children)
+                ),
+                None,
             )
-        name = _unquote(key.strip())
-        for pair in pairs:
-            key_node = pair.child_by_field_name("key")
-            if key_node is not None and _unquote(self.parser.node_text(key_node).strip()) == name:
-                dotted = f"{parent_target}.{name}" if parent_target else name
-                raise self._duplicate_key(key, parent_target, dotted)
+            content = None
+            if doc is not None:
+                content = next(
+                    (c for c in doc.named_children if c.type in ("block_node", "flow_node")), None
+                )
+        mapping = self.parser.yaml_mapping(content)
+        if content is not None and mapping is None:
+            where = f"value at '{parent_target}'" if parent_target else "document root"
+            raise ApplierError(
+                f"YAML {where} is not a mapping (only a mapping, `{{}}` or a key "
+                "with no value can take a new key)"
+            )
 
-        last_pair = pairs[-1]
-        indent = self._get_indent(self.lines[last_pair.start_point[0]])
-        insert_line = last_pair.end_point[0] + 1
-        new_line = f"{indent}{key}: {value}"
-        self.lines = self.lines[:insert_line] + [new_line] + self.lines[insert_line:]
+        entries = [] if mapping is None else [
+            c for c in mapping.named_children if "comment" not in c.type
+        ]
+        for entry in entries:
+            key_node = entry
+            if entry.type in ("block_mapping_pair", "flow_pair"):
+                key_node = entry.child_by_field_name("key")
+            if key_node is None or self.parser.yaml_key_name(self.parser.node_text(key_node)) != name:
+                continue
+            if mapping.type == "flow_mapping":
+                # Keys inside a flow mapping are not addressable.
+                where = f"'{parent_target}'" if parent_target else "the root"
+                raise ApplierError(
+                    f"Key '{name}' already exists in the flow mapping at {where}; "
+                    "to change its value, rewrite the mapping with replace_value"
+                    + (f" on '{parent_target}'." if parent_target else ".")
+                )
+            dotted = f"{parent_target}.{name}" if parent_target else name
+            raise self._duplicate_key(key, parent_target, dotted)
+
+        new_entry = f"{key_text}: {value}"
+        if mapping is not None and mapping.type == "flow_mapping":
+            self._insert_entry(
+                mapping,
+                entries,
+                new_entry,
+                expand_empty=False,
+                empty_trailing_comma=False,
+                default_unit="  ",
+            )
+            return "Update successful"
+
+        if mapping is not None:
+            last_pair = entries[-1]
+            indent = self._get_indent(self.lines[last_pair.start_point[0]])
+            insert_line = last_pair.end_point[0] + 1
+        elif pair is not None:
+            # `parent:` with no value: its new mapping goes below it, deeper
+            # than the key's own column.
+            src = self.parser.source_bytes
+            line_start = src.rfind(b"\n", 0, pair.start_byte) + 1
+            column = len(src[line_start : pair.start_byte].decode("utf-8"))
+            indent = " " * column + self._indent_unit("  ")
+            insert_line = pair.end_point[0] + 1
+        else:
+            # Nothing in the file yet: the key goes after its last non-blank line.
+            indent = ""
+            insert_line = len(self.lines)
+            while insert_line and not self.lines[insert_line - 1].strip():
+                insert_line -= 1
+        self.lines = self.lines[:insert_line] + [indent + new_entry] + self.lines[insert_line:]
         return self._save()
+
+    def _yaml_key_source(self, key: str) -> str:
+        """
+        A key as written in a YAML mapping. A key already in quotes is used
+        as given. A name that starts with a letter or `_` and goes on with
+        letters, digits, `_`, `-`, `.`, `/` and spaces stays plain, unless
+        YAML would read it as a boolean or null (yes, off, null, ...).
+        Anything else (a leading digit or indicator such as `-`, `?`, `&`,
+        `*`, `!`, `[`; a `:`, `#` or `,`; a tab) is quoted, in the quote
+        style most of the file's quoted scalars use, or in double quotes if
+        it needs escapes.
+        """
+        key = key.strip()
+        if len(key) >= 2 and key[0] == key[-1] and key[0] in "\"'":
+            return key
+        if _YAML_PLAIN_KEY.fullmatch(key) and not _YAML_RESERVED.fullmatch(key):
+            return key
+        needs_escapes = re.search(r"[\x00-\x1f]", key) or _YAML_ESCAPE.search(key)
+        quoted = ("single_quote_scalar", "double_quote_scalar")
+        if not needs_escapes and self._majority_quote(quoted) == "'":
+            return "'" + key.replace("'", "''") + "'"
+        text = json.dumps(key, ensure_ascii=False)
+        return _YAML_ESCAPE.sub(lambda m: f"\\u{ord(m.group()):04x}", text)
+
+
+    def _majority_quote(self, string_types: tuple[str, ...]) -> str:
+        """The quote character (' or ") that most of the file's string
+        nodes (those of `string_types`) start with; '"' on a tie."""
+        counts = {'"': 0, "'": 0}
+        stack = [self.parser.tree.root_node]
+        while stack:
+            node = stack.pop()
+            if node.type in string_types:
+                quote = self.parser.node_text(node)[:1]
+                if quote in counts:
+                    counts[quote] += 1
+                continue
+            stack.extend(node.children)
+        return "'" if counts["'"] > counts['"'] else '"'
 
     def _toml_key_taken(self, root, parent_target: str, pairs: list, key: str) -> bool:
         """Whether `key` is already defined in a TOML table (or the root): as
@@ -970,7 +1081,16 @@ class Applier:
         return False
 
     def _add_key_toml(self, parent_target: str, key: str, value: str) -> str:
+        """
+        Add `key = value` to a TOML table: the root (parent_target ''), a
+        [table] named as in its header, or an inline table (`t = { a = 1 }`
+        or `{}`) that parent_target names as a key path, which gets the
+        entry inline as _insert_entry writes it. The key is quoted only when
+        it is not a bare key (_toml_key_source).
+        """
         root = self.parser.tree.root_node
+        key_text = self._toml_key_source(key)
+        inline = None
         if parent_target:
             # Find the table matching parent_target
             table = None
@@ -986,17 +1106,23 @@ class Applier:
                             break
                 queue.extend(curr.named_children)
             if table is None:
-                raise ApplierError(f"TOML table '[{parent_target}]' not found")
-            pairs = [c for c in table.named_children if c.type == "pair"]
-            if pairs:
-                last_pair = pairs[-1]
-                insert_line = last_pair.end_point[0] + 1
-                indent = self._get_indent(self.lines[last_pair.start_point[0]])
+                inline = self.parser._search_toml_dotted(root, parent_target)
+                if inline is None:
+                    raise ApplierError(f"TOML table '[{parent_target}]' not found")
+                if inline.type != "inline_table":
+                    raise ApplierError(f"TOML value at '{parent_target}' is not a table")
+                pairs = [c for c in inline.named_children if c.type == "pair"]
             else:
-                # Empty table: insert on the line after the header
-                header = table.named_children[0]
-                insert_line = header.end_point[0] + 1
-                indent = ""
+                pairs = [c for c in table.named_children if c.type == "pair"]
+                if pairs:
+                    last_pair = pairs[-1]
+                    insert_line = last_pair.end_point[0] + 1
+                    indent = self._get_indent(self.lines[last_pair.start_point[0]])
+                else:
+                    # Empty table: insert on the line after the header
+                    header = table.named_children[0]
+                    insert_line = header.end_point[0] + 1
+                    indent = ""
         else:
             # Root-level pair (before any table)
             top_pairs = [c for c in root.named_children if c.type == "pair"]
@@ -1009,18 +1135,62 @@ class Applier:
                 indent = ""
 
         siblings = pairs if parent_target else top_pairs
-        if self._toml_key_taken(root, parent_target, siblings, key):
-            dotted = f"{parent_target}.{key}" if parent_target else key
-            raise self._duplicate_key(key, parent_target, dotted)
+        if self._toml_key_taken(root, parent_target, siblings, key_text):
+            if inline is not None:
+                # Keys inside an inline table are not addressable.
+                raise ApplierError(
+                    f"Key '{key_text}' already exists in the inline table at "
+                    f"'{parent_target}'; to change its value, rewrite the table "
+                    f"with replace_value on '{parent_target}'."
+                )
+            dotted = f"{parent_target}.{key_text}" if parent_target else key_text
+            raise self._duplicate_key(key_text, parent_target, dotted)
 
-        new_line = f"{indent}{key} = {value}"
+        if inline is not None:
+            self._insert_entry(
+                inline,
+                pairs,
+                f"{key_text} = {value}",
+                expand_empty=False,
+                empty_trailing_comma=False,
+                default_unit="  ",
+            )
+            return "Update successful"
+        new_line = f"{indent}{key_text} = {value}"
         self.lines = self.lines[:insert_line] + [new_line] + self.lines[insert_line:]
         return self._save()
+
+    def _toml_key_source(self, key: str) -> str:
+        """
+        A key as written in TOML. Dots separate the parts of a dotted key
+        (a.b is key b in table a), as in TOML itself. Each part that is a
+        bare key (ASCII letters, digits, `_` and `-`) or is already in
+        quotes is kept as given; any other part (with a space, `:`, `#`,
+        non-ASCII letters, ...) becomes a basic string ("...", escaped). A
+        key with an empty part ('', 'a..b') is quoted whole.
+        """
+        key = key.strip()
+        parts = _split_key_path(key)
+        if not all(parts):
+            parts = [key]
+        out = []
+        for part in parts:
+            if len(part) >= 2 and part[0] == part[-1] and part[0] in "\"'":
+                out.append(part)
+            elif re.fullmatch(r"[A-Za-z0-9_-]+", part):
+                out.append(part)
+            else:
+                # json.dumps escapes everything TOML requires except DEL.
+                out.append(json.dumps(part, ensure_ascii=False).replace("\x7f", "\\u007f"))
+        return ".".join(out)
 
     def add_key(self, parent_target: str, key: str, value: str) -> str:
         """
         Add a new key-value pair inside a container:
-          - JSON objects / YAML mappings / TOML tables (via dotted path to parent)
+          - JSON objects / YAML mappings / TOML tables (via dotted path to
+            parent, from the top level), including YAML flow mappings and
+            keys with no value and TOML inline tables (see _add_key_yaml,
+            _add_key_toml)
           - Python dict literals (parent_target is the variable name, e.g.
             'CONFIG', optionally followed by keys into nested dicts:
             'CONFIG."db"')
@@ -1052,12 +1222,8 @@ class Applier:
             if value_node and value_node.parent and value_node.parent.type == "pair":
                 return value_node.parent
         elif ext in (".yml", ".yaml"):
-            value_node = self.parser._search_yaml_dotted(root, dotted_path)
-            if value_node:
-                p = value_node.parent
-                while p and p.type != "block_mapping_pair":
-                    p = p.parent
-                return p
+            # The pair itself, so a key with no value (`key:`) is found too.
+            return self.parser.find_yaml_pair(root, dotted_path)
         elif ext == ".toml":
             value_node = self.parser._search_toml_dotted(root, dotted_path)
             if value_node and value_node.parent and value_node.parent.type == "pair":
@@ -1280,17 +1446,7 @@ class Applier:
         if re.fullmatch(r"[A-Za-z_$][\w$]*|0|[1-9][0-9]*", key, re.ASCII):
             return key
 
-        counts = {'"': 0, "'": 0}
-        stack = [self.parser.tree.root_node]
-        while stack:
-            node = stack.pop()
-            if node.type == "string":
-                quote = self.parser.node_text(node)[:1]
-                if quote in counts:
-                    counts[quote] += 1
-                continue
-            stack.extend(node.children)
-        if counts["'"] > counts['"']:
+        if self._majority_quote(("string",)) == "'":
             escaped = key.replace("\\", "\\\\").replace("'", "\\'")
             return "'" + escaped.replace("\n", "\\n").replace("\r", "\\r") + "'"
         return json.dumps(key, ensure_ascii=False)
@@ -1418,7 +1574,7 @@ class Applier:
             # Multi-line values (e.g. a mapping with several keys) get the
             # `-` marker on the first line and a 2-space hanging indent on
             # continuation lines so they nest under the sequence item.
-            value_lines = value.splitlines() or [""]
+            value_lines = _content_lines(value) or [""]
             new_item_lines = [f"{indent}- {value_lines[0]}"]
             for cont in value_lines[1:]:
                 new_item_lines.append(f"{indent}  {cont}")
@@ -1516,7 +1672,9 @@ class Applier:
     def add_field(self, class_target: str, content: str) -> str:
         """
         Add a field/attribute/member at the top of a class body (fields-before-methods
-        convention).
+        convention): before its first member, but after a Python class
+        docstring or a Java enum's constants. Indentation and spacing as for
+        add_method (_insert_member).
 
         Design decision: option (a) -- the caller provides the literal text to insert.
         The tool does NOT auto-wrap in language-specific constructs (e.g. no implicit
@@ -1536,55 +1694,274 @@ class Applier:
                     break
             if struct_node is None:
                 raise ApplierError(f"'{class_target}' is not a struct; add_field needs a struct_type")
-            # Insert inside the struct braces, after the opening line
-            insert_line = struct_node.start_point[0] + 1
-            # Infer indent from existing field, or fallback
-            indent = ""
-            for i in range(insert_line, min(len(self.lines), struct_node.end_point[0])):
-                stripped = self.lines[i].strip()
-                if stripped and stripped not in ("{", "}"):
-                    indent = self._get_indent(self.lines[i])
-                    break
-            if not indent:
-                struct_indent = self._get_indent(self.lines[node.start_point[0]])
-                indent = struct_indent + "\t"
-            content_lines = self._reindent(content.splitlines(), indent)
-            self.lines = self.lines[:insert_line] + content_lines + self.lines[insert_line:]
+            body = next(
+                (c for c in struct_node.named_children if c.type == "field_declaration_list"),
+                None,
+            )
+        else:
+            body = node.child_by_field_name("body")
+        if body is None and self.parser.ext != ".rb":
+            raise ApplierError(f"Could not find class body for '{class_target}'")
+        return self._insert_member(class_target, node, body, content, at_end=False)
+
+    def _insert_member(self, class_target: str, node, body, content: str, at_end: bool) -> str:
+        """
+        Insert content as a member of the class `node`, whose members `body`
+        holds (None for an empty Ruby class): after the last member for
+        add_method (at_end=True), else before the first one, but after a
+        Python class docstring, for add_field. A Java enum's members are
+        those after its constants, which stay first (_java_enum_members).
+
+        The content is re-indented like the class's existing members (see
+        _member_indent), keeping its own relative indentation, written in
+        tabs when the members are indented with tabs (_tab_indent). A
+        method is separated from the member before it as the class separates
+        its methods (_method_gap); a field gets a blank line after it when
+        the member it lands above is a method with no blank line between
+        them. No blank line is added before the closing brace. A braced body
+        on one line (`class K {}`, `class K { a() {} }`) is rebuilt over
+        several lines, the existing members on one of their own, and
+        comments that follow the `{` on its line stay there. A Python or
+        Ruby class whose body shares a line with its header (or its `end`)
+        has no line to insert on and is refused.
+        """
+        ext = self.parser.ext
+        lines = _content_lines(content)
+        while lines and not lines[0].strip():
+            lines.pop(0)
+        while lines and not lines[-1].strip():
+            lines.pop()
+        if not lines:
+            raise ApplierError("content is empty: pass the source of the member to add")
+        members = list(body.named_children) if body is not None else []
+        # Members start after the `{`; a Java enum's after its constants
+        # and the `;` that ends them (`semi`, written when they have none).
+        start, semi, indent_from = (body.start_byte + 1 if body is not None else 0), b"", members
+        if body is not None and body.type == "enum_body":
+            start, semi, members = self._java_enum_members(body)
+            indent_from = members or indent_from
+        member_indent = self._member_indent(node, indent_from)
+        if "\t" in member_indent:
+            lines = self._tab_indent(lines)
+        lines = self._reindent(lines, member_indent)
+        method_types = self._interface_func_types() | {"method_signature", "abstract_method_signature"}
+        gap_before = self._method_gap(body, members, method_types) if at_end and members else 0
+        compact = ApplierError(
+            f"The body of '{class_target}' shares a line with its header or its "
+            "end, so there is no line of its own to add a member on. Rewrite the "
+            "class over several lines with replace_function."
+        )
+
+        if ext in (".py", ".rb"):
+            rest = members
+            if ext == ".py":
+                if members and not self._starts_line(members[0].start_byte):
+                    raise compact
+                if at_end:
+                    insert_line = node.end_point[0] + 1
+                elif members and self._is_docstring_node(members[0]):
+                    insert_line = members[0].end_point[0] + 1
+                    rest = members[1:]
+                else:
+                    insert_line = members[0].start_point[0] if members else body.start_point[0]
+            else:
+                end = node.children[-1]
+                if end.type != "end" or not self._starts_line(end.start_byte):
+                    raise compact
+                if not members:
+                    insert_line = end.start_point[0]
+                elif not self._starts_line(members[0].start_byte) or body.end_point[0] >= end.start_point[0]:
+                    raise compact
+                else:
+                    insert_line = body.end_point[0] + 1 if at_end else members[0].start_point[0]
+            gap_after = 0
+            if not at_end:
+                following = next((m for m in rest if not self._is_aside(m)), None)
+                if (
+                    following is not None
+                    and following.type in method_types
+                    and all(line.strip() for line in self.lines[insert_line : rest[0].start_point[0]])
+                ):
+                    gap_after = 1
+            new_lines = [""] * gap_before + lines + [""] * gap_after
+            self.lines = self.lines[:insert_line] + new_lines + self.lines[insert_line:]
             return self._save()
 
-        body = node.child_by_field_name("body")
-        if body is None:
-            raise ApplierError(f"Could not find class body for '{class_target}'")
-
-        if self.parser.ext == ".py":
-            insert_line = body.start_point[0]
-            indent = self._get_indent(self.lines[insert_line]) if insert_line < len(self.lines) else ""
-            if not indent:
-                class_indent = self._get_indent(self.lines[node.start_point[0]])
-                indent = class_indent + "    "
-        elif self.parser.ext == ".rb":
-            # Ruby body_statement starts at the first statement inside the class
-            insert_line = body.start_point[0]
-            indent = self._get_indent(self.lines[insert_line]) if insert_line < len(self.lines) else ""
-            if not indent:
-                class_indent = self._get_indent(self.lines[node.start_point[0]])
-                indent = class_indent + "  "
+        src = self.parser.source_bytes
+        open_b, close_b = body.start_byte, body.end_byte - 1
+        if src[open_b : open_b + 1] != b"{" or src[close_b : close_b + 1] != b"}":
+            raise ApplierError(f"Could not find the braces of the body of '{class_target}'")
+        class_indent = self._get_indent(self.lines[node.start_point[0]]).encode("utf-8")
+        indent = member_indent.encode("utf-8")
+        text = "\n".join(lines).encode("utf-8")
+        following = next((m for m in members if not self._is_aside(m)), None)
+        gap = b"\n" if not at_end and following is not None and following.type in method_types else b""
+        constants = src[open_b + 1 : start].strip()
+        if (body.start_point[0] == body.end_point[0] and (members or constants)) or (semi and not constants):
+            # A body on one line (or an enum with no constants) is rebuilt
+            # over several lines: the enum constants (or a lone `;`), the
+            # existing members and the new one each on their own.
+            existing = src[start:close_b].strip()
+            parts = [indent + constants + semi, b""] if semi or constants else []
+            if not existing:
+                parts.append(text)
+            elif at_end:
+                parts += [indent + existing] + [b""] * gap_before + [text]
+            else:
+                parts += [text] + [b""] * len(gap) + [indent + existing]
+            new = src[: open_b + 1] + b"\n" + b"\n".join(parts) + b"\n" + class_indent + src[close_b:]
+        elif not members and constants:
+            # A Java enum with only its constants: the member goes on a line
+            # of its own after them, one blank line between.
+            last = max([start] + [c.end_byte for c in body.named_children])
+            nl = src.find(b"\n", last)
+            if 0 <= nl < close_b:
+                pos = nl + 1
+                new = src[:start] + semi + src[start:pos] + b"\n" + text + b"\n" + src[pos:]
+            else:
+                new = (
+                    src[:start] + semi + src[start:close_b].rstrip(b" \t") + b"\n\n"
+                    + text + b"\n" + class_indent + src[close_b:]
+                )
+        elif not members:
+            # Only whitespace between the braces: the member goes on lines
+            # of its own, and the `}` keeps its line (or gets one).
+            close_start = src.rfind(b"\n", 0, close_b) + 1
+            close_indent = src[close_start:close_b] if self._starts_line(close_b) else class_indent
+            new = src[: open_b + 1] + b"\n" + text + b"\n" + close_indent + src[close_b:]
+        elif at_end:
+            spacing = b"\n" * gap_before
+            if self._starts_line(close_b):
+                # After the last member's line; blank lines that were
+                # before the `}` stay there.
+                pos = src.find(b"\n", members[-1].end_byte) + 1
+                new = src[:pos] + spacing + text + b"\n" + src[pos:]
+            else:
+                new = src[:close_b].rstrip(b" \t") + b"\n" + spacing + text + b"\n" + class_indent + src[close_b:]
         else:
-            # JS/TS class_body / C++ field_declaration_list: body.start_point[0] is the `{` line
-            insert_line = body.start_point[0] + 1
-            indent = ""
-            for i in range(insert_line, min(len(self.lines), body.end_point[0])):
-                stripped = self.lines[i].strip()
-                if stripped and stripped not in ("{", "}", "public:", "private:", "protected:"):
-                    indent = self._get_indent(self.lines[i])
-                    break
-            if not indent:
-                class_indent = self._get_indent(self.lines[node.start_point[0]])
-                indent = class_indent + "    "
+            # Comments right after the `{` (or an enum's `;`) on its line.
+            n, row = 0, src.count(b"\n", 0, start)
+            while n < len(members) and "comment" in members[n].type and members[n].start_point[0] == row:
+                row = members[n].end_point[0]
+                n += 1
+            nl = src.find(b"\n", members[n - 1].end_byte) if n else -1
+            if self._starts_line(members[0].start_byte):
+                pos = src.rfind(b"\n", 0, members[0].start_byte) + 1
+                new = src[:pos] + text + b"\n" + gap + src[pos:]
+            elif n and (n == len(members) or members[n].start_point[0] > row) and 0 <= nl < close_b:
+                # Only comments follow the `{` on its line: they stay there
+                # (a NOSONAR or NOLINT there applies to that line), and the
+                # member goes on the next line, above any blank lines.
+                pos = nl + 1
+                if n < len(members) and b"\n" in src[pos : members[n].start_byte]:
+                    gap = b""
+                new = src[:pos] + text + b"\n" + gap + src[pos:]
+            else:
+                # The first member follows the `{` (or an enum's `;`) on its
+                # line: it moves to a line of its own below the new one, and
+                # a blank line separates enum constants from the new member.
+                new = (
+                    src[:start] + b"\n" + (b"\n" if constants else b"") + text + b"\n" + gap
+                    + indent + src[start:].lstrip(b" \t")
+                )
+        self._write_bytes(new)
+        return "Update successful"
 
-        content_lines = self._reindent(content.splitlines(), indent)
-        self.lines = self.lines[:insert_line] + content_lines + self.lines[insert_line:]
-        return self._save()
+    def _java_enum_members(self, body):
+        """
+        Where the members of the Java enum `body` start, as (byte, semi,
+        members): after the `;` that ends its constants, with the members
+        that follow it, or, when it has none of those, after the last
+        constant (and its trailing comma), with semi b";" for the `;` Java
+        needs there before any other member, and no members.
+        """
+        decls = next((c for c in body.named_children if c.type == "enum_body_declarations"), None)
+        if decls is not None:
+            return decls.children[0].end_byte, b"", list(decls.named_children)
+        constants = [c for c in body.children if c.type in ("enum_constant", ",")]
+        return (constants[-1].end_byte if constants else body.start_byte + 1), b";", []
+
+    @staticmethod
+    def _tab_indent(lines: list[str]) -> list[str]:
+        """
+        `lines` with the indentation they have beyond their first line's
+        written in tabs: one per indentation step of the content (the
+        smallest such indentation it has), any spaces left over kept. Lines
+        indented less than the first, and content that already uses tabs
+        for it, are left as they are.
+        """
+        first = lines[0]
+        base = first[: len(first) - len(first.lstrip(" \t"))]
+        extra = []
+        for line in lines:
+            rest = line[len(base) :] if line.strip() and line.startswith(base) else ""
+            extra.append(rest[: len(rest) - len(rest.lstrip(" \t"))])
+        widths = [len(ws) for ws in extra if ws]
+        if not widths or any("\t" in ws for ws in extra):
+            return lines
+        step = min(widths)
+        result = []
+        for line, ws in zip(lines, extra):
+            if ws:
+                tabs, spaces = divmod(len(ws), step)
+                line = base + "\t" * tabs + " " * spaces + line[len(base) + len(ws) :]
+            result.append(line)
+        return result
+
+    def _starts_line(self, byte: int) -> bool:
+        """Whether only whitespace precedes `byte` on its line."""
+        src = self.parser.source_bytes
+        return not src[src.rfind(b"\n", 0, byte) + 1 : byte].strip()
+
+    @staticmethod
+    def _is_aside(node) -> bool:
+        """Class-body nodes that are not members of their own: comments,
+        decorators (TS puts a method's beside it) and C++ access labels."""
+        return node.type in ("decorator", "access_specifier") or "comment" in node.type
+
+    def _member_indent(self, node, members) -> str:
+        """
+        Indentation for a new member of the class `node`: that of its last
+        member on a line of its own (comments and decorators only when there
+        is no such member; C++ access labels never), else the class line's
+        indentation plus one indent unit of the file, or of the language when
+        no line in the file is indented.
+        """
+        indent = self._own_line_indent([m for m in members if not self._is_aside(m)], None)
+        if indent is None:
+            indent = self._own_line_indent(
+                [m for m in members if m.type != "access_specifier"], None
+            )
+        if indent is None:
+            default = {".py": "    ", ".java": "    ", ".go": "\t"}.get(self.parser.ext, "  ")
+            indent = self._get_indent(self.lines[node.start_point[0]]) + self._indent_unit(default)
+        return indent
+
+    def _method_gap(self, body, members, method_types) -> int:
+        """
+        Blank lines (0 or 1) to put between a new method and the member
+        before it, the way the class separates its methods: 1 if any method
+        has a blank line between it (or its decorators and leading comment)
+        and the member before it, 0 if there are such pairs and none does.
+        A class with no such pair gets 1, a TS interface 0, as interface
+        members are usually written one per line. A method added right
+        after a C++ access label (`public:`) goes directly under it.
+        """
+        labels = [m for m in members if "comment" not in m.type]
+        if labels and labels[-1].type == "access_specifier":
+            return 0
+        code = [m for m in members if not self._is_aside(m)]
+        stacked = False
+        for prev, cur in zip(code, code[1:]):
+            if cur.type not in method_types:
+                continue
+            start = self._symbol_span(cur)[0].start_point[0]
+            if any(not line.strip() for line in self.lines[prev.end_point[0] + 1 : start]):
+                return 1
+            stacked = True
+        if stacked:
+            return 0
+        return 0 if body.type == "interface_body" and self.parser.ext in _JS_EXTS else 1
 
     def replace_signature(self, target: str, new_signature: str) -> str:
         """
@@ -1796,18 +2173,45 @@ class Applier:
             queue = list(body.named_children)
             while queue:
                 child = queue.pop(0)
+                if child.type == "decorated_definition":
+                    definition = child.child_by_field_name("definition")
+                    if definition is not None and definition.type == "class_definition":
+                        # A nested class, decorated: not listed, like an
+                        # undecorated one.
+                        continue
                 if child.type in func_types:
-                    methods.append((get_name(child), child.start_point[0] + 1))
+                    methods.append((get_name(child), first_line(child)))
                 else:
                     # Descend into sub-containers (e.g. enum_body_declarations)
                     if child.type in ("enum_body_declarations", "class_body", "interface_body"):
                         queue.extend(child.named_children)
             return methods
 
+        def first_line(node):
+            # A symbol starts at its decorators or JS/TS `export`.
+            return self._symbol_span(node)[0].start_point[0] + 1
+
         lines_out = []
         for child in root.named_children:
-            if child.type in class_types:
-                name = get_name(child)
+            name, kind_type = None, child.type
+            if child.type == "export_statement":
+                # JS/TS: list the exported declaration under its own name;
+                # an anonymous `export default function/class` is `default`.
+                decl = child.child_by_field_name("declaration")
+                if decl is not None:
+                    child, kind_type = decl, decl.type
+                else:
+                    child = self.parser.anonymous_default_export(child)
+                    if child is None:
+                        continue
+                    name, kind_type = "default", DEFAULT_EXPORT_KINDS[child.type]
+            elif child.type == "decorated_definition":
+                # Python: a decorated class is listed as a class.
+                definition = child.child_by_field_name("definition")
+                if definition is not None and definition.type == "class_definition":
+                    child, kind_type = definition, definition.type
+            if kind_type in class_types:
+                name = name or get_name(child)
                 kind_map = {
                     "class_definition": "class",
                     "class_declaration": "class",
@@ -1819,12 +2223,12 @@ class Applier:
                     "record_declaration": "record",
                 }
                 kind = kind_map.get(child.type, child.type)
-                lines_out.append(f"{kind} {name} (line {child.start_point[0] + 1})")
+                lines_out.append(f"{kind} {name} (line {first_line(child)})")
                 for mname, mline in walk_class_methods(child):
                     lines_out.append(f"  method {name}.{mname} (line {mline})")
-            elif child.type in func_types:
-                name = get_name(child)
-                lines_out.append(f"function {name} (line {child.start_point[0] + 1})")
+            elif kind_type in func_types:
+                name = name or get_name(child)
+                lines_out.append(f"function {name} (line {first_line(child)})")
 
         if not lines_out:
             return "(no top-level symbols found)"
@@ -2092,7 +2496,7 @@ class Applier:
         Insert content at the top of a function body, preserving existing statements.
         """
         insert_line, target_indent = self._body_insert_point(target, "top")
-        content_lines = self._reindent(content.splitlines(), target_indent)
+        content_lines = self._reindent(_content_lines(content), target_indent)
         self.lines = self.lines[:insert_line] + content_lines + self.lines[insert_line:]
         return self._save()
 
@@ -2101,7 +2505,7 @@ class Applier:
         Insert content at the bottom of a function body, preserving existing statements.
         """
         insert_line, target_indent = self._body_insert_point(target, "bottom")
-        content_lines = self._reindent(content.splitlines(), target_indent)
+        content_lines = self._reindent(_content_lines(content), target_indent)
         self.lines = self.lines[:insert_line] + content_lines + self.lines[insert_line:]
         return self._save()
 
@@ -2114,13 +2518,14 @@ class Applier:
         if not node:
             raise ApplierError(f"Target '{target}' not found in {self.filepath}")
 
-        insert_line = node.start_point[0]
+        # Above the symbol's decorators and a JS/TS `export` (see _symbol_span).
+        insert_line = self._symbol_span(node)[0].start_point[0]
         target_indent = (
             self._get_indent(self.lines[insert_line])
             if insert_line < len(self.lines)
             else ""
         )
-        content_lines = self._reindent(content.splitlines(), target_indent)
+        content_lines = self._reindent(_content_lines(content), target_indent)
 
         # Add a blank separator line after the inserted content if the target line is non-blank
         separator = (
@@ -2146,9 +2551,10 @@ class Applier:
         if not node:
             raise ApplierError(f"Target '{target}' not found in {self.filepath}")
 
-        insert_line = node.end_point[0] + 1
-        target_indent = self._get_indent(self.lines[node.start_point[0]])
-        content_lines = self._reindent(content.splitlines(), target_indent)
+        first, last = self._symbol_span(node)
+        insert_line = last.end_point[0] + 1
+        target_indent = self._get_indent(self.lines[first.start_point[0]])
+        content_lines = self._reindent(_content_lines(content), target_indent)
 
         # Blank separator before the inserted content if the preceding line is non-blank
         separator = (
@@ -2739,7 +3145,7 @@ class Applier:
                 "op='remove' first"
             )
         target_indent = self._get_indent(self.lines[insert_line]) if insert_line < len(self.lines) else ""
-        comment_lines = self._reindent(comment.splitlines(), target_indent)
+        comment_lines = self._reindent(_content_lines(comment), target_indent)
         self.lines = self.lines[:insert_line] + comment_lines + self.lines[insert_line:]
         return self._save()
 
@@ -2784,7 +3190,7 @@ class Applier:
 
         start_line = node.start_point[0]
         target_indent = self._get_indent(self.lines[start_line]) if start_line < len(self.lines) else ""
-        comment_lines = self._reindent(new_comment.splitlines(), target_indent)
+        comment_lines = self._reindent(_content_lines(new_comment), target_indent)
 
         comment_range = self._find_leading_comment_range(start_line)
         if comment_range is None:
@@ -2940,7 +3346,8 @@ class Applier:
             node = self.parser.find_node_by_name(target)
             if not node:
                 raise ApplierError(f"Target '{target}' not found in {self.filepath}")
-            return self.parser.node_text(node)
+            first, last = self._symbol_span(node)
+            return self.parser.source_bytes[first.start_byte : last.end_byte].decode("utf-8")
         if depth == "interface":
             return self._read_interface(target)
         if depth == "signature":
@@ -3008,12 +3415,14 @@ class Applier:
 
         source = self.parser.source_bytes
 
-        # Header: everything from node start up to body content
+        # Header: everything from the symbol's start (decorators and a JS/TS
+        # `export` included) up to body content
+        head = self._symbol_span(node)[0].start_byte
         if ext in (".py", ".rb"):
-            header = source[node.start_byte:body.start_byte].decode("utf-8").rstrip()
+            header = source[head:body.start_byte].decode("utf-8").rstrip()
         else:
             # Brace-delimited: body node starts with {, include it in header
-            header = source[node.start_byte:body.start_byte + 1].decode("utf-8").rstrip()
+            header = source[head:body.start_byte + 1].decode("utf-8").rstrip()
 
         parts = [header]
 
@@ -3142,7 +3551,7 @@ class Applier:
         if position not in ("bottom", "top"):
             raise ApplierError(f"position must be 'bottom' or 'top', got: {position}")
 
-        content_lines = content.splitlines()
+        content_lines = _content_lines(content)
 
         if position == "bottom":
             while self.lines and not self.lines[-1].strip():
@@ -3290,8 +3699,9 @@ class Applier:
     def _find_symbol_for_comment(self, target: str):
         """
         Resolve a comment target like find_node_by_name, but anchored on the
-        whole key-value pair for YAML/TOML keys, and with a TOML-specific
-        fallback: if the target doesn't match a pair, try matching a [table] header.
+        whole key-value pair for YAML/TOML keys and on the first node of a
+        source symbol (_symbol_span), and with a TOML-specific fallback: if
+        the target doesn't match a pair, try matching a [table] header.
         Comment tools operate on positional anchors, so tables are valid targets.
         """
         node = self.parser.find_node_by_name(target)
@@ -3308,7 +3718,10 @@ class Applier:
                     pair = pair.parent
                 if pair is not None:
                     node = pair
-            return node
+                return node
+            # The comment belongs above the symbol's decorators and a JS/TS
+            # `export` (see _symbol_span).
+            return self._symbol_span(node)[0]
 
         if self.parser.ext == ".toml" and "." not in target:
             queue = [self.parser.tree.root_node]
@@ -3407,7 +3820,7 @@ class Applier:
         end_line = seq_node.end_point[0] + 1
         target_indent = " " * seq_node.start_point[1]
 
-        lines = content.splitlines()
+        lines = _content_lines(content)
         non_blank = [ln for ln in lines if ln.strip()]
         if not non_blank:
             raise ApplierError("Cannot replace YAML sequence with empty content")

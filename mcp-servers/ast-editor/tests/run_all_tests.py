@@ -343,16 +343,15 @@ def test_javascript():
     )
     result = read_file(path)
     check("add_method: set method added", result, "set(key, value)")
-    check("add_method: closing brace intact", result, "}")
-    # Verify blank line before closing brace
-    lines = result.splitlines()
-    closing_idx = next(
-        i for i in reversed(range(len(lines))) if lines[i].strip() == "}"
-    )
-    check(
-        "add_method: blank line before closing brace",
-        lines[closing_idx - 1].strip(),
-        "",
+    # One blank line after get(), as between the existing methods, and none
+    # before the class's closing brace.
+    _exact(
+        "add_method: separated like the other methods, no blank line before }",
+        result,
+        FIXTURES["js"]["content"].replace(
+            "    }\n}\n",
+            "    }\n\n    set(key, value) {\n        this.items.set(key, value);\n    }\n}\n",
+        ),
     )
 
 
@@ -3191,7 +3190,7 @@ def test_syntax_guard():
             lambda a: a.add_method(
                 "LRUCache", "    clear(): void {\n        this.items.clear();"
             ),
-            ("at line 17, column 2 (missing '}')",),
+            ("at line 16, column 2 (missing '}')",),
         ),
         (
             "c",
@@ -3211,7 +3210,7 @@ def test_syntax_guard():
             lambda a: a.add_method(
                 "LRUCache", "    public void clear() {\n        items.clear();"
             ),
-            ("at line 27, column 2 (missing '}')",),
+            ("at line 26, column 2 (missing '}')",),
         ),
         (
             "go",
@@ -3405,11 +3404,14 @@ def test_syntax_guard():
             check(f"json {label}: file untouched", "PASS" if _read_bytes(path) == before else "FAIL", "PASS")
     path = _write_temp("test_guard.json", '{\n  "a": 1\n}\n')
     Applier(path).add_key("", "b", "6.02E+23")
-    # Such a file still counts as clean (json accepts it), so a later
-    # broken edit is refused, at json's position.
+    # Such a file parses cleanly (the parser masks the exponent signs for
+    # tree-sitter), so a later broken edit is refused, at tree-sitter's
+    # position on the line json reports too.
+    check("json with + exponents: file parses cleanly",
+          "PASS" if not Applier(path).parser.tree.root_node.has_error else "FAIL", "PASS")
     message = _refusal(lambda: Applier(path).replace_value("a", "[1,"))
     check("json with + exponents: broken edit refused", message,
-          "Edit refused: the result would have a syntax error at line 2, column 11 (Expecting value)")
+          "Edit refused: the result would have a syntax error at line 2, column 6 (cannot parse ': [1,,')")
     os.remove(path)
     # JSONC: comments stay allowed (json rejects them, but tree-sitter
     # accepts the result), and a real error is still refused.
@@ -4569,6 +4571,466 @@ def test_body_insert_placement():
     finally:
         shutil.rmtree(work, ignore_errors=True)
 
+# ──────────────────────────────────────────────
+# JS/TS exports; add_method / add_field layout; decorators and leading comments
+# ──────────────────────────────────────────────
+
+
+def _read_result(name: str, content: str, action) -> str:
+    """Write tests/<name>, return what action(Applier) returns (or
+    'REFUSED: <error>'), and remove the file."""
+    path = _write_temp(name, content)
+    try:
+        result = action(Applier(path))
+    except ApplierError as e:
+        result = f"REFUSED: {e}"
+    os.remove(path)
+    return result
+
+
+def test_exported_symbols():
+    print("\n═══ JS/TS exported symbols: list_symbols and targeting ═══")
+
+    # The reported case, in every JS/TS extension: exported, default-exported
+    # and plain declarations are all listed, classes with their methods.
+    repro = (
+        "export function a() {}\n"
+        "function b() {}\n"
+        "export default function c() {}\n"
+        "export class K { m() {} }\n"
+    )
+    expected = (
+        "function a (line 1)\nfunction b (line 2)\nfunction c (line 3)\n"
+        "class K (line 4)\n  method K.m (line 4)"
+    )
+    for ext in (".js", ".jsx", ".mjs", ".cjs", ".ts", ".tsx"):
+        _exact(
+            f"list_symbols {ext}: exported declarations listed",
+            _read_result("exports" + ext, repro, lambda a: a.list_symbols()),
+            expected,
+        )
+
+    # An exported declaration is listed exactly when its plain form is
+    # (const arrow functions, generators, abstract classes, type aliases and
+    # enums are listed in neither form).
+    for ext, plain in [
+        (".js", "function f() {}\n"),
+        (".js", "class C {\n  m() {}\n}\n"),
+        (".js", "const f = () => 1;\n"),
+        (".js", "function* g() {}\n"),
+        (".ts", "interface I {\n  x: number;\n}\n"),
+        (".ts", "abstract class A {\n  m() {}\n}\n"),
+        (".ts", "type T = string;\n"),
+        (".ts", "enum E {\n  A,\n}\n"),
+    ]:
+        label = plain.split("\n")[0]
+        _exact(
+            f"list_symbols {ext}: 'export {label}' listed like the plain form",
+            _read_result("forms" + ext, "export " + plain, lambda a: a.list_symbols()),
+            _read_result("forms" + ext, plain, lambda a: a.list_symbols()),
+        )
+
+    module = (
+        "/** Adds. */\n"
+        "export function add(x, y) {\n"
+        "  return x + y;\n"
+        "}\n"
+        "\n"
+        "export default class {\n"
+        "  run() {\n"
+        "    return 1;\n"
+        "  }\n"
+        "}\n"
+        "\n"
+        "export class Store {\n"
+        "  get(k) {\n"
+        "    return k;\n"
+        "  }\n"
+        "}\n"
+    )
+    default_end = "    return 1;\n  }\n}\n"
+    for ext in (".js", ".ts"):
+        name = "exported" + ext
+
+        def edit(action):
+            return _edit_result(name, module, action)
+
+        listed = _read_result(name, module, lambda a: a.list_symbols())
+        _exact(
+            f"{ext} list_symbols: anonymous default export listed as 'default'",
+            listed,
+            "function add (line 2)\nclass default (line 6)\n  method default.run (line 7)\n"
+            "class Store (line 12)\n  method Store.get (line 13)",
+        )
+        # Every listed name is a valid target.
+        for target in [line.split()[1] for line in listed.splitlines()]:
+            result = _read_result(name, module, lambda a: a.read_symbol(target))
+            check(
+                f"{ext} read_symbol('{target}'): listed name resolves",
+                "FAIL: " + result if result.startswith("REFUSED") else "PASS",
+                "PASS",
+            )
+        _exact(
+            f"{ext} read_symbol: includes `export`",
+            _read_result(name, module, lambda a: a.read_symbol("add")),
+            "export function add(x, y) {\n  return x + y;\n}",
+        )
+        _exact(
+            f"{ext} read_symbol('default'): the default export",
+            _read_result(name, module, lambda a: a.read_symbol("default")),
+            "export default class {\n  run() {\n    return 1;\n  }\n}",
+        )
+        _exact(
+            f"{ext} read_symbol depth=signature: the declaration's own signature",
+            _read_result(name, module, lambda a: a.read_symbol("add", depth="signature")),
+            "function add(x, y)",
+        )
+        _exact(
+            f"{ext} read_symbol depth=interface: header includes `export`",
+            _read_result(name, module, lambda a: a.read_symbol("Store", depth="interface")),
+            "export class Store {\nget(k) ...\n}",
+        )
+        _exact(
+            f"{ext} replace_function: round trip keeps `export`",
+            edit(lambda a: a.replace_function(
+                "add", "export function add(x, y, z) {\n  return x + y + z;\n}"
+            )),
+            module.replace(
+                "export function add(x, y) {\n  return x + y;\n",
+                "export function add(x, y, z) {\n  return x + y + z;\n",
+            ),
+        )
+        _exact(
+            f"{ext} replace_signature: `export` kept",
+            edit(lambda a: a.replace_signature("add", "function add(x, y, z)")),
+            module.replace("add(x, y)", "add(x, y, z)"),
+        )
+        _exact(
+            f"{ext} delete_symbol: export statement and its doc comment removed",
+            edit(lambda a: a.delete_symbol("Store")),
+            module[: module.index("\nexport class Store")],
+        )
+        result = edit(lambda a: a.delete_symbol("default"))
+        check(
+            f"{ext} delete_symbol('default'): default export removed",
+            "PASS" if "export default" not in result and "export class Store" in result else result,
+            "PASS",
+        )
+        _exact(
+            f"{ext} edit_leading_comment replace: above the export",
+            edit(lambda a: a.edit_leading_comment("add", "replace", "// Sums.")),
+            module.replace("/** Adds. */", "// Sums."),
+        )
+        _exact(
+            f"{ext} edit_leading_comment add: above the export",
+            edit(lambda a: a.edit_leading_comment("Store", "add", "/** Store. */")),
+            module.replace("\nexport class Store", "\n/** Store. */\nexport class Store"),
+        )
+        _exact(
+            f"{ext} insert_sibling after the default export",
+            edit(lambda a: a.insert_sibling("default", "const q = 1;", "after")),
+            module.replace(default_end, default_end + "\nconst q = 1;\n"),
+        )
+        _exact(
+            f"{ext} add_method on the default export",
+            edit(lambda a: a.add_method("default", "stop() {}")),
+            module.replace(default_end, "    return 1;\n  }\n\n  stop() {}\n}\n"),
+        )
+        _exact(
+            f"{ext} replace_function_body on default.run",
+            edit(lambda a: a.replace_function_body("default.run", "return 2;")),
+            module.replace("    return 1;", "    return 2;"),
+        )
+        check(
+            f"{ext} find_references: exported class found",
+            _read_result(name, module, lambda a: a.find_references("Store")),
+            "line 12: export class Store {",
+        )
+
+    # TS decorators written before `export` belong to the exported class.
+    svc = (
+        "const x = 1;\n"
+        "\n"
+        "/** Svc. */\n"
+        "@Injectable()\n"
+        "export class Svc {\n"
+        "  run() {}\n"
+        "}\n"
+    )
+    _exact(
+        "ts decorated export: listed at its decorator",
+        _read_result("svc.ts", svc, lambda a: a.list_symbols()),
+        "class Svc (line 4)\n  method Svc.run (line 6)",
+    )
+    _exact(
+        "ts decorated export: read_symbol includes the decorator",
+        _read_result("svc.ts", svc, lambda a: a.read_symbol("Svc")),
+        "@Injectable()\nexport class Svc {\n  run() {}\n}",
+    )
+    _exact(
+        "ts decorated export: leading comment replaced above the decorator",
+        _edit_result("svc.ts", svc, lambda a: a.edit_leading_comment("Svc", "replace", "// Service.")),
+        svc.replace("/** Svc. */", "// Service."),
+    )
+    _exact(
+        "ts decorated export: delete_symbol removes decorator and doc comment",
+        _edit_result("svc.ts", svc, lambda a: a.delete_symbol("Svc")),
+        "const x = 1;\n",
+    )
+    _exact(
+        "ts decorated export: insert_sibling before goes above the decorator",
+        _edit_result("svc.ts", svc.replace("/** Svc. */\n", ""),
+                     lambda a: a.insert_sibling("Svc", "const y = 2;", "before")),
+        svc.replace("/** Svc. */\n", "const y = 2;\n\n"),
+    )
+
+
+def test_class_member_layout():
+    print("\n═══ add_method / add_field: indentation and spacing ═══")
+
+    ts4 = "class K {\n    x = 1;\n\n    a() {\n        return 0;\n    }\n}\n"
+    ts4_added = (
+        "class K {\n    x = 1;\n\n    a() {\n        return 0;\n    }\n\n"
+        "    m() {\n        return 1;\n    }\n}\n"
+    )
+    py_tabs = "class K:\n\t\"\"\"Doc.\"\"\"\n\tdef a(self):\n\t\treturn 1\n"
+    rb4 = "class R\n    def a\n    end\nend\n"
+    # (label, file name, source, action, expected file text)
+    cases = [
+        # The reported case: a 4-space TS class used to get a 2-space method
+        # and a blank line before its closing brace.
+        ("ts: method indented like the class's members", "k.ts", ts4,
+         lambda a: a.add_method("K", "m() {\n    return 1;\n}"), ts4_added),
+        ("ts: indented snippet re-based, relative indentation kept", "k.ts", ts4,
+         lambda a: a.add_method("K", "        m() {\n            return 1;\n        }"), ts4_added),
+        ("ts: blank lines around the snippet dropped", "k.ts", ts4,
+         lambda a: a.add_method("K", "\n\nm() {\n    return 1;\n}\n\n"), ts4_added),
+        ("ts: methods without blank lines between them stay that way", "k.ts",
+         "class K {\n  a() {}\n  b() {}\n}\n",
+         lambda a: a.add_method("K", "c() {}"),
+         "class K {\n  a() {}\n  b() {}\n  c() {}\n}\n"),
+        ("ts: empty class gets the file's indent unit", "k.ts",
+         "function f() {\n    return 1;\n}\n\nexport class K {}\n",
+         lambda a: a.add_method("K", "m() {}"),
+         "function f() {\n    return 1;\n}\n\nexport class K {\n    m() {}\n}\n"),
+        ("ts: empty class in an unindented file gets the TS default", "k.ts",
+         "class K {}\n", lambda a: a.add_method("K", "m() {}"), "class K {\n  m() {}\n}\n"),
+        ("ts: a blank line already before } stays", "k.ts",
+         "class K {\n    a() {}\n\n}\n", lambda a: a.add_method("K", "m() {}"),
+         "class K {\n    a() {}\n\n    m() {}\n\n}\n"),
+        ("ts: interface members stay one per line", "i.ts",
+         "interface I {\n    a: number;\n}\n", lambda a: a.add_method("I", "m(): void;"),
+         "interface I {\n    a: number;\n    m(): void;\n}\n"),
+        ("ts add_field: above a decorated first method, blank line between", "k.ts",
+         "class K {\n    @dec()\n    a() {}\n}\n", lambda a: a.add_field("K", "x = 1;"),
+         "class K {\n    x = 1;\n\n    @dec()\n    a() {}\n}\n"),
+        ("ts add_field: among fields, no blank line", "k.ts",
+         "class K {\n    a = 1;\n\n    m() {}\n}\n", lambda a: a.add_field("K", "b = 2;"),
+         "class K {\n    b = 2;\n    a = 1;\n\n    m() {}\n}\n"),
+        ("js: one-line class body opened up", "k.js",
+         "class K { a() {} }\n", lambda a: a.add_method("K", "b() {}"),
+         "class K {\n  a() {}\n\n  b() {}\n}\n"),
+        ("js add_field: empty one-line class", "k.js",
+         "class K {}\n", lambda a: a.add_field("K", "x = 1;"), "class K {\n  x = 1;\n}\n"),
+        ("java: 2-space class", "J.java",
+         "class J {\n  int x;\n\n  void a() {}\n}\n",
+         lambda a: a.add_method("J", "void m() {\n  return;\n}"),
+         "class J {\n  int x;\n\n  void a() {}\n\n  void m() {\n    return;\n  }\n}\n"),
+        ("java add_field: above the first method", "J.java",
+         "class J {\n  void a() {}\n}\n", lambda a: a.add_field("J", "private int x;"),
+         "class J {\n  private int x;\n\n  void a() {}\n}\n"),
+        ("java: empty class in an unindented file gets the Java default", "J.java",
+         "class J {}\n", lambda a: a.add_method("J", "void m() {}"), "class J {\n    void m() {}\n}\n"),
+        ("cpp: access label does not set the indentation", "c.cpp",
+         "class C {\npublic:\n  int x;\n};\n", lambda a: a.add_method("C", "void m() {}"),
+         "class C {\npublic:\n  int x;\n\n  void m() {}\n};\n"),
+        ("cpp add_field: empty struct", "c.cpp",
+         "struct E {};\n", lambda a: a.add_field("E", "int y;"), "struct E {\n  int y;\n};\n"),
+        ("py: tab-indented class", "t.py",
+         "class K:\n\tdef a(self):\n\t\treturn 1\n",
+         lambda a: a.add_method("K", "def m(self):\n\treturn 2"),
+         "class K:\n\tdef a(self):\n\t\treturn 1\n\n\tdef m(self):\n\t\treturn 2\n"),
+        ("py add_field: tab-indented, after the docstring", "t.py", py_tabs,
+         lambda a: a.add_field("K", "x = 1"),
+         "class K:\n\t\"\"\"Doc.\"\"\"\n\tx = 1\n\n\tdef a(self):\n\t\treturn 1\n"),
+        ("py add_field: after the docstring, existing blank line kept", "t.py",
+         "class K:\n    \"\"\"Doc.\"\"\"\n\n    def a(self):\n        return 1\n",
+         lambda a: a.add_field("K", "x = 1"),
+         "class K:\n    \"\"\"Doc.\"\"\"\n    x = 1\n\n    def a(self):\n        return 1\n"),
+        ("py: 2-space class", "t.py", "class K:\n  def a(self):\n    return 1\n",
+         lambda a: a.add_method("K", "def m(self):\n  return 2"),
+         "class K:\n  def a(self):\n    return 1\n\n  def m(self):\n    return 2\n"),
+        ("rb: 4-space class", "r.rb", rb4, lambda a: a.add_method("R", "def m\n  1\nend"),
+         "class R\n    def a\n    end\n\n    def m\n      1\n    end\nend\n"),
+        ("rb add_field: above the first method", "r.rb", rb4,
+         lambda a: a.add_field("R", "attr_reader :x"),
+         "class R\n    attr_reader :x\n\n    def a\n    end\nend\n"),
+        ("rb: empty class", "r.rb", "class R\nend\n", lambda a: a.add_method("R", "def m\nend"),
+         "class R\n  def m\n  end\nend\n"),
+        ("go add_field: empty one-line struct", "s.go", "package main\n\ntype T struct{}\n",
+         lambda a: a.add_field("T", "A int"), "package main\n\ntype T struct{\n\tA int\n}\n"),
+        ("go add_field: indented like the existing fields", "s.go",
+         "package main\n\ntype T struct {\n    B int\n}\n", lambda a: a.add_field("T", "A int"),
+         "package main\n\ntype T struct {\n    A int\n    B int\n}\n"),
+    ]
+    cases += [
+        ("ts: after a comment on the last member's line", "k.ts",
+         "class K {\n  a() {} // note\n}\n", lambda a: a.add_method("K", "b() {}"),
+         "class K {\n  a() {} // note\n\n  b() {}\n}\n"),
+        ("ts: multi-byte text before the class", "u.ts",
+         "// ═══ é ═══\nclass K {}\n", lambda a: a.add_method("K", "m() { return '→'; }"),
+         "// ═══ é ═══\nclass K {\n  m() { return '→'; }\n}\n"),
+        ("cpp: class nested in a namespace", "n.cpp",
+         "namespace n {\n  class C {};\n}\n", lambda a: a.add_method("C", "void m() {}"),
+         "namespace n {\n  class C {\n    void m() {}\n  };\n}\n"),
+        ("py: nested class", "n.py",
+         "class O:\n    class I:\n        def a(self):\n            pass\n",
+         lambda a: a.add_method("O.I", "def m(self):\n    pass"),
+         "class O:\n    class I:\n        def a(self):\n            pass\n\n"
+         "        def m(self):\n            pass\n"),
+    ]
+    for label, name, source, action, expected in cases:
+        _exact(f"member layout {label}", _edit_result(name, source, action), expected)
+
+    # Line endings are kept by both insertion paths.
+    _exact("member layout ts: CRLF file stays CRLF",
+           _edit_result("k.ts", "class K {\n    a() {}\n}\n",
+                        lambda a: a.add_method("K", "m() {}"), "\r\n"),
+           "class K {\r\n    a() {}\r\n\r\n    m() {}\r\n}\r\n")
+    _exact("member layout py: CRLF file stays CRLF",
+           _edit_result("k.py", "class K:\n    def a(self):\n        pass\n",
+                        lambda a: a.add_field("K", "x = 1"), "\r\n"),
+           "class K:\r\n    x = 1\r\n\r\n    def a(self):\r\n        pass\r\n")
+
+    # A Python or Ruby class body on its header's line has no line to insert
+    # on: refused, file untouched (Python's used to land before the class).
+    for label, name, source, action in [
+        ("py add_method", "t.py", "class K: pass\n", lambda a: a.add_method("K", "def m(self):\n    pass")),
+        ("py add_field", "t.py", "class K: pass\n", lambda a: a.add_field("K", "x = 1")),
+        ("rb add_method", "r.rb", "class R; end\n", lambda a: a.add_method("R", "def m\nend")),
+    ]:
+        result = _edit_result(name, source, action)
+        check(f"member layout {label} on a one-line class: refused", result,
+              "REFUSED: The body of ")
+        check(f"member layout {label} on a one-line class: points to replace_function",
+              result, "with replace_function")
+        check(f"member layout {label} on a one-line class: file untouched",
+              "PASS" if "[FILE CHANGED]" not in result else "FAIL", "PASS")
+    check("member layout: empty content refused",
+          _edit_result("k.ts", ts4, lambda a: a.add_method("K", "\n  \n")),
+          "REFUSED: content is empty")
+
+
+def test_decorator_leading_comments():
+    print("\n═══ decorators and leading comments (TS, JS, Python, Java) ═══")
+
+    # Each method has a doc comment above two decorators/annotations. TS puts
+    # the decorators beside the method in the class body; JS and Java keep
+    # them inside the method node and Python in its decorated_definition, and
+    # all four must behave alike.
+    # (label, file name, source, target, doc line, new comment line,
+    #  replace_function content, its expected source fragment, sibling)
+    ts = (
+        "class S {\n    x = 1;\n\n    /** Finds. */\n    @Get()\n    @Auth\n"
+        "    find() {\n        return 1;\n    }\n}\n"
+    )
+    langs = [
+        ("ts", "s.ts", ts, "S.find", "    /** Finds. */\n", "    // New.\n",
+         "@Post()\nfind() {\n    return 2;\n}", "    @Post()\n    find() {\n        return 2;\n    }\n",
+         "y = 2;"),
+        ("js", "s.js", ts, "S.find", "    /** Finds. */\n", "    // New.\n",
+         "@Post()\nfind() {\n    return 2;\n}", "    @Post()\n    find() {\n        return 2;\n    }\n",
+         "y = 2;"),
+        ("python", "s.py",
+         "class S:\n    x = 1\n\n    # Finds.\n    @property\n    @cached\n"
+         "    def find(self):\n        return 1\n",
+         "S.find", "    # Finds.\n", "    # New.\n",
+         "@staticmethod\ndef find():\n    return 2", "    @staticmethod\n    def find():\n        return 2\n",
+         "y = 2"),
+        ("java", "S.java",
+         "class S {\n    int x;\n\n    /** Finds. */\n    @Override\n    @Deprecated\n"
+         "    public String find() {\n        return \"\";\n    }\n}\n",
+         "S.find", "    /** Finds. */\n", "    // New.\n",
+         "@Override\npublic String find() {\n    return \"b\";\n}",
+         "    @Override\n    public String find() {\n        return \"b\";\n    }\n",
+         "int y;"),
+    ]
+    for label, name, source, target, doc, new, new_def, new_def_text, sibling in langs:
+        decorated = source[source.index(doc) + len(doc):]
+        definition_end = decorated.index("\n    }\n") + 7 if "{" in decorated else len(decorated)
+        definition = decorated[:definition_end]
+        bare = source.replace(doc, "")
+        _exact(f"{label} add: comment goes above the first decorator",
+               _edit_result(name, bare, lambda a: a.edit_leading_comment(target, "add", new.strip())),
+               source.replace(doc, new))
+        check(f"{label} add: comment above the decorators is detected",
+              _edit_result(name, source, lambda a: a.edit_leading_comment(target, "add", new.strip())),
+              f"already has a leading comment (line 4):\n{doc.strip()}")
+        _exact(f"{label} replace: comment above the decorators replaced",
+               _edit_result(name, source, lambda a: a.edit_leading_comment(target, "replace", new.strip())),
+               source.replace(doc, new))
+        _exact(f"{label} remove: comment above the decorators removed",
+               _edit_result(name, source, lambda a: a.edit_leading_comment(target, "remove")),
+               bare)
+        head = source[: source.index(doc)].rstrip("\n")
+        result = _edit_result(name, source, lambda a: a.delete_symbol(target))
+        check(f"{label} delete_symbol: decorators and doc comment go too",
+              "PASS" if result.startswith(head) and "@" not in result
+              and "find" not in result and doc.strip() not in result else result,
+              "PASS")
+        result = _edit_result(name, source, lambda a: a.delete_symbol(target, include_leading_comments=False))
+        check(f"{label} delete_symbol include_leading_comments=False: doc kept, decorators gone",
+              "PASS" if result.startswith(head + "\n\n" + doc) and "@" not in result
+              and "find" not in result else result,
+              "PASS")
+        _exact(f"{label} read_symbol: starts at the first decorator",
+               _read_result(name, source, lambda a: a.read_symbol(target)),
+               definition.strip())
+        check(f"{label} list_symbols: method listed at its first decorator",
+              _read_result(name, source, lambda a: a.list_symbols()),
+              f"method {target} (line 5)")
+        _exact(f"{label} replace_function: decorators replaced with the definition",
+               _edit_result(name, source, lambda a: a.replace_function(target, new_def)),
+               source.replace(definition, new_def_text))
+        _exact(f"{label} insert_sibling before: above the decorators",
+               _edit_result(name, bare, lambda a: a.insert_sibling(target, sibling, "before")),
+               bare.replace(definition, f"    {sibling}\n\n" + definition))
+
+    # A comment between two TS decorators is part of the decorated member.
+    between = "class S {\n    x = 1;\n\n    @A()\n    // why\n    @B()\n    m() {}\n}\n"
+    result = _edit_result("b.ts", between, lambda a: a.delete_symbol("S.m"))
+    check("ts comment between decorators: delete_symbol removes all of it",
+          "PASS" if "@" not in result and "why" not in result and "m()" not in result else result,
+          "PASS")
+    _exact("ts comment between decorators: add goes above the first decorator",
+           _edit_result("b.ts", between, lambda a: a.edit_leading_comment("S.m", "add", "// Doc.")),
+           between.replace("    @A()", "    // Doc.\n    @A()"))
+
+    # A decorated Python class is listed as a class, and its decorators go
+    # with it (they used to be listed as 'function <anonymous>' and left
+    # behind by delete_symbol).
+    dc = "x = 1\n\n\n# Data.\n@dataclass\nclass D:\n    a: int = 1\n"
+    _exact("py decorated class: listed as a class",
+           _read_result("d.py", dc, lambda a: a.list_symbols()), "class D (line 5)")
+    _exact("py decorated class: read_symbol includes the decorator",
+           _read_result("d.py", dc, lambda a: a.read_symbol("D")),
+           "@dataclass\nclass D:\n    a: int = 1")
+    _exact("py decorated class: delete_symbol removes decorator and comment",
+           _edit_result("d.py", dc, lambda a: a.delete_symbol("D")), "x = 1\n")
+    _exact("py decorated class: comment replaced above the decorator",
+           _edit_result("d.py", dc, lambda a: a.edit_leading_comment("D", "replace", "# Record.")),
+           dc.replace("# Data.", "# Record."))
+    _exact("py decorated class: replace_function replaces the decorators too",
+           _edit_result("d.py", dc, lambda a: a.replace_function(
+               "D", "@dataclass(frozen=True)\nclass D:\n    a: int = 2")),
+           dc.replace("@dataclass\nclass D:\n    a: int = 1", "@dataclass(frozen=True)\nclass D:\n    a: int = 2"))
+    check("py decorated class: interface header includes the decorator",
+          _read_result("d.py", dc, lambda a: a.read_symbol("D", depth="interface")),
+          "@dataclass\nclass D:")
+    _exact("py decorated class: add_method still targets the class",
+           _edit_result("d.py", dc, lambda a: a.add_method("D", "def m(self):\n    return 1")),
+           dc + "\n    def m(self):\n        return 1\n")
+
 def test_docs_name_real_tools():
     print("\n═══ docs and tool metadata only name tools that exist ═══")
 
@@ -4632,6 +5094,575 @@ def test_docs_name_real_tools():
     check("read_symbol(depth='interface') on json: names the real tool", result,
           "REFUSED: read_symbol(depth='interface') is not supported for .json")
 
+def test_config_path_lookup():
+    print("\n═══ Config files: dotted paths are followed from the root ═══")
+
+    json_deeper = '{"x": {"a": {"b": 1}}}\n'
+    json_both = '{"x": {"a": {"b": 1}}, "a": {"b": 3}}\n'
+    yaml_deeper = "x:\n  a:\n    b: 1\n"
+    yaml_both = "x:\n  a:\n    b: 1\na:\n  b: 3\n"
+    # (label, file name, content, edit, expected file, or None if the
+    # target must not be found)
+    cases = [
+        # a.b exists only deeper (x.a.b), or b only below another key.
+        ("json a.b only deeper: replace_value", "p.json", json_deeper,
+         lambda a: a.replace_value("a.b", "2"), None),
+        ("json a.b only deeper: delete_key", "p.json", json_deeper,
+         lambda a: a.delete_key("a.b"), None),
+        ("json a only deeper: add_key", "p.json", '{"x": {"a": {"m": 0}}}\n',
+         lambda a: a.add_key("a", "k", "1"), None),
+        ("json a.b only deeper: append_to_array", "p.json", '{"x": {"a": {"b": [1]}}}\n',
+         lambda a: a.append_to_array("a.b", "2"), None),
+        ("json a.b only deeper: remove_from_array", "p.json", '{"x": {"a": {"b": [1, 2]}}}\n',
+         lambda a: a.remove_from_array("a.b", "1"), None),
+        ("json b only under a", "p.json", '{"a": {"b": 1}}\n',
+         lambda a: a.replace_value("b", "2"), None),
+        ("json a.b only under a.x", "p.json", '{"a": {"x": {"b": 1}}}\n',
+         lambda a: a.replace_value("a.b", "2"), None),
+        ("json a.b missing", "p.json", '{"a": {"c": 1}}\n',
+         lambda a: a.replace_value("a.b", "2"), None),
+        # a.b both deeper and at the root: the root one is edited.
+        ("json a.b deeper and at root: replace_value", "p.json", json_both,
+         lambda a: a.replace_value("a.b", "2"), '{"x": {"a": {"b": 1}}, "a": {"b": 2}}\n'),
+        ("json a.b deeper and at root: delete_key", "p.json", json_both,
+         lambda a: a.delete_key("a.b"), '{"x": {"a": {"b": 1}}, "a": {}}\n'),
+        ("json a deeper and at root: add_key", "p.json", '{"x": {"a": {"m": 0}}, "a": {"m": 0}}\n',
+         lambda a: a.add_key("a", "k", "1"), '{"x": {"a": {"m": 0}}, "a": {"m": 0, "k": 1}}\n'),
+        ("json a.b deeper and at root: remove_from_array", "p.json",
+         '{"x": {"a": {"b": [1, 2]}}, "a": {"b": [1, 2]}}\n',
+         lambda a: a.remove_from_array("a.b", "1"), '{"x": {"a": {"b": [1, 2]}}, "a": {"b": [2]}}\n'),
+        ("yaml a.b only deeper: replace_value", "p.yaml", yaml_deeper,
+         lambda a: a.replace_value("a.b", "2"), None),
+        ("yaml a.b only deeper: delete_key", "p.yaml", yaml_deeper,
+         lambda a: a.delete_key("a.b"), None),
+        ("yaml a only deeper: add_key", "p.yaml", "x:\n  a:\n    m: 0\n",
+         lambda a: a.add_key("a", "k", "1"), None),
+        ("yaml a.b only deeper: append_to_array", "p.yaml", "x:\n  a:\n    b:\n      - 1\n",
+         lambda a: a.append_to_array("a.b", "2"), None),
+        ("yaml b only under a", "p.yaml", "a:\n  b: 1\n",
+         lambda a: a.replace_value("b", "2"), None),
+        ("yaml a.b only under a.x", "p.yaml", "a:\n  x:\n    b: 1\n",
+         lambda a: a.replace_value("a.b", "2"), None),
+        ("yaml a.b missing", "p.yaml", "a:\n  c: 1\n",
+         lambda a: a.replace_value("a.b", "2"), None),
+        ("yaml a.b deeper and at root: replace_value", "p.yaml", yaml_both,
+         lambda a: a.replace_value("a.b", "2"), "x:\n  a:\n    b: 1\na:\n  b: 2\n"),
+        ("yaml a.b deeper and at root: delete_key", "p.yaml", "x:\n  a:\n    b: 1\na:\n  b: 3\n  c: 4\n",
+         lambda a: a.delete_key("a.b"), "x:\n  a:\n    b: 1\na:\n  c: 4\n"),
+        ("yaml a deeper and at root: add_key", "p.yaml", "x:\n  a:\n    m: 0\na:\n  m: 0\n",
+         lambda a: a.add_key("a", "k", "1"), "x:\n  a:\n    m: 0\na:\n  m: 0\n  k: 1\n"),
+        ("yaml key of a later document", "p.yaml", "a: 1\n---\nb: 2\n",
+         lambda a: a.replace_value("b", "3"), "a: 1\n---\nb: 3\n"),
+        ("yaml delete_key on a key with no value", "p.yaml", "a:\nb: 1\n",
+         lambda a: a.delete_key("a"), "b: 1\n"),
+        ("yaml document after a directive", "p.yaml", "%YAML 1.2\n---\na:\n  b: 1\n",
+         lambda a: a.replace_value("a.b", "2"), "%YAML 1.2\n---\na:\n  b: 2\n"),
+        ("yaml document with a tag", "p.yaml", "--- !!map\na:\n  b: 1\n",
+         lambda a: a.replace_value("a.b", "2"), "--- !!map\na:\n  b: 2\n"),
+        ("yaml document after comments", "p.yaml", "# c\n---\n# d\na:\n  b: 1\n",
+         lambda a: a.replace_value("a.b", "2"), "# c\n---\n# d\na:\n  b: 2\n"),
+        ("yaml mapping with an anchor", "p.yaml", "a: &x\n  b: 1\n",
+         lambda a: a.replace_value("a.b", "2"), "a: &x\n  b: 2\n"),
+        ("yaml add_key at the root after a directive", "p.yaml", "%YAML 1.2\n---\na: 1\n",
+         lambda a: a.add_key("", "k", "2"), "%YAML 1.2\n---\na: 1\nk: 2\n"),
+        ("toml x only in a [table]: replace_value", "p.toml", "[t]\nx = 1\n",
+         lambda a: a.replace_value("x", "2"), None),
+        ("toml x only in a [table]: delete_key", "p.toml", "[t]\nx = 1\n",
+         lambda a: a.delete_key("x"), None),
+        ("toml x missing", "p.toml", "y = 1\n",
+         lambda a: a.replace_value("x", "2"), None),
+        ("toml x at root and in a [table]", "p.toml", "x = 0\n\n[t]\nx = 1\n",
+         lambda a: a.replace_value("x", "2"), "x = 2\n\n[t]\nx = 1\n"),
+        ("toml t.x", "p.toml", "x = 0\n\n[t]\nx = 1\n",
+         lambda a: a.replace_value("t.x", "2"), "x = 0\n\n[t]\nx = 2\n"),
+        # Dotted [a.b] table names stay addressable, and JSON keys compare
+        # by their decoded text.
+        ("toml key of an [a.b] table", "p.toml", "[a]\nc = 0\n\n[a.b]\nc = 1\n",
+         lambda a: a.replace_value("a.b.c", "2"), "[a]\nc = 0\n\n[a.b]\nc = 2\n"),
+        ("json key written with an escape", "p.json", '{"caf\\u00e9": {"b": 1}}\n',
+         lambda a: a.replace_value("café.b", "2"), '{"caf\\u00e9": {"b": 2}}\n'),
+    ]
+    for label, name, content, action, expected in cases:
+        result = _edit_result(name, content, action)
+        if expected is None:
+            check(f"{label}: not found", result, "REFUSED: ")
+            check(f"{label}: says not found", result, "not found")
+            check(f"{label}: file untouched", "PASS" if "[FILE CHANGED]" not in result else "FAIL", "PASS")
+        else:
+            _exact(label, result, expected)
+
+    for label, name, content, target, expected in [
+        ("json a.b deeper and at root", "p.json", json_both, "a.b", "3"),
+        ("json a.b only deeper", "p.json", json_deeper, "a.b", "REFUSED: Target 'a.b' not found"),
+        ("yaml a.b deeper and at root", "p.yaml", yaml_both, "a.b", "3"),
+        ("yaml a.b only deeper", "p.yaml", yaml_deeper, "a.b", "REFUSED: Target 'a.b' not found"),
+        ("toml x at root and in a [table]", "p.toml", "x = 0\n\n[t]\nx = 1\n", "x", "0"),
+        ("toml x only in a [table]", "p.toml", "[t]\nx = 1\n", "x", "REFUSED: Target 'x' not found"),
+    ]:
+        result = _read_result(name, content, lambda a: a.read_symbol(target))
+        check(f"read_symbol {label}", result, expected)
+        if not expected.startswith("REFUSED"):
+            _exact(f"read_symbol {label}: just the root value", result, expected)
+
+def test_add_key_config_shapes():
+    print("\n═══ add_key: empty, flow and inline YAML/TOML mappings, key quoting ═══")
+    import tomllib
+
+    try:
+        import yaml  # not a dependency of this server: checked when installed
+    except ImportError:
+        yaml = None
+
+    def lookup(data, path):
+        for part in path:
+            data = data[part]
+        return data
+
+    # (label, content, parent_target, key, value, expected file, path to
+    # the new key in the loaded data)
+    yaml_cases = [
+        ("empty flow mapping", "a: {}\nb: 1\n", "a", "k", "1", "a: { k: 1 }\nb: 1\n", ("a", "k")),
+        ("key with no value", "a:\nb: 1\n", "a", "k", "v", "a:\n  k: v\nb: 1\n", ("a", "k")),
+        ("key with no value, 4-space file", "top:\n    a:\n    b: 1\n", "top.a", "k", "1",
+         "top:\n    a:\n        k: 1\n    b: 1\n", ("top", "a", "k")),
+        ("key with no value but a comment", "a: # later\nb: 1\n", "a", "k", "1",
+         "a: # later\n  k: 1\nb: 1\n", ("a", "k")),
+        ("last key, with no value", "b: 1\na:\n", "a", "k", "1", "b: 1\na:\n  k: 1\n", ("a", "k")),
+        ("flow mapping", "a: {x: 1}\n", "a", "k", "2", "a: {x: 1, k: 2}\n", ("a", "k")),
+        ("padded flow mapping", "a: { x: 1, y: 2 }\n", "a", "k", "3",
+         "a: { x: 1, y: 2, k: 3 }\n", ("a", "k")),
+        ("flow mapping over several lines", "a: {\n  x: 1,\n  y: 2\n}\n", "a", "k", "3",
+         "a: {\n  x: 1,\n  y: 2,\n  k: 3\n}\n", ("a", "k")),
+        ("flow mapping with an anchor", "a: &base {x: 1}\n", "a", "k", "2",
+         "a: &base {x: 1, k: 2}\n", ("a", "k")),
+        ("root flow mapping", "{a: 1}\n", "", "k", "2", "{a: 1, k: 2}\n", ("k",)),
+        ("root empty flow mapping", "{}\n", "", "k", "1", "{ k: 1 }\n", ("k",)),
+        ("empty file", "", "", "k", "1", "k: 1\n", ("k",)),
+        ("comments only", "# settings\n", "", "k", "1", "# settings\nk: 1\n", ("k",)),
+        ("block mapping", "a:\n  x: 1\n", "a", "k", "2", "a:\n  x: 1\n  k: 2\n", ("a", "k")),
+        # Keys stay plain unless they have to be quoted.
+        ("plain key with spaces", "a: 1\n", "", "my key", "2", "a: 1\nmy key: 2\n", ("my key",)),
+        ("plain key with dots", "a: 1\n", "", "a.b", "2", "a: 1\na.b: 2\n", ("a.b",)),
+        ("plain key, non-ASCII", "a: 1\n", "", "café", "2", "a: 1\ncafé: 2\n", ("café",)),
+        ("plain key, spaces around", "a: 1\n", "", " k ", "2", "a: 1\nk: 2\n", ("k",)),
+        ("key with a colon", "a: 1\n", "", "a:b", "2", 'a: 1\n"a:b": 2\n', ("a:b",)),
+        ("key with colon and space", "a: 1\n", "", "a: b", "2", 'a: 1\n"a: b": 2\n', ("a: b",)),
+        ("key with ' #'", "a: 1\n", "", "a #b", "2", 'a: 1\n"a #b": 2\n', ("a #b",)),
+        ("key starting with a digit", "a: 1\n", "", "123", "2", 'a: 1\n"123": 2\n', ("123",)),
+        ("key that reads as a float", "a: 1\n", "", "1.5", "2", 'a: 1\n"1.5": 2\n', ("1.5",)),
+        ("key that reads as a boolean", "a: 1\n", "", "yes", "2", 'a: 1\n"yes": 2\n', ("yes",)),
+        ("key that reads as null", "a: 1\n", "", "null", "2", 'a: 1\n"null": 2\n', ("null",)),
+        ("key with a tab", "a: 1\n", "", "a\tb", "2", 'a: 1\n"a\\tb": 2\n', ("a\tb",)),
+        ("key with a double quote", "a: 1\n", "", 'say "hi"', "2",
+         'a: 1\n"say \\"hi\\"": 2\n', ('say "hi"',)),
+        ("key with a line separator", "a: 1\n", "", "a\N{LINE SEPARATOR}b", "2",
+         'a: 1\n"a\\u2028b": 2\n', ("a\N{LINE SEPARATOR}b",)),
+        ("key with DEL", "a: 1\n", "", "a\x7fb", "2", 'a: 1\n"a\\u007fb": 2\n', ("a\x7fb",)),
+        ("key given quoted", "a: 1\n", "", '"x y"', "2", 'a: 1\n"x y": 2\n', ("x y",)),
+        ("comma key into a flow mapping", "m: {x: 1}\n", "m", "a, b", "2",
+         'm: {x: 1, "a, b": 2}\n', ("m", "a, b")),
+        ("file that single-quotes", "a: 'x'\nb: 'y'\n", "", "#c", "2",
+         "a: 'x'\nb: 'y'\n'#c': 2\n", ("#c",)),
+        ("file that single-quotes, apostrophe", "a: 'x'\n", "", "it's #1", "2",
+         "a: 'x'\n'it''s #1': 2\n", ("it's #1",)),
+    ]
+    yaml_cases += [
+        (f"key starting with {ch}", "a: 1\n", "", ch + "x", "2", f'a: 1\n"{ch}x": 2\n', (ch + "x",))
+        for ch in "-?&*!|>%@`[{"
+    ]
+    for label, content, parent, key, value, expected, path in yaml_cases:
+        result = _edit_result("k.yaml", content, lambda a: a.add_key(parent, key, value))
+        _exact(f"yaml add_key {label}", result, expected)
+        if yaml is not None:
+            try:
+                loaded = yaml.safe_load(result)
+                got = "PASS" if lookup(loaded, path) == yaml.safe_load(value) else f"FAIL: {loaded!r}"
+            except Exception as e:
+                got = f"FAIL: {type(e).__name__}: {e}"
+            check(f"yaml add_key {label}: loads with the new key", got, "PASS")
+    if yaml is None:
+        print("  [NOTE] PyYAML is not installed here: yaml.safe_load checks skipped")
+
+    toml_cases = [
+        ("inline table", "t = { a = 1 }\n", "t", "k", "2", "t = { a = 1, k = 2 }\n", ("t", "k")),
+        ("empty inline table", "t = {}\n", "t", "k", "2", "t = { k = 2 }\n", ("t", "k")),
+        ("inline table in a [table]", "[s]\nt = { a = 1 }\n", "s.t", "k", "2",
+         "[s]\nt = { a = 1, k = 2 }\n", ("s", "t", "k")),
+        ("compact inline table", "t = {a=1}\n", "t", "k", "2", "t = {a=1, k = 2}\n", ("t", "k")),
+        ("inline table, key quoted", "t = { a = 1 }\n", "t", "x y", "2",
+         't = { a = 1, "x y" = 2 }\n', ("t", "x y")),
+        ("[table]", "[t]\na = 1\n", "t", "k", "2", "[t]\na = 1\nk = 2\n", ("t", "k")),
+        ("[table], key quoted", "[t]\na = 1\n", "t", "x y", "2", '[t]\na = 1\n"x y" = 2\n', ("t", "x y")),
+        ("key with a space", "a = 1\n", "", "x y", "2", 'a = 1\n"x y" = 2\n', ("x y",)),
+        ("key with a colon", "a = 1\n", "", "x:y", "2", 'a = 1\n"x:y" = 2\n', ("x:y",)),
+        ("key starting with #", "a = 1\n", "", "#c", "2", 'a = 1\n"#c" = 2\n', ("#c",)),
+        ("non-ASCII key", "a = 1\n", "", "café", "2", 'a = 1\n"café" = 2\n', ("café",)),
+        ("bare key with a leading digit", "a = 1\n", "", "1st", "2", "a = 1\n1st = 2\n", ("1st",)),
+        ("bare key with - and _", "a = 1\n", "", "my-key_2", "2", "a = 1\nmy-key_2 = 2\n", ("my-key_2",)),
+        ("dotted key", "a = 1\n", "", "b.c", "2", "a = 1\nb.c = 2\n", ("b", "c")),
+        ("dotted key, one part quoted", "a = 1\n", "", "b.x y", "2", 'a = 1\nb."x y" = 2\n', ("b", "x y")),
+        ("key with a dot, given quoted", "a = 1\n", "", '"b.c"', "2", 'a = 1\n"b.c" = 2\n', ("b.c",)),
+        ("literal-string key", "a = 1\n", "", "'x y'", "2", "a = 1\n'x y' = 2\n", ("x y",)),
+        ("key with a double quote", "a = 1\n", "", 'say "hi"', "2",
+         'a = 1\n"say \\"hi\\"" = 2\n', ('say "hi"',)),
+        ("empty key", "a = 1\n", "", "", "2", 'a = 1\n"" = 2\n', ("",)),
+        ("key with a tab", "a = 1\n", "", "a\tb", "2", 'a = 1\n"a\\tb" = 2\n', ("a\tb",)),
+        ("key with DEL", "a = 1\n", "", "a\x7fb", "2", 'a = 1\n"a\\u007fb" = 2\n', ("a\x7fb",)),
+    ]
+    for label, content, parent, key, value, expected, path in toml_cases:
+        result = _edit_result("k.toml", content, lambda a: a.add_key(parent, key, value))
+        _exact(f"toml add_key {label}", result, expected)
+        try:
+            loaded = tomllib.loads(result)
+            want = tomllib.loads(f"v = {value}")["v"]
+            got = "PASS" if lookup(loaded, path) == want else f"FAIL: {loaded!r}"
+        except Exception as e:
+            got = f"FAIL: {type(e).__name__}: {e}"
+        check(f"toml add_key {label}: loads with the new key", got, "PASS")
+
+    # (label, file name, content, parent_target, key, expected error)
+    for label, name, content, parent, key, error in [
+        ("yaml key in a flow mapping", "k.yaml", "a: {x: 1}\n", "a", "x",
+         "Key 'x' already exists in the flow mapping at 'a'"),
+        ("yaml key quoted in a flow mapping", "k.yaml", 'a: {"x": 1}\n', "a", "x", "already exists"),
+        ("yaml key in the root flow mapping", "k.yaml", "{x: 1}\n", "", "x",
+         "already exists in the flow mapping at the root"),
+        ("yaml escaped key", "k.yaml", 'a:\n  "q\\"k": 1\n', "a", 'q"k', "already exists in 'a'"),
+        ("yaml single-quoted key", "k.yaml", "a:\n  'it''s': 1\n", "a", "it's", "already exists in 'a'"),
+        ("yaml scalar parent", "k.yaml", "a: 1\n", "a", "k", "YAML value at 'a' is not a mapping"),
+        ("yaml null parent", "k.yaml", "a: null\n", "a", "k", "YAML value at 'a' is not a mapping"),
+        ("yaml sequence root", "k.yaml", "- 1\n", "", "k", "YAML document root is not a mapping"),
+        ("yaml missing parent", "k.yaml", "a: 1\n", "b", "k", "YAML key 'b' not found"),
+        ("toml key in an inline table", "k.toml", "t = { a = 1 }\n", "t", "a",
+         "Key 'a' already exists in the inline table at 't'; to change its value, "
+         "rewrite the table with replace_value on 't'."),
+        ("toml quoted key, given bare", "k.toml", '"x y" = 1\n', "", "x y", "already exists in the root"),
+        ("toml bare key, given quoted", "k.toml", "xy = 1\n", "", '"xy"', "already exists in the root"),
+        ("toml scalar parent", "k.toml", "t = 1\n", "t", "k", "TOML value at 't' is not a table"),
+        ("toml missing parent", "k.toml", "a = 1\n", "t", "k", "TOML table '[t]' not found"),
+    ]:
+        result = _edit_result(name, content, lambda a: a.add_key(parent, key, "2"))
+        check(f"add_key refused ({label})", result, "REFUSED: ")
+        check(f"add_key refused ({label}): {error}", result, error)
+        check(f"add_key refused ({label}): file untouched", "PASS" if "[FILE CHANGED]" not in result else "FAIL", "PASS")
+
+def test_content_line_breaks():
+    print("\n═══ Caller content is split into lines on \\n only ═══")
+
+    # Characters str.splitlines() breaks lines on, besides \n and \r. Inside
+    # a string literal (or a comment) they are ordinary characters.
+    seps = "\x0b\x0c\x1c\x1d\x1e\x85\N{LINE SEPARATOR}\N{PARAGRAPH SEPARATOR}"
+    py = "class K:\n    def f(self):\n        return 1\n\n\ndef g():\n    return 2\n"
+    js = "class K {\n  f() {\n    return 1;\n  }\n}\n\nfunction g() {\n  return 2;\n}\n"
+    # (file name, content, tool label, edit taking the text to put inside
+    # the literal or comment). Every edit must come out exactly as it does
+    # with an ordinary character (`~`) in place of the separator.
+    edits = [
+        ("c.py", py, "insert_in_body top", lambda a, s: a.insert_in_body("g", f'    s = "{s}"\n', at="top")),
+        ("c.py", py, "insert_in_body bottom", lambda a, s: a.insert_in_body("g", f'    s = "{s}"\n', at="bottom")),
+        ("c.py", py, "replace_function_body", lambda a, s: a.replace_function_body("g", f'    return "{s}"')),
+        ("c.py", py, "replace_function", lambda a, s: a.replace_function("g", f'def g():\n    return "{s}"')),
+        ("c.py", py, "add_top_level", lambda a, s: a.add_top_level(f'S = "{s}"')),
+        ("c.py", py, "add_top_level top", lambda a, s: a.add_top_level(f'S = "{s}"', position="top")),
+        ("c.py", py, "insert_sibling before", lambda a, s: a.insert_sibling("g", f'S = "{s}"', "before")),
+        ("c.py", py, "insert_sibling after", lambda a, s: a.insert_sibling("g", f'S = "{s}"', "after")),
+        ("c.py", py, "add_method", lambda a, s: a.add_method("K", f'    def h(self):\n        return "{s}"')),
+        ("c.py", py, "add_field", lambda a, s: a.add_field("K", f'    s = "{s}"')),
+        ("c.py", py, "edit_leading_comment add", lambda a, s: a.edit_leading_comment("g", "add", f"# {s}")),
+        ("c.py", py, "edit_leading_comment replace", lambda a, s: a.edit_leading_comment("g", "replace", f"# {s}")),
+        ("c.js", js, "insert_in_body top", lambda a, s: a.insert_in_body("g", f'  const s = "{s}";\n', at="top")),
+        ("c.js", js, "insert_in_body bottom", lambda a, s: a.insert_in_body("g", f'  const s = "{s}";\n', at="bottom")),
+        ("c.js", js, "replace_function_body", lambda a, s: a.replace_function_body("g", f'  return "{s}";')),
+        ("c.js", js, "replace_function", lambda a, s: a.replace_function("g", f'function g() {{\n  return "{s}";\n}}')),
+        ("c.js", js, "add_top_level", lambda a, s: a.add_top_level(f'const S = "{s}";')),
+        ("c.js", js, "insert_sibling before", lambda a, s: a.insert_sibling("g", f'const S = "{s}";', "before")),
+        ("c.js", js, "insert_sibling after", lambda a, s: a.insert_sibling("g", f'const S = "{s}";', "after")),
+        ("c.js", js, "add_method", lambda a, s: a.add_method("K", f'  h() {{\n    return "{s}";\n  }}')),
+        ("c.js", js, "add_field", lambda a, s: a.add_field("K", f'  s = "{s}";')),
+        ("c.js", js, "edit_leading_comment add", lambda a, s: a.edit_leading_comment("g", "add", f"// {s}")),
+    ]
+    for name, content, tool, edit in edits:
+        lang = name.rsplit(".", 1)[1]
+        plain = _edit_result(name, content, lambda a: edit(a, "a~b"))
+        check(f"{lang} {tool}: edit with `~` written", "PASS" if not plain.startswith("REFUSED") else plain, "PASS")
+        chars = seps
+        if lang == "js" and tool.startswith("edit_leading_comment"):
+            # U+2028 and U+2029 end a JS line comment.
+            chars = seps.replace("\N{LINE SEPARATOR}", "").replace("\N{PARAGRAPH SEPARATOR}", "")
+        # All of them together for every tool, and one at a time for the
+        # most common ones.
+        groups = [chars] + (list(chars) if tool in ("insert_in_body top", "add_top_level") else [])
+        for sep in groups:
+            what = "all separators" if len(sep) > 1 else f"U+{ord(sep):04X}"
+            result = _edit_result(name, content, lambda a: edit(a, f"a{sep}b"))
+            _exact(f"{lang} {tool}, {what}: kept inside its line", result, plain.replace("~", sep))
+
+    # The same in a CRLF file, with CRLF content.
+    result = _edit_result(
+        "c.py",
+        "def g():\n    return 2\n",
+        lambda a: a.insert_in_body("g", f'    s = "a{seps}b"\r\n    t = 1\r\n', at="top"),
+        "\r\n",
+    )
+    _exact("py CRLF insert_in_body, all separators", result,
+           f'def g():\r\n    s = "a{seps}b"\r\n    t = 1\r\n    return 2\r\n')
+
+    # So do append_to_array and replace_value on a YAML block sequence. (YAML
+    # forbids most of the separators; U+0085 is an ordinary character in
+    # YAML 1.2, which tree-sitter-yaml follows.)
+    result = _edit_result("c.yaml", "l:\n  - a\n", lambda a: a.append_to_array("l", '"x\x85y"'))
+    _exact("yaml append_to_array, U+0085", result, 'l:\n  - a\n  - "x\x85y"\n')
+    result = _edit_result("c.yaml", "l:\n  - a\n", lambda a: a.replace_value("l", '- "x\x85y"\n- b'))
+    _exact("yaml replace_value sequence, U+0085", result, 'l:\n  - "x\x85y"\n  - b\n')
+
+
+def test_json_plus_exponents():
+    print("\n═══ JSON numbers with a + exponent (6.02E+23) ═══")
+
+    # tree-sitter-json cannot parse an exponent written with `+`; the parser
+    # masks the sign, so the number node covers the whole token.
+    from ast_editor.parser import TreeSitterParser
+
+    path = _write_temp("e.json", '{"a": 6.02E+23, "s": "1e+5", "t": [1e+5, -2E+0]}\n')
+    parser = TreeSitterParser(path)
+    check("parser: file with + exponents parses cleanly",
+          "PASS" if not parser.tree.root_node.has_error else "FAIL", "PASS")
+    numbers = []
+    stack = [parser.tree.root_node]
+    while stack:
+        node = stack.pop()
+        if node.type == "number":
+            numbers.append(parser.node_text(node))
+        stack.extend(node.children)
+    _exact("parser: number nodes are whole tokens", sorted(numbers), sorted(["6.02E+23", "1e+5", "-2E+0"]))
+    os.remove(path)
+
+    one_line = '{"a": 1, "b": 6.02E+23}\n'
+    multi = '{\n  "a": 1,\n  "b": 6.02E+23\n}\n'
+    # (label, content, edit, expected file)
+    cases = [
+        ("replace_value", one_line, lambda a: a.replace_value("b", "1"), '{"a": 1, "b": 1}\n'),
+        ("replace_value, lowercase e, nested", '{"x": {"b": 1e+5}}\n',
+         lambda a: a.replace_value("x.b", "2"), '{"x": {"b": 2}}\n'),
+        ("replace_value with a + exponent", one_line,
+         lambda a: a.replace_value("b", "1.5E+3"), '{"a": 1, "b": 1.5E+3}\n'),
+        ("replace_value beside one", '{"b": 6.02E+23, "a": 1}\n',
+         lambda a: a.replace_value("a", "2"), '{"b": 6.02E+23, "a": 2}\n'),
+        ("delete_key, last entry", multi, lambda a: a.delete_key("b"), '{\n  "a": 1\n}\n'),
+        ("delete_key, last entry inline", one_line, lambda a: a.delete_key("b"), '{"a": 1}\n'),
+        ("delete_key, first entry", '{"b": 6.02E+23, "a": 1}\n', lambda a: a.delete_key("b"), '{"a": 1}\n'),
+        ("delete_key after one", '{"b": 6.02E+23, "a": 1}\n', lambda a: a.delete_key("a"), '{"b": 6.02E+23}\n'),
+        ("add_key after one", multi, lambda a: a.add_key("", "c", "2"),
+         '{\n  "a": 1,\n  "b": 6.02E+23,\n  "c": 2\n}\n'),
+        ("add_key after one, inline", '{"b": -1.5e+10}\n', lambda a: a.add_key("", "c", "2"),
+         '{"b": -1.5e+10, "c": 2}\n'),
+        ("append_to_array after one", '{\n  "v": [\n    1e+5\n  ]\n}\n',
+         lambda a: a.append_to_array("v", "2"), '{\n  "v": [\n    1e+5,\n    2\n  ]\n}\n'),
+        ("remove_from_array", '{"v": [1e+5, 2]}\n', lambda a: a.remove_from_array("v", "1e+5"), '{"v": [2]}\n'),
+        ("strings are not numbers", '{"s": "1e+5", "q": "say \\"2E+3\\"", "n": 2E+3}\n',
+         lambda a: a.replace_value("n", "3"), '{"s": "1e+5", "q": "say \\"2E+3\\"", "n": 3}\n'),
+    ]
+    for label, content, action, expected in cases:
+        _exact(f"json + exponent: {label}", _edit_result("e.json", content, action), expected)
+
+    for label, content, target, expected in [
+        ("number", one_line, "b", "6.02E+23"),
+        ("string", '{"s": "1e+5"}\n', "s", '"1e+5"'),
+        ("key that looks like one", '{"1e+5": 7}\n', "1e+5", "7"),
+    ]:
+        result = _read_result("e.json", content, lambda a: a.read_symbol(target))
+        _exact(f"json + exponent: read_symbol {label}", result, expected)
+
+
+def test_member_layout_followups():
+    print("\n═══ add_method / add_field: brace-line comments, tabs, one-line bodies, enums ═══")
+
+    def field_then_comment(a):
+        a.add_field("K", "x = 1;")
+        a.edit_leading_comment("K.a", "add", "// doc")
+
+    # (label, file name, source, action, expected file text)
+    cases = [
+        # A comment after the `{` on its line stays there: line-scoped
+        # directives (NOSONAR, NOLINT) keep applying to the class line, and
+        # the comment does not become the first member's leading comment.
+        ("ts add_field: comment on the brace line stays", "k.ts",
+         "class K { // note\n  a() {}\n}\n", lambda a: a.add_field("K", "x = 1;"),
+         "class K { // note\n  x = 1;\n\n  a() {}\n}\n"),
+        ("java add_field: NOSONAR on the brace line stays", "K.java",
+         "class K { // NOSONAR\n    void a() {}\n}\n", lambda a: a.add_field("K", "int x;"),
+         "class K { // NOSONAR\n    int x;\n\n    void a() {}\n}\n"),
+        ("cpp add_field: NOLINT on the brace line stays", "k.cpp",
+         "class K { // NOLINT\n    void a() {}\n};\n", lambda a: a.add_field("K", "int x;"),
+         "class K { // NOLINT\n    int x;\n\n    void a() {}\n};\n"),
+        ("ts: the method's leading comment can still be added", "k.ts",
+         "class K { // note\n  a() {}\n}\n", field_then_comment,
+         "class K { // note\n  x = 1;\n\n  // doc\n  a() {}\n}\n"),
+        ("java add_field: block comment on the brace line, blank line kept", "K.java",
+         "class K { /* c */\n\n    void a() {}\n}\n", lambda a: a.add_field("K", "int x;"),
+         "class K { /* c */\n    int x;\n\n    void a() {}\n}\n"),
+        ("java add_field: brace-line comment and no member", "K.java",
+         "class K { // c\n}\n", lambda a: a.add_field("K", "int x;"),
+         "class K { // c\n    int x;\n}\n"),
+        ("java add_field: code after the brace still moves down", "K.java",
+         "class K { int y; // c\n    void a() {}\n}\n", lambda a: a.add_field("K", "int x;"),
+         "class K {\n    int x;\n    int y; // c\n    void a() {}\n}\n"),
+        # Content indented with spaces gets tabs in a tab-indented class.
+        ("py add_method: 4-space snippet in a tab-indented class", "t.py",
+         "class K:\n\tdef a(self):\n\t\treturn 1\n",
+         lambda a: a.add_method("K", "def b(self):\n    if self:\n        return 2"),
+         "class K:\n\tdef a(self):\n\t\treturn 1\n\n\tdef b(self):\n\t\tif self:\n\t\t\treturn 2\n"),
+        ("py add_field: 4-space snippet in a tab-indented class", "t.py",
+         "class K:\n\tdef a(self):\n\t\treturn 1\n",
+         lambda a: a.add_field("K", "x = (\n    1\n)"),
+         "class K:\n\tx = (\n\t\t1\n\t)\n\n\tdef a(self):\n\t\treturn 1\n"),
+        ("js add_method: 2-space snippet in a tab-indented class", "k.js",
+         "class K {\n\ta() {}\n}\n", lambda a: a.add_method("K", "m() {\n  return 1;\n}"),
+         "class K {\n\ta() {}\n\n\tm() {\n\t\treturn 1;\n\t}\n}\n"),
+        ("java add_method: indented snippet in a tab-indented class", "K.java",
+         "class K {\n\tvoid a() {}\n}\n",
+         lambda a: a.add_method("K", "    void b() {\n        int x;\n    }"),
+         "class K {\n\tvoid a() {}\n\n\tvoid b() {\n\t\tint x;\n\t}\n}\n"),
+        ("rb add_method: 2-space snippet in a tab-indented class", "r.rb",
+         "class R\n\tdef a\n\tend\nend\n", lambda a: a.add_method("R", "def m\n  1\nend"),
+         "class R\n\tdef a\n\tend\n\n\tdef m\n\t\t1\n\tend\nend\n"),
+        # A non-empty body on one line is opened up completely.
+        ("js add_field: one-line class body", "k.js",
+         "class K { a() {} }\n", lambda a: a.add_field("K", "x = 1;"),
+         "class K {\n  x = 1;\n\n  a() {}\n}\n"),
+        ("ts add_method: one-line exported class", "k.ts",
+         "export class K { a() {} }\n", lambda a: a.add_method("K", "b() {}"),
+         "export class K {\n  a() {}\n\n  b() {}\n}\n"),
+        ("go add_field: one-line struct", "s.go",
+         "package main\n\ntype S struct{ A int }\n", lambda a: a.add_field("S", "B string"),
+         "package main\n\ntype S struct{\n\tB string\n\tA int\n}\n"),
+        ("cpp add_method: one-line struct", "c.cpp",
+         "struct E { int a; };\n", lambda a: a.add_method("E", "void m() {}"),
+         "struct E {\n  int a;\n\n  void m() {}\n};\n"),
+        ("cpp add_method: one-line class in a namespace", "n.cpp",
+         "namespace n {\n  class C { int a; };\n}\n", lambda a: a.add_method("C", "void m() {}"),
+         "namespace n {\n  class C {\n    int a;\n\n    void m() {}\n  };\n}\n"),
+        # A method added after a C++ access label goes right under it.
+        ("cpp add_method: class with only an access label", "c.cpp",
+         "class K {\npublic:\n};\n", lambda a: a.add_method("K", "void b() {}"),
+         "class K {\npublic:\n  void b() {}\n};\n"),
+        ("cpp add_method: after a trailing access label", "c.cpp",
+         "class K {\n  void a() {}\npublic:\n};\n", lambda a: a.add_method("K", "void b() {}"),
+         "class K {\n  void a() {}\npublic:\n  void b() {}\n};\n"),
+        # Java enums: new members go after the constants, which get the `;`
+        # Java needs before other members when they have none.
+        ("java add_field: enum with methods", "E.java",
+         "enum E {\n    A, B;\n\n    void m() {}\n}\n", lambda a: a.add_field("E", "int x;"),
+         "enum E {\n    A, B;\n\n    int x;\n\n    void m() {}\n}\n"),
+        ("java add_method: enum with methods", "E.java",
+         "enum E {\n    A, B;\n\n    void m() {}\n}\n", lambda a: a.add_method("E", "void n() {}"),
+         "enum E {\n    A, B;\n\n    void m() {}\n\n    void n() {}\n}\n"),
+        ("java add_method: enum with no ;", "E.java",
+         "enum E {\n    A, B\n}\n", lambda a: a.add_method("E", "void n() {}"),
+         "enum E {\n    A, B;\n\n    void n() {}\n}\n"),
+        ("java add_field: enum with only constants and a ;", "E.java",
+         "enum E {\n    A, B;\n}\n", lambda a: a.add_field("E", "int x;"),
+         "enum E {\n    A, B;\n\n    int x;\n}\n"),
+        ("java add_method: enum constants with a comment", "E.java",
+         "enum E {\n    A, B // last\n}\n", lambda a: a.add_method("E", "void n() {}"),
+         "enum E {\n    A, B; // last\n\n    void n() {}\n}\n"),
+        ("java add_method: enum constant with a body", "E.java",
+         "enum E {\n    A {\n        void f() {}\n    },\n    B\n}\n",
+         lambda a: a.add_method("E", "void n() {}"),
+         "enum E {\n    A {\n        void f() {}\n    },\n    B;\n\n    void n() {}\n}\n"),
+        ("java add_field: enum with a constructor", "E.java",
+         "enum E {\n    A(1), B(2);\n\n    private final int v;\n\n    E(int v) { this.v = v; }\n}\n",
+         lambda a: a.add_field("E", "int x;"),
+         "enum E {\n    A(1), B(2);\n\n    int x;\n    private final int v;\n\n"
+         "    E(int v) { this.v = v; }\n}\n"),
+        ("java add_field: one-line enum", "E.java",
+         "enum E { A, B }\n", lambda a: a.add_field("E", "int x;"),
+         "enum E {\n    A, B;\n\n    int x;\n}\n"),
+        ("java add_field: one-line enum with a method", "E.java",
+         "enum E { A; void m() {} }\n", lambda a: a.add_field("E", "int x;"),
+         "enum E {\n    A;\n\n    int x;\n\n    void m() {}\n}\n"),
+        ("java add_method: empty enum", "E.java",
+         "enum E {}\n", lambda a: a.add_method("E", "void n() {}"),
+         "enum E {\n    ;\n\n    void n() {}\n}\n"),
+        ("java add_method: enum nested in a class", "E.java",
+         "class O {\n    enum E {\n        A, B\n    }\n}\n", lambda a: a.add_method("O.E", "void n() {}"),
+         "class O {\n    enum E {\n        A, B;\n\n        void n() {}\n    }\n}\n"),
+    ]
+    for label, name, source, action, expected in cases:
+        _exact(f"member layout {label}", _edit_result(name, source, action), expected)
+
+    # A decorated class nested in a class is not listed (as an undecorated
+    # one is not); it used to show up as 'method O.<anonymous>'.
+    outline = _read_result(
+        "n.py",
+        "class O:\n    @dataclass\n    class I:\n        x: int\n\n    def m(self):\n        pass\n",
+        lambda a: a.list_symbols(),
+    )
+    _exact("list_symbols: decorated nested Python class not listed", outline,
+           "class O (line 1)\n  method O.m (line 6)")
+
+
+def test_config_key_followups():
+    print("\n═══ YAML/TOML keys: first document with content, quoted names, inline tables ═══")
+
+    # (label, file name, content, edit, expected file text)
+    cases = [
+        # add_key at the root goes to the first document that has content.
+        ("yaml add_key at the root after an empty document", "k.yaml",
+         "---\n---\nb: 2\n", lambda a: a.add_key("", "k", "1"), "---\n---\nb: 2\nk: 1\n"),
+        ("yaml add_key at the root after a document with only a comment", "k.yaml",
+         "---\n# c\n---\nb: 2\n", lambda a: a.add_key("", "k", "1"), "---\n# c\n---\nb: 2\nk: 1\n"),
+        # YAML keys are matched by the name they spell, as add_key does.
+        ("yaml replace_value on a single-quoted key with ''", "k.yaml",
+         "a:\n  'it''s': 1\n", lambda a: a.replace_value("a.it's", "2"), "a:\n  'it''s': 2\n"),
+        ("yaml replace_value on a key with an escape", "k.yaml",
+         'a:\n  "caf\\u00e9": 1\n', lambda a: a.replace_value("a.café", "2"), 'a:\n  "caf\\u00e9": 2\n'),
+        ("yaml delete_key on a key with an escape", "k.yaml",
+         'a:\n  "caf\\u00e9": 1\n  b: 2\n', lambda a: a.delete_key("a.café"), "a:\n  b: 2\n"),
+        ("yaml add_key under a parent with an escape", "k.yaml",
+         '"caf\\u00e9":\n  b: 1\n', lambda a: a.add_key("café", "k", "2"), '"caf\\u00e9":\n  b: 1\n  k: 2\n'),
+        ("yaml quoted key, bare name", "k.yaml",
+         'a:\n  "x y": 1\n', lambda a: a.replace_value("a.x y", "2"), 'a:\n  "x y": 2\n'),
+        ("yaml quoted key, name written with its quotes", "k.yaml",
+         'a:\n  "x y": 1\n', lambda a: a.replace_value('a."x y"', "2"), 'a:\n  "x y": 2\n'),
+    ]
+    for label, name, content, action, expected in cases:
+        _exact(label, _edit_result(name, content, action), expected)
+
+    for label, content, target in [
+        ("single-quoted key with ''", "a:\n  'it''s': 1\n", "a.it's"),
+        ("key with an escape", 'a:\n  "caf\\u00e9": 1\n', "a.café"),
+    ]:
+        _exact(f"yaml read_symbol {label}",
+               _read_result("k.yaml", content, lambda a: a.read_symbol(target)), "1")
+
+    # The duplicate check runs on the document add_key would write to.
+    result = _edit_result("k.yaml", "---\n---\nk: 2\n", lambda a: a.add_key("", "k", "1"))
+    check("yaml add_key after an empty document: duplicate refused", result,
+          "REFUSED: Key 'k' already exists in the root")
+    check("yaml add_key after an empty document: file untouched",
+          "PASS" if "[FILE CHANGED]" not in result else "FAIL", "PASS")
+
+    # The target a YAML duplicate refusal points to can be used.
+    path = _write_temp("k.yaml", "a:\n  'it''s': 1\n")
+    message = _refusal(lambda: Applier(path).add_key("a", "it's", "2"))
+    check("yaml duplicate refusal names the target", message, "target \"a.it's\"")
+    try:
+        Applier(path).replace_value("a.it's", "3")
+        result = read_file(path)
+    except ApplierError as e:
+        result = f"REFUSED: {e}"
+    _exact("yaml duplicate refusal: its target works with replace_value", result, "a:\n  'it''s': 3\n")
+    os.remove(path)
+
+    # A key inside a TOML inline table is not addressable, so the refusal
+    # points to rewriting the table instead of a 't.a' target.
+    result = _edit_result("k.toml", "t = { a = 1 }\n", lambda a: a.add_key("t", "a", "2"))
+    check("toml inline table duplicate: points to the table", result,
+          "rewrite the table with replace_value on 't'")
+    check("toml inline table duplicate: no unaddressable 't.a' target",
+          "PASS" if "'t.a'" not in result else f"FAIL: {result}", "PASS")
+
 
 # ──────────────────────────────────────────────
 # Main
@@ -4686,7 +5717,16 @@ if __name__ == "__main__":
     test_java_signature_annotations()
     test_comment_and_parameter_validation()
     test_body_insert_placement()
+    test_exported_symbols()
+    test_class_member_layout()
+    test_decorator_leading_comments()
     test_docs_name_real_tools()
+    test_config_path_lookup()
+    test_add_key_config_shapes()
+    test_content_line_breaks()
+    test_json_plus_exponents()
+    test_member_layout_followups()
+    test_config_key_followups()
 
     # Reset all fixtures to clean state after tests
     for lang in FIXTURES:

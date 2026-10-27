@@ -20,12 +20,19 @@ yield byte-identical output. Cells that haven't been edited replay their
 original raw text; modified cells regenerate from structured fields. The
 frontmatter is always replayed from its raw text: key edits rewrite only the
 lines of that key.
+
+Line endings: "\\n", "\\r\\n" and a lone "\\r" each end a line, so CRLF and
+mixed-ending documents parse like LF ones, and cell sources and the YAML that
+callers see use "\\n". Raw text keeps the file's own line breaks; everything
+the serializer writes anew (edited cells, edited header lines, the break
+between parts) uses the document's line break, the one most of its lines end
+with.
 """
 from __future__ import annotations
 
 import re
 import textwrap
-from collections import OrderedDict
+from collections import Counter, OrderedDict
 from dataclasses import dataclass, field
 from typing import NamedTuple, Optional
 
@@ -47,16 +54,19 @@ class Frontmatter:
     YAML frontmatter at the top of the document, if any. raw is the source of
     truth and is always replayed as is: set_key and remove_key rewrite only the
     lines of the key they change, so comments, blank lines, quoting, tags (!r,
-    !expr) and key order elsewhere in the header stay byte for byte.
+    !expr), key order and line breaks elsewhere in the header stay byte for
+    byte (but a lone "\\r" they leave just before a "\\n" is written as newline,
+    see _join). The lines they write end with newline, the document's line break.
     """
     data: dict = field(default_factory=dict)   # parsed YAML, unknown tags as TaggedScalar; {} if unreadable
     raw: str = ""                              # original text between the --- fences (inclusive)
     present: bool = False
     error: Optional[str] = None                # why the header couldn't be read as a YAML mapping, else None
+    newline: str = "\n"                        # the document's line break, set by parse: lines written anew use it
 
     def text(self) -> str:
-        """The YAML between the --- fences."""
-        return "".join(self._split()[1]) if self.present else ""
+        """The YAML between the --- fences, with "\\n" line breaks."""
+        return _with_newline("".join(self._split()[1]), "\n") if self.present else ""
 
     def set_key(self, key: str, value: str) -> None:
         """
@@ -68,9 +78,12 @@ class Frontmatter:
         key goes just before the closing fence. Raises FrontmatterError, leaving
         the header unchanged, if the header can't be edited key by key.
         """
+        # YAML reads "\r\n" and "\r" as "\n" too, so this keeps the value's meaning.
+        value = _with_newline(value, "\n")
         parsed = _parse_yaml_value(value)
         if not self.present:
-            self._commit(key, "---\n" + _render_entry(_new_key_prefix(key), value, parsed) + "---\n", [key])
+            header = "---\n" + _render_entry(_new_key_prefix(key), value, parsed) + "---\n"
+            self._commit(key, _with_newline(header, self.newline), [key])
             return
         head, body, tail = self._split()
         keys = _editable_keys(body)
@@ -80,16 +93,16 @@ class Frontmatter:
         if not spans:
             # Before a document end marker ("..."), if the header has one.
             at = next((i for i, line in enumerate(lines) if _DOC_END.match(line)), len(lines))
-            lines.insert(at, _render_entry(_new_key_prefix(key), value, parsed))
-            self._commit(key, head + "".join(lines) + tail, names + [key])
+            lines.insert(at, self._entry(_new_key_prefix(key), value, parsed))
+            self._commit(key, _join([head, *lines, tail], self.newline), names + [key])
             return
         (first, start, end), repeats = spans[0], spans[1:]
         # Leave one copy holding the new value: YAML readers either keep the last copy or reject repeats.
         for _, repeat_start, repeat_end in reversed(repeats):
             del lines[repeat_start:repeat_end]
-        lines[start:end] = [_render_entry(first.prefix, value, parsed)]
+        lines[start:end] = [self._entry(first.prefix, value, parsed)]
         kept = keys.index(first)
-        self._commit(key, head + "".join(lines) + tail, [n for i, n in enumerate(names) if n != key or i == kept])
+        self._commit(key, _join([head, *lines, tail], self.newline), [n for i, n in enumerate(names) if n != key or i == kept])
 
     def remove_key(self, key: str) -> None:
         """
@@ -107,13 +120,17 @@ class Frontmatter:
         lines = list(body)
         for _, start, end in reversed(spans):
             del lines[start:end]
-        self._commit(key, head + "".join(lines) + tail, [k.name for k in keys if k.name != key])
+        self._commit(key, _join([head, *lines, tail], self.newline), [k.name for k in keys if k.name != key])
 
     def _split(self) -> tuple[str, list[str], str]:
         """raw as (opening fence line, header body lines, closing fence line plus anything after it)."""
         lines = _lines(self.raw)
         close = next(i for i in range(1, len(lines)) if _FENCE_LINE.match(lines[i]))
         return lines[0], lines[1:close], "".join(lines[close:])
+
+    def _entry(self, prefix: str, value: str, parsed) -> str:
+        """The header lines for one key, as _render_entry writes them, with the document's line break."""
+        return _with_newline(_render_entry(prefix, value, parsed), self.newline)
 
     def _commit(self, key: str, raw: str, names: list) -> None:
         """
@@ -133,13 +150,13 @@ class Frontmatter:
 @dataclass
 class Cell:
     cell_type: str                             # "markdown" or "code"
-    source: str                                # body only (no fences, no frontmatter markers)
+    source: str                                # body only (no fences, no frontmatter markers), "\n" line breaks
     # Code-cell-only fields
     language: str = "r"                        # "r", "python", "bash", "sql", ... for code cells
     label: Optional[str] = None                # chunk label, e.g. "setup" in  ```{r setup, echo=FALSE}
     options: "OrderedDict[str, str]" = field(default_factory=OrderedDict)
     # Bookkeeping
-    raw: str = ""                              # original full text (with fences / prose newlines)
+    raw: str = ""                              # original full text (with fences and the file's own line breaks)
     dirty: bool = False                        # True after any structural edit
 
     def mark_dirty(self) -> None:
@@ -159,9 +176,11 @@ def parse(text: str) -> tuple[Frontmatter, list[Cell]]:
     """
     Parse the text of an .rmd document into a Frontmatter and an ordered list
     of Cells. Byte-level round-trip is preserved on unmodified parse-then-
-    serialize cycles.
+    serialize cycles. The document's line break goes in frontmatter.newline,
+    which serialize writes edited parts with.
     """
     frontmatter, body_start_idx = _extract_frontmatter(text)
+    frontmatter.newline = _detect_newline(text)
     body = text[body_start_idx:]
     cells = _split_body(body)
     return frontmatter, cells
@@ -170,93 +189,90 @@ def parse(text: str) -> tuple[Frontmatter, list[Cell]]:
 def _extract_frontmatter(text: str) -> tuple[Frontmatter, int]:
     """Return (Frontmatter, index into text where body begins)."""
     fm = Frontmatter()
-    # Must start with `---` on its own line (optionally with trailing whitespace and a newline)
-    m = re.match(r"^---[ \t]*\n", text)
-    if not m:
+    lines = _LINE.finditer(text)
+    # Must start with `---` on its own line (optionally with trailing whitespace), ended by a line break
+    first = next(lines, None)
+    if first is None or not _FENCE_LINE.match(first.group()) or not first.group().endswith(("\n", "\r")):
         return fm, 0
     # Find the closing `---` on its own line
-    # Search starting after the opening fence
-    search_from = m.end()
-    close_pat = re.compile(r"^---[ \t]*(?:\n|$)", re.MULTILINE)
-    close_match = close_pat.search(text, search_from)
-    if close_match is None:
+    close = next((line for line in lines if _FENCE_LINE.match(line.group())), None)
+    if close is None:
         return fm, 0  # Unterminated frontmatter -- treat whole thing as body
-    fm.data, fm.error, _ = _read_header(text[search_from:close_match.start()])
-    fm.raw = text[0:close_match.end()]
+    fm.data, fm.error, _ = _read_header(_with_newline(text[first.end():close.start()], "\n"))
+    fm.raw = text[:close.end()]
     fm.present = True
-    return fm, close_match.end()
+    return fm, close.end()
 
 
 def _split_body(body: str) -> list[Cell]:
     """
     Walk body line by line, splitting into markdown prose cells and code chunks.
-    Each cell's raw text preserves its original newlines so serialization can
-    replay unchanged cells byte-for-byte. Only "\\n" ends a line, as for knitr:
+    Each cell's raw text preserves its original line breaks so serialization can
+    replay unchanged cells byte-for-byte; its source has "\\n" breaks. Only
+    "\\n", "\\r\\n" and a lone "\\r" end a line, as for knitr (R's readLines):
     form feeds, U+2028 and the other breaks str.splitlines knows stay inside a
-    line, so every cell but the last ends with "\\n". (Files are read with
-    universal newlines, so "\\r\\n" and "\\r" arrive as "\\n".)
+    line, so every cell but the last ends with a line break.
     """
     cells: list[Cell] = []
     lines = _lines(body)
+    # The same lines ending in "\n": fences are matched, and sources built, on these.
+    plain = [_with_newline(line, "\n") for line in lines]
     i = 0
     n = len(lines)
-    # Buffer for accumulating prose lines
-    prose_buf: list[str] = []
+    # First line of the prose not yet in a cell
+    prose_start = 0
 
-    def flush_prose():
-        if prose_buf:
-            raw = "".join(prose_buf)
-            cells.append(Cell(cell_type="markdown", source=raw, raw=raw))
-            prose_buf.clear()
+    def flush_prose(end: int) -> None:
+        nonlocal prose_start
+        if end > prose_start:
+            cells.append(Cell(
+                cell_type="markdown",
+                source="".join(plain[prose_start:end]),
+                raw="".join(lines[prose_start:end]),
+            ))
+        prose_start = end
 
     while i < n:
-        line = lines[i]
-        open_m = _CHUNK_OPEN.match(line.rstrip("\n"))
+        open_m = _CHUNK_OPEN.match(plain[i].rstrip("\n"))
         if open_m:
-            flush_prose()
+            flush_prose(i)
             lang = open_m.group(1)
             inside = open_m.group(2)
             label, options = _parse_label_and_options(inside)
             # Find the closing fence
             j = i + 1
-            chunk_body_lines: list[str] = []
             while j < n:
                 # Closing ``` on its own line (no braces)
-                if _CODE_FENCE.match(lines[j].rstrip("\n")) and not _CHUNK_OPEN.match(lines[j].rstrip("\n")):
+                if _CODE_FENCE.match(plain[j].rstrip("\n")) and not _CHUNK_OPEN.match(plain[j].rstrip("\n")):
                     # Only accept as a CLOSE if it's a bare ``` (or ``` followed by whitespace)
-                    if re.match(r"^```[ \t]*$", lines[j].rstrip("\n")):
+                    if re.match(r"^```[ \t]*$", plain[j].rstrip("\n")):
                         break
-                chunk_body_lines.append(lines[j])
                 j += 1
             # j now points at the closing fence line, OR == n (unterminated)
             if j >= n:
                 # Unterminated chunk -- fall back: treat the whole remainder as prose
-                prose_buf.append(lines[i])
-                for k in range(i + 1, n):
-                    prose_buf.append(lines[k])
-                flush_prose()
+                flush_prose(n)
                 return cells
             # Construct the Cell
-            source = "".join(chunk_body_lines)
+            source = "".join(plain[i + 1:j])
             # Strip exactly one trailing newline from source so the closing fence line stays outside
             if source.endswith("\n"):
                 source_no_trailing_nl = source[:-1]
             else:
                 source_no_trailing_nl = source
-            raw = lines[i] + source + lines[j]
             cells.append(Cell(
                 cell_type="code",
                 source=source_no_trailing_nl,
                 language=lang,
                 label=label,
                 options=options,
-                raw=raw,
+                raw="".join(lines[i:j + 1]),
             ))
             i = j + 1
+            prose_start = i
         else:
-            prose_buf.append(line)
             i += 1
-    flush_prose()
+    flush_prose(n)
     return cells
 
 
@@ -331,19 +347,23 @@ def serialize(frontmatter: Frontmatter, cells: list[Cell]) -> str:
     The frontmatter and unmodified cells replay their original raw text. A part
     without a trailing newline (the file's last line had none) gets one only when
     another part follows it, so fences never run together and an unedited
-    document still round-trips byte for byte.
+    document still round-trips byte for byte. Edited cells and that newline use
+    frontmatter.newline, the document's line break, whatever breaks the cell
+    source was given with.
     """
+    newline = frontmatter.newline
     parts: list[str] = [frontmatter.raw] if frontmatter.present else []
     for cell in cells:
-        parts.append(_render_cell(cell) if cell.dirty or not cell.raw else cell.raw)
+        parts.append(_with_newline(_render_cell(cell), newline) if cell.dirty or not cell.raw else cell.raw)
     out_parts: list[str] = []
     for part in parts:
         if not part:
             continue
-        if out_parts and not out_parts[-1].endswith("\n"):
-            out_parts.append("\n")
+        if out_parts and not out_parts[-1].endswith(("\n", "\r")):
+            out_parts.append(newline)
         out_parts.append(part)
-    return "".join(out_parts)
+    # _join keeps a lone "\r" ending a part (from a mixed-ending file) apart from a "\n" after it.
+    return _join(out_parts, newline)
 
 
 def _render_cell(cell: Cell) -> str:
@@ -464,15 +484,19 @@ def yaml_string(value: str, *, quote: bool = False) -> str:
     return yaml.dump(value, Dumper=yaml.SafeDumper, default_style='"', allow_unicode=True, width=float("inf")).rstrip("\n")
 
 
-# A closing --- fence line, as _extract_frontmatter finds it.
-_FENCE_LINE = re.compile(r"---[ \t]*\n?\Z")
+# A line break, as knitr (R's readLines) reads them; nothing else ends a line.
+_LINE_BREAK = re.compile(r"\r\n?|\n")
+# One line with its line break, or a last line without one.
+_LINE = re.compile(r"[^\r\n]*(?:\r\n?|\n)|[^\r\n]+")
+# A --- fence line, as _extract_frontmatter finds it.
+_FENCE_LINE = re.compile(r"---[ \t]*(?:\r\n?|\n)?\Z")
 # A column-0 "key:" line, used only for headers that don't parse: a plain or
 # quoted key, then ":" followed by a space or the end of the line.
 _KEY_LINE = re.compile(r"""("(?:[^"\\\n]|\\.)*"|'(?:[^'\n]|'')*'|[^\s#'"?:,\[\]{}&*!|>%@`-][^:#\n]*?)[ \t]*:(?=[ \t\n]|$)""")
 # A YAML document end marker; it also ends the last key's lines.
-_DOC_END = re.compile(r"\.\.\.(?:[ \t]|$)")
+_DOC_END = re.compile(r"\.\.\.(?:[ \t\r\n]|\Z)")
 # Characters YAML treats as line breaks but line-level editing doesn't.
-_OTHER_BREAKS = re.compile(r"[\r\x85\u2028\u2029]")
+_OTHER_BREAKS = re.compile(r"[\x85\u2028\u2029]")
 
 
 class _Key(NamedTuple):
@@ -483,9 +507,42 @@ class _Key(NamedTuple):
 
 
 def _lines(text: str) -> list[str]:
-    """Split text into lines that keep their newline. Only "\\n" ends a line (unlike str.splitlines)."""
-    lines = text.split("\n")
-    return [line + "\n" for line in lines[:-1]] + ([lines[-1]] if lines[-1] else [])
+    """
+    Split text into lines that keep their line break. Only "\\n", "\\r\\n" and a
+    lone "\\r" end a line (unlike str.splitlines).
+    """
+    return _LINE.findall(text)
+
+
+def _with_newline(text: str, newline: str) -> str:
+    """text with every line break ("\\n", "\\r\\n" or a lone "\\r") written as newline."""
+    if newline == "\n" and "\r" not in text:
+        return text
+    return _LINE_BREAK.sub(newline, text)
+
+def _join(parts: list[str], newline: str) -> str:
+    """
+    parts joined into one text. A part ending in a lone "\\r" (from a mixed-ending
+    file), then one starting with "\\n", would read back as one "\\r\\n" line
+    break: that "\\r" is written as newline instead, so they stay two line breaks.
+    """
+    out: list[str] = []
+    for part in parts:
+        if not part:
+            continue
+        if out and out[-1].endswith("\r") and part.startswith("\n"):
+            out[-1] = out[-1][:-1] + ("\r\n" if newline == "\r" else newline)
+        out.append(part)
+    return "".join(out)
+
+
+def _detect_newline(text: str) -> str:
+    """
+    The line break most lines of text end with: "\\n", "\\r\\n" or "\\r". A tie
+    goes to the one used first; text without a line break gets "\\n".
+    """
+    counts = Counter(_LINE_BREAK.findall(text))
+    return counts.most_common(1)[0][0] if counts else "\n"
 
 
 def _read_header(body: str) -> tuple[dict, Optional[str], Optional[list[_Key]]]:
@@ -499,7 +556,11 @@ def _read_header(body: str) -> tuple[dict, Optional[str], Optional[list[_Key]]]:
              like keys.
     Unknown tags such as !r are not errors: they load as TaggedScalar.
     """
-    loader = _TolerantLoader(body)
+    try:
+        loader = _TolerantLoader(body)
+    except yaml.YAMLError as e:
+        # The reader rejects control characters such as a form feed before parsing starts.
+        return {}, _yaml_problem(e), _guess_keys(_lines(body))
     try:
         try:
             root = loader.get_single_node()
@@ -578,7 +639,8 @@ def _yaml_problem(e: Exception) -> str:
 
 
 def _editable_keys(body: list[str]) -> list[_Key]:
-    _, error, keys = _read_header("".join(body))
+    # Line breaks as "\n" for YAML and line counting; each line is still one line.
+    _, error, keys = _read_header(_with_newline("".join(body), "\n"))
     if keys is None:
         raise FrontmatterError(
             "Frontmatter can't be edited key by key: "
