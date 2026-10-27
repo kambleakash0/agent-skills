@@ -94,7 +94,8 @@ All tools require `file_path` to be an **absolute path**. Every tool except `cre
 - Polyglot chunks (`{python}`, `{bash}`, `{sql}`) parse and round-trip correctly. For execution, the matching Jupyter kernel must be installed.
 - Regular markdown code fences (` ```python ` without braces) stay as prose — only ` ```{lang} ` form is treated as a chunk.
 - A document whose last line has no trailing newline keeps it that way, unless a cell is added after it or moved past it. Then a newline goes in between, so chunk fences never end up on the same line as other text.
-- Only a newline ends a line, as in knitr. A form feed or a Unicode line separator (U+2028) stays part of its line, so a chunk fence that follows one on the same line doesn't start a chunk.
+- Only a line break ends a line, as in knitr: `\n`, `\r\n`, or a lone `\r`. A form feed or a Unicode line separator (U+2028) stays part of its line, so a chunk fence that follows one on the same line doesn't start a chunk.
+- **Line endings are kept.** A CRLF document, or one that mixes line endings, parses like an LF one: the YAML header, chunk fences and chunk headers are found the same way, and `get_cell`, `get_frontmatter` and `find_in_rmd` return text with `\n` line breaks. On save, cells you don't edit and header lines outside the edited key keep their bytes; an edited cell is rewritten whole, and everything an edit writes (a cell, a chunk header, a frontmatter key's lines, a new header) uses the document's line ending, the one most of its lines end with. The one exception: a lone `\r` that an edit leaves just before a `\n` is rewritten in the document's line ending, so the two don't read back as one `\r\n` line break. Write the text you pass with `\n`; `\r\n` works too, and both are converted. An untouched CRLF file saves back byte for byte. `create_rmd` always writes LF.
 
 ### Frontmatter edits
 

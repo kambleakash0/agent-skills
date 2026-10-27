@@ -4,26 +4,26 @@ When editing `.py`, `.js`, `.ts`, `.c`, `.cpp`, `.rb`, `.go`, `.java`, `.json`, 
 
 **Picking a tool — always start here:**
 
-1. **Unsure of the file layout?** Call `list_symbols` first. Call `read_symbol(target)` to read one function/class's full source without reading the whole file. Call `read_symbol(target, depth="interface")` for a class's API (methods + fields, no bodies) or for a function's signature. Call `read_symbol(target, depth="signature")` for signature-only. Call `read_imports` to see dependencies. Call `find_references` before renaming anything. Dotted targets descend into closures: Go `stdioCmd.RunE` (func_literal in struct field), JS/TS `app.handler` (arrow function in object literal).
+1. **Unsure of the file layout?** Call `list_symbols` first. Call `read_symbol(target)` to read one function/class's full source without reading the whole file. Call `read_symbol(target, depth="interface")` for a class's API (methods + fields, no bodies) or for a function's signature. Call `read_symbol(target, depth="signature")` for signature-only. Call `read_imports` to see dependencies. Call `find_references` before renaming anything. Dotted targets descend into closures: Go `stdioCmd.RunE` (func_literal in struct field), JS/TS `app.handler` (arrow function in object literal). JS/TS exports are listed and targeted by their own names (an anonymous `export default function/class` is `default`); a symbol's decorators and its `export` are part of it, so `read_symbol` shows them, `replace_function` content should include them, and `delete_symbol` removes them.
 2. **Adding new content** — choose the narrowest tool:
    - Top-level (function, class, constant, type alias): `add_top_level` (use `position="top"` to prepend after preamble)
-   - In a class: `add_method`, `add_field`
+   - In a class: `add_method` (after the last member), `add_field` (before the first, after a Python docstring or a Java enum's constants); both indent like the class's existing members (in tabs for a tab-indented class) and keep your content's relative indentation
    - At top of a function body: `insert_in_body(at="top")`
    - At bottom of a function body: `insert_in_body(at="bottom")`
    - At a specific spot inside a function body (anchored to an existing snippet): `insert_in_body(after=...)` or `insert_in_body(before=...)`
    - Relative to an existing top-level symbol: `insert_sibling(position="before"|"after")`
    - Imports: `add_import` (new line) or `add_import_name` (add to existing `from X import ...` or `import { a, b } from "mod"`)
    - Parameters: `add_parameter`
-   - Leading comment: `edit_leading_comment(op="add", comment=...)` (refused if the symbol already has one; the error quotes it, so use `op="replace"` with a block that repeats any lines to keep, such as lint or compiler directives)
+   - Leading comment: `edit_leading_comment(op="add", comment=...)` (goes above the symbol's decorators/annotations and `export`; refused if the symbol already has one; the error quotes it, so use `op="replace"` with a block that repeats any lines to keep, such as lint or compiler directives)
    - Python docstring: `replace_docstring`
-   - Any dict/object (config OR Python/JS/TS literal): `add_key` (refused if the key already exists; use `replace_value`). For Python/JS/TS, `parent_target` is the module-level variable name, dotted into nested literals (`CONFIG.server`, `CONFIG."db"`)
+   - Any dict/object (config OR Python/JS/TS literal): `add_key` (refused if the key already exists; use `replace_value`). For config files, `parent_target` is the full dotted path from the top level (`""` for the root); YAML `{}`/flow mappings, a YAML key with no value and TOML inline tables work too, and YAML/TOML keys are quoted for you only when they need it (in TOML, `a.b` is a dotted key: pass `'"a.b"'` for a name containing a dot). For Python/JS/TS, `parent_target` is the module-level variable name, dotted into nested literals (`CONFIG.server`, `CONFIG."db"`)
    - Any list/array (config OR Python literal): `append_to_array`
 3. **Modifying existing content:**
    - Full function: `replace_function`
    - Body only: `replace_function_body`
    - One statement/block inside a large body: `replace_in_body(target, old_snippet, new_snippet)` — scoped match; the single biggest token-saver for long functions
    - Signature only: `replace_signature` (existing decorators/annotations such as `@Override` are kept unless you include your own)
-   - Value of an existing key (config, Python dict or JS/TS object): `replace_value`
+   - Value of an existing key (config, Python dict or JS/TS object): `replace_value` (config targets are full dotted paths from the top level: `a.b` never matches a deeper `x.a.b`)
    - Leading comment: `edit_leading_comment(op="replace", comment=...)`
    - Python docstring: `replace_docstring`
 4. **Removing content:**
@@ -45,7 +45,7 @@ When editing `.py`, `.js`, `.ts`, `.c`, `.cpp`, `.rb`, `.go`, `.java`, `.json`, 
 **Safety nets:**
 
 - Every edit is parse-checked before it is saved. An edit that would introduce a syntax error into a file that parsed cleanly is refused (the message gives the error's line and column) and the file is left unchanged: fix the content and retry, or, if the code is valid but uses syntax the parser does not support (very new language features, macro-heavy C/C++), use your normal edit tool. Files that already had syntax errors are not guarded.
-- Line endings are preserved (CRLF files stay CRLF). Always write content, snippets and anchors with `\n` line breaks.
+- Line endings are preserved (CRLF files stay CRLF). Always write content, snippets and anchors with `\n` line breaks; only `\n` (or CRLF) breaks a line, so form feeds or U+2028 inside string literals are kept as written.
 
 **Escape hatches — when to step outside ast-editor:**
 
