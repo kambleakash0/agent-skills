@@ -3121,6 +3121,16 @@ def test_tool_schemas():
         "PASS" if (mcp.instructions or "").strip() else "FAIL",
         "PASS",
     )
+    # Clients show the instructions in addition to AST-EDITOR.md, which many
+    # users include as well, so they stay short.
+    size = len(mcp.instructions or "")
+    check(
+        "schema: server instructions are at most 1500 characters",
+        "PASS" if size <= 1500 else f"FAIL: {size} characters",
+        "PASS",
+    )
+    for phrase in ("list_symbols", "replace_in_body", "parse-checked", "normal edit tool", '"editor.fontSize"'):
+        check(f"schema: server instructions mention {phrase}", mcp.instructions or "", phrase)
     expected_version = _pkg_version("ast-editor-mcp")
     check(
         "schema: server version matches package metadata",
@@ -4610,9 +4620,9 @@ def test_exported_symbols():
             expected,
         )
 
-    # An exported declaration is listed exactly when its plain form is
-    # (const arrow functions, generators, abstract classes, type aliases and
-    # enums are listed in neither form).
+    # An exported declaration is listed exactly as its plain form is (const
+    # arrow functions, generators, abstract classes, type aliases and enums
+    # included).
     for ext, plain in [
         (".js", "function f() {}\n"),
         (".js", "class C {\n  m() {}\n}\n"),
@@ -4688,7 +4698,7 @@ def test_exported_symbols():
         _exact(
             f"{ext} read_symbol depth=interface: header includes `export`",
             _read_result(name, module, lambda a: a.read_symbol("Store", depth="interface")),
-            "export class Store {\nget(k) ...\n}",
+            "export class Store {\n  get(k) ...\n}",
         )
         _exact(
             f"{ext} replace_function: round trip keeps `export`",
@@ -5323,10 +5333,10 @@ def test_add_key_config_shapes():
     # (label, file name, content, parent_target, key, expected error)
     for label, name, content, parent, key, error in [
         ("yaml key in a flow mapping", "k.yaml", "a: {x: 1}\n", "a", "x",
-         "Key 'x' already exists in the flow mapping at 'a'"),
+         "Key 'x' already exists in 'a'; use replace_value with target 'a.x'"),
         ("yaml key quoted in a flow mapping", "k.yaml", 'a: {"x": 1}\n', "a", "x", "already exists"),
         ("yaml key in the root flow mapping", "k.yaml", "{x: 1}\n", "", "x",
-         "already exists in the flow mapping at the root"),
+         "already exists in the root; use replace_value with target 'x'"),
         ("yaml escaped key", "k.yaml", 'a:\n  "q\\"k": 1\n', "a", 'q"k', "already exists in 'a'"),
         ("yaml single-quoted key", "k.yaml", "a:\n  'it''s': 1\n", "a", "it's", "already exists in 'a'"),
         ("yaml scalar parent", "k.yaml", "a: 1\n", "a", "k", "YAML value at 'a' is not a mapping"),
@@ -5334,8 +5344,7 @@ def test_add_key_config_shapes():
         ("yaml sequence root", "k.yaml", "- 1\n", "", "k", "YAML document root is not a mapping"),
         ("yaml missing parent", "k.yaml", "a: 1\n", "b", "k", "YAML key 'b' not found"),
         ("toml key in an inline table", "k.toml", "t = { a = 1 }\n", "t", "a",
-         "Key 'a' already exists in the inline table at 't'; to change its value, "
-         "rewrite the table with replace_value on 't'."),
+         "Key 'a' already exists in 't'; use replace_value with target 't.a' to change its value."),
         ("toml quoted key, given bare", "k.toml", '"x y" = 1\n', "", "x y", "already exists in the root"),
         ("toml bare key, given quoted", "k.toml", "xy = 1\n", "", '"xy"', "already exists in the root"),
         ("toml scalar parent", "k.toml", "t = 1\n", "t", "k", "TOML value at 't' is not a table"),
@@ -5655,13 +5664,1099 @@ def test_config_key_followups():
     _exact("yaml duplicate refusal: its target works with replace_value", result, "a:\n  'it''s': 3\n")
     os.remove(path)
 
-    # A key inside a TOML inline table is not addressable, so the refusal
-    # points to rewriting the table instead of a 't.a' target.
-    result = _edit_result("k.toml", "t = { a = 1 }\n", lambda a: a.add_key("t", "a", "2"))
-    check("toml inline table duplicate: points to the table", result,
-          "rewrite the table with replace_value on 't'")
-    check("toml inline table duplicate: no unaddressable 't.a' target",
-          "PASS" if "'t.a'" not in result else f"FAIL: {result}", "PASS")
+    # Keys inside TOML inline tables and YAML flow mappings are addressable,
+    # so the refusal names the key's own target, and that target works.
+    for label, name, content, parent, key, target, expected in [
+        ("toml inline table", "k.toml", "t = { a = 1 }\n", "t", "a", "t.a", "t = { a = 3 }\n"),
+        ("yaml flow mapping", "k.yaml", "a: {x: 1}\n", "a", "x", "a.x", "a: {x: 3}\n"),
+    ]:
+        path = _write_temp(name, content)
+        message = _refusal(lambda: Applier(path).add_key(parent, key, "2"))
+        check(f"{label} duplicate: names the key's target", message, f"target '{target}'")
+        try:
+            Applier(path).replace_value(target, "3")
+            result = read_file(path)
+        except ApplierError as e:
+            result = f"REFUSED: {e}"
+        _exact(f"{label} duplicate: its target works with replace_value", result, expected)
+        os.remove(path)
+
+
+def test_insert_before_leading_comments():
+    print("\n═══ insert_sibling before: above the target's leading comment ═══")
+
+    # (label, file name, source, target, content, expected file text). The
+    # comment documents the target, so new code goes above it, and above
+    # the decorators, annotations and `export` below it.
+    cases = [
+        ("py function (reported)", "s.py",
+         "x = 1\n\n# Doc for f\ndef f():\n    pass\n", "f", "def g():\n    pass",
+         "x = 1\n\ndef g():\n    pass\n\n# Doc for f\ndef f():\n    pass\n"),
+        ("py decorated function", "s.py",
+         "x = 1\n\n\n# Doc\n@dec\ndef f():\n    pass\n", "f", "def g():\n    pass",
+         "x = 1\n\n\ndef g():\n    pass\n\n# Doc\n@dec\ndef f():\n    pass\n"),
+        ("py method", "s.py",
+         "class A:\n    x = 1\n\n    # Doc\n    def f(self):\n        pass\n", "A.f",
+         "def g(self):\n    pass",
+         "class A:\n    x = 1\n\n    def g(self):\n        pass\n\n    # Doc\n    def f(self):\n        pass\n"),
+        ("js multi-line JSDoc", "s.js",
+         "const x = 1;\n\n/**\n * Doc.\n */\nfunction f() {}\n", "f", "function g() {}",
+         "const x = 1;\n\nfunction g() {}\n\n/**\n * Doc.\n */\nfunction f() {}\n"),
+        ("ts decorated export", "s.ts",
+         "const x = 1;\n\n// Doc\n@Dec()\nexport class K {}\n", "K", "const y = 2;",
+         "const x = 1;\n\nconst y = 2;\n\n// Doc\n@Dec()\nexport class K {}\n"),
+        ("ts decorated method", "s.ts",
+         "class S {\n  x = 1;\n\n  /** Finds. */\n  @Get()\n  find() {}\n}\n", "S.find", "y = 2;",
+         "class S {\n  x = 1;\n\n  y = 2;\n\n  /** Finds. */\n  @Get()\n  find() {}\n}\n"),
+        ("go Godoc", "s.go",
+         "package main\n\n// F does.\nfunc F() {}\n", "F", "func G() {}",
+         "package main\n\nfunc G() {}\n\n// F does.\nfunc F() {}\n"),
+        ("java Javadoc and annotation", "S.java",
+         "class A {\n    int x;\n\n    /** Doc. */\n    @Override\n    public String toString() { return \"\"; }\n}\n",
+         "A.toString", "int y;",
+         "class A {\n    int x;\n\n    int y;\n\n    /** Doc. */\n    @Override\n"
+         "    public String toString() { return \"\"; }\n}\n"),
+        ("ruby comment", "s.rb",
+         "class A\n  # Doc\n  def m\n  end\nend\n", "A.m", "def n\nend",
+         "class A\n  def n\n  end\n\n  # Doc\n  def m\n  end\nend\n"),
+        ("c block comment", "s.c",
+         "int x;\n\n/* Doc */\nint f(void) { return 0; }\n", "f", "int g(void) { return 1; }",
+         "int x;\n\nint g(void) { return 1; }\n\n/* Doc */\nint f(void) { return 0; }\n"),
+        ("cpp line comment", "s.cpp",
+         "int x;\n\n// Doc\nclass A {};\n", "A", "class B {};",
+         "int x;\n\nclass B {};\n\n// Doc\nclass A {};\n"),
+        # A comment separated from the target by a blank line is not its
+        # leading comment and stays above the new code.
+        ("py detached comment stays above", "s.py",
+         "# Section\n\ndef f():\n    pass\n", "f", "X = 1",
+         "# Section\n\nX = 1\n\ndef f():\n    pass\n"),
+        # A `#!` line and encoding or magic comments only work at the top of
+        # the file, so they are never taken for the target's comment.
+        ("py shebang and coding line stay first", "s.py",
+         "#!/usr/bin/env python\n# -*- coding: utf-8 -*-\ndef main():\n    pass\n", "main", "X = 1",
+         "#!/usr/bin/env python\n# -*- coding: utf-8 -*-\nX = 1\n\ndef main():\n    pass\n"),
+        ("ruby magic comment stays first", "s.rb",
+         "# frozen_string_literal: true\n# Doc\nclass A\nend\n", "A", "X = 1",
+         "# frozen_string_literal: true\nX = 1\n\n# Doc\nclass A\nend\n"),
+        # Further down, a comment that mentions a coding is just a comment.
+        ("py comment naming a coding below the top lines", "s.py",
+         "x = 1\n\n# Decoding: from bytes\ndef f():\n    pass\n", "f", "Y = 2",
+         "x = 1\n\nY = 2\n\n# Decoding: from bytes\ndef f():\n    pass\n"),
+    ]
+    for label, name, source, target, content, expected in cases:
+        _exact(f"insert_sibling before ({label})",
+               _edit_result(name, source, lambda a: a.insert_sibling(target, content, "before")),
+               expected)
+
+    # The other comment tools leave the file's directives alone too.
+    _exact("delete_symbol keeps the #! line",
+           _edit_result("s.py", "#!/usr/bin/env python\n# Doc\ndef main():\n    pass\n",
+                        lambda a: a.delete_symbol("main")),
+           "#!/usr/bin/env python\n")
+    _exact("delete_symbol keeps the #! and coding lines, not the comment below them",
+           _edit_result("s.py", "#!/usr/bin/env python\n# -*- coding: utf-8 -*-\n# Main.\ndef main():\n    pass\n",
+                        lambda a: a.delete_symbol("main")),
+           "#!/usr/bin/env python\n# -*- coding: utf-8 -*-\n")
+    _exact("edit_leading_comment add goes below the #! line",
+           _edit_result("s.py", "#!/usr/bin/env python\ndef main():\n    pass\n",
+                        lambda a: a.edit_leading_comment("main", "add", "# Main.")),
+           "#!/usr/bin/env python\n# Main.\ndef main():\n    pass\n")
+    check("edit_leading_comment remove: a #! line is no leading comment",
+          _edit_result("s.py", "#!/usr/bin/env python\ndef main():\n    pass\n",
+                       lambda a: a.edit_leading_comment("main", "remove")),
+          "REFUSED: No leading comment found above 'main'")
+
+
+def test_ts_abstract_classes():
+    print("\n═══ TS abstract classes and abstract methods ═══")
+
+    # The reported case: listed, and a valid add_method target.
+    repro = "export abstract class A {\n  m(): void {}\n}\n"
+    for ext in (".ts", ".tsx"):
+        _exact(f"{ext} list_symbols: exported abstract class listed",
+               _read_result("abs" + ext, repro, lambda a: a.list_symbols()),
+               "class A (line 1)\n  method A.m (line 2)")
+        _exact(f"{ext} add_method on an exported abstract class",
+               _edit_result("abs" + ext, repro, lambda a: a.add_method("A", "n(): void {}")),
+               "export abstract class A {\n  m(): void {}\n\n  n(): void {}\n}\n")
+
+    ts = (
+        "export abstract class A {\n"
+        "  x = 1;\n"
+        "\n"
+        "  /** M. */\n"
+        "  abstract m(): void;\n"
+        "\n"
+        "  n(): void {\n"
+        "    return;\n"
+        "  }\n"
+        "}\n"
+        "\n"
+        "abstract class B {\n"
+        "  f() {}\n"
+        "}\n"
+    )
+
+    def edit(action):
+        return _edit_result("abs.ts", ts, action)
+
+    def read(action):
+        return _read_result("abs.ts", ts, action)
+
+    _exact("list_symbols: abstract classes with their abstract and regular methods",
+           read(lambda a: a.list_symbols()),
+           "class A (line 1)\n  method A.m (line 5)\n  method A.n (line 7)\n"
+           "class B (line 12)\n  method B.f (line 13)")
+    _exact("read_symbol: exported abstract class includes `export`",
+           read(lambda a: a.read_symbol("A")), ts[: ts.index("\n\nabstract class B")])
+    _exact("read_symbol: abstract method", read(lambda a: a.read_symbol("A.m")), "abstract m(): void")
+    _exact("read_symbol depth=signature: abstract method",
+           read(lambda a: a.read_symbol("A.m", depth="signature")), "abstract m(): void")
+    _exact("read_symbol depth=signature: abstract class header",
+           read(lambda a: a.read_symbol("A", depth="signature")), "abstract class A")
+    _exact("read_symbol depth=interface: abstract class",
+           read(lambda a: a.read_symbol("A", depth="interface")),
+           "export abstract class A {\n  x = 1\n  /** M. */\n  abstract m(): void\n  n(): void ...\n}")
+    _exact("add_method on an abstract class",
+           edit(lambda a: a.add_method("B", "g() {}")),
+           ts.replace("  f() {}\n}", "  f() {}\n\n  g() {}\n}"))
+    _exact("add_field on an exported abstract class",
+           edit(lambda a: a.add_field("A", "y = 2;")),
+           ts.replace("  x = 1;\n", "  y = 2;\n  x = 1;\n"))
+    _exact("replace_function_body on an abstract class's method",
+           edit(lambda a: a.replace_function_body("A.n", "console.log(1);")),
+           ts.replace("    return;", "    console.log(1);"))
+    _exact("replace_function on an abstract method",
+           edit(lambda a: a.replace_function("A.m", "abstract m(x: number): void;")),
+           ts.replace("abstract m(): void;", "abstract m(x: number): void;"))
+    _exact("edit_leading_comment replace on an abstract method",
+           edit(lambda a: a.edit_leading_comment("A.m", "replace", "// New.")),
+           ts.replace("/** M. */", "// New."))
+    _exact("edit_leading_comment add on an abstract class",
+           edit(lambda a: a.edit_leading_comment("B", "add", "// B.")),
+           ts.replace("\nabstract class B", "\n// B.\nabstract class B"))
+    _exact("delete_symbol: abstract method with its doc comment",
+           edit(lambda a: a.delete_symbol("A.m")),
+           ts.replace("  /** M. */\n  abstract m(): void;\n\n", ""))
+    _exact("delete_symbol: exported abstract class",
+           edit(lambda a: a.delete_symbol("A")), "abstract class B {\n  f() {}\n}\n")
+    _exact("delete_symbol: abstract class",
+           edit(lambda a: a.delete_symbol("B")), ts[: ts.index("\nabstract class B")])
+    _exact("insert_sibling before an abstract class",
+           edit(lambda a: a.insert_sibling("B", "const q = 1;", "before")),
+           ts.replace("\nabstract class B", "\nconst q = 1;\n\nabstract class B"))
+    _exact("insert_sibling after an exported abstract class",
+           edit(lambda a: a.insert_sibling("A", "const q = 1;", "after")),
+           ts.replace("}\n\nabstract class B", "}\n\nconst q = 1;\n\nabstract class B"))
+
+    # A Java interface method has no body either: its signature is its text.
+    _exact("java read_symbol depth=signature: interface method",
+           _read_result("S.java", "interface S {\n    String get(String k);\n}\n",
+                        lambda a: a.read_symbol("S.get", depth="signature")),
+           "String get(String k)")
+
+
+def test_delete_symbol_separators():
+    print("\n═══ delete_symbol: the blank lines that separated the symbol go too ═══")
+
+    # (label, file name, source, target, expected file text)
+    cases = [
+        ("py last method before a top-level statement (reported)", "d.py",
+         "class A:\n    def f(self):\n        pass\n\n    def g(self):\n        pass\n\n\nx = 1\n",
+         "A.g", "class A:\n    def f(self):\n        pass\n\n\nx = 1\n"),
+        ("py first function of the file (reported)", "d.py",
+         "def f():\n    pass\n\n\ndef g():\n    pass\n", "f", "def g():\n    pass\n"),
+        ("py first function with its comment", "d.py",
+         "# Doc\ndef f():\n    pass\n\n\ndef g():\n    pass\n", "f", "def g():\n    pass\n"),
+        ("py function between two others", "d.py",
+         "import os\n\n\ndef f():\n    pass\n\n\ndef g():\n    pass\n\n\ndef h():\n    pass\n", "g",
+         "import os\n\n\ndef f():\n    pass\n\n\ndef h():\n    pass\n"),
+        ("py first function after the module docstring", "d.py",
+         '"""Mod."""\n\n\ndef f():\n    pass\n\n\ndef g():\n    pass\n', "f",
+         '"""Mod."""\n\n\ndef g():\n    pass\n'),
+        ("py constant before a function: the wider gap stays", "d.py",
+         "A = 1\nB = 2\n\n\ndef f():\n    pass\n", "B", "A = 1\n\n\ndef f():\n    pass\n"),
+        ("py first method", "d.py",
+         "class A:\n    def f(self):\n        pass\n\n    def g(self):\n        pass\n", "A.f",
+         "class A:\n    def g(self):\n        pass\n"),
+        ("py first method after the class docstring", "d.py",
+         'class A:\n    """Doc."""\n\n    def f(self):\n        pass\n\n    def g(self):\n        pass\n', "A.f",
+         'class A:\n    """Doc."""\n\n    def g(self):\n        pass\n'),
+        ("js first method", "d.js",
+         "class A {\n  f() {}\n\n  g() {}\n}\n", "A.f", "class A {\n  g() {}\n}\n"),
+        ("js last method: no blank line before the }", "d.js",
+         "class A {\n  f() {}\n\n  g() {}\n}\n\nfunction h() {}\n", "A.g",
+         "class A {\n  f() {}\n}\n\nfunction h() {}\n"),
+        ("ts first export", "d.ts",
+         "export function f() {}\n\nexport function g() {}\n", "f", "export function g() {}\n"),
+        ("ts only member", "d.ts", "class A {\n\n  f() {}\n\n}\n", "A.f", "class A {\n}\n"),
+        ("go struct", "d.go",
+         "package main\n\ntype Foo struct{}\n\nfunc main() {}\n", "Foo", "package main\n\nfunc main() {}\n"),
+        ("go first function with its Godoc", "d.go",
+         "package main\n\n// F.\nfunc F() {}\n\nfunc G() {}\n", "F", "package main\n\nfunc G() {}\n"),
+        ("java first method", "D.java",
+         "class A {\n    void f() {}\n\n    void g() {}\n}\n", "A.f", "class A {\n    void g() {}\n}\n"),
+        ("java last method with its Javadoc", "D.java",
+         "class A {\n    void f() {}\n\n    /** Doc. */\n    void g() {}\n}\n", "A.g",
+         "class A {\n    void f() {}\n}\n"),
+        ("ruby first method", "d.rb",
+         "class A\n  def a\n  end\n\n  def b\n  end\nend\n", "A.a", "class A\n  def b\n  end\nend\n"),
+        ("ruby last method", "d.rb",
+         "class A\n  def a\n  end\n\n  def b\n  end\nend\n\nX = 1\n", "A.b",
+         "class A\n  def a\n  end\nend\n\nX = 1\n"),
+        ("cpp first method after an access label", "d.cpp",
+         "class A {\npublic:\n  void f() {}\n\n  void g() {}\n};\n", "A.f",
+         "class A {\npublic:\n  void g() {}\n};\n"),
+        ("c first struct", "d.c",
+         "struct S {\n  int a;\n};\n\nint f(void) { return 0; }\n", "S", "int f(void) { return 0; }\n"),
+        ("c function right after an #include", "d.c",
+         "#include <stdio.h>\nint f(void) { return 0; }\n\nint g(void) { return 0; }\n", "f",
+         "#include <stdio.h>\n\nint g(void) { return 0; }\n"),
+        ("py form feed line below the symbol stays (page break)", "d.py",
+         "def f():\n    pass\n\n\x0c\ndef g():\n    pass\n", "f", "\x0c\ndef g():\n    pass\n"),
+        ("py form feed line above the symbol stays (page break)", "d.py",
+         "def f():\n    pass\n\x0c\n\ndef g():\n    pass\n", "g", "def f():\n    pass\n\x0c\n"),
+    ]
+    for label, name, source, target, expected in cases:
+        _exact(f"delete_symbol ({label})",
+               _edit_result(name, source, lambda a: a.delete_symbol(target)), expected)
+    crlf = "def f():\n    pass\n\n\ndef g():\n    pass\n"
+    _exact("delete_symbol (crlf first function)",
+           _edit_result("d.py", crlf, lambda a: a.delete_symbol("f"), "\r\n"),
+           "def g():\r\n    pass\r\n")
+
+    # A kept comment stays where it was, the wider gap below it.
+    _exact("delete_symbol include_leading_comments=False: comment and gap kept",
+           _edit_result("d.py", "x = 1\n\n# keep\ndef f():\n    pass\n\n\ndef g():\n    pass\n",
+                        lambda a: a.delete_symbol("f", include_leading_comments=False)),
+           "x = 1\n\n# keep\n\n\ndef g():\n    pass\n")
+
+
+def test_interface_indentation():
+    print("\n═══ read_symbol depth=interface: members keep their indentation ═══")
+
+    # (label, file name, source, target, expected interface)
+    cases = [
+        ("py (reported)", "i.py",
+         "class A:\n    x = 1\n\n    def f(self, a):\n        return a\n", "A",
+         "class A:\n    x = 1\n    def f(self, a): ..."),
+        ("py nested class: its own indentation comes off", "i.py",
+         'class O:\n    class A:\n        """Doc.\n\n        More.\n        """\n        x = 1\n\n'
+         "        @property\n        def f(self):\n            return 1\n", "O.A",
+         'class A:\n    """Doc.\n\n    More.\n    """\n    x = 1\n    @property\n    def f(self): ...'),
+        ("ts decorated member, multi-line signature", "i.ts",
+         "export class S {\n  private x: number;\n\n  @Get()\n  find(a: string,\n       b: number): void {\n"
+         "    return;\n  }\n}\n", "S",
+         "export class S {\n  private x: number\n  @Get()\n  find(a: string,\n       b: number): void ...\n}"),
+        ("ts class on one line", "i.ts",
+         "class K { a = 1; b() {} }\n", "K", "class K {\n  a = 1\n  b() ...\n}"),
+        ("js tab-indented class", "i.js",
+         "class K {\n\tconstructor() {\n\t\tthis.a = 1;\n\t}\n\n\tget() {}\n}\n", "K",
+         "class K {\n\tconstructor() ...\n\tget() ...\n}"),
+        ("java nested class", "I.java",
+         "class Outer {\n    static class A {\n        int x;\n\n        /** Doc. */\n        void f() {}\n    }\n}\n",
+         "Outer.A", "static class A {\n    int x;\n    /** Doc. */\n    void f() ...\n}"),
+        ("cpp access labels keep their colons", "i.cpp",
+         "class A {\npublic:\n  void f() {}\nprivate:\n  int x;\n};\n", "A",
+         "class A {\npublic:\n  void f() ...\nprivate:\n  int x;\n}"),
+        ("ruby", "i.rb",
+         "class A\n  attr_reader :x\n\n  def f(a)\n    a\n  end\nend\n", "A",
+         "class A\n  attr_reader :x\n  def f(a) ...\nend"),
+        ("ruby nested class", "i.rb",
+         "module M\n  class A\n    def f\n      1\n    end\n  end\nend\n", "M.A", "class A\n  def f ...\nend"),
+        ("c struct", "i.c", "struct S {\n  int a;\n  char b;\n};\n", "S", "struct S {\n  int a;\n  char b;\n}"),
+    ]
+    for label, name, source, target, expected in cases:
+        _exact(f"read_symbol depth=interface ({label})",
+               _read_result(name, source, lambda a: a.read_symbol(target, depth="interface")),
+               expected)
+
+
+def test_js_ts_symbol_kinds():
+    print("\n═══ JS/TS: generators, functions bound to names, enums, type aliases ═══")
+
+    repro = (
+        "enum E { A }\n"
+        "type T = number;\n"
+        "function* gen() {\n"
+        "  yield 1;\n"
+        "}\n"
+        "const arrow = () => 1;\n"
+        "export const ex = (x: number) => x;\n"
+        "interface I {\n"
+        "  a: number;\n"
+        "}\n"
+    )
+    for ext in (".ts", ".tsx"):
+        _exact(f"{ext} list_symbols: enum, type alias, generator, arrow functions (reported)",
+               _read_result("kinds" + ext, repro, lambda a: a.list_symbols()),
+               "enum E (line 1)\ntype T (line 2)\nfunction gen (line 3)\nfunction arrow (line 6)\n"
+               "function ex (line 7)\ninterface I (line 8)")
+
+    # Functions bound to one name by const/let/var, exported or not; other
+    # values, and declarations of several names, are not functions.
+    js_kinds = (
+        "const add = (a, b) => {\n"
+        "  return a + b;\n"
+        "};\n"
+        "let fe = function (a) {\n"
+        "  return a;\n"
+        "};\n"
+        "var g2 = function* () {};\n"
+        "export function* gen() {}\n"
+        "const n = 1;\n"
+        "const two = () => 1, b = 2;\n"
+        "export const ex = async (x) => x;\n"
+    )
+    listed_js = (
+        "function add (line 1)\nfunction fe (line 4)\nfunction g2 (line 7)\nfunction gen (line 8)\n"
+        "function ex (line 11)"
+    )
+    for ext in (".js", ".jsx", ".mjs", ".cjs", ".ts", ".tsx"):
+        listed = _read_result("kinds" + ext, js_kinds, lambda a: a.list_symbols())
+        _exact(f"{ext} list_symbols: functions bound to names and generators", listed, listed_js)
+        for target in [line.split()[1] for line in listed.splitlines()]:
+            result = _read_result("kinds" + ext, js_kinds, lambda a: a.read_symbol(target))
+            check(f"{ext} read_symbol('{target}'): listed name resolves",
+                  "FAIL: " + result if result.startswith("REFUSED") else "PASS", "PASS")
+
+    js = (
+        "const x = 1;\n"
+        "\n"
+        "// Adds.\n"
+        "const add = (a, b) => {\n"
+        "  return a + b;\n"
+        "};\n"
+        "\n"
+        "export const sq = (n) => n * n;\n"
+        "\n"
+        "let fe = function (a) {\n"
+        "  return a;\n"
+        "};\n"
+        "\n"
+        "function* gen() {\n"
+        "  yield 1;\n"
+        "}\n"
+    )
+    for ext in (".js", ".ts"):
+        name = "bound" + ext
+
+        def edit(action):
+            return _edit_result(name, js, action)
+
+        def read(action):
+            return _read_result(name, js, action)
+
+        _exact(f"{ext} read_symbol: arrow function", read(lambda a: a.read_symbol("add")),
+               "const add = (a, b) => {\n  return a + b;\n};")
+        _exact(f"{ext} read_symbol: exported arrow function", read(lambda a: a.read_symbol("sq")),
+               "export const sq = (n) => n * n;")
+        _exact(f"{ext} read_symbol depth=signature: arrow function",
+               read(lambda a: a.read_symbol("add", depth="signature")), "const add = (a, b) =>")
+        _exact(f"{ext} read_symbol depth=signature: arrow function with an expression body",
+               read(lambda a: a.read_symbol("sq", depth="signature")), "const sq = (n) =>")
+        _exact(f"{ext} read_symbol depth=interface: function expression",
+               read(lambda a: a.read_symbol("fe", depth="interface")), "let fe = function (a)")
+        _exact(f"{ext} read_symbol depth=signature: generator",
+               read(lambda a: a.read_symbol("gen", depth="signature")), "function* gen()")
+        _exact(f"{ext} replace_function_body: arrow function",
+               edit(lambda a: a.replace_function_body("add", "return b + a;")),
+               js.replace("  return a + b;", "  return b + a;"))
+        _exact(f"{ext} insert_in_body at=top: arrow function",
+               edit(lambda a: a.insert_in_body("add", "console.log(a);", at="top")),
+               js.replace("  return a + b;", "  console.log(a);\n  return a + b;"))
+        _exact(f"{ext} insert_in_body at=bottom: function expression",
+               edit(lambda a: a.insert_in_body("fe", "a++;", at="bottom")),
+               js.replace("  return a;\n", "  return a;\n  a++;\n"))
+        _exact(f"{ext} replace_in_body: generator",
+               edit(lambda a: a.replace_in_body("gen", "yield 1;", "yield 2;")),
+               js.replace("yield 1;", "yield 2;"))
+        _exact(f"{ext} delete_in_body: arrow function",
+               edit(lambda a: a.delete_in_body("add", "  return a + b;\n")),
+               js.replace("  return a + b;\n", ""))
+        for tool, action in [
+            ("replace_function_body", lambda a: a.replace_function_body("sq", "return n;")),
+            ("insert_in_body", lambda a: a.insert_in_body("sq", "n++;", at="top")),
+            ("replace_in_body", lambda a: a.replace_in_body("sq", "n * n", "n ** 2")),
+        ]:
+            result = edit(action)
+            check(f"{ext} {tool}: expression body refused", result, "expression body")
+            check(f"{ext} {tool}: refusal points to replace_function", result,
+                  "rewrite it with replace_function")
+            check(f"{ext} {tool}: file untouched", "PASS" if "[FILE CHANGED]" not in result else result, "PASS")
+        _exact(f"{ext} replace_signature: with its const",
+               edit(lambda a: a.replace_signature("add", "const add = (a, b, c) =>")),
+               js.replace("(a, b) =>", "(a, b, c) =>"))
+        _exact(f"{ext} replace_signature: the function's own part",
+               edit(lambda a: a.replace_signature("add", "async (a, b, c) =>")),
+               js.replace("(a, b) =>", "async (a, b, c) =>"))
+        _exact(f"{ext} replace_signature: exported arrow function keeps `export`",
+               edit(lambda a: a.replace_signature("sq", "const sq = (m) =>")),
+               js.replace("(n) =>", "(m) =>"))
+        _exact(f"{ext} replace_signature: depth=signature round trip",
+               edit(lambda a: a.replace_signature("add", a.read_symbol("add", depth="signature"))), js)
+        _exact(f"{ext} add_parameter: arrow function",
+               edit(lambda a: a.add_parameter("add", "c")), js.replace("(a, b) =>", "(a, b, c) =>"))
+        _exact(f"{ext} remove_parameter: arrow function",
+               edit(lambda a: a.remove_parameter("add", "b")), js.replace("(a, b) =>", "(a) =>"))
+        _exact(f"{ext} replace_function: exported arrow function",
+               edit(lambda a: a.replace_function("sq", "export const sq = (n) => n ** 2;")),
+               js.replace("n * n", "n ** 2"))
+        _exact(f"{ext} delete_symbol: arrow function with its comment",
+               edit(lambda a: a.delete_symbol("add")),
+               js.replace("// Adds.\nconst add = (a, b) => {\n  return a + b;\n};\n\n", ""))
+        _exact(f"{ext} edit_leading_comment replace: arrow function",
+               edit(lambda a: a.edit_leading_comment("add", "replace", "// Sums.")),
+               js.replace("// Adds.", "// Sums."))
+        _exact(f"{ext} edit_leading_comment add: above the export",
+               edit(lambda a: a.edit_leading_comment("sq", "add", "// Squares.")),
+               js.replace("export const sq", "// Squares.\nexport const sq"))
+        _exact(f"{ext} insert_sibling before: above the comment",
+               edit(lambda a: a.insert_sibling("add", "const y = 2;", "before")),
+               js.replace("// Adds.", "const y = 2;\n\n// Adds."))
+        _exact(f"{ext} insert_sibling after a generator",
+               edit(lambda a: a.insert_sibling("gen", "const y = 2;", "after")),
+               js + "\nconst y = 2;\n")
+
+    # One function among several names is not listed, but still targetable.
+    _exact("js insert_in_body: function in a declaration of several names",
+           _edit_result("multi.js", "const a = () => {\n  return 1;\n}, b = 2;\n",
+                        lambda a: a.insert_in_body("a", "x();", at="top")),
+           "const a = () => {\n  x();\n  return 1;\n}, b = 2;\n")
+    # An object-literal closure with an expression body points to replace_value.
+    check("js closure with an expression body: refusal points to replace_value",
+          _edit_result("obj.js", "const app = {\n  h: () => 1,\n};\n",
+                       lambda a: a.replace_function_body("app.h", "return 2;")),
+          "rewrite it with replace_value")
+
+    tsd = (
+        "enum E {\n"
+        "  A,\n"
+        "  B,\n"
+        "}\n"
+        "\n"
+        "/** T. */\n"
+        "type T = number;\n"
+        "\n"
+        "export interface I {\n"
+        "  a: number;\n"
+        "}\n"
+    )
+    _exact("ts list_symbols: enum, type alias and exported interface",
+           _read_result("kinds.ts", tsd, lambda a: a.list_symbols()),
+           "enum E (line 1)\ntype T (line 7)\ninterface I (line 9)")
+    _exact("ts read_symbol: enum", _read_result("kinds.ts", tsd, lambda a: a.read_symbol("E")),
+           "enum E {\n  A,\n  B,\n}")
+    _exact("ts read_symbol: type alias", _read_result("kinds.ts", tsd, lambda a: a.read_symbol("T")),
+           "type T = number;")
+    _exact("ts read_symbol depth=interface: enum",
+           _read_result("kinds.ts", tsd, lambda a: a.read_symbol("E", depth="interface")),
+           "enum E {\n  A\n  B\n}")
+    _exact("ts replace_function: type alias",
+           _edit_result("kinds.ts", tsd, lambda a: a.replace_function("T", "type T = string;")),
+           tsd.replace("type T = number;", "type T = string;"))
+    _exact("ts delete_symbol: type alias with its doc comment",
+           _edit_result("kinds.ts", tsd, lambda a: a.delete_symbol("T")),
+           tsd.replace("/** T. */\ntype T = number;\n\n", ""))
+    _exact("ts delete_symbol: enum",
+           _edit_result("kinds.ts", tsd, lambda a: a.delete_symbol("E")),
+           tsd[tsd.index("/** T. */"):])
+    _exact("ts edit_leading_comment add: enum",
+           _edit_result("kinds.ts", tsd, lambda a: a.edit_leading_comment("E", "add", "// E.")),
+           "// E.\n" + tsd)
+    _exact("ts insert_sibling before: type alias",
+           _edit_result("kinds.ts", tsd, lambda a: a.insert_sibling("T", "const z = 1;", "before")),
+           tsd.replace("/** T. */", "const z = 1;\n\n/** T. */"))
+
+def _check_loads(label: str, name: str, text: str):
+    """check() that an edited JSON or TOML file still loads."""
+    import json as _json
+    import tomllib
+
+    if text.startswith("REFUSED"):
+        return
+    try:
+        if name.endswith(".json"):
+            _json.loads(text)
+        elif name.endswith(".toml"):
+            tomllib.loads(text)
+        got = "PASS"
+    except ValueError as e:
+        got = f"FAIL: {type(e).__name__}: {e}"
+    check(f"{label}: still loads", got, "PASS")
+
+
+def test_config_quoted_paths():
+    print("\n═══ Config paths: a quoted segment is one key, dots included ═══")
+
+    # (label, file name, content, edit, expected file, or None if the
+    # target must not be found)
+    cases = [
+        ("json replace_value", "q.json", '{\n  "editor.fontSize": 12\n}\n',
+         lambda a: a.replace_value('"editor.fontSize"', "14"), '{\n  "editor.fontSize": 14\n}\n'),
+        ("json nested", "q.json", '{"a": {"b.c": {"d": 1}}}\n',
+         lambda a: a.replace_value('a."b.c".d', "2"), '{"a": {"b.c": {"d": 2}}}\n'),
+        ("json quoted path is the dotted key", "q.json", '{"a.b": 1, "a": {"b": 2}}\n',
+         lambda a: a.replace_value('"a.b"', "3"), '{"a.b": 3, "a": {"b": 2}}\n'),
+        ("json bare path still nests", "q.json", '{"a.b": 1, "a": {"b": 2}}\n',
+         lambda a: a.replace_value("a.b", "3"), '{"a.b": 1, "a": {"b": 3}}\n'),
+        ("json escaped quote in a segment", "q.json", '{"say \\"hi\\".x": 1}\n',
+         lambda a: a.replace_value('"say \\"hi\\".x"', "2"), '{"say \\"hi\\".x": 2}\n'),
+        ("json spaces around a quoted segment", "q.json", '{"a": {"b.c": 1}}\n',
+         lambda a: a.replace_value('a. "b.c" ', "2"), '{"a": {"b.c": 2}}\n'),
+        ("json delete_key", "q.json", '{\n  "editor.fontSize": 12,\n  "x": 1\n}\n',
+         lambda a: a.delete_key('"editor.fontSize"'), '{\n  "x": 1\n}\n'),
+        ("json add_key parent", "q.json", '{"a.b": {"x": 1}}\n',
+         lambda a: a.add_key('"a.b"', "k", "2"), '{"a.b": {"x": 1, "k": 2}}\n'),
+        ("json add_key key is one name", "q.json", '{"a": 1}\n',
+         lambda a: a.add_key("", "x.y", "2"), '{"a": 1, "x.y": 2}\n'),
+        ("json add_key key given quoted", "q.json", '{"a": 1}\n',
+         lambda a: a.add_key("", '"x.y"', "2"), '{"a": 1, "x.y": 2}\n'),
+        ("json append_to_array", "q.json", '{"a.b": [1]}\n',
+         lambda a: a.append_to_array('"a.b"', "2"), '{"a.b": [1, 2]}\n'),
+        ("json remove_from_array", "q.json", '{"a.b": [1, 2]}\n',
+         lambda a: a.remove_from_array('"a.b"', "2"), '{"a.b": [1]}\n'),
+        ("json array element", "q.json", '{"a": [1, 2]}\n',
+         lambda a: a.replace_value("a.0", "3"), None),
+        ("yaml plain key", "q.yaml", "a.b: 1\n",
+         lambda a: a.replace_value('"a.b"', "2"), "a.b: 2\n"),
+        ("yaml double-quoted key", "q.yaml", '"a.b": 1\n',
+         lambda a: a.replace_value('"a.b"', "2"), '"a.b": 2\n'),
+        ("yaml single-quoted key", "q.yaml", "'a.b': 1\n",
+         lambda a: a.replace_value('"a.b"', "2"), "'a.b': 2\n"),
+        ("yaml bare path still nests", "q.yaml", "a.b: 1\na:\n  b: 2\n",
+         lambda a: a.replace_value("a.b", "3"), "a.b: 1\na:\n  b: 3\n"),
+        ("yaml nested", "q.yaml", 'x:\n  "y.z":\n    k: 1\n',
+         lambda a: a.replace_value('x."y.z".k', "2"), 'x:\n  "y.z":\n    k: 2\n'),
+        ("yaml delete_key", "q.yaml", "a.b: 1\nc: 2\n",
+         lambda a: a.delete_key('"a.b"'), "c: 2\n"),
+        ("yaml add_key parent", "q.yaml", "a.b:\n  x: 1\n",
+         lambda a: a.add_key('"a.b"', "k", "2"), "a.b:\n  x: 1\n  k: 2\n"),
+        ("yaml append_to_array", "q.yaml", "a.b:\n  - 1\n",
+         lambda a: a.append_to_array('"a.b"', "2"), "a.b:\n  - 1\n  - 2\n"),
+        ("yaml remove_from_array", "q.yaml", "a.b: [1, 2]\n",
+         lambda a: a.remove_from_array('"a.b"', "2"), "a.b: [1]\n"),
+        ("yaml edit_leading_comment", "q.yaml", "x: 1\na.b: 2\n",
+         lambda a: a.edit_leading_comment('"a.b"', "add", "# note"), "x: 1\n# note\na.b: 2\n"),
+        ("yaml sequence element", "q.yaml", "a:\n  - 1\n",
+         lambda a: a.replace_value("a.0", "3"), None),
+        ("toml basic-string key", "q.toml", '"a.b" = 1\n',
+         lambda a: a.replace_value('"a.b"', "2"), '"a.b" = 2\n'),
+        ("toml basic-string key, single-quoted path", "q.toml", '"a.b" = 1\n',
+         lambda a: a.replace_value("'a.b'", "2"), '"a.b" = 2\n'),
+        ("toml literal-string key", "q.toml", "'a.b' = 1\n",
+         lambda a: a.replace_value('"a.b"', "2"), "'a.b' = 2\n"),
+        ("toml key with an escape", "q.toml", '"caf\\u00e9" = 1\n',
+         lambda a: a.replace_value("café", "2"), '"caf\\u00e9" = 2\n'),
+        ("toml quoted header", "q.toml", '[x."y.z"]\nk = 1\n',
+         lambda a: a.replace_value("x.'y.z'.k", "2"), '[x."y.z"]\nk = 2\n'),
+        ("toml literal-string header", "q.toml", "[x.'y.z']\nk = 1\n",
+         lambda a: a.replace_value('x."y.z".k', "2"), "[x.'y.z']\nk = 2\n"),
+        ("toml header with spaces", "q.toml", '[ x . "y.z" ]\nk = 1\n',
+         lambda a: a.replace_value('x."y.z".k', "2"), '[ x . "y.z" ]\nk = 2\n'),
+        ("toml dotted key at the root", "q.toml", "x.y = 1\n",
+         lambda a: a.replace_value("x.y", "2"), "x.y = 2\n"),
+        ("toml dotted key in a [table]", "q.toml", "[t]\nx.y = 1\n",
+         lambda a: a.replace_value("t.x.y", "2"), "[t]\nx.y = 2\n"),
+        ("toml delete_key", "q.toml", '"a.b" = 1\nc = 2\n',
+         lambda a: a.delete_key('"a.b"'), "c = 2\n"),
+        ("toml add_key to a quoted [table]", "q.toml", '[x."y.z"]\nk = 1\n',
+         lambda a: a.add_key("x.'y.z'", "n", "2"), '[x."y.z"]\nk = 1\nn = 2\n'),
+        ("toml append_to_array", "q.toml", '"a.b" = [1]\n',
+         lambda a: a.append_to_array('"a.b"', "2"), '"a.b" = [1, 2]\n'),
+        ("toml remove_from_array", "q.toml", '"a.b" = [1, 2]\n',
+         lambda a: a.remove_from_array('"a.b"', "2"), '"a.b" = [1]\n'),
+        ("toml comment on a key", "q.toml", 'v = 1\n"a.b" = 2\n',
+         lambda a: a.edit_leading_comment('"a.b"', "add", "# note"), 'v = 1\n# note\n"a.b" = 2\n'),
+        ("toml comment on a quoted [table]", "q.toml", 'v = 1\n\n[x."y.z"]\nk = 1\n',
+         lambda a: a.edit_leading_comment('x."y.z"', "add", "# note"),
+         'v = 1\n\n# note\n[x."y.z"]\nk = 1\n'),
+        ("toml comment on a dotted [table]", "q.toml", "[tool.uv]\nk = 1\n",
+         lambda a: a.edit_leading_comment("tool.uv", "add", "# note"), "# note\n[tool.uv]\nk = 1\n"),
+        ("toml array element", "q.toml", "a = [1, 2]\n",
+         lambda a: a.replace_value("a.0", "3"), None),
+    ]
+    for label, name, content, action, expected in cases:
+        result = _edit_result(name, content, action)
+        if expected is None:
+            check(f"{label}: not addressable", result, "not found")
+            check(f"{label}: file untouched", "PASS" if "[FILE CHANGED]" not in result else "FAIL", "PASS")
+        else:
+            _exact(label, result, expected)
+            _check_loads(label, name, result)
+
+    for label, name, content, target, expected in [
+        ("json", "q.json", '{"editor.fontSize": 12}\n', '"editor.fontSize"', "12"),
+        ("yaml", "q.yaml", "'a.b': 1\n", '"a.b"', "1"),
+        ("toml", "q.toml", "[x.'y.z']\nk = 1\n", 'x."y.z".k', "1"),
+    ]:
+        _exact(f"read_symbol {label} quoted segment",
+               _read_result(name, content, lambda a: a.read_symbol(target)), expected)
+
+    # A duplicate refusal names a target that works, quoted where needed.
+    for label, name, content, parent, key, target, expected in [
+        ("json", "q.json", '{"editor.fontSize": 12}\n', "", "editor.fontSize",
+         '"editor.fontSize"', '{"editor.fontSize": 14}\n'),
+        ("json nested", "q.json", '{"a": {"b.c": 1}}\n', "a", "b.c", 'a."b.c"', '{"a": {"b.c": 14}}\n'),
+        ("yaml", "q.yaml", "a.b: 1\n", "", "a.b", '"a.b"', "a.b: 14\n"),
+        ("toml", "q.toml", '"a.b" = 1\n', "", '"a.b"', '"a.b"', '"a.b" = 14\n'),
+    ]:
+        path = _write_temp(name, content)
+        message = _refusal(lambda: Applier(path).add_key(parent, key, "2"))
+        check(f"{label} duplicate refusal names a quoted target", message, f"target '{target}'")
+        try:
+            Applier(path).replace_value(target, "14")
+            result = read_file(path)
+        except ApplierError as e:
+            result = f"REFUSED: {e}"
+        _exact(f"{label} duplicate refusal: its target works with replace_value", result, expected)
+        os.remove(path)
+
+
+def test_config_inline_entries():
+    print("\n═══ Config paths into YAML flow mappings and TOML inline tables ═══")
+
+    # (label, file name, content, edit, expected file text)
+    cases = [
+        ("yaml replace_value", "f.yaml", "a: {x: 1, y: 2}\n",
+         lambda a: a.replace_value("a.x", "5"), "a: {x: 5, y: 2}\n"),
+        ("yaml replace_value, nested", "f.yaml", "a: {b: {c: 1}}\n",
+         lambda a: a.replace_value("a.b.c", "5"), "a: {b: {c: 5}}\n"),
+        ("yaml replace_value in a root flow mapping", "f.yaml", "{x: 1}\n",
+         lambda a: a.replace_value("x", "5"), "{x: 5}\n"),
+        ("yaml replace_value over several lines", "f.yaml", "a: {\n  x: 1,\n  y: 2\n}\n",
+         lambda a: a.replace_value("a.y", "5"), "a: {\n  x: 1,\n  y: 5\n}\n"),
+        ("yaml replace_value on a key without a value", "f.yaml", "a: {x, y: 1}\n",
+         lambda a: a.replace_value("a.x", "5"), "a: {x: 5, y: 1}\n"),
+        ("yaml replace_value on `x: ,`", "f.yaml", "a: {x: , y: 1}\n",
+         lambda a: a.replace_value("a.x", "5"), "a: {x: 5, y: 1}\n"),
+        ("yaml replace_value on `x:,`", "f.yaml", "a: {x:, y: 1}\n",
+         lambda a: a.replace_value("a.x", "5"), "a: {x: 5, y: 1}\n"),
+        ("yaml replace_value after add_key", "f.yaml", "a: {x: 1}\n",
+         lambda a: (a.add_key("a", "k", "2"), Applier(a.filepath).replace_value("a.k", "3")),
+         "a: {x: 1, k: 3}\n"),
+        ("yaml delete_key, first", "f.yaml", "a: {x: 1, y: 2}\n",
+         lambda a: a.delete_key("a.x"), "a: {y: 2}\n"),
+        ("yaml delete_key, last", "f.yaml", "a: {x: 1, y: 2}\n",
+         lambda a: a.delete_key("a.y"), "a: {x: 1}\n"),
+        ("yaml delete_key, only", "f.yaml", "a: {b: {c: 1}}\n",
+         lambda a: a.delete_key("a.b.c"), "a: {b: {}}\n"),
+        ("yaml delete_key, key without a value", "f.yaml", "a: {x, y: 1}\n",
+         lambda a: a.delete_key("a.x"), "a: {y: 1}\n"),
+        ("yaml delete_key, own line", "f.yaml", "a: {\n  x: 1,\n  y: 2\n}\n",
+         lambda a: a.delete_key("a.y"), "a: {\n  x: 1\n}\n"),
+        ("yaml add_key, nested empty flow mapping", "f.yaml", "a: {b: {}}\n",
+         lambda a: a.add_key("a.b", "k", "1"), "a: {b: { k: 1 }}\n"),
+        ("yaml add_key, nested flow mapping", "f.yaml", "a: {b: {c: 1}}\n",
+         lambda a: a.add_key("a.b", "k", "2"), "a: {b: {c: 1, k: 2}}\n"),
+        ("yaml add_key under a flow key without a value", "f.yaml", "a: {x, y: 1}\n",
+         lambda a: a.add_key("a.x", "k", "2"), "a: {x: { k: 2 }, y: 1}\n"),
+        ("yaml add_key under `x:` in a flow mapping", "f.yaml", "a: {x: , y: 1}\n",
+         lambda a: a.add_key("a.x", "k", "2"), "a: {x: { k: 2 }, y: 1}\n"),
+        ("yaml append_to_array in a flow mapping", "f.yaml", "a: {b: [1]}\n",
+         lambda a: a.append_to_array("a.b", "2"), "a: {b: [1, 2]}\n"),
+        ("yaml comment on a flow key on its own line", "f.yaml", "a: {\n  x: 1,\n  y: 2\n}\n",
+         lambda a: a.edit_leading_comment("a.y", "add", "# note"), "a: {\n  x: 1,\n  # note\n  y: 2\n}\n"),
+        ("toml replace_value", "f.toml", "t = { a = 1, b = 2 }\n",
+         lambda a: a.replace_value("t.a", "5"), "t = { a = 5, b = 2 }\n"),
+        ("toml replace_value, nested", "f.toml", "t = { b = { c = 1 } }\n",
+         lambda a: a.replace_value("t.b.c", "5"), "t = { b = { c = 5 } }\n"),
+        ("toml replace_value in a [table]", "f.toml", "[s]\nt = { a = 1 }\n",
+         lambda a: a.replace_value("s.t.a", "5"), "[s]\nt = { a = 5 }\n"),
+        ("toml replace_value, quoted inner key", "f.toml", 't = { "a.b" = 1 }\n',
+         lambda a: a.replace_value('t."a.b"', "5"), 't = { "a.b" = 5 }\n'),
+        ("toml replace_value, dotted inner key", "f.toml", "t = { a.b = 1 }\n",
+         lambda a: a.replace_value("t.a.b", "5"), "t = { a.b = 5 }\n"),
+        ("toml replace_value after add_key", "f.toml", "t = { a = 1 }\n",
+         lambda a: (a.add_key("t", "k", "2"), Applier(a.filepath).replace_value("t.k", "3")),
+         "t = { a = 1, k = 3 }\n"),
+        ("toml delete_key, first", "f.toml", "t = { a = 1, b = 2 }\n",
+         lambda a: a.delete_key("t.a"), "t = { b = 2 }\n"),
+        ("toml delete_key, last", "f.toml", "t = { a = 1, b = 2 }\n",
+         lambda a: a.delete_key("t.b"), "t = { a = 1 }\n"),
+        ("toml delete_key, only", "f.toml", "t = { b = { c = 1 } }\n",
+         lambda a: a.delete_key("t.b.c"), "t = { b = {} }\n"),
+        ("toml add_key, nested inline table", "f.toml", "t = { b = { c = 1 } }\n",
+         lambda a: a.add_key("t.b", "d", "2"), "t = { b = { c = 1, d = 2 } }\n"),
+        ("toml append_to_array in an inline table", "f.toml", "t = { d = [] }\n",
+         lambda a: a.append_to_array("t.d", "1"), "t = { d = [1] }\n"),
+    ]
+    for label, name, content, action, expected in cases:
+        result = _edit_result(name, content, action)
+        _exact(label, result, expected)
+        _check_loads(label, name, result)
+
+    for label, name, content, target, expected in [
+        ("yaml flow key", "f.yaml", "a: {x: 1, y: {z: 2}}\n", "a.y.z", "2"),
+        ("yaml flow key without a value", "f.yaml", "a: {x, y: 1}\n", "a.x", ""),
+        ("toml inline key", "f.toml", "t = { a = 1, b = { c = 2 } }\n", "t.b.c", "2"),
+    ]:
+        _exact(f"read_symbol {label}", _read_result(name, content, lambda a: a.read_symbol(target)), expected)
+
+    # A comment line above an inline key would belong to the key its line
+    # starts with.
+    for label, name, content, target in [
+        ("yaml", "f.yaml", "a: {x: 1}\n", "a.x"),
+        ("toml", "f.toml", "t = { a = 1 }\n", "t.a"),
+    ]:
+        result = _edit_result(name, content, lambda a: a.edit_leading_comment(target, "add", "# note"))
+        check(f"{label} comment on an inline key: refused", result, "REFUSED: ")
+        check(f"{label} comment on an inline key: says why", result, "does not start its line")
+        check(f"{label} comment on an inline key: file untouched",
+              "PASS" if "[FILE CHANGED]" not in result else "FAIL", "PASS")
+
+    for label, name, content, parent, key, target in [
+        ("yaml nested flow mapping", "f.yaml", "a: {b: {c: 1}}\n", "a.b", "c", "a.b.c"),
+        ("toml nested inline table", "f.toml", "t = { b = { c = 1 } }\n", "t.b", "c", "t.b.c"),
+    ]:
+        result = _edit_result(name, content, lambda a: a.add_key(parent, key, "2"))
+        check(f"{label} duplicate names the key's target", result, f"target '{target}'")
+
+
+def test_yaml_keys_without_value():
+    print("\n═══ YAML keys with no value: read_symbol, replace_value, comments ═══")
+
+    # (label, content, target, new value, expected file text)
+    cases = [
+        ("one line", "a:\nb: 1\n", "a", "3", "a: 3\nb: 1\n"),
+        ("nested", "x:\n  a:\n  b: 1\n", "x.a", "3", "x:\n  a: 3\n  b: 1\n"),
+        ("before a comment", "a: # later\nb: 1\n", "a", "3", "a: 3 # later\nb: 1\n"),
+        ("trailing space", "a: \nb: 1\n", "a", "3", "a: 3\nb: 1\n"),
+        ("last line", "b: 1\na:\n", "a", "3", "b: 1\na: 3\n"),
+        ("flow mapping value", "a:\nb: 1\n", "a", "{k: v}", "a: {k: v}\nb: 1\n"),
+        ("scalar with a colon", "a:\nb: 1\n", "a", "http://x.y", "a: http://x.y\nb: 1\n"),
+        ("leading newline", "a:\nb: 1\n", "a", "\n3", "a: 3\nb: 1\n"),
+        ("block mapping", "a:\nb: 1\n", "a", "k: 1\nm: 2", "a:\n  k: 1\n  m: 2\nb: 1\n"),
+        ("one-line block mapping", "a:\nb: 1\n", "a", "k: v", "a:\n  k: v\nb: 1\n"),
+        ("block sequence", "a:\nb: 1\n", "a", "- 1\n- 2", "a:\n  - 1\n  - 2\nb: 1\n"),
+        ("one-item block sequence", "a:\nb: 1\n", "a", "- 1", "a:\n  - 1\nb: 1\n"),
+        ("block in a 4-space file", "top:\n    a:\n    b: 1\n", "top.a", "k: 1",
+         "top:\n    a:\n        k: 1\n    b: 1\n"),
+        ("block keeps relative indentation", "a:\n", "a", "k:\n  m: 1", "a:\n  k:\n    m: 1\n"),
+        ("quoted key with a dot", '"a.b":\nc: 1\n', '"a.b"', "3", '"a.b": 3\nc: 1\n'),
+        ("block below a comment", "a: # c\nb: 1\n", "a", "k: 1\nm: 2", "a: # c\n  k: 1\n  m: 2\nb: 1\n"),
+        ("block on a last line with no newline", "b: 1\na:", "a", "k: 1\nm: 2", "b: 1\na:\n  k: 1\n  m: 2\n"),
+        # A block scalar header or node properties stay on the key's line.
+        ("block scalar", "a:\nb: 1\n", "a", "|\n  line one\n  line two", "a: |\n  line one\n  line two\nb: 1\n"),
+        ("block scalar before a comment", "a: # c\nb: 1\n", "a", "|\n  text", "a: | # c\n  text\nb: 1\n"),
+        ("folded scalar", "a:\nb: 1\n", "a", ">-\n  text", "a: >-\n  text\nb: 1\n"),
+        ("anchor", "a:\nb: 1\n", "a", "&x\n  k: 1", "a: &x\n  k: 1\nb: 1\n"),
+        ("tag, nested", "x:\n  a:\n", "x.a", "!!map\n  k: 1", "x:\n  a: !!map\n    k: 1\n"),
+    ]
+    for label, content, target, value, expected in cases:
+        result = _edit_result("n.yaml", content, lambda a: a.replace_value(target, value))
+        _exact(f"yaml replace_value on a key with no value ({label})", result, expected)
+
+    for label, value, expected in [
+        ("one line", "3", "a: 3\r\nb: 1\r\n"),
+        ("block", "k: 1\nm: 2", "a:\r\n  k: 1\r\n  m: 2\r\nb: 1\r\n"),
+    ]:
+        result = _edit_result("n.yaml", "a:\nb: 1\n", lambda a: a.replace_value("a", value), newline="\r\n")
+        _exact(f"yaml replace_value on a key with no value, CRLF ({label})", result, expected)
+
+    _exact("yaml read_symbol on a key with no value",
+           _read_result("n.yaml", "x:\n  a:\n  b: 1\n", lambda a: a.read_symbol("x.a")), "")
+    check("yaml read_symbol on a missing key: still refused",
+          _read_result("n.yaml", "a:\n", lambda a: a.read_symbol("b")), "REFUSED: Target 'b' not found")
+
+    # (label, content, target, op, comment, expected file text)
+    for label, content, target, op, comment, expected in [
+        ("add", "x: 1\na:\nb: 1\n", "a", "add", "# note", "x: 1\n# note\na:\nb: 1\n"),
+        ("add, nested", "x:\n  a:\n  b: 1\n", "x.a", "add", "# note", "x:\n  # note\n  a:\n  b: 1\n"),
+        ("replace", "# old\na:\nb: 1\n", "a", "replace", "# new", "# new\na:\nb: 1\n"),
+        ("remove", "# old\na:\nb: 1\n", "a", "remove", "", "a:\nb: 1\n"),
+    ]:
+        result = _edit_result("n.yaml", content, lambda a: a.edit_leading_comment(target, op, comment))
+        _exact(f"yaml edit_leading_comment on a key with no value ({label})", result, expected)
+
+
+def test_append_to_array_layout():
+    print("\n═══ append_to_array keeps the array's layout ═══")
+
+    # (label, file name, content, target, value, expected file text)
+    cases = [
+        ("json inline", "r.json", '{"a": [1, 2]}\n', "a", "3", '{"a": [1, 2, 3]}\n'),
+        ("json inline, padded", "r.json", '{"a": [ 1, 2 ]}\n', "a", "3", '{"a": [ 1, 2, 3 ]}\n'),
+        ("json empty", "r.json", '{"a": []}\n', "a", "3", '{"a": [3]}\n'),
+        ("json inline in a multi-line object", "r.json", '{\n  "a": [1, 2]\n}\n', "a", "3",
+         '{\n  "a": [1, 2, 3]\n}\n'),
+        ("json one per line", "r.json", '{\n  "a": [\n    1,\n    2\n  ]\n}\n', "a", "3",
+         '{\n  "a": [\n    1,\n    2,\n    3\n  ]\n}\n'),
+        ("json objects one per line", "r.json", '{\n  "a": [\n    {"x": 1}\n  ]\n}\n', "a", '{"x": 2}',
+         '{\n  "a": [\n    {"x": 1},\n    {"x": 2}\n  ]\n}\n'),
+        ("json empty, brackets on two lines", "r.json", '{\n  "a": [\n  ]\n}\n', "a", "3",
+         '{\n  "a": [\n    3\n  ]\n}\n'),
+        ("json tab-indented", "r.json", '{\n\t"a": [\n\t\t1\n\t]\n}\n', "a", "2",
+         '{\n\t"a": [\n\t\t1,\n\t\t2\n\t]\n}\n'),
+        ("toml inline", "r.toml", "a = [1, 2]\n", "a", "3", "a = [1, 2, 3]\n"),
+        ("toml inline, trailing comma", "r.toml", "a = [1, 2,]\n", "a", "3", "a = [1, 2, 3,]\n"),
+        ("toml empty", "r.toml", "a = []\n", "a", "3", "a = [3]\n"),
+        ("toml one per line", "r.toml", "a = [\n    1,\n    2\n]\n", "a", "3",
+         "a = [\n    1,\n    2,\n    3\n]\n"),
+        ("toml one per line, trailing comma", "r.toml", "a = [\n  1,\n  2,\n]\n", "a", "3",
+         "a = [\n  1,\n  2,\n  3,\n]\n"),
+        ("toml comment on the last line", "r.toml", "a = [\n  1,\n  2, # two\n]\n", "a", "3",
+         "a = [\n  1,\n  2, # two\n  3,\n]\n"),
+        ("toml comment, no trailing comma", "r.toml", "a = [\n  1,\n  2 # two\n]\n", "a", "3",
+         "a = [\n  1,\n  2, # two\n  3\n]\n"),
+        ("toml empty, brackets on two lines", "r.toml", "a = [\n]\n", "a", "3", "a = [\n  3\n]\n"),
+        ("toml in a [table]", "r.toml", '[p]\ndeps = [\n    "a",\n]\n', "p.deps", '"b"',
+         '[p]\ndeps = [\n    "a",\n    "b",\n]\n'),
+        ("yaml flow", "r.yaml", "a: [1, 2]\n", "a", "3", "a: [1, 2, 3]\n"),
+        ("yaml flow, padded", "r.yaml", "a: [ 1 ]\n", "a", "3", "a: [ 1, 3 ]\n"),
+        ("yaml flow, empty", "r.yaml", "a: []\n", "a", "3", "a: [3]\n"),
+        ("yaml flow, one per line", "r.yaml", "a: [\n  1,\n  2\n]\n", "a", "3", "a: [\n  1,\n  2,\n  3\n]\n"),
+        ("yaml flow, trailing comma", "r.yaml", "a: [\n  1,\n  2,\n]\n", "a", "3",
+         "a: [\n  1,\n  2,\n  3,\n]\n"),
+    ]
+    for label, name, content, target, value, expected in cases:
+        result = _edit_result(name, content, lambda a: a.append_to_array(target, value))
+        _exact(f"append_to_array {label}", result, expected)
+        _check_loads(f"append_to_array {label}", name, result)
+
+    result = _edit_result("r.toml", "a = [\n  1,\n]\n", lambda a: a.append_to_array("a", "2"), newline="\r\n")
+    _exact("append_to_array toml one per line, CRLF", result, "a = [\r\n  1,\r\n  2,\r\n]\r\n")
+
+
+def test_indentation_whitespace():
+    print("\n═══ Indentation is spaces and tabs only: form feeds and U+2028 stay ═══")
+
+    # (label, content, edit, expected file text)
+    cases = [
+        ("insert_sibling: a form feed before the new def stays", "def f():\n    return 1\n",
+         lambda a: a.insert_sibling("f", "\x0cdef g():\n    return 2\n", "after"),
+         "def f():\n    return 1\n\n\x0cdef g():\n    return 2\n"),
+        ("insert_sibling: the target's form feed is not copied", "\x0cdef f():\n    return 1\n",
+         lambda a: a.insert_sibling("f", "def g():\n    return 2\n", "after"),
+         "\x0cdef f():\n    return 1\n\ndef g():\n    return 2\n"),
+        ("replace_function: no form feed added to the body", "x = 1\n\n\n\x0cdef f():\n    return 1\n",
+         lambda a: a.replace_function("f", "def f():\n    return 2\n"),
+         "x = 1\n\n\ndef f():\n    return 2\n"),
+        ("add_method: U+2028 starting a docstring line stays", "class A:\n    def f(self):\n        return 1\n",
+         lambda a: a.add_method("A", '        def g(self):\n            """Doc.\n\u2028more"""\n            return 1\n'),
+         'class A:\n    def f(self):\n        return 1\n\n    def g(self):\n        """Doc.\n    \u2028more"""\n        return 1\n'),
+        ("add_method: a form feed starting a string line stays", "class A:\n    def f(self):\n        return 1\n",
+         lambda a: a.add_method("A", '        def g(self):\n            s = """\n\x0cpage"""\n            return s\n'),
+         'class A:\n    def f(self):\n        return 1\n\n    def g(self):\n        s = """\n    \x0cpage"""\n        return s\n'),
+    ]
+    for label, content, action, expected in cases:
+        _exact(label, _edit_result("w.py", content, action), expected)
+
+    path = _write_temp("w.py", "x = 1\n")
+    a = Applier(path)
+    for label, line, indent in [
+        ("a form feed is not indentation", "\x0c    x", ""),
+        ("spaces and tabs before a form feed", " \t\x0cx", " \t"),
+        ("U+2028 is not indentation", "  \u2028x", "  "),
+        ("U+00A0 is not indentation", "\u00a0x", ""),
+    ]:
+        _exact(f"_get_indent: {label}", repr(a._get_indent(line)), repr(indent))
+    _exact("_reindent keeps form feeds and U+2028",
+           repr(a._reindent(["    a", "\u2028b", "  \x0cc"], "  ")),
+           repr(["  a", "  \u2028b", "  \x0cc"]))
+    os.remove(path)
+
+
+def test_leading_comments_in_strings():
+    print("\n═══ Leading comments: comment-like lines inside strings are text ═══")
+
+    yaml_job = "job:\n  run: |\n    echo hi\n    # step two\n  env: 1\n"
+    # (label, file name, source, edit, expected file text)
+    cases = [
+        ("insert_sibling before: py `#` line closing a string (reported)", "s.py",
+         'X = """abc\n# fake comment"""\ndef f():\n    pass\n',
+         lambda a: a.insert_sibling("f", "def g():\n    pass", "before"),
+         'X = """abc\n# fake comment"""\ndef g():\n    pass\n\ndef f():\n    pass\n'),
+        ("insert_sibling before: js `//` line closing a template literal (reported)", "s.js",
+         "const s = `\n// not a comment`;\nfunction f() {}\n",
+         lambda a: a.insert_sibling("f", "function g() {}", "before"),
+         "const s = `\n// not a comment`;\nfunction g() {}\n\nfunction f() {}\n"),
+        ("insert_sibling before: a real comment under the string still moves up", "s.py",
+         'X = """abc\n# fake"""\n# Doc for f\ndef f():\n    pass\n',
+         lambda a: a.insert_sibling("f", "def g():\n    pass", "before"),
+         'X = """abc\n# fake"""\ndef g():\n    pass\n\n# Doc for f\ndef f():\n    pass\n'),
+        ("insert_sibling before: `/*` opening a string is no comment start", "s.js",
+         "const s = `\n/*`; /* real\ncomment */\nfunction f() {}\n",
+         lambda a: a.insert_sibling("f", "function g() {}", "before"),
+         "const s = `\n/*`; /* real\ncomment */\nfunction g() {}\n\nfunction f() {}\n"),
+        ("delete_symbol: the string's last line is not deleted as a comment", "s.py",
+         'X = """abc\n# fake comment"""\ndef f():\n    pass\n',
+         lambda a: a.delete_symbol("f"),
+         'X = """abc\n# fake comment"""\n'),
+        ("edit_leading_comment remove: a YAML block scalar line is not a comment (reported)", "s.yaml",
+         yaml_job, lambda a: a.edit_leading_comment("job.env", "remove"),
+         "REFUSED: No leading comment found above 'job.env'"),
+        ("edit_leading_comment add: lands under the block scalar", "s.yaml",
+         yaml_job, lambda a: a.edit_leading_comment("job.env", "add", "# env doc"),
+         "job:\n  run: |\n    echo hi\n    # step two\n  # env doc\n  env: 1\n"),
+        ("edit_leading_comment replace: the block scalar keeps its line", "s.yaml",
+         yaml_job, lambda a: a.edit_leading_comment("job.env", "replace", "# env doc"),
+         "job:\n  run: |\n    echo hi\n    # step two\n  # env doc\n  env: 1\n"),
+    ]
+    for label, name, source, action, expected in cases:
+        _exact(label, _edit_result(name, source, action), expected)
+
+
+def test_ts_ambiguous_names():
+    print("\n═══ TS: a name that is both a type and a value is refused ═══")
+
+    zod = (
+        "import { z } from 'zod';\n\n"
+        "export const User = z.object({ name: z.string() });\n\n"
+        "/** The user type. */\n"
+        "export type User = z.infer<typeof User>;\n"
+    )
+    zod_refusal = (
+        "REFUSED: 'User' is ambiguous: `const User` (line 3) and `type User` (line 6) "
+        "both declare it, and a target cannot say which one it means. Edit these "
+        "declarations with your normal edit tool."
+    )
+    _exact("zod pattern: list_symbols lists the type",
+           _read_result("amb.ts", zod, lambda a: a.list_symbols()), "type User (line 6)")
+    _exact("zod pattern: read_symbol is refused (reported)",
+           _read_result("amb.ts", zod, lambda a: a.read_symbol("User")), zod_refusal)
+    _exact("zod pattern: delete_symbol is refused, the file untouched (reported)",
+           _edit_result("amb.ts", zod, lambda a: a.delete_symbol("User")), zod_refusal)
+    _exact("zod pattern in .tsx: replace_function is refused",
+           _edit_result("amb.tsx", zod, lambda a: a.replace_function("User", "export type User = {};")),
+           zod_refusal)
+
+    props = "export interface Props {\n  a: number;\n}\nexport const Props = (p: Props) => p.a;\n"
+    _exact("interface and function: read_symbol is refused",
+           _read_result("amb.ts", props, lambda a: a.read_symbol("Props")),
+           "REFUSED: 'Props' is ambiguous: `interface Props` (line 1) and `const Props` (line 4) "
+           "both declare it, and a target cannot say which one it means. Edit these "
+           "declarations with your normal edit tool.")
+    _exact("three declarations are all named",
+           _read_result("amb.ts", "const U = 1;\ntype U = number;\ninterface U {}\n",
+                        lambda a: a.read_symbol("U")),
+           "REFUSED: 'U' is ambiguous: `const U` (line 1), `type U` (line 2) and `interface U` "
+           "(line 3) all declare it, and a target cannot say which one it means. Edit these "
+           "declarations with your normal edit tool.")
+    _exact("declare const and type: refused",
+           _read_result("amb.ts", "declare const X: number;\ntype X = string;\n",
+                        lambda a: a.read_symbol("X")).split(" both ")[0],
+           "REFUSED: 'X' is ambiguous: `const X` (line 1) and `type X` (line 2)")
+
+    # Not ambiguous: overload signatures, merged interfaces, getter/setter
+    # pairs, a same-named local in another scope.
+    _exact("function overloads: the implementation",
+           _read_result("amb.ts", "export function f(a: string): string;\nexport function f(a: any) { return a; }\n",
+                        lambda a: a.read_symbol("f")),
+           "export function f(a: any) { return a; }")
+    _exact("merged interfaces: the first",
+           _read_result("amb.ts", "interface A { x: number }\ninterface A { y: number }\n",
+                        lambda a: a.read_symbol("A")),
+           "interface A { x: number }")
+    _exact("getter and setter: the first",
+           _read_result("amb.ts", "class A {\n  get x() { return 1; }\n  set x(v) {}\n}\n",
+                        lambda a: a.read_symbol("A.x")),
+           "get x() { return 1; }")
+    _exact("a local of the same name in a function body",
+           _read_result("amb.ts", "type User = number;\nfunction g() {\n  const User = 1;\n}\n",
+                        lambda a: a.read_symbol("User")),
+           "type User = number;")
+
+
+def test_ts_kind_tool_followups():
+    print("\n═══ TS enums, type aliases, abstract methods and bare arrow parameters ═══")
+
+    enum = "export enum E {\n  A,\n  B,\n}\n"
+    enum_refusal = (
+        "REFUSED: 'E' is an enum, not a class or interface, so add_method and add_field "
+        "cannot add to it; rewrite it with replace_function"
+    )
+    _exact("add_field on a TS enum is refused (reported)",
+           _edit_result("k.ts", enum, lambda a: a.add_field("E", "C,")), enum_refusal)
+    _exact("add_method on a TS enum is refused (reported)",
+           _edit_result("k.ts", enum, lambda a: a.add_method("E", "C,")), enum_refusal)
+    _exact("add_method on a TS type alias is refused",
+           _edit_result("k.ts", "type T = { a: number };\n", lambda a: a.add_method("T", "m(): void;")),
+           "REFUSED: 'T' is a type alias, not a class or interface, so add_method and "
+           "add_field cannot add to it; rewrite it with replace_function")
+    _exact("read_symbol signature on a type alias is refused",
+           _read_result("k.ts", "type T = number;\n", lambda a: a.read_symbol("T", "signature")),
+           "REFUSED: 'T' is a type alias, which has no signature; read it with depth='full'")
+
+    abstract = "abstract class A {\n  abstract m(): void;\n}\n"
+    for label, sig in [("without", "abstract m(x: number): void"),
+                       ("with", "  abstract m(x: number): void;")]:
+        _exact(f"replace_signature on an abstract method, new signature {label} `;`",
+               _edit_result("k.ts", abstract, lambda a: a.replace_signature("A.m", sig)),
+               "abstract class A {\n  abstract m(x: number): void;\n}\n")
+    _exact("replace_signature on an abstract method written without `;`",
+           _edit_result("k.ts", "abstract class A {\n  abstract m(): void\n  n() {}\n}\n",
+                        lambda a: a.replace_signature("A.m", "abstract m(x: number): void")),
+           "abstract class A {\n  abstract m(x: number): void\n  n() {}\n}\n")
+    _exact("replace_signature on a Java interface method",
+           _edit_result("K.java", "interface A {\n    void m();\n}\n",
+                        lambda a: a.replace_signature("A.m", "void m(int x);")),
+           "interface A {\n    void m(int x);\n}\n")
+    _exact("list_symbols: an overloaded abstract method is listed once",
+           _read_result("k.ts",
+                        "export abstract class A {\n  abstract m(): void;\n  n() {}\n  abstract m(x: number): void;\n}\n",
+                        lambda a: a.list_symbols()),
+           "class A (line 1)\n  method A.m (line 2)\n  method A.n (line 3)")
+
+    bare = "const f = x => {\n  return x;\n};\n"
+    # (label, file name, source, edit, expected file text)
+    cases = [
+        ("add_parameter at the end (reported)", "k.js", bare,
+         lambda a: a.add_parameter("f", "y"), "const f = (x, y) => {\n  return x;\n};\n"),
+        ("add_parameter at the start of an async arrow", "k.js",
+         "const f = async x => {\n  return x;\n};\n",
+         lambda a: a.add_parameter("f", "y", "start"), "const f = async (y, x) => {\n  return x;\n};\n"),
+        ("add_parameter to an expression-bodied TS arrow", "k.ts", "export const f = x => x * 2;\n",
+         lambda a: a.add_parameter("f", "y: number"), "export const f = (x, y: number) => x * 2;\n"),
+        ("add_parameter to an arrow in an object literal", "k.js",
+         "const app = {\n  handler: req => {\n    return req;\n  },\n};\n",
+         lambda a: a.add_parameter("app.handler", "res"),
+         "const app = {\n  handler: (req, res) => {\n    return req;\n  },\n};\n"),
+        ("remove_parameter leaves () (reported)", "k.js", bare,
+         lambda a: a.remove_parameter("f", "x"), "const f = () => {\n  return x;\n};\n"),
+        ("remove_parameter with another name is refused", "k.js", bare,
+         lambda a: a.remove_parameter("f", "z"), "REFUSED: Parameter 'z' not found in 'f'"),
+    ]
+    for label, name, source, action, expected in cases:
+        _exact(f"bare arrow parameter: {label}", _edit_result(name, source, action), expected)
+
+
+def test_yaml_explicit_keys():
+    print("\n═══ YAML: an explicit key with no value (`? a`) ═══")
+
+    # (label, source, edit, expected file text)
+    cases = [
+        ("replace_value adds a `:` line (reported)", "? a\nb: 1\n",
+         lambda a: a.replace_value("a", "3"), "? a\n: 3\nb: 1\n"),
+        ("nested, in the `?`'s column", "top:\n  ? a\n  b: 1\n",
+         lambda a: a.replace_value("top.a", "3"), "top:\n  ? a\n  : 3\n  b: 1\n"),
+        ("a comment after the key stays on its line", "? a # c\nb: 1\n",
+         lambda a: a.replace_value("a", "3"), "? a # c\n: 3\nb: 1\n"),
+        ("a block sequence goes below the `:`", "? a\nb: 1\n",
+         lambda a: a.replace_value("a", "- x\n- y"), "? a\n:\n  - x\n  - y\nb: 1\n"),
+        ("a block scalar header stays after the `:`", "? a\nb: 1\n",
+         lambda a: a.replace_value("a", "|\n  text\n  more"), "? a\n: |\n  text\n  more\nb: 1\n"),
+        ("the last key of the file", "b: 1\n? a",
+         lambda a: a.replace_value("a", "3"), "b: 1\n? a\n: 3\n"),
+    ]
+    for label, source, action, expected in cases:
+        _exact(f"explicit key: {label}", _edit_result("x.yaml", source, action), expected)
+    _exact("explicit key: crlf",
+           _edit_result("x.yaml", "? a\nb: 1\n", lambda a: a.replace_value("a", "3"), "\r\n"),
+           "? a\r\n: 3\r\nb: 1\r\n")
+
+    # The key keeps its name: it can be read and replaced again.
+    path = _write_temp("x.yaml", "? a\nb: 1\n")
+    try:
+        Applier(path).replace_value("a", "3")
+        back = Applier(path).read_symbol("a")
+        Applier(path).replace_value("a", "4")
+        again = read_file(path)
+    except ApplierError as e:
+        back = again = f"REFUSED: {e}"
+    os.remove(path)
+    _exact("explicit key: read back after the edit", back, "3")
+    _exact("explicit key: replaced again", again, "? a\n: 4\nb: 1\n")
 
 
 # ──────────────────────────────────────────────
@@ -5727,6 +6822,20 @@ if __name__ == "__main__":
     test_json_plus_exponents()
     test_member_layout_followups()
     test_config_key_followups()
+    test_insert_before_leading_comments()
+    test_ts_abstract_classes()
+    test_delete_symbol_separators()
+    test_interface_indentation()
+    test_js_ts_symbol_kinds()
+    test_config_quoted_paths()
+    test_config_inline_entries()
+    test_yaml_keys_without_value()
+    test_append_to_array_layout()
+    test_indentation_whitespace()
+    test_leading_comments_in_strings()
+    test_ts_ambiguous_names()
+    test_ts_kind_tool_followups()
+    test_yaml_explicit_keys()
 
     # Reset all fixtures to clean state after tests
     for lang in FIXTURES:

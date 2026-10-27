@@ -11,7 +11,7 @@ import os
 from collections import OrderedDict
 from typing import Optional
 
-from rmd_editor.parser import Cell, Frontmatter, FrontmatterError, dump_yaml, parse, serialize, yaml_string, _with_newline
+from rmd_editor.parser import Cell, Frontmatter, FrontmatterError, dump_yaml, parse, serialize, yaml_string, _lines, _with_newline
 
 
 class RmdManagerError(Exception):
@@ -73,7 +73,9 @@ class RmdManager:
     Open, edit, and save a .rmd file. Mutations are written to disk on each
     successful operation. Parse state is rebuilt per-instance; create a new
     RmdManager after any external edit. Cell sources use "\\n" line breaks
-    whatever the file uses; saving keeps the file's own (see parser).
+    whatever the file uses; saving keeps the file's own, and a UTF-8 byte order
+    mark the file starts with (see parser). Line counts, split offsets and line
+    numbers all split lines as the parser does.
     """
 
     def __init__(self, file_path: str):
@@ -123,8 +125,10 @@ class RmdManager:
             return "(document has no cells)"
         lines = []
         for i, cell in enumerate(self.cells):
-            line_count = cell.source.count("\n") + (0 if cell.source.endswith("\n") or not cell.source else 1)
-            preview = cell.source.strip().splitlines()[0] if cell.source.strip() else ""
+            # Lines as the parser splits them, so counts match split_cell and find_in_rmd.
+            line_count = len(_lines(cell.source))
+            stripped = cell.source.strip()
+            preview = _lines(stripped)[0].rstrip("\r\n") if stripped else ""
             if len(preview) > 60:
                 preview = preview[:57] + "..."
             if cell.cell_type == "code":
@@ -174,7 +178,8 @@ class RmdManager:
     def split_cell(self, index: int, line_offset: int) -> str:
         idx = self._validate_index(index)
         cell = self.cells[idx]
-        lines = cell.source.splitlines(keepends=True)
+        # Only a line break ends a line, as list_cells counts them: a form feed or U+2028 stays inside one.
+        lines = _lines(cell.source)
         if line_offset < 1 or line_offset >= len(lines):
             raise RmdManagerError(
                 f"line_offset {line_offset} out of range (1..{len(lines)-1}) for cell with {len(lines)} line(s)"
@@ -340,7 +345,9 @@ class RmdManager:
             return "(empty pattern)"
         hits: list[str] = []
         for i, cell in enumerate(self.cells):
-            for ln, line in enumerate(cell.source.splitlines(), start=1):
+            # Numbered as list_cells counts lines and split_cell takes offsets.
+            for ln, line in enumerate(_lines(cell.source), start=1):
+                line = line.rstrip("\r\n")
                 if pattern in line:
                     hits.append(f"cell[{i}] line {ln}: {line}")
         if not hits:

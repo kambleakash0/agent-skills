@@ -133,6 +133,11 @@ def read_raw(path: str) -> str:
     with open(path, encoding="utf-8", newline="") as f:
         return f.read()
 
+def read_bytes(path: str) -> bytes:
+    """The file's bytes, byte order mark included."""
+    with open(path, "rb") as f:
+        return f.read()
+
 
 def lone_newlines(text: str) -> int:
     """How many "\\n" in text are not part of a "\\r\\n"."""
@@ -529,6 +534,115 @@ def test_mixed_line_endings():
     check_same("cr header: set keeps the blank line after the rewritten key", read_raw(path),
                "---\rtitle: y\r\n\nz: 1\r---\rA\rB\rC\r")
     check_same("cr header: blank line still read after the set", RmdManager(path).frontmatter.text(), "title: y\n\nz: 1\n")
+
+def test_line_numbers_agree():
+    print("\n═══ line counts, split offsets and line numbers agree ═══")
+    # A form feed doesn't end a line (see test_line_breaks): list_cells, find_in_rmd and split_cell all see 2 lines
+    ff = chr(0x0C)
+    text = f"```{{r}}\na <- 1{ff}b <- 2\nc <- 3\n```\n"
+    path = write_raw("line_numbers.rmd", text)
+    mgr = RmdManager(path)
+    check("line numbers: list_cells counts 2 lines", mgr.list_cells(), f"[0] code (r) 2L  a <- 1{ff}b <- 2")
+    check_same("line numbers: find_in_rmd numbers the last line 2", mgr.find_in_rmd("c <- 3"), "cell[0] line 2: c <- 3")
+    check_same("line numbers: find_in_rmd shows the whole first line", mgr.find_in_rmd("b <- 2"), f"cell[0] line 1: a <- 1{ff}b <- 2")
+    try:
+        mgr.split_cell(0, 2)
+        check("line numbers: split_cell takes offsets up to the line count minus 1", "no error", "out of range")
+    except RmdManagerError as e:
+        check("line numbers: split_cell takes offsets up to the line count minus 1", str(e), "(1..1) for cell with 2 line(s)")
+    mgr.split_cell(0, 1)
+    check_same("line numbers: split_cell splits at the line break, not the form feed", read_raw(path),
+               f"```{{r}}\na <- 1{ff}b <- 2\n```\n```{{r}}\nc <- 3\n```\n")
+    # The same for every break str.splitlines knows but knitr doesn't, in prose and in chunks
+    for code in (0x0B, 0x0C, 0x1C, 0x85, 0x2028, 0x2029):
+        ch = chr(code)
+        text = f"Intro{ch}more\nlast\n\n```{{r}}\nx <- 1{ch}y <- 2\nz <- 3\n```\n"
+        path = write_raw("line_numbers.rmd", text)
+        mgr = RmdManager(path)
+        listing = mgr.list_cells()
+        check(f"line numbers: U+{code:04X} prose has 3 lines", listing, f"[0] markdown 3L  Intro{ch}more")
+        check(f"line numbers: U+{code:04X} chunk has 2 lines", listing, f"[1] code (r) 2L  x <- 1{ch}y <- 2")
+        check_same(f"line numbers: U+{code:04X} prose line numbers", mgr.find_in_rmd("last"), "cell[0] line 2: last")
+        check_same(f"line numbers: U+{code:04X} chunk line numbers", mgr.find_in_rmd("z <- 3"), "cell[1] line 2: z <- 3")
+        check_same(f"line numbers: U+{code:04X} stays inside the line find_in_rmd shows", mgr.find_in_rmd("more"),
+                   f"cell[0] line 1: Intro{ch}more")
+        mgr.split_cell(1, 1)
+        mgr.split_cell(0, 1)
+        check(f"line numbers: U+{code:04X} split prose at its line break",
+              [c.source for c in mgr.cells[:2]], [f"Intro{ch}more\n", "last\n\n"])
+        check_same(f"line numbers: U+{code:04X} split chunk at its line break", read_raw(path),
+                   text.replace(f"y <- 2\nz", f"y <- 2\n```\n```{{r}}\nz"))
+    # YAML also takes NEL, U+2028 and U+2029 for line breaks; the error's line number counts the file's lines
+    for code in (0x85, 0x2028, 0x2029):
+        path = write_raw("line_numbers.rmd", f'---\ntitle: "a{chr(code)}b"\nkey: value\n\tbad: x\n---\n')
+        check(f"line numbers: U+{code:04X} in the header leaves YAML error lines as the file's",
+              RmdManager(path).get_frontmatter(), "(line 4 of the file)")
+
+
+def test_byte_order_mark():
+    print("\n═══ UTF-8 byte order mark ═══")
+    bom = chr(0xFEFF)
+    body = "---\ntitle: x\n---\n\n# H\n\n```{r}\nx <- 1\n```\n"
+    text = bom + body
+    fm, cells = parse(text)
+    check("bom: parser finds the header after the mark", (fm.present, fm.data), (True, {"title": "x"}))
+    check("bom: parser round-trips", serialize(fm, cells) == text, True)
+    fm, cells = parse(bom + "```{r}\nx\n```\n")
+    check("bom: parser finds a chunk fence after the mark", [(c.cell_type, c.source) for c in cells], [("code", "x")])
+    path = write_raw("bom.rmd", text)
+    mgr = RmdManager(path)
+    check_same("bom: get_frontmatter reads the header", mgr.get_frontmatter(), "title: x")
+    check("bom: cells hold no mark", [(c.cell_type, c.source) for c in mgr.cells], [("markdown", "\n# H\n\n"), ("code", "x <- 1")])
+    check("bom: list_cells shows the prose", mgr.list_cells(), "[0] markdown 3L  # H")
+    mgr._save()
+    check("bom: untouched file saves back byte for byte", read_bytes(path), text.encode("utf-8"))
+    RmdManager(path).set_frontmatter_key("author", "y")
+    check_same("bom: set_frontmatter_key keeps the mark", read_raw(path), bom + body.replace("title: x\n", "title: x\nauthor: y\n"))
+    RmdManager(path).remove_frontmatter_key("title")
+    check_same("bom: remove_frontmatter_key keeps the mark", read_raw(path), bom + body.replace("title: x\n", "author: y\n"))
+    RmdManager(path).replace_cell_source(1, "y <- 2")
+    check_same("bom: cell edits keep the mark", read_raw(path), bom + "---\nauthor: y\n---\n\n# H\n\n```{r}\ny <- 2\n```\n")
+    check("bom: the mark is written as UTF-8 bytes", read_bytes(path).startswith(b"\xef\xbb\xbf---\n"), True)
+    # Without a header the mark stays at the start of the file, whichever cell comes first
+    path = write_raw("bom.rmd", bom + "```{r}\nx\n```\nprose\n")
+    mgr = RmdManager(path)
+    check("bom: a first-line chunk is a chunk", mgr.list_cells(), "[0] code (r) 1L  x")
+    check_same("bom: no frontmatter", mgr.get_frontmatter(), "(no frontmatter)")
+    mgr.delete_cell(0)
+    check_same("bom: deleting the first cell keeps the mark", read_raw(path), bom + "prose\n")
+    RmdManager(path).add_cell(0, "a <- 1")
+    check_same("bom: a new first cell goes after the mark", read_raw(path), bom + "```{r}\na <- 1\n```\nprose\n")
+    RmdManager(path).move_cell(0, 1)
+    check_same("bom: moving the first cell keeps the mark", read_raw(path), bom + "prose\n```{r}\na <- 1\n```\n")
+    RmdManager(path).set_frontmatter_key("title", "t")
+    check_same("bom: a new header goes after the mark", read_raw(path), bom + "---\ntitle: t\n---\n\nprose\n```{r}\na <- 1\n```\n")
+    # CRLF documents keep both the mark and their line breaks
+    crlf = bom + body.replace("\n", "\r\n")
+    path = write_raw("bom.rmd", crlf)
+    RmdManager(path)._save()
+    check("bom: untouched CRLF file saves back byte for byte", read_bytes(path), crlf.encode("utf-8"))
+    RmdManager(path).set_frontmatter_key("author", "y")
+    check_same("bom: CRLF header edit keeps the mark", read_raw(path), crlf.replace("title: x\r\n", "title: x\r\nauthor: y\r\n"))
+    # Only one mark is set aside: a second U+FEFF is text, so the header isn't on the first line
+    twice = bom + bom + body
+    path = write_raw("bom.rmd", twice)
+    mgr = RmdManager(path)
+    check_same("bom: a second mark is text", mgr.get_frontmatter(), "(no frontmatter)")
+    mgr._save()
+    check("bom: a second mark round-trips", read_bytes(path), twice.encode("utf-8"))
+    # A file that is only the mark
+    path = write_raw("bom.rmd", bom)
+    mgr = RmdManager(path)
+    check_same("bom: mark-only file has no cells", mgr.list_cells(), "(document has no cells)")
+    mgr.add_cell(-1, "x")
+    check_same("bom: mark-only file gets its first cell after the mark", read_raw(path), bom + "```{r}\nx\n```\n")
+    # create_rmd writes no mark, even over a file that has one
+    path = os.path.join(WORK_DIR, "bom_created.rmd")
+    create_rmd(path, title="t")
+    check("bom: create_rmd writes no mark", read_bytes(path).startswith(b"---\n"), True)
+    write_raw("bom.rmd", text)
+    create_rmd(os.path.join(WORK_DIR, "bom.rmd"), title="t", overwrite=True)
+    check("bom: create_rmd overwrite drops the mark", read_bytes(os.path.join(WORK_DIR, "bom.rmd")).startswith(b"---\n"), True)
 
 
 # ──────────────────────────────────────────────
@@ -1894,6 +2008,8 @@ if __name__ == "__main__":
         test_line_breaks()
         test_crlf_documents()
         test_mixed_line_endings()
+        test_line_numbers_agree()
+        test_byte_order_mark()
         test_create_rmd()
         test_create_rmd_quoting()
         test_extension_case()

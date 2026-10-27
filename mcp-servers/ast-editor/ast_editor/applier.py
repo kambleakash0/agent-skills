@@ -3,11 +3,14 @@ import json
 import os
 import re
 import warnings
-from ast_editor.parser import TreeSitterParser, first_syntax_error, DEFAULT_EXPORT_KINDS
-
-
-class ApplierError(Exception):
-    pass
+from ast_editor.parser import (
+    DEFAULT_EXPORT_KINDS,
+    ApplierError,
+    TreeSitterParser,
+    first_syntax_error,
+    split_config_path,
+    toml_key_names,
+)
 
 
 def _split_lines(text: str) -> list[str]:
@@ -29,9 +32,10 @@ def _content_lines(text: str) -> list[str]:
 
 
 def _trailing_blank_lines(lines: list[str]) -> int:
-    """Number of blank (empty or whitespace-only) lines that end `lines`."""
+    """Number of blank lines (empty, or only spaces and tabs) that end
+    `lines`. A form feed line (a Python page break) is text, not blank."""
     n = 0
-    while n < len(lines) and not lines[-1 - n].strip():
+    while n < len(lines) and not lines[-1 - n].strip(" \t"):
         n += 1
     return n
 
@@ -73,6 +77,16 @@ def _json_syntax_error(source: bytes) -> ValueError | None:
 
 _JS_EXTS = (".js", ".jsx", ".mjs", ".cjs", ".ts", ".tsx")
 
+# Methods and functions declared without a body: TS abstract methods, method
+# signatures (class overloads, interface members) and function overloads,
+# and Java abstract and interface methods.
+_BODILESS_FUNCTIONS = (
+    "abstract_method_signature",
+    "method_signature",
+    "function_signature",
+    "method_declaration",
+)
+
 # YAML keys that may stay plain scalars (see Applier._yaml_key_source),
 # and the plain scalars YAML 1.1 (PyYAML) or 1.2 reads as booleans or null.
 _YAML_PLAIN_KEY = re.compile(r"[^\W\d][\w\-./ ]*")
@@ -83,6 +97,25 @@ _YAML_RESERVED = re.compile(
 # What a double-quoted YAML scalar has to escape beyond what json.dumps
 # escapes: the other non-printable characters and the Unicode line breaks.
 _YAML_ESCAPE = re.compile(r"[\x7f-\x9f\u2028\u2029\ufeff\ufffe\uffff]")
+# Content that starts a block sequence or block mapping (`- a`, `? k`,
+# `x: 1`, `"x y": 1`, `x:`), which cannot follow `key:` on its line.
+_YAML_BLOCK_START = re.compile(
+    r"[ \t]*(?:[-?](?:[ \t]|$)"
+    r"|(?:\"(?:[^\"\\\n]|\\.)*\"|'(?:[^'\n]|'')*'|[^\s#'\"{}\[\],&*!|>%@`-][^#\n]*?)[ \t]*:(?:[ \t]|$))"
+)
+# A line that is only a block scalar header (`|`, `>-`, `|2`) or node
+# properties (`&anchor`, `!tag`), which the rest of a value follows on the
+# lines below, maybe with a comment.
+_YAML_NODE_HEADER = re.compile(
+    r"(?:[&!][^\s#]*[ \t]+)*(?:[&!][^\s#]*|[|>][-+0-9]*)(?:[ \t]+#.*)?"
+)
+# An encoding declaration, which Python (PEP 263) and Ruby read on the first
+# two lines, and a Ruby magic comment, read anywhere in the comments at the
+# top of the file.
+_CODING_COMMENT = re.compile(r"[ \t\f]*#.*?coding[:=][ \t]*[-\w.]+")
+_RUBY_MAGIC_COMMENT = re.compile(
+    r"[ \t]*#.*?\b(frozen_string_literal|warn_indent|shareable_constant_value)[ \t]*:"
+)
 
 
 def _split_key_path(path: str) -> list[str]:
@@ -137,6 +170,16 @@ def _python_keys_equal(a: str, b: str) -> bool:
         return False
 
 
+def _config_path(parent: str, name: str) -> str:
+    """The JSON or YAML target path of key `name` under the path `parent`
+    ('' for the root), the key in double quotes when it has to be one
+    segment of its own (split_config_path): when it has a dot, starts with
+    a quote or has spaces or tabs around it."""
+    if "." in name or name[:1] in "\"'" or name != name.strip(" \t"):
+        name = json.dumps(name, ensure_ascii=False)
+    return f"{parent}.{name}" if parent else name
+
+
 class Applier:
     def __init__(self, filepath: str):
         self.filepath = filepath
@@ -151,7 +194,10 @@ class Applier:
         self.lines = _split_lines(self.parser.source_code)
 
     def _get_indent(self, line: str) -> str:
-        return line[: len(line) - len(line.lstrip())]
+        """The spaces and tabs a line starts with. A form feed, U+2028 or
+        other whitespace after them is part of the line's text, not its
+        indentation (Python reads a form feed there as a page break)."""
+        return line[: len(line) - len(line.lstrip(" \t"))]
 
     def _reindent(self, content_lines: list[str], target_indent: str) -> list[str]:
         if not content_lines:
@@ -164,7 +210,8 @@ class Applier:
             elif line.startswith(old_indent):
                 result.append(target_indent + line[len(old_indent) :])
             else:
-                result.append(target_indent + line.lstrip())
+                # Only spaces and tabs are indentation (see _get_indent).
+                result.append(target_indent + line.lstrip(" \t"))
         return result
 
     def _symbol_span(self, node):
@@ -193,6 +240,18 @@ class Applier:
                 first = prev
             prev = prev.prev_named_sibling
         return first, node
+
+    def _callable(self, node, target: str):
+        """
+        The function that `node`, found for `target`, defines: the
+        function_definition inside a Python decorated_definition, the arrow
+        function, function expression or generator a JS/TS `const`/`let`/`var`
+        binds to the target's name (`const f = () => {}`), else node itself.
+        """
+        if node.type == "decorated_definition":
+            return next((c for c in node.named_children if c.type == "function_definition"), node)
+        bound = self.parser.js_bound_function(node, target.split(".")[-1])
+        return bound if bound is not None else node
 
     def replace_function(self, target: str, content: str) -> str:
         node = self.parser.find_node_by_name(target)
@@ -223,6 +282,11 @@ class Applier:
                 raise ApplierError(f"Target '{target}' not found ({e})") from e
             if found is not None:
                 node, prefix = found
+        if not node and self.parser.ext in (".yml", ".yaml"):
+            # A key written with no value (`key:`) has no value node.
+            pair = self.parser.find_yaml_pair(self.parser.tree.root_node, target)
+            if pair is not None:
+                return self._fill_yaml_value(pair, content.lstrip("\n"))
         if not node:
             raise ApplierError(f"Target '{target}' not found")
 
@@ -289,26 +353,7 @@ class Applier:
         return entry.child_by_field_name("value"), ""
 
     def replace_function_body(self, target: str, content: str) -> str:
-        node = self.parser.find_node_by_name(target)
-        if not node:
-            raise ApplierError(f"Target '{target}' not found in {self.filepath}")
-
-        func_node = node
-        if node.type == "decorated_definition":
-            for child in node.named_children:
-                if child.type == "function_definition":
-                    func_node = child
-                    break
-
-        block_node = func_node.child_by_field_name("body")
-        if not block_node:
-            for child in func_node.children:
-                if child.type in ("block", "statement_block", "compound_statement", "body_statement", "constructor_body"):
-                    block_node = child
-                    break
-
-        if not block_node:
-            raise ApplierError(f"Could not find body block for target '{target}'")
+        func_node, block_node = self._get_function_body_node(target)
 
         # Python and Ruby use indented body lines between def/class and end markers.
         if self.parser.ext == ".py" or self.parser.ext in (".rb",):
@@ -324,7 +369,7 @@ class Applier:
 
         target_indent = self._get_indent(self.lines[start_line]) if start_line < len(self.lines) else ""
         if not target_indent and start_line < len(self.lines) and self.lines[start_line].strip() == "":
-             sig_indent = self._get_indent(self.lines[node.start_point[0]])
+             sig_indent = self._get_indent(self.lines[func_node.start_point[0]])
              default_indent = "    " if self.parser.ext in (".py", ".rb", ".java") else "  "
              target_indent = sig_indent + default_indent
 
@@ -345,6 +390,7 @@ class Applier:
         node = self.parser.find_node_by_name(class_target)
         if not node:
             raise ApplierError(f"Target class '{class_target}' not found")
+        self._refuse_ts_non_class(class_target, node)
 
         # Go: methods live outside the struct. Insert after the enclosing type_declaration.
         if self.parser.ext == ".go":
@@ -374,6 +420,8 @@ class Applier:
         contiguous leading comment block (Godoc, Javadoc, `#` comments, `//`
         comments, or C-style `/* ... */` blocks) directly above the symbol --
         pass `include_leading_comments=False` to keep that comment in place.
+        The blank lines that separated the symbol from its neighbours go with
+        it (see _separator_lines).
         """
         node = self.parser.find_node_by_name(target)
         if not node:
@@ -390,8 +438,63 @@ class Applier:
             if comment_range is not None:
                 start_line = comment_range[0]
 
+        start_line, end_line = self._separator_lines(first, last, start_line, end_line)
         self.lines = self.lines[:start_line] + self.lines[end_line:]
         return self._save()
+
+    def _separator_lines(self, first, last, start_line: int, end_line: int) -> tuple[int, int]:
+        """
+        For delete_symbol: the lines [start_line, end_line) that the symbol
+        spanning nodes first..last takes up, widened by the blank lines that
+        separated it from its neighbours, so that the rest is spaced as the
+        file spaces its symbols. A symbol that opens its file or body (no
+        sibling above it; a C++ access label counts as an opening) takes the
+        blank lines below it, so none are left at the top of the file or
+        after the `{`; one that closes its body takes those above it, so
+        none are left before the `}` and the next top-level symbol keeps its
+        own separation; of a symbol between two others only the wider of
+        its two gaps stays.
+        """
+        # Only spaces and tabs make a line blank: a form feed line (a Python
+        # page break) is the file's text and stays.
+        before = 0
+        while start_line - before > 0 and not self.lines[start_line - before - 1].strip(" \t"):
+            before += 1
+        after = 0
+        while end_line + after < len(self.lines) and not self.lines[end_line + after].strip(" \t"):
+            after += 1
+        # The node whose parent holds the symbol's siblings: past wrappers
+        # that hold nothing else (a Go type_declaration around its one
+        # type_spec), but not out of a class body.
+        unit = first
+        while (
+            unit.parent is not None
+            and unit.parent.parent is not None
+            and unit.parent.type not in ("block", "body_statement")
+            and unit.parent.start_point[0] >= first.start_point[0]
+            and unit.parent.end_point[0] <= last.end_point[0]
+        ):
+            unit = unit.parent
+        siblings = unit.parent.named_children if unit.parent is not None else []
+
+        def last_row(node) -> int:
+            # A node that ends with its line break (a C #include) ends at
+            # column 0 of the next line.
+            row, column = node.end_point
+            return row - 1 if column == 0 and row > node.start_point[0] else row
+
+        above = any(last_row(s) < start_line and s.type != "access_specifier" for s in siblings)
+        below = any(s.start_point[0] >= end_line for s in siblings)
+        if not above:
+            end_line += after
+        if not below:
+            start_line -= before
+        if above and below:
+            if before >= after:
+                end_line += after
+            else:
+                start_line -= before
+        return start_line, end_line
 
     def _save(self) -> str:
         """
@@ -706,16 +809,19 @@ class Applier:
         expand_empty: bool,
         empty_trailing_comma: bool,
         default_unit: str,
+        pad_empty: bool = True,
     ) -> None:
         """
         Write `entry` (e.g. '"key": value') after the last of `entries` in a
-        brace-delimited container (JSON object, Python dict, JS/TS object
-        literal), following the container's layout: entries one per line get
-        a new line at the last entry's indentation, an inline container stays
-        inline, and a trailing comma after the last entry is kept (the new
-        entry gets one too). A comment on the last entry's line stays there.
-        An empty container becomes `{ entry }`, or with `expand_empty` is
-        opened onto separate lines (`empty_trailing_comma` adds a comma).
+        brace- or bracket-delimited container (JSON object or array, Python
+        dict, JS/TS object literal, YAML flow mapping or sequence, TOML
+        inline table or array), following the container's layout: entries
+        one per line get a new line at the last entry's indentation, an
+        inline container stays inline, and a trailing comma after the last
+        entry is kept (the new entry gets one too). A comment on the last
+        entry's line stays there. An empty container becomes `{ entry }`
+        (`[entry]` without `pad_empty`), or with `expand_empty` is opened
+        onto separate lines (`empty_trailing_comma` adds a comma).
         """
         src = self.parser.source_bytes
         open_brace, close_brace = container.children[0], container.children[-1]
@@ -771,7 +877,8 @@ class Applier:
                 text = f"\n{inner_indent}{entry}{comma}\n{base_indent}"
                 edits.append((open_brace.end_byte, close_brace.start_byte, text))
             else:
-                edits.append((open_brace.end_byte, close_brace.start_byte, f" {entry} "))
+                text = f" {entry} " if pad_empty else entry
+                edits.append((open_brace.end_byte, close_brace.start_byte, text))
 
         # Apply back to front. The sort is stable, so of two edits at the same
         # offset the one listed later ends up first (the comma before the new
@@ -902,8 +1009,7 @@ class Applier:
 
         pairs = [c for c in parent.named_children if c.type == "pair"]
         if any(self._json_key_name(p) == name for p in pairs):
-            dotted = f"{parent_target}.{name}" if parent_target else name
-            raise self._duplicate_key(name, parent_target, dotted)
+            raise self._duplicate_key(name, parent_target, _config_path(parent_target, name))
 
         self._insert_entry(
             parent,
@@ -919,13 +1025,15 @@ class Applier:
         """
         Add `key: value` to a YAML mapping: the top-level mapping of the
         first document with content (parent_target ''), or the value of the key
-        parent_target names (TreeSitterParser.find_yaml_pair). A block
-        mapping gets a new line at its keys' indentation and a flow mapping
-        ({a: 1} or {}) an inline entry, as _insert_entry writes it. A key with no value
-        (`parent:`) gets a nested block mapping on the line below, one
-        indentation unit deeper, and a file with nothing in it yet (empty or
-        only comments) the new line at its end. The key is quoted only when
-        it has to be (_yaml_key_source).
+        parent_target names (TreeSitterParser.find_yaml_pair), in a flow
+        mapping too. A block mapping gets a new line at its keys'
+        indentation and a flow mapping ({a: 1} or {}) an inline entry, as
+        _insert_entry writes it. A key with no value (`parent:`) gets a
+        nested block mapping on the line below, one indentation unit deeper
+        (inside a flow mapping, `{parent:}` or `{parent}`, the inline
+        `parent: { key: value }`), and a file with nothing in it yet (empty
+        or only comments) the new line at its end. The key is quoted only
+        when it has to be (_yaml_key_source).
         """
         root = self.parser.tree.root_node
         key_text = self._yaml_key_source(key)
@@ -961,27 +1069,16 @@ class Applier:
                 "with no value can take a new key)"
             )
 
-        entries = [] if mapping is None else [
-            c for c in mapping.named_children if "comment" not in c.type
-        ]
+        entries = self.parser.yaml_entries(mapping)
         for entry in entries:
-            key_node = entry
-            if entry.type in ("block_mapping_pair", "flow_pair"):
-                key_node = entry.child_by_field_name("key")
-            if key_node is None or self.parser.yaml_key_name(self.parser.node_text(key_node)) != name:
-                continue
-            if mapping.type == "flow_mapping":
-                # Keys inside a flow mapping are not addressable.
-                where = f"'{parent_target}'" if parent_target else "the root"
-                raise ApplierError(
-                    f"Key '{name}' already exists in the flow mapping at {where}; "
-                    "to change its value, rewrite the mapping with replace_value"
-                    + (f" on '{parent_target}'." if parent_target else ".")
-                )
-            dotted = f"{parent_target}.{name}" if parent_target else name
-            raise self._duplicate_key(key, parent_target, dotted)
+            key_node = self.parser.yaml_entry_key(entry)
+            if key_node is not None and self.parser.yaml_key_name(self.parser.node_text(key_node)) == name:
+                raise self._duplicate_key(key, parent_target, _config_path(parent_target, name))
 
         new_entry = f"{key_text}: {value}"
+        if mapping is None and pair is not None and pair.type != "block_mapping_pair":
+            # A key with no value inside a flow mapping gets an inline one.
+            return self._fill_yaml_value(pair, f"{{ {new_entry} }}")
         if mapping is not None and mapping.type == "flow_mapping":
             self._insert_entry(
                 mapping,
@@ -1013,6 +1110,72 @@ class Applier:
                 insert_line -= 1
         self.lines = self.lines[:insert_line] + [indent + new_entry] + self.lines[insert_line:]
         return self._save()
+
+    def _fill_yaml_value(self, pair, content: str) -> str:
+        """
+        Give a YAML key written with no value (`key:`, or in a flow mapping
+        `{key:}` or `{key}`) the value `content`. One line goes after the
+        colon, before a comment there (`key: 3 # note`), and `{key}` gets
+        its colon too. In a block mapping, content of several lines, or one
+        line that starts a block sequence or mapping (`- a`, `x: 1`), goes
+        on the lines below the key instead, one indentation unit deeper
+        than the key, keeping its relative indentation; a first line that
+        is only a block scalar header or node properties (`|`, `>-`,
+        `&anchor`, `!tag`) stays after the colon, as YAML writes it. An
+        explicit key with no value (`? key`) gets a `: value` line below it,
+        in the column of its `?`.
+        """
+        src = self.parser.source_bytes
+        lines = _content_lines(content)
+        inline, below = content, []
+        if pair.type == "block_mapping_pair" and (len(lines) > 1 or _YAML_BLOCK_START.match(content)):
+            inline, below = "", lines
+            if len(lines) > 1 and _YAML_NODE_HEADER.fullmatch(lines[0].strip(" \t")):
+                inline, below = lines[0].strip(" \t"), lines[1:]
+
+        colon = next((c for c in pair.children if c.type == ":"), None)
+        if pair.type == "block_mapping_pair" and colon is None and pair.children and pair.children[0].type == "?":
+            # An explicit key with no value (`? a`): `? a: 3` would make the
+            # mapping {a: 3} the key, so the value gets a `:` line of its
+            # own, in the `?`'s column, after the key's last line.
+            line_start = src.rfind(b"\n", 0, pair.start_byte) + 1
+            column = len(src[line_start : pair.start_byte].decode("utf-8"))
+            line_end = src.find(b"\n", pair.end_byte)
+            if line_end == -1:
+                line_end = len(src)
+            text = "\n" + " " * column + ":" + (f" {inline}" if inline else "")
+            indent = " " * column + self._indent_unit("  ")
+            text += "".join("\n" + line for line in self._reindent(below, indent))
+            self._write_bytes(src[:line_end] + text.encode("utf-8") + src[line_end:])
+            return "Update successful"
+
+        edits: list[tuple[int, str]] = []  # (offset, text to insert)
+        if below:
+            line_start = src.rfind(b"\n", 0, pair.start_byte) + 1
+            column = len(src[line_start : pair.start_byte].decode("utf-8"))
+            indent = " " * column + self._indent_unit("  ")
+            line_end = src.find(b"\n", pair.end_byte)
+            if line_end == -1:
+                line_end = len(src)
+            edits.append((line_end, "".join("\n" + line for line in self._reindent(below, indent))))
+        if inline:
+            if colon is None:
+                edits.append((pair.end_byte, f": {inline}"))
+            elif src[colon.end_byte : colon.end_byte + 1] in (b" ", b"\t"):
+                # Keep the space after the colon; a comment after the value
+                # needs one before its `#`.
+                pos = colon.end_byte + 1
+                pad = "" if src[pos : pos + 1] in (b"", b" ", b"\t", b"\n", b",", b"}", b"]") else " "
+                edits.append((pos, inline + pad))
+            else:
+                edits.append((colon.end_byte, f" {inline}"))
+        # Back to front; the sort is stable, so at one offset (`key:` at the
+        # end of its line) the text after the colon ends up first.
+        new_bytes = src
+        for pos, text in sorted(edits, key=lambda e: e[0], reverse=True):
+            new_bytes = new_bytes[:pos] + text.encode("utf-8") + new_bytes[pos:]
+        self._write_bytes(new_bytes)
+        return "Update successful"
 
     def _yaml_key_source(self, key: str) -> str:
         """
@@ -1059,52 +1222,38 @@ class Applier:
         sub-table header (`[parent.key]`, `[[parent.key]]`). A dotted key
         whose leading parts name a table that has its own header
         (`a.c = 1` beside `[a]`) counts too, since TOML forbids defining that
-        table twice."""
-        new = [_unquote(p) for p in _split_key_path(key)]
+        table twice. Keys compare by the names they spell (toml_key_names)."""
+        new = toml_key_names(key)
         for pair in pairs:
-            have = [_unquote(p) for p in _split_key_path(self.parser.node_text(pair.children[0]))]
+            have = toml_key_names(self.parser.node_text(pair.children[0]))
             n = min(len(have), len(new))
             if have[:n] == new[:n]:
                 return True
-        parent = [_unquote(p) for p in _split_key_path(parent_target)] if parent_target else []
+        parent = toml_key_names(parent_target) if parent_target else []
         full = parent + new
-        stack = [root]
-        while stack:
-            node = stack.pop()
-            if node.type in ("table", "table_array_element") and node.named_children:
-                header = self.parser.node_text(node.named_children[0])
-                h = [_unquote(p) for p in _split_key_path(header)]
-                # Headers of the parent table and its ancestors do not count.
-                if len(h) > len(parent) and (h[: len(full)] == full or full[: len(h)] == h):
-                    return True
-            stack.extend(node.named_children)
+        for node in root.named_children:
+            if node.type not in ("table", "table_array_element"):
+                continue
+            h = self.parser.toml_header_names(node)
+            # Headers of the parent table and its ancestors do not count.
+            if h is not None and len(h) > len(parent) and (h[: len(full)] == full or full[: len(h)] == h):
+                return True
         return False
 
     def _add_key_toml(self, parent_target: str, key: str, value: str) -> str:
         """
         Add `key = value` to a TOML table: the root (parent_target ''), a
-        [table] named as in its header, or an inline table (`t = { a = 1 }`
-        or `{}`) that parent_target names as a key path, which gets the
-        entry inline as _insert_entry writes it. The key is quoted only when
-        it is not a bare key (_toml_key_source).
+        [table] whose header spells the path (TreeSitterParser.toml_table:
+        [a."b.c"] is 'a."b.c"'), or an inline table (`t = { a = 1 }` or
+        `{}`, nested ones too) that parent_target names as a key path
+        (toml_pair), which gets the entry inline as _insert_entry writes it.
+        The key is quoted only when it is not a bare key (_toml_key_source).
         """
         root = self.parser.tree.root_node
         key_text = self._toml_key_source(key)
         inline = None
         if parent_target:
-            # Find the table matching parent_target
-            table = None
-            queue = [root]
-            while queue:
-                curr = queue.pop(0)
-                if curr.type == "table":
-                    header = curr.named_children[0] if curr.named_children else None
-                    if header:
-                        name = self.parser.node_text(header).strip("[] \n")
-                        if name == parent_target:
-                            table = curr
-                            break
-                queue.extend(curr.named_children)
+            table = self.parser.toml_table(root, parent_target)
             if table is None:
                 inline = self.parser._search_toml_dotted(root, parent_target)
                 if inline is None:
@@ -1136,13 +1285,7 @@ class Applier:
 
         siblings = pairs if parent_target else top_pairs
         if self._toml_key_taken(root, parent_target, siblings, key_text):
-            if inline is not None:
-                # Keys inside an inline table are not addressable.
-                raise ApplierError(
-                    f"Key '{key_text}' already exists in the inline table at "
-                    f"'{parent_target}'; to change its value, rewrite the table "
-                    f"with replace_value on '{parent_target}'."
-                )
+            # key_text is written like a path, so it extends parent_target.
             dotted = f"{parent_target}.{key_text}" if parent_target else key_text
             raise self._duplicate_key(key_text, parent_target, dotted)
 
@@ -1163,14 +1306,16 @@ class Applier:
     def _toml_key_source(self, key: str) -> str:
         """
         A key as written in TOML. Dots separate the parts of a dotted key
-        (a.b is key b in table a), as in TOML itself. Each part that is a
+        (a.b is key b in table a), as in TOML itself and in TOML target
+        paths, so '"a.b"' or "'a.b'" is one name. Each part that is a
         bare key (ASCII letters, digits, `_` and `-`) or is already in
         quotes is kept as given; any other part (with a space, `:`, `#`,
         non-ASCII letters, ...) becomes a basic string ("...", escaped). A
         key with an empty part ('', 'a..b') is quoted whole.
         """
         key = key.strip()
-        parts = _split_key_path(key)
+        # Split as a TOML target path is (toml_key_names), quotes kept.
+        parts = split_config_path(key, "\"'", strip=True, raw=True)
         if not all(parts):
             parts = [key]
         out = []
@@ -1214,7 +1359,10 @@ class Applier:
         raise ApplierError(f"add_key is not supported for {ext}")
 
     def _find_config_pair_by_path(self, dotted_path: str):
-        """Find the key-value pair node for a dotted path in JSON/YAML/TOML."""
+        """The key-value pair at a JSON/YAML/TOML key path (also inside a
+        YAML flow mapping or TOML inline table), or None. In YAML that is
+        the entry itself, so a key with no value (`key:`, `{key}`) is found
+        too."""
         root = self.parser.tree.root_node
         ext = self.parser.ext
         if ext == ".json":
@@ -1222,18 +1370,16 @@ class Applier:
             if value_node and value_node.parent and value_node.parent.type == "pair":
                 return value_node.parent
         elif ext in (".yml", ".yaml"):
-            # The pair itself, so a key with no value (`key:`) is found too.
             return self.parser.find_yaml_pair(root, dotted_path)
         elif ext == ".toml":
-            value_node = self.parser._search_toml_dotted(root, dotted_path)
-            if value_node and value_node.parent and value_node.parent.type == "pair":
-                return value_node.parent
+            return self.parser.toml_pair(root, dotted_path)
         return None
 
     def delete_key(self, target: str) -> str:
         """
         Delete a key-value pair from a container:
-          - JSON / YAML / TOML config files (dotted path to key).
+          - JSON / YAML / TOML config files (key path from the top level,
+            into YAML flow mappings and TOML inline tables too).
           - Python module-level dict literals (target is 'DictName' + '.' + key-literal,
             e.g. 'CONFIG."foo"').
           - JS / TS module-level const/let/var object literals (target is
@@ -1244,7 +1390,8 @@ class Applier:
           - Python targets may also continue into nested dicts
             ('CONFIG."db"."host"').
 
-        For JSON and JS/TS, also removes the adjacent comma to keep the file valid.
+        For JSON, JS/TS, YAML flow mappings and TOML inline tables, also
+        removes the adjacent comma to keep the file valid.
         """
         ext = self.parser.ext
         if ext == ".py":
@@ -1267,13 +1414,18 @@ class Applier:
         if pair is None:
             raise ApplierError(f"Key '{target}' not found in {self.filepath}")
 
-        if ext == ".json":
-            parent = pair.parent
-            sibling_pairs = [c for c in parent.named_children if c.type == "pair"]
-            self._delete_entry(parent, sibling_pairs, sibling_pairs.index(pair))
+        # JSON objects, YAML flow mappings and TOML inline tables are cut
+        # like brace-delimited literals, keeping the inline style.
+        parent = pair.parent
+        if ext == ".json" or parent.type in ("flow_mapping", "inline_table"):
+            if parent.type == "flow_mapping":
+                entries = self.parser.yaml_entries(parent)
+            else:
+                entries = [c for c in parent.named_children if c.type == "pair"]
+            self._delete_entry(parent, entries, entries.index(pair))
             return "Update successful"
 
-        # YAML / TOML: remove the pair's line(s)
+        # YAML block mappings / TOML tables: remove the pair's line(s)
         start_line = pair.start_point[0]
         end_line = pair.end_point[0] + 1
         self.lines = self.lines[:start_line] + self.lines[end_line:]
@@ -1471,7 +1623,12 @@ class Applier:
     def append_to_array(self, target: str, value: str) -> str:
         """
         Append a value to an array/list:
-          - JSON arrays / YAML sequences / TOML arrays (via dotted path to array)
+          - JSON arrays, TOML arrays and YAML flow sequences (via the key
+            path to the array), in the array's layout as _insert_entry
+            writes it: an inline array stays inline (`[1, 2, 3]`; an empty
+            one becomes `[3]`), one with an element per line gets a new line
+            at the elements' indentation, and a trailing comma is kept.
+          - YAML block sequences: a `- value` item after the last one.
           - Python module-level list literals (target is the variable name)
         """
         ext = self.parser.ext
@@ -1479,113 +1636,52 @@ class Applier:
             return self.append_to_list(target, value)
 
         root = self.parser.tree.root_node
-
         if ext == ".json":
             arr = self.parser._search_json_dotted(root, target)
             if arr is None or arr.type != "array":
                 raise ApplierError(f"JSON array at '{target}' not found")
-            elements = [c for c in arr.named_children]
-            source_bytes = self.parser.source_bytes
-            if elements:
-                last = elements[-1]
-                indent = self._get_indent(self.lines[last.start_point[0]])
-                insertion = f",\n{indent}{value}"
-                insert_byte = last.end_byte
-            else:
-                close_line = arr.end_point[0]
-                close_indent = (
-                    self._get_indent(self.lines[close_line])
-                    if close_line < len(self.lines)
-                    else ""
-                )
-                inner_indent = close_indent + "  "
-                insertion = f"\n{inner_indent}{value}\n{close_indent}"
-                insert_byte = arr.start_byte + 1
-            new_bytes = (
-                source_bytes[:insert_byte]
-                + insertion.encode("utf-8")
-                + source_bytes[insert_byte:]
-            )
-            self._write_bytes(new_bytes)
-            return "Update successful"
-
-        if ext == ".toml":
+        elif ext == ".toml":
             arr = self.parser._search_toml_dotted(root, target)
             if arr is None or arr.type != "array":
-                raise ApplierError(
-                    f"TOML array at '{target}' not found (is it an inline array?)"
-                )
-            elements = [c for c in arr.named_children]
-            source_bytes = self.parser.source_bytes
-            if elements:
-                last = elements[-1]
-                if arr.start_point[0] == arr.end_point[0]:
-                    insertion = f", {value}"
-                    insert_byte = last.end_byte
-                else:
-                    indent = self._get_indent(self.lines[last.start_point[0]])
-                    insertion = f",\n{indent}{value}"
-                    insert_byte = last.end_byte
-            else:
-                insertion = f"{value}"
-                insert_byte = arr.start_byte + 1
-            new_bytes = (
-                source_bytes[:insert_byte]
-                + insertion.encode("utf-8")
-                + source_bytes[insert_byte:]
-            )
-            self._write_bytes(new_bytes)
-            return "Update successful"
-
-        if ext in (".yml", ".yaml"):
+                raise ApplierError(f"TOML array at '{target}' not found")
+        elif ext in (".yml", ".yaml"):
             value_node = self.parser._search_yaml_dotted(root, target)
-            collection = self._resolve_yaml_value(value_node)
-            if collection is None or collection.type not in (
-                "block_sequence",
-                "flow_sequence",
-            ):
+            arr = self._resolve_yaml_value(value_node)
+            if arr is None or arr.type not in ("block_sequence", "flow_sequence"):
                 raise ApplierError(f"YAML sequence at '{target}' not found")
-            if collection.type == "flow_sequence":
-                elements = [c for c in collection.named_children]
-                source_bytes = self.parser.source_bytes
-                if elements:
-                    insertion = f", {value}"
-                    insert_byte = elements[-1].end_byte
-                else:
-                    insertion = f"{value}"
-                    insert_byte = collection.start_byte + 1
-                new_bytes = (
-                    source_bytes[:insert_byte]
-                    + insertion.encode("utf-8")
-                    + source_bytes[insert_byte:]
-                )
-                self._write_bytes(new_bytes)
-                return "Update successful"
-            items = [
-                c for c in collection.named_children if c.type == "block_sequence_item"
-            ]
-            if not items:
-                raise ApplierError(
-                    "Cannot append to empty YAML block sequence (unsupported in v1)"
-                )
-            last = items[-1]
-            indent = self._get_indent(self.lines[last.start_point[0]])
-            insert_line = last.end_point[0] + 1
-            # Multi-line values (e.g. a mapping with several keys) get the
-            # `-` marker on the first line and a 2-space hanging indent on
-            # continuation lines so they nest under the sequence item.
-            value_lines = _content_lines(value) or [""]
-            new_item_lines = [f"{indent}- {value_lines[0]}"]
-            for cont in value_lines[1:]:
-                new_item_lines.append(f"{indent}  {cont}")
-            self.lines = (
-                self.lines[:insert_line]
-                + new_item_lines
-                + self.lines[insert_line:]
-            )
-            return self._save()
+            if arr.type == "block_sequence":
+                return self._append_yaml_block_item(arr, value)
+        else:
+            raise ApplierError(f"append_to_array is not supported for {ext}")
 
-        raise ApplierError(f"append_to_array is not supported for {ext}")
+        self._insert_entry(
+            arr,
+            [c for c in arr.named_children if "comment" not in c.type],
+            value,
+            expand_empty=False,
+            empty_trailing_comma=False,
+            default_unit="  ",
+            pad_empty=False,
+        )
+        return "Update successful"
+
+    def _append_yaml_block_item(self, seq, value: str) -> str:
+        """Add `- value` after the last item of a YAML block sequence, at its
+        items' indentation. Multi-line values (e.g. a mapping with several
+        keys) get the `-` marker on the first line and a 2-space hanging
+        indent on continuation lines so they nest under the item."""
+        items = [c for c in seq.named_children if c.type == "block_sequence_item"]
+        if not items:
+            raise ApplierError("Cannot append to empty YAML block sequence (unsupported in v1)")
+        last = items[-1]
+        indent = self._get_indent(self.lines[last.start_point[0]])
+        insert_line = last.end_point[0] + 1
+        value_lines = _content_lines(value) or [""]
+        new_item_lines = [f"{indent}- {value_lines[0]}"]
+        for cont in value_lines[1:]:
+            new_item_lines.append(f"{indent}  {cont}")
+        self.lines = self.lines[:insert_line] + new_item_lines + self.lines[insert_line:]
+        return self._save()
 
     def remove_from_array(self, target: str, value_match: str) -> str:
         """
@@ -1684,6 +1780,7 @@ class Applier:
         node = self.parser.find_node_by_name(class_target)
         if not node:
             raise ApplierError(f"Target class '{class_target}' not found")
+        self._refuse_ts_non_class(class_target, node)
 
         # Go: field goes inside the struct_type's braces (which live inside type_spec)
         if self.parser.ext == ".go":
@@ -1703,6 +1800,20 @@ class Applier:
         if body is None and self.parser.ext != ".rb":
             raise ApplierError(f"Could not find class body for '{class_target}'")
         return self._insert_member(class_target, node, body, content, at_end=False)
+
+    def _refuse_ts_non_class(self, class_target: str, node) -> None:
+        """
+        For add_method and add_field: refuse a TS enum or type alias. They
+        are targets like classes, but hold no methods or fields (an enum's
+        members are its constants).
+        """
+        kinds = {"enum_declaration": "an enum", "type_alias_declaration": "a type alias"}
+        if self.parser.ext in (".ts", ".tsx") and node.type in kinds:
+            raise ApplierError(
+                f"'{class_target}' is {kinds[node.type]}, not a class or interface, "
+                "so add_method and add_field cannot add to it; rewrite it with "
+                "replace_function"
+            )
 
     def _insert_member(self, class_target: str, node, body, content: str, at_end: bool) -> str:
         """
@@ -1737,7 +1848,7 @@ class Applier:
         # Members start after the `{`; a Java enum's after its constants
         # and the `;` that ends them (`semi`, written when they have none).
         start, semi, indent_from = (body.start_byte + 1 if body is not None else 0), b"", members
-        if body is not None and body.type == "enum_body":
+        if body is not None and body.type == "enum_body" and ext == ".java":
             start, semi, members = self._java_enum_members(body)
             indent_from = members or indent_from
         member_indent = self._member_indent(node, indent_from)
@@ -1976,25 +2087,29 @@ class Applier:
 
         Decorators (Python, JS/TS) and Java annotations are preserved when
         new_signature has none; if it includes its own, those replace them.
+        For a JS/TS function bound to a name, a new_signature that starts
+        with const/let/var (`const f = (x) =>`) replaces the declaration's
+        head as well, and one that does not (`(x) =>`) only the function's.
+        A method declared without a body (a TS abstract method, a Java
+        interface or abstract method) is all signature but its final `;`,
+        which stays whether or not new_signature ends with one.
         """
         node = self.parser.find_node_by_name(target)
         if not node:
             raise ApplierError(f"Target '{target}' not found in {self.filepath}")
 
-        func_node = node
-        if node.type == "decorated_definition":
-            for child in node.named_children:
-                if child.type == "function_definition":
-                    func_node = child
-                    break
+        func_node = self._callable(node, target)
 
         body = func_node.child_by_field_name("body")
-        if body is None:
+        if body is None and func_node.type not in _BODILESS_FUNCTIONS:
             raise ApplierError(f"Could not find body for target '{target}'")
 
+        # The signature ends where the body starts; a method declared
+        # without one (`abstract m(): void;`) is all signature but the `;`
+        # that ends it, as _get_signature reads it.
         sig_end = func_node.start_byte
         for child in func_node.children:
-            if child == body:
+            if child == body or (body is None and child.type == ";"):
                 break
             sig_end = child.end_byte
 
@@ -2021,6 +2136,9 @@ class Applier:
                 for line in sig_lines[1:]
             ]
         new_signature = "\n".join(sig_lines).rstrip()
+        if body is None:
+            # The `;` after a bodiless declaration stays in the file.
+            new_signature = new_signature.removesuffix(";").rstrip()
 
         # Decorators and annotations stay unless new_signature brings its
         # own, which then replace them. Python's and TS's sit outside
@@ -2028,7 +2146,13 @@ class Applier:
         # the span back over them; Java annotations (in `modifiers`) and JS
         # decorators are inside it, so keeping them narrows the span.
         replace_from, kept = func_node.start_byte, ""
-        if node.type == "decorated_definition":
+        if func_node is not node and node.type in ("lexical_declaration", "variable_declaration"):
+            # A JS/TS function bound to a name: `const f = (x) =>`, as
+            # read_symbol(depth="signature") gives it, replaces the
+            # declaration's head too; `(x) =>` only the function's own.
+            if re.match(r"(const|let|var)\b", new_signature):
+                replace_from = node.start_byte
+        elif node.type == "decorated_definition":
             if new_signature.startswith("@"):
                 replace_from = node.start_byte
         elif self._signature_has_annotations(new_signature):
@@ -2118,7 +2242,12 @@ class Applier:
         """
         Return a formatted outline of top-level functions, classes, and methods in
         the file. Read-only. Output is a multi-line string: one entry per line,
-        formatted as `<type> <name> (line N)`.
+        formatted as `<type> <name> (line N)`. In JS/TS, generator functions
+        and a `const`/`let`/`var` that declares one name bound to an arrow
+        function or function expression are functions; TS abstract classes
+        are classes (their abstract methods listed with the other methods,
+        an overloaded one once), and enums, type aliases and interfaces are
+        `enum`, `type` and `interface`.
         """
         ext = self.parser.ext
         root = self.parser.tree.root_node
@@ -2127,11 +2256,16 @@ class Applier:
             class_types = {"class_definition"}
             func_types = {"function_definition", "decorated_definition"}
         elif ext in (".ts", ".tsx"):
-            class_types = {"class_declaration", "interface_declaration"}
-            func_types = {"function_declaration", "method_definition"}
+            class_types = {"class_declaration", "abstract_class_declaration", "interface_declaration", "enum_declaration"}
+            func_types = {
+                "function_declaration",
+                "generator_function_declaration",
+                "method_definition",
+                "abstract_method_signature",
+            }
         elif ext in (".js", ".jsx", ".mjs", ".cjs"):
             class_types = {"class_declaration"}
-            func_types = {"function_declaration", "method_definition"}
+            func_types = {"function_declaration", "generator_function_declaration", "method_definition"}
         elif ext in (".c", ".h"):
             class_types = {"struct_specifier", "union_specifier", "enum_specifier"}
             func_types = {"function_definition"}
@@ -2180,7 +2314,13 @@ class Applier:
                         # undecorated one.
                         continue
                 if child.type in func_types:
-                    methods.append((get_name(child), first_line(child)))
+                    name = get_name(child)
+                    if child.type == "abstract_method_signature" and any(m[0] == name for m in methods):
+                        # Overloads of an abstract method (`abstract m(): void;
+                        # abstract m(x: number): void;`) are one method,
+                        # listed at its first declaration.
+                        continue
+                    methods.append((name, first_line(child)))
                 else:
                     # Descend into sub-containers (e.g. enum_body_declarations)
                     if child.type in ("enum_body_declarations", "class_body", "interface_body"):
@@ -2215,6 +2355,7 @@ class Applier:
                 kind_map = {
                     "class_definition": "class",
                     "class_declaration": "class",
+                    "abstract_class_declaration": "class",
                     "class_specifier": "class",
                     "class": "class",
                     "module": "module",
@@ -2229,6 +2370,12 @@ class Applier:
             elif kind_type in func_types:
                 name = name or get_name(child)
                 lines_out.append(f"function {name} (line {first_line(child)})")
+            elif kind_type == "type_alias_declaration":
+                lines_out.append(f"type {get_name(child)} (line {first_line(child)})")
+            elif (bound := self.parser.js_bound_function(child)) is not None:
+                # `const f = () => {}`: the name's declarator holds the function.
+                name = self.parser.node_text(bound.parent.child_by_field_name("name"))
+                lines_out.append(f"function {name} (line {first_line(child)})")
 
         if not lines_out:
             return "(no top-level symbols found)"
@@ -2237,21 +2384,27 @@ class Applier:
     def _get_signature(self, target: str) -> str:
         """
         Return the signature text of a function (everything before its body),
-        with surrounding whitespace stripped. Read-only.
+        with surrounding whitespace stripped. Read-only. A JS/TS function
+        bound to a name starts at its `const`/`let`/`var` (`const f = (x) =>`);
+        a method or function with no body (a TS abstract method, a Java
+        interface method) is its whole text, without the final `;`. A TS
+        type alias has no signature and is refused.
         """
         node = self.parser.find_node_by_name(target)
         if not node:
             raise ApplierError(f"Target '{target}' not found in {self.filepath}")
 
-        func_node = node
-        if node.type == "decorated_definition":
-            for child in node.named_children:
-                if child.type == "function_definition":
-                    func_node = child
-                    break
+        func_node = self._callable(node, target)
 
         body = func_node.child_by_field_name("body")
         if body is None:
+            if func_node.type in _BODILESS_FUNCTIONS:
+                return self.parser.node_text(func_node).strip().rstrip(";").rstrip()
+            if func_node.type == "type_alias_declaration":
+                raise ApplierError(
+                    f"'{target}' is a type alias, which has no signature; "
+                    "read it with depth='full'"
+                )
             raise ApplierError(f"Could not find body for target '{target}'")
 
         sig_end = func_node.start_byte
@@ -2260,23 +2413,20 @@ class Applier:
                 break
             sig_end = child.end_byte
 
-        signature = self.parser.source_bytes[func_node.start_byte : sig_end].decode(
-            "utf-8"
-        )
+        start = node if node.type in ("lexical_declaration", "variable_declaration") else func_node
+        signature = self.parser.source_bytes[start.start_byte : sig_end].decode("utf-8")
         return signature.strip()
 
     def _get_function_body_node(self, target: str):
-        """Resolve target to the body block node (block/statement_block/compound_statement/body_statement/constructor_body)."""
+        """Resolve target to (function node, body block node): the
+        block/statement_block/compound_statement/body_statement/constructor_body
+        of the function (see _callable). An arrow function whose body is an
+        expression (`() => x`) has no block, and is refused."""
         node = self.parser.find_node_by_name(target)
         if not node:
             raise ApplierError(f"Target '{target}' not found in {self.filepath}")
 
-        func_node = node
-        if node.type == "decorated_definition":
-            for child in node.named_children:
-                if child.type == "function_definition":
-                    func_node = child
-                    break
+        func_node = self._callable(node, target)
 
         body = func_node.child_by_field_name("body")
         if body is None:
@@ -2286,6 +2436,13 @@ class Applier:
                     break
         if body is None:
             raise ApplierError(f"Could not find body block for target '{target}'")
+        if func_node.type == "arrow_function" and body.type != "statement_block":
+            tool = "replace_function" if func_node.parent.type == "variable_declarator" else "replace_value"
+            raise ApplierError(
+                f"'{target}' is an arrow function with an expression body "
+                f"(`(...) => expression`), not a block of statements; rewrite it "
+                f"with {tool}"
+            )
         return func_node, body
 
     def replace_in_body(self, target: str, old_snippet: str, new_snippet: str) -> str:
@@ -2512,14 +2669,20 @@ class Applier:
     def _insert_before(self, target: str, content: str) -> str:
         """
         Insert content as a sibling immediately before a named symbol (function, class,
-        method, or top-level assignment).
+        method, or top-level assignment): above its leading comment block,
+        decorators and JS/TS `export`, followed by a blank line.
         """
         node = self.parser.find_node_by_name(target)
         if not node:
             raise ApplierError(f"Target '{target}' not found in {self.filepath}")
 
-        # Above the symbol's decorators and a JS/TS `export` (see _symbol_span).
+        # Above the symbol's decorators and a JS/TS `export` (see
+        # _symbol_span), and above its leading comment, which documents the
+        # symbol and must stay on top of it.
         insert_line = self._symbol_span(node)[0].start_point[0]
+        comment_range = self._find_leading_comment_range(insert_line)
+        if comment_range is not None:
+            insert_line = comment_range[0]
         target_indent = (
             self._get_indent(self.lines[insert_line])
             if insert_line < len(self.lines)
@@ -2976,21 +3139,23 @@ class Applier:
         return "Update successful"
 
     def _find_parameter_list(self, target: str):
-        """Locate the parameter list node for a function/method across languages."""
+        """Locate the parameter list node for a function/method across
+        languages. For a JS/TS arrow function with one unparenthesized
+        parameter (`x => ...`) that parameter's identifier is returned
+        (see _is_bare_arrow_parameter)."""
         node = self.parser.find_node_by_name(target)
         if not node:
             raise ApplierError(f"Target '{target}' not found in {self.filepath}")
 
-        func_node = node
-        if node.type == "decorated_definition":
-            for c in node.named_children:
-                if c.type == "function_definition":
-                    func_node = c
-                    break
+        func_node = self._callable(node, target)
 
         params = func_node.child_by_field_name("parameters")
         if params is not None:
             return params
+        if func_node.type == "arrow_function":
+            bare = func_node.child_by_field_name("parameter")
+            if bare is not None:
+                return bare
 
         # C/C++: parameters live inside the declarator chain
         declarator = func_node.child_by_field_name("declarator")
@@ -3003,6 +3168,18 @@ class Applier:
             declarator = declarator.child_by_field_name("declarator")
 
         raise ApplierError(f"Could not find parameter list for '{target}'")
+
+    def _is_bare_arrow_parameter(self, params) -> bool:
+        """Whether the node _find_parameter_list returned is the lone
+        unparenthesized parameter of a JS/TS arrow function (`x => ...`),
+        which add_parameter and remove_parameter rewrite with parentheses:
+        `(x, y) =>`, `() =>`."""
+        parent = params.parent
+        return (
+            parent is not None
+            and parent.type == "arrow_function"
+            and parent.child_by_field_name("parameter") == params
+        )
 
     def _parameter_name(self, param_node) -> str:
         """Extract the identifier name from a parameter node across languages."""
@@ -3032,7 +3209,8 @@ class Applier:
         Add a parameter to a function signature. position must be 'end' (default)
         or 'start'; anything else raises ApplierError. parameter should be the
         literal source text of the new parameter (e.g. 'default=None' or
-        'const int* buf').
+        'const int* buf'). A JS/TS arrow function's one unparenthesized
+        parameter gets parentheses: `x => x` becomes `(x, y) => x`.
         """
         if position not in ("start", "end"):
             raise ApplierError(
@@ -3042,6 +3220,18 @@ class Applier:
         existing = [c for c in params.named_children]
 
         source_bytes = self.parser.source_bytes
+
+        if self._is_bare_arrow_parameter(params):
+            # `x => ...` takes a second parameter only in parentheses.
+            old = self.parser.node_text(params)
+            pair = f"{parameter}, {old}" if position == "start" else f"{old}, {parameter}"
+            new_bytes = (
+                source_bytes[: params.start_byte]
+                + f"({pair})".encode("utf-8")
+                + source_bytes[params.end_byte :]
+            )
+            self._write_bytes(new_bytes)
+            return "Update successful"
 
         if not existing:
             # Empty parameter list: insert between ( and )
@@ -3066,9 +3256,18 @@ class Applier:
 
     def remove_parameter(self, target: str, parameter_name: str) -> str:
         """
-        Remove a parameter by name from a function signature.
+        Remove a parameter by name from a function signature. A JS/TS arrow
+        function left without its one unparenthesized parameter (`x => 1`)
+        becomes `() => 1`.
         """
         params = self._find_parameter_list(target)
+        if self._is_bare_arrow_parameter(params):
+            # `x => ...` without its one parameter is `() => ...`.
+            if self.parser.node_text(params) != parameter_name:
+                raise ApplierError(f"Parameter '{parameter_name}' not found in '{target}'")
+            source_bytes = self.parser.source_bytes
+            self._write_bytes(source_bytes[: params.start_byte] + b"()" + source_bytes[params.end_byte :])
+            return "Update successful"
         existing = [c for c in params.named_children]
 
         idx = None
@@ -3340,10 +3539,14 @@ class Applier:
             the old `get_signature`.
 
         For config files (JSON/YAML/TOML), "full" returns the value node's
-        source and the other depths raise.
+        source ('' for a YAML key with no value) and the other depths raise.
         """
         if depth == "full":
             node = self.parser.find_node_by_name(target)
+            if not node and self.parser.ext in (".yml", ".yaml"):
+                # A key written with no value (`key:`) reads as no text.
+                if self.parser.find_yaml_pair(self.parser.tree.root_node, target) is not None:
+                    return ""
             if not node:
                 raise ApplierError(f"Target '{target}' not found in {self.filepath}")
             first, last = self._symbol_span(node)
@@ -3380,8 +3583,9 @@ class Applier:
     def _read_interface(self, target: str) -> str:
         """
         Return a stub view of a class: its header, field declarations, and method
-        signatures (with bodies replaced by ' ...'). For a function target, returns
-        just its signature. Read-only.
+        signatures (with bodies replaced by ' ...'), each member at its
+        indentation relative to the class's header (see _interface_line). For a
+        function target, returns just its signature. Read-only.
         """
         node = self.parser.find_node_by_name(target)
         if not node:
@@ -3400,8 +3604,13 @@ class Applier:
                     inner = c
                     break
 
-        # Function target -- return signature only
-        if inner.type in func_types:
+        # Function target (a bodiless method, or a JS/TS function bound to a
+        # name, too) -- return signature only
+        if (
+            inner.type in func_types
+            or inner.type in _BODILESS_FUNCTIONS
+            or self._callable(node, target) is not node
+        ):
             return self._get_signature(target)
 
         # Go: struct/interface definition + top-level receiver methods
@@ -3416,30 +3625,33 @@ class Applier:
         source = self.parser.source_bytes
 
         # Header: everything from the symbol's start (decorators and a JS/TS
-        # `export` included) up to body content
-        head = self._symbol_span(node)[0].start_byte
+        # `export` included) up to body content. `base`, the indentation of
+        # the class's own line, comes off every line shown.
+        first = self._symbol_span(node)[0]
+        head = first.start_byte
+        base = self._get_indent(self.lines[first.start_point[0]])
         if ext in (".py", ".rb"):
             header = source[head:body.start_byte].decode("utf-8").rstrip()
         else:
             # Brace-delimited: body node starts with {, include it in header
             header = source[head:body.start_byte + 1].decode("utf-8").rstrip()
 
-        parts = [header]
+        parts = [self._interface_line(head, header, base, base)]
 
         # Walk body members: signatures for methods, full text for fields
-        self._collect_interface_members(body, func_types, parts)
+        indent = self._member_indent(inner, list(body.named_children))
+        self._collect_interface_members(body, func_types, parts, base, indent)
 
         # Closing token
         if ext in (".rb",):
             tail = source[body.end_byte:node.end_byte].decode("utf-8").strip()
             if tail:
-                indent = self._get_indent(self.lines[inner.start_point[0]])
-                parts.append(indent + tail)
+                tail_start = node.end_byte - len(tail.encode("utf-8"))
+                parts.append(self._interface_line(tail_start, tail, base, base))
         elif ext not in (".py",):
             # Brace-delimited: closing } (or }; for C++)
-            indent = self._get_indent(self.lines[inner.start_point[0]])
             closing = source[body.end_byte - 1:node.end_byte].decode("utf-8").rstrip()
-            parts.append(indent + closing)
+            parts.append(self._interface_line(body.end_byte - 1, closing, base, base))
 
         return "\n".join(parts)
 
@@ -3448,10 +3660,8 @@ class Applier:
         ext = self.parser.ext
         if ext == ".py":
             return {"function_definition", "decorated_definition"}
-        if ext in (".ts", ".tsx"):
-            return {"function_declaration", "method_definition"}
-        if ext in (".js", ".jsx", ".mjs", ".cjs"):
-            return {"function_declaration", "method_definition"}
+        if ext in _JS_EXTS:
+            return {"function_declaration", "generator_function_declaration", "method_definition"}
         if ext in (".c", ".h", ".cpp", ".cc", ".cxx", ".hpp", ".hxx", ".hh"):
             return {"function_definition"}
         if ext in (".rb",):
@@ -3495,16 +3705,38 @@ class Applier:
         sig = self.parser.source_bytes[child.start_byte:sig_end].decode("utf-8").rstrip()
         return sig + " ..."
 
-    def _collect_interface_members(self, container, func_types, parts):
-        """Walk a class body, appending signatures for methods and full text for fields."""
+    def _collect_interface_members(self, container, func_types, parts, base: str, indent: str):
+        """Walk a class body, appending signatures for methods and full text
+        for fields, at their indentation relative to the class (see
+        _interface_line; `indent` for a member that follows other code on
+        its line)."""
         for child in container.named_children:
             sig = self._extract_method_sig(child, func_types)
             if sig is not None:
-                parts.append(sig)
+                parts.append(self._interface_line(child.start_byte, sig, base, indent))
             elif child.type in ("enum_body_declarations", "class_body", "interface_body"):
-                self._collect_interface_members(child, func_types, parts)
+                self._collect_interface_members(child, func_types, parts, base, indent)
             else:
-                parts.append(self.parser.node_text(child))
+                text = self.parser.node_text(child)
+                if child.type == "access_specifier":
+                    # The grammar leaves the `:` of a C++ `public:` outside.
+                    text += ":"
+                parts.append(self._interface_line(child.start_byte, text, base, indent))
+
+    def _interface_line(self, start_byte: int, text: str, base: str, indent: str) -> str:
+        """
+        `text`, source that starts at start_byte (a class's header, a member
+        or its signature, the closing brace), as read_symbol(depth="interface")
+        shows it: its first line at the indentation of its line in the file,
+        or at `indent` when other code comes before it there, and every line
+        without `base`, the indentation of the class's own line, so members
+        keep their indentation relative to the class header. A line indented
+        less than `base` is left as it is.
+        """
+        src = self.parser.source_bytes
+        prefix = src[src.rfind(b"\n", 0, start_byte) + 1 : start_byte].decode("utf-8")
+        lines = ((prefix if not prefix.strip() else indent) + text).split("\n")
+        return "\n".join(line[len(base):] if line.startswith(base) else line for line in lines)
 
     def _read_interface_go(self, node, inner) -> str:
         """Go-specific: struct/interface definition + all receiver method signatures."""
@@ -3627,7 +3859,11 @@ class Applier:
           - C-style block comments: /* ... */ (single-line and multi-line)
         Stops at the first blank line or non-comment code line; a line with
         code before or between block comments (`int x = 1; /* n */`) counts
-        as code.
+        as code, and so does a line that only looks like a comment inside a
+        multi-line string, template literal or YAML block scalar
+        (_comment_starts_line). Python and Ruby directives at the top of the
+        file (a `#!` line, encoding and magic comments) are never included
+        (_file_directive_lines).
         """
         prefixes = self._comment_prefixes()
         if not prefixes:
@@ -3647,9 +3883,10 @@ class Applier:
                 if "/*" in stripped:
                     # Reached the start of the block
                     in_block = False
-                    if not stripped.startswith("/*"):
+                    if not stripped.startswith("/*") or not self._comment_starts_line(i):
                         # `code; /* ...` -- the block trails code, so it is
-                        # not part of the leading comment.
+                        # not part of the leading comment; nor is a `/*`
+                        # inside a string.
                         i = block_end
                         break
                 i -= 1
@@ -3661,6 +3898,10 @@ class Applier:
 
             # Line comment (#, //, etc.)
             if any(stripped.startswith(p) for p in prefixes):
+                if not self._comment_starts_line(i):
+                    # A `#` or `//` line inside a multi-line string,
+                    # template literal or YAML block scalar is text.
+                    break
                 i -= 1
                 continue
 
@@ -3673,6 +3914,8 @@ class Applier:
                     and stripped.endswith("*/")
                     and stripped.find("*/", 2) == len(stripped) - 2
                 ):
+                    if not self._comment_starts_line(i):
+                        break
                     i -= 1
                     continue
                 if stripped.endswith("*/"):
@@ -3691,50 +3934,79 @@ class Applier:
         if in_block:
             # No `/*` above the `*/` (e.g. a JS regex /a*/): not a comment.
             i = block_end
-        first_comment_line = i + 1
+        # A `#!` line and the encoding and magic comments after it are not
+        # part of any symbol's comment.
+        first_comment_line = max(i + 1, self._file_directive_lines())
         if first_comment_line >= start_line:
             return None
         return (first_comment_line, start_line)
 
+    def _comment_starts_line(self, row: int) -> bool:
+        """
+        Whether the text on line `row` starts with a comment in the parse
+        tree, not only by its characters: a line inside a multi-line string,
+        template literal or YAML block scalar that starts with `#`, `//` or
+        `/*` is part of that string, and never a symbol's leading comment.
+        The text starts after any whitespace, as _find_leading_comment_range
+        strips it (a form feed before a `#` included).
+        """
+        line = self.lines[row]
+        column = len(line[: len(line) - len(line.lstrip())].encode("utf-8"))
+        node = self.parser.tree.root_node.descendant_for_point_range((row, column), (row, column))
+        return node is not None and "comment" in node.type
+
+    def _file_directive_lines(self) -> int:
+        """
+        The number of lines at the top of a Python or Ruby file that are
+        directives rather than comments: a `#!` line, an encoding
+        declaration on one of the first two lines (`# -*- coding: utf-8 -*-`)
+        and, in Ruby, the magic comments after them (`# frozen_string_literal:
+        true`). They only work there, so they never count as a symbol's
+        leading comment, which edits move or remove.
+        """
+        ext = self.parser.ext
+        if ext not in (".py", ".rb"):
+            return 0
+        n = 0
+        while n < len(self.lines):
+            line = self.lines[n]
+            if not (
+                (n == 0 and line.startswith("#!"))
+                or (n < 2 and _CODING_COMMENT.match(line))
+                or (ext == ".rb" and _RUBY_MAGIC_COMMENT.match(line))
+            ):
+                break
+            n += 1
+        return n
+
     def _find_symbol_for_comment(self, target: str):
         """
-        Resolve a comment target like find_node_by_name, but anchored on the
-        whole key-value pair for YAML/TOML keys and on the first node of a
-        source symbol (_symbol_span), and with a TOML-specific fallback: if
-        the target doesn't match a pair, try matching a [table] header.
-        Comment tools operate on positional anchors, so tables are valid targets.
+        Resolve a comment target. In YAML and TOML it is the whole key-value
+        pair at the key path (_find_config_pair_by_path, so a YAML key with
+        no value is found too) or, in TOML, a [table] whose header spells
+        the path (TreeSitterParser.toml_table); comment tools operate on
+        positional anchors, so tables are valid targets. A key that does not
+        start its line (inside a flow mapping or inline table) is refused,
+        as the comment line above belongs to the key the line starts with.
+        In source files it is the first node of the symbol find_node_by_name
+        finds (_symbol_span), so the comment goes above its decorators and a
+        JS/TS `export`.
         """
+        if self.parser.ext in (".yml", ".yaml", ".toml"):
+            node = self._find_config_pair_by_path(target)
+            if node is None and self.parser.ext == ".toml":
+                node = self.parser.toml_table(self.parser.tree.root_node, target)
+            if node is not None and not self._starts_line(node.start_byte):
+                raise ApplierError(
+                    f"'{target}' does not start its line (it is inside a flow mapping or "
+                    "inline table), so it has no leading comment of its own; a comment "
+                    "line above it would belong to the key the line starts with"
+                )
+            return node
         node = self.parser.find_node_by_name(target)
-        if node is not None:
-            # Config lookups return the value, but the comment belongs above
-            # its key: a YAML mapping value starts on the line after `key:`.
-            if self.parser.ext in (".yml", ".yaml", ".toml"):
-                pair = node
-                while pair is not None and pair.type not in (
-                    "block_mapping_pair",
-                    "flow_pair",
-                    "pair",
-                ):
-                    pair = pair.parent
-                if pair is not None:
-                    node = pair
-                return node
-            # The comment belongs above the symbol's decorators and a JS/TS
-            # `export` (see _symbol_span).
-            return self._symbol_span(node)[0]
-
-        if self.parser.ext == ".toml" and "." not in target:
-            queue = [self.parser.tree.root_node]
-            while queue:
-                curr = queue.pop(0)
-                if curr.type == "table":
-                    header = curr.named_children[0] if curr.named_children else None
-                    if header:
-                        name = self.parser.node_text(header).strip("[] \n")
-                        if name == target:
-                            return curr
-                queue.extend(curr.named_children)
-        return None
+        if node is None:
+            return None
+        return self._symbol_span(node)[0]
 
     def _is_ruby_require_call(self, call_node) -> bool:
         """Return True if a Ruby `call` node is a require/require_relative/load statement."""

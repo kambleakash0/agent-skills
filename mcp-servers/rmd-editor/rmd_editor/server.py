@@ -141,6 +141,10 @@ def create_rmd(
 def list_cells(file_path: FilePath) -> str:
     """List all cells in the .rmd with index, type (code/markdown), language/label/option-count for code chunks, line count, and a one-line preview.
 
+    Only a line break (\\n, \\r\\n or a lone \\r) ends a line, as in knitr: a form
+    feed or U+2028 stays inside its line. split_cell and find_in_rmd count lines
+    the same way.
+
     Args:
         file_path: Absolute path to a .rmd file.
     """
@@ -225,7 +229,7 @@ def split_cell(
     index: CellIndex,
     line_offset: Annotated[
         int,
-        Field(description="Number of lines that stay in the original cell, from 1 to its line count minus 1; the rest move to a new cell inserted right after it, which keeps a chunk's language but not its label or options."),
+        Field(description="Number of lines that stay in the original cell, from 1 to its line count (as list_cells shows it) minus 1; the rest move to a new cell inserted right after it, which keeps a chunk's language but not its label or options."),
     ],
 ) -> str:
     """Split a cell into two at the given line offset (1-indexed, exclusive upper).
@@ -235,7 +239,8 @@ def split_cell(
         index: Zero-based cell index.
         line_offset: 1-indexed line number where the split happens; the first
             line_offset lines stay in the original cell, the rest move to the
-            new cell.
+            new cell. Lines are counted as list_cells and find_in_rmd count
+            them: only a line break ends one, not a form feed or U+2028.
     """
     try:
         return RmdManager(file_path).split_cell(index, line_offset)
@@ -481,7 +486,9 @@ def find_in_rmd(
 
     Args:
         file_path: Absolute path to a .rmd file.
-        pattern: Substring to find; returns `cell[i] line N: <text>` per hit.
+        pattern: Substring to find; returns `cell[i] line N: <text>` per hit,
+            with lines numbered as list_cells counts them and split_cell takes
+            offsets.
     """
     try:
         return RmdManager(file_path).find_in_rmd(pattern)

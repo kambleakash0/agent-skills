@@ -26,7 +26,13 @@ mixed-ending documents parse like LF ones, and cell sources and the YAML that
 callers see use "\\n". Raw text keeps the file's own line breaks; everything
 the serializer writes anew (edited cells, edited header lines, the break
 between parts) uses the document's line break, the one most of its lines end
-with.
+with. Nothing else ends a line (not a form feed, NEL or U+2028), and the
+manager counts, splits and numbers lines by the same rule (_lines).
+
+A byte order mark (U+FEFF) at the very start is not part of the text the
+document is parsed from: parse sets it aside in Frontmatter.bom and serialize
+writes it back first, so a BOM file's header is still found and the file
+round-trips byte for byte.
 """
 from __future__ import annotations
 
@@ -63,6 +69,7 @@ class Frontmatter:
     present: bool = False
     error: Optional[str] = None                # why the header couldn't be read as a YAML mapping, else None
     newline: str = "\n"                        # the document's line break, set by parse: lines written anew use it
+    bom: bool = False                          # the text began with a byte order mark (U+FEFF), set by parse: serialize writes it back
 
     def text(self) -> str:
         """The YAML between the --- fences, with "\\n" line breaks."""
@@ -171,16 +178,25 @@ class Cell:
 _CHUNK_OPEN = re.compile(r"^```\{\s*([A-Za-z][A-Za-z0-9_]*)\s*(.*?)\s*\}\s*$")
 _CODE_FENCE = re.compile(r"^```")
 
+# A UTF-8 byte order mark as decoded text; editors on Windows may write one before the --- fence.
+_BOM = "\ufeff"
+
 
 def parse(text: str) -> tuple[Frontmatter, list[Cell]]:
     """
     Parse the text of an .rmd document into a Frontmatter and an ordered list
     of Cells. Byte-level round-trip is preserved on unmodified parse-then-
     serialize cycles. The document's line break goes in frontmatter.newline,
-    which serialize writes edited parts with.
+    which serialize writes edited parts with. A byte order mark (U+FEFF) at the
+    very start is set aside in frontmatter.bom, so a header or chunk fence on the
+    first line is still found and no cell source starts with it.
     """
+    bom = text.startswith(_BOM)
+    if bom:
+        text = text[len(_BOM):]
     frontmatter, body_start_idx = _extract_frontmatter(text)
     frontmatter.newline = _detect_newline(text)
+    frontmatter.bom = bom
     body = text[body_start_idx:]
     cells = _split_body(body)
     return frontmatter, cells
@@ -349,7 +365,8 @@ def serialize(frontmatter: Frontmatter, cells: list[Cell]) -> str:
     another part follows it, so fences never run together and an unedited
     document still round-trips byte for byte. Edited cells and that newline use
     frontmatter.newline, the document's line break, whatever breaks the cell
-    source was given with.
+    source was given with. A byte order mark that parse set aside
+    (frontmatter.bom) goes back at the very start, whichever part comes first.
     """
     newline = frontmatter.newline
     parts: list[str] = [frontmatter.raw] if frontmatter.present else []
@@ -363,7 +380,7 @@ def serialize(frontmatter: Frontmatter, cells: list[Cell]) -> str:
             out_parts.append(newline)
         out_parts.append(part)
     # _join keeps a lone "\r" ending a part (from a mixed-ending file) apart from a "\n" after it.
-    return _join(out_parts, newline)
+    return (_BOM if frontmatter.bom else "") + _join(out_parts, newline)
 
 
 def _render_cell(cell: Cell) -> str:
@@ -560,12 +577,12 @@ def _read_header(body: str) -> tuple[dict, Optional[str], Optional[list[_Key]]]:
         loader = _TolerantLoader(body)
     except yaml.YAMLError as e:
         # The reader rejects control characters such as a form feed before parsing starts.
-        return {}, _yaml_problem(e), _guess_keys(_lines(body))
+        return {}, _yaml_problem(e, body), _guess_keys(_lines(body))
     try:
         try:
             root = loader.get_single_node()
         except yaml.YAMLError as e:
-            return {}, _yaml_problem(e), _guess_keys(_lines(body))
+            return {}, _yaml_problem(e, body), _guess_keys(_lines(body))
         if root is None:
             return {}, None, []
         # Before construction, which rewrites merge keys (<<) in place.
@@ -574,7 +591,7 @@ def _read_header(body: str) -> tuple[dict, Optional[str], Optional[list[_Key]]]:
             data = loader.construct_document(root)
         except (yaml.YAMLError, ValueError) as e:
             # Valid YAML holding a value PyYAML can't build, such as the date 2026-13-45.
-            return {}, _yaml_problem(e), keys
+            return {}, _yaml_problem(e, body), keys
     finally:
         loader.dispose()
     if not isinstance(data, dict):
@@ -630,12 +647,20 @@ def _guess_keys(lines: list[str]) -> list[_Key]:
     return keys
 
 
-def _yaml_problem(e: Exception) -> str:
-    """A one-line description of a YAML error, with its file line number when known."""
+def _yaml_problem(e: Exception, body: str) -> str:
+    """
+    A one-line description of a YAML error, with its file line number when known.
+    body is the header text the error came from, with "\\n" line breaks.
+    """
     problem = getattr(e, "problem", None) or str(e).split("\n")[0]
     mark = getattr(e, "problem_mark", None)
-    # Header body line 0 is file line 2, after the opening fence.
-    return f"{problem} (line {mark.line + 2} of the file)" if mark is not None else problem
+    if mark is None:
+        return problem
+    # Counted from the mark's index, not its line: YAML also takes NEL, U+2028 and
+    # U+2029 for line breaks, which the file's lines don't. Header body line 0 is
+    # file line 2, after the opening fence.
+    line = body.count("\n", 0, mark.index) + 2
+    return f"{problem} (line {line} of the file)"
 
 
 def _editable_keys(body: list[str]) -> list[_Key]:

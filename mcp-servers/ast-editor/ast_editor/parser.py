@@ -28,6 +28,21 @@ DEFAULT_EXPORT_KINDS = {
     "class": "class_declaration",
 }
 
+# Values that make a JS/TS `const`/`let`/`var` a function in all but name
+# (`const f = () => {}`), which list_symbols lists and the tools target as
+# functions; "function" is older grammars' name for function_expression.
+JS_FUNCTION_VALUES = ("arrow_function", "function_expression", "function", "generator_function")
+
+# Statements that wrap one TS declaration (`export ...`, `declare ...`), whose
+# siblings are the declaration's own (see _refuse_ambiguous_ts).
+_TS_DECLARATION_WRAPPERS = ("export_statement", "ambient_declaration")
+
+
+class ApplierError(Exception):
+    """An edit or lookup the tools refuse, with a message for the caller.
+    Defined here so that find_node_by_name can refuse an ambiguous target;
+    ast_editor.applier, whose edits raise it, imports it from here."""
+
 
 def detect_newline(data: bytes) -> str:
     """Return the file's line-ending style: "\\r\\n" when most of its line
@@ -67,6 +82,113 @@ def mask_json_exponents(data: bytes) -> bytes:
         return b"0" if match.group(0) == b"+" else match.group(0)
 
     return _JSON_STRING_OR_EXPONENT_PLUS.sub(keep_strings, data)
+
+
+# A backslash escape in a double-quoted key or path segment: \uXXXX,
+# \UXXXXXXXX, \xHH or a single character.
+_KEY_ESCAPE = re.compile(r"\\(?:u([0-9A-Fa-f]{4})|U([0-9A-Fa-f]{8})|x([0-9A-Fa-f]{2})|(.))", re.S)
+_KEY_SIMPLE_ESCAPES = {
+    "b": "\b",
+    "t": "\t",
+    "n": "\n",
+    "f": "\f",
+    "r": "\r",
+    "e": "\x1b",
+    '"': '"',
+    "\\": "\\",
+    "/": "/",
+}
+
+
+def decode_quoted_key(text: str) -> str:
+    """
+    The name a quoted key or path segment spells. A double-quoted one is
+    read as a JSON string or, failing that, with the escapes TOML basic
+    strings add (\\UXXXXXXXX, \\xHH, \\e); an unknown escape stays as
+    written. A single-quoted one (a TOML literal string) is the text
+    between its quotes.
+    """
+    if text[:1] == "'":
+        return text[1:-1]
+    try:
+        name = json.loads(text)
+    except ValueError:
+        name = None
+    if isinstance(name, str):
+        return name
+
+    def unescape(match: re.Match) -> str:
+        code = match.group(1) or match.group(2) or match.group(3)
+        if code is None:
+            return _KEY_SIMPLE_ESCAPES.get(match.group(4), match.group(0))
+        try:
+            return chr(int(code, 16))
+        except ValueError:  # beyond U+10FFFF
+            return match.group(0)
+
+    return _KEY_ESCAPE.sub(unescape, text[1:-1])
+
+
+def _closing_quote(text: str, start: int) -> int:
+    """Index of the quote that closes the one at text[start], or -1. Inside
+    double quotes a backslash escapes the next character; single quotes
+    have no escapes."""
+    quote = text[start]
+    i = start + 1
+    while i < len(text):
+        if text[i] == "\\" and quote == '"':
+            i += 2
+            continue
+        if text[i] == quote:
+            return i
+        i += 1
+    return -1
+
+
+def split_config_path(path: str, quotes: str = '"', strip: bool = False, raw: bool = False) -> list[str]:
+    """
+    The key names a JSON, YAML or TOML target path spells, one per segment.
+    Dots separate the segments, and a segment wrapped in one of `quotes`
+    (double quotes; for TOML also single quotes) is one name taken
+    literally, dots included: '"editor.fontSize"' is the single key
+    editor.fontSize and 'a."b.c".d' the keys a, b.c and d. Spaces and tabs
+    around a quoted segment are ignored and its escapes resolved
+    (decode_quoted_key). Any other segment is taken as written (with
+    `strip`, without spaces and tabs around it), as is one whose closing
+    quote is missing or followed by something other than a dot. With
+    `raw`, quoted segments are returned as written, quotes included.
+    """
+    names: list[str] = []
+    i = 0
+    while True:
+        j = i
+        while j < len(path) and path[j] in " \t":
+            j += 1
+        if j < len(path) and path[j] in quotes:
+            end = _closing_quote(path, j)
+            k = end + 1
+            while 0 < k < len(path) and path[k] in " \t":
+                k += 1
+            if end != -1 and (k == len(path) or path[k] == "."):
+                segment = path[j : end + 1]
+                names.append(segment if raw else decode_quoted_key(segment))
+                if k == len(path):
+                    return names
+                i = k + 1
+                continue
+        dot = path.find(".", i)
+        segment = path[i:] if dot == -1 else path[i:dot]
+        names.append(segment.strip(" \t") if strip else segment)
+        if dot == -1:
+            return names
+        i = dot + 1
+
+
+def toml_key_names(text: str) -> list[str]:
+    """The names a TOML key (`a."b.c"`, `'x y'`, `a . b`) or a TOML target
+    path spells: the two share one syntax (split_config_path with double
+    and single quotes, spaces around dots ignored)."""
+    return split_config_path(text, "\"'", strip=True)
 
 
 class TreeSitterParser:
@@ -150,10 +272,19 @@ class TreeSitterParser:
             of object-literal properties (`app.handler`).
         JS/TS exported declarations are found by their own names (the
         declaration inside the export statement is returned); an anonymous
-        `export default function/class` is named `default`.
+        `export default function/class` is named `default`. Generator
+        functions, TS abstract classes and their abstract methods, enums and
+        type aliases are found like other declarations, and a `const`/`let`/
+        `var` by the name it declares (the whole declaration is returned;
+        js_bound_function gets the function bound to it). A TS name that two
+        kinds of declaration in one scope declare (a type and a value: `const
+        User` and `type User`) is refused as ambiguous with an ApplierError
+        (_refuse_ambiguous_ts).
         In JSON, YAML and TOML files the target is a key path followed from
-        the top level, and the key's value node is returned (see
-        _search_json_dotted, find_yaml_pair and _search_toml_dotted).
+        the top level, a segment in double quotes (in TOML also single
+        quotes) being one key with any dots in it (split_config_path), and
+        the key's value node is returned (see _search_json_dotted,
+        find_yaml_pair and toml_pair); a YAML key with no value has none.
         """
         parts = target_name.split(".")
 
@@ -167,16 +298,30 @@ class TreeSitterParser:
                 closure = self._find_js_closure_by_var(parts[0], parts[1])
                 if closure is not None:
                     return closure
-            class_types = ["class_declaration", "interface_declaration"]
-            func_types = ["function_declaration", "method_definition", "arrow_function", "variable_declaration"]
-            var_types = ["variable_declaration", "lexical_declaration"]
+            class_types = ["class_declaration", "abstract_class_declaration", "interface_declaration"]
+            func_types = [
+                "function_declaration",
+                "generator_function_declaration",
+                "method_definition",
+                "abstract_method_signature",
+                "arrow_function",
+                "variable_declaration",
+            ]
+            var_types = ["variable_declaration", "lexical_declaration", "enum_declaration", "type_alias_declaration"]
         elif self.ext in (".js", ".jsx", ".mjs", ".cjs"):
             if len(parts) == 2:
                 closure = self._find_js_closure_by_var(parts[0], parts[1])
                 if closure is not None:
                     return closure
             class_types = ["class_declaration"]
-            func_types = ["function_declaration", "method_definition", "arrow_function", "variable_declaration", "lexical_declaration"]
+            func_types = [
+                "function_declaration",
+                "generator_function_declaration",
+                "method_definition",
+                "arrow_function",
+                "variable_declaration",
+                "lexical_declaration",
+            ]
             var_types = ["variable_declaration", "lexical_declaration"]
         elif self.ext in C_EXTS:
             class_types = ["struct_specifier", "union_specifier", "enum_specifier"]
@@ -316,14 +461,79 @@ class TreeSitterParser:
                             name_node = child.child_by_field_name("name")
                             if name_node:
                                 if self.node_text(name_node) == name:
+                                    self._refuse_ambiguous_ts(outer_node, name, valid_types)
                                     return outer_node
 
                 if name_node:
                     if self.node_text(name_node) == name:
+                        self._refuse_ambiguous_ts(outer_node, name, valid_types)
                         return outer_node
 
             queue.extend(curr.named_children)
         return None
+
+    def _refuse_ambiguous_ts(self, match: Node, name: str, valid_types: list[str]) -> None:
+        """
+        In a TS file, refuse `name` when, beside the declaration `match`
+        found for it, another kind of declaration in the same scope declares
+        it too. TS keeps types apart from values, so one name can be both
+        (`const User = z.object(...)` and `type User = z.infer<typeof User>`,
+        or an interface and a function), and the tools would act on
+        whichever comes first, perhaps not the one list_symbols showed.
+        Declarations of one kind (merged interfaces) are not compared, and
+        function overload signatures are no targets.
+        """
+        if self.ext not in (".ts", ".tsx"):
+            return
+        statement = match
+        while statement.parent is not None and statement.parent.type in _TS_DECLARATION_WRAPPERS:
+            statement = statement.parent
+        if statement.parent is None:
+            return
+        found = [(statement, match)]
+        for sibling in statement.parent.named_children:
+            if sibling == statement:
+                continue
+            decl = sibling
+            while decl is not None and decl.type in _TS_DECLARATION_WRAPPERS:
+                decl = decl.child_by_field_name("declaration") or next(
+                    (c for c in decl.named_children if c.type in valid_types), None
+                )
+            if decl is not None and decl.type in valid_types and decl.type != match.type and self._ts_declares(decl, name):
+                found.append((sibling, decl))
+        if len(found) < 2:
+            return
+        found.sort(key=lambda f: f[0].start_byte)
+        named = [f"`{self._ts_declaration_label(decl, name)}` (line {stmt.start_point[0] + 1})" for stmt, decl in found]
+        raise ApplierError(
+            f"'{name}' is ambiguous: {', '.join(named[:-1])} and {named[-1]} "
+            f"{'both' if len(named) == 2 else 'all'} declare it, and a target "
+            "cannot say which one it means. Edit these declarations with your "
+            "normal edit tool."
+        )
+
+    def _ts_declares(self, decl: Node, name: str) -> bool:
+        """Whether the TS declaration `decl` declares `name`: by its name
+        field, or for a `const`/`let`/`var` by one of its declarators."""
+        name_node = decl.child_by_field_name("name")
+        if name_node is not None:
+            return self.node_text(name_node) == name
+        return any(
+            child.type == "variable_declarator"
+            and (declared := child.child_by_field_name("name")) is not None
+            and self.node_text(declared) == name
+            for child in decl.named_children
+        )
+
+    def _ts_declaration_label(self, decl: Node, name: str) -> str:
+        """How _refuse_ambiguous_ts shows a declaration: its keywords and
+        name, `const User`, `type User`, `abstract class A`."""
+        if decl.type in ("lexical_declaration", "variable_declaration"):
+            return f"{self.node_text(decl.children[0])} {name}"
+        name_node = decl.child_by_field_name("name")
+        start = next((c.start_byte for c in decl.children if c.type != "decorator"), decl.start_byte)
+        head = self.source_bytes[start : name_node.start_byte].decode("utf-8")
+        return " ".join(head.split() + [name])
 
     def anonymous_default_export(self, node: Node) -> Node | None:
         """For a JS/TS `export default function () {}` or `export default
@@ -344,13 +554,15 @@ class TreeSitterParser:
 
     def _search_json_dotted(self, root: Node, target_name: str) -> Node | None:
         """
-        The value at a dotted key path in a JSON document, or None. The path
-        is followed from the top-level object one key per segment: 'a.b' is
+        The value at a key path in a JSON document, or None. The path is
+        followed from the top-level object one key per segment: 'a.b' is
         key b of the object under the top-level key a, never an a.b nested
-        deeper. Keys compare by their decoded text (json_key_name).
+        deeper, and a segment in double quotes is one key, dots included
+        ('"editor.fontSize"', see split_config_path). Keys compare by their
+        decoded text (json_key_name).
         """
         node = next((c for c in root.named_children if c.type != "comment"), None)
-        for part in target_name.split("."):
+        for part in split_config_path(target_name):
             if node is None or node.type != "object":
                 return None
             node = next(
@@ -387,25 +599,24 @@ class TreeSitterParser:
 
     def find_yaml_pair(self, root: Node, target_name: str) -> Node | None:
         """
-        The block_mapping_pair at a dotted key path in a YAML stream, or
-        None. The path is followed from a document's top-level mapping one
-        key per segment: 'a.b' is key b of the mapping under the top-level
-        key a, never an a.b nested deeper. The documents of a multi-document
-        stream are tried in order. A key written in quotes matches the name
-        it spells, escapes resolved ('it''s' is it's, "caf\\u00e9" café), as
-        add_key compares keys. Keys inside flow mappings ({a: 1}) are not
-        addressable.
+        The entry (yaml_entries) at a key path in a YAML stream, or None.
+        The path is followed from a document's top-level mapping one key per
+        segment: 'a.b' is key b of the mapping under the top-level key a,
+        never an a.b nested deeper. Block and flow mappings are followed
+        alike, so 'a.x' is x in `a: {x: 1}`. A segment in double quotes is
+        one key, dots included ('"a.b"', see split_config_path). The
+        documents of a multi-document stream are tried in order. A key
+        written in quotes matches the name it spells, escapes resolved
+        ('it''s' is it's, "caf\\u00e9" café), as add_key compares keys.
         """
-        parts = target_name.split(".")
+        parts = split_config_path(target_name, strip=True)
         for doc in root.named_children:
             if doc.type != "document":
                 continue
             pair, node = None, self.yaml_mapping(doc)
             for part in parts:
-                pairs = node.named_children if node is not None and node.type == "block_mapping" else []
                 pair = next(
-                    (p for p in pairs if p.type == "block_mapping_pair" and self._yaml_key_is(p, part)),
-                    None,
+                    (e for e in self.yaml_entries(node) if self._yaml_key_is(e, part)), None
                 )
                 if pair is None:
                     break
@@ -415,14 +626,36 @@ class TreeSitterParser:
         return None
 
     def _yaml_key_is(self, pair: Node, name: str) -> bool:
-        """Whether a YAML pair's key is `name`: the name its source spells
+        """Whether a YAML entry's key is `name`: the name its source spells
         (yaml_key_name: quotes removed, escapes resolved), or its source
         text as written."""
-        key_node = pair.child_by_field_name("key")
+        key_node = self.yaml_entry_key(pair)
         if key_node is None:
             return False
         key = self.node_text(key_node).strip()
         return key == name or self.yaml_key_name(key) == name
+
+    @staticmethod
+    def yaml_entries(mapping: Node | None) -> list[Node]:
+        """The entries of a YAML mapping (as yaml_mapping returns it): its
+        pairs and, in a flow mapping, the keys written without a value (the
+        `b` of `{a: 1, b}`), which are flow_nodes. Comments are left out."""
+        if mapping is None:
+            return []
+        if mapping.type == "block_mapping":
+            return [c for c in mapping.named_children if c.type == "block_mapping_pair"]
+        if mapping.type == "flow_mapping":
+            return [c for c in mapping.named_children if c.type in ("flow_pair", "flow_node")]
+        return []
+
+    @staticmethod
+    def yaml_entry_key(entry: Node) -> Node | None:
+        """The key node of a YAML mapping entry: a pair's key field, or the
+        flow_node itself for a key written without a value in a flow
+        mapping."""
+        if entry.type == "flow_node":
+            return entry
+        return entry.child_by_field_name("key")
 
     @staticmethod
     def yaml_key_name(text: str) -> str:
@@ -458,40 +691,86 @@ class TreeSitterParser:
         return None
 
     def _search_toml_dotted(self, root: Node, target_name: str) -> Node | None:
+        """The value of the pair toml_pair finds, or None."""
+        pair = self.toml_pair(root, target_name)
+        return self.toml_value(pair) if pair is not None else None
+
+    def toml_pair(self, root: Node, target_name: str) -> Node | None:
         """
-        The value at a dotted key path in a TOML document, or None: 'key' is
-        a top-level key and 'a.b.key' is `key` in the [a.b] table, written
-        as it is in the file (a quoted key with its quotes). Like the JSON
-        and YAML lookups, a path never resolves to a key somewhere deeper:
-        a top-level target does not match a key inside a table.
+        The pair that defines the key a TOML target path names, or None. The
+        path is the key's full name from the top level, written like a TOML
+        dotted key (toml_key_names: '"a.b"' or "'a.b'" is one name), and
+        names compare by what they spell, so [a."b.c"] and [ a . 'b.c' ]
+        are the same table. It can name a top-level key ('version'), a key
+        in a [table] ('project.version', 'a.b.key' in [a.b]), a dotted key
+        (`x.y = 1` is 'x.y'; in [t], 't.x.y') or a key in an inline table
+        ('t.a' in `t = { a = 1 }`, nested ones too). Like the JSON and YAML
+        lookups, a path never resolves to a key somewhere deeper: a
+        top-level target does not match a key inside a table. [[array]]
+        tables are not searched, as array elements are not addressable.
         """
-        parts = target_name.split(".")
-        queue = [root]
-        # In TOML, we look for table blocks like [part1.part2] or pairs part1 = ...
-        # For simplicity, we search for pair nodes matching the last part inside a table matching the prefix.
-        if len(parts) > 1:
-            table_name = ".".join(parts[:-1])
-            target_key = parts[-1]
-            while queue:
-                curr = queue.pop(0)
-                if curr.type == "table":
-                    header = curr.named_children[0]
-                    name = self.node_text(header).strip("[] \n")
-                    if name == table_name:
-                        for child in curr.named_children:
-                            if child.type == "pair":
-                                # TOML pairs don't use named fields for key/value
-                                k_node = child.children[0]
-                                if self.node_text(k_node) == target_key:
-                                    return child.children[2]  # child 1 is '='
-                queue.extend(curr.named_children)
-        else:
-            # A top-level pair (one before the first [table] header); the
-            # keys of tables are not searched.
-            for curr in root.named_children:
-                if curr.type == "pair" and self.node_text(curr.children[0]) == parts[0]:
-                    return curr.children[2]
+        want = toml_key_names(target_name)
+        for names, pair in self._toml_pairs(root):
+            if names == want:
+                return pair
         return None
+
+    def _toml_pairs(self, root: Node):
+        """Yield (full key names, pair) for each pair of a TOML document
+        outside [[array]] tables, in document order, the pairs of inline
+        tables included."""
+        for child in root.named_children:
+            if child.type == "pair":
+                yield from self._toml_pair_names([], child)
+            elif child.type == "table":
+                prefix = self.toml_header_names(child)
+                if prefix is None:
+                    continue
+                for pair in child.named_children:
+                    if pair.type == "pair":
+                        yield from self._toml_pair_names(prefix, pair)
+
+    def _toml_pair_names(self, prefix: list[str], pair: Node):
+        """Yield (full key names, pair) for a TOML pair under `prefix` and for
+        the pairs of the inline table it holds, if any."""
+        names = prefix + toml_key_names(self.node_text(pair.children[0]))
+        yield names, pair
+        value = self.toml_value(pair)
+        if value is not None and value.type == "inline_table":
+            for inner in value.named_children:
+                if inner.type == "pair":
+                    yield from self._toml_pair_names(names, inner)
+
+    @staticmethod
+    def toml_value(pair: Node) -> Node | None:
+        """The value node of a TOML pair (the node after its `=`), or None."""
+        seen_equals = False
+        for child in pair.children:
+            if seen_equals and child.is_named:
+                return child
+            seen_equals = seen_equals or child.type == "="
+        return None
+
+    def toml_header_names(self, table: Node) -> list[str] | None:
+        """The names a TOML [table] or [[array]] header spells, or None if
+        the node has no header key."""
+        header = table.named_children[0] if table.named_children else None
+        if header is None or header.type not in ("bare_key", "quoted_key", "dotted_key"):
+            return None
+        return toml_key_names(self.node_text(header))
+
+    def toml_table(self, root: Node, target_name: str) -> Node | None:
+        """The [table] whose header spells the names of the TOML target path
+        target_name (as toml_pair compares them), or None."""
+        want = toml_key_names(target_name)
+        return next(
+            (
+                c
+                for c in root.named_children
+                if c.type == "table" and self.toml_header_names(c) == want
+            ),
+            None,
+        )
 
     def node_text(self, node) -> str:
         """Return the source text for a node using its byte offsets (safe for multi-byte chars)."""
@@ -672,3 +951,26 @@ class TreeSitterParser:
                         return result
             return None
         return walk(self.tree.root_node)
+
+    def js_bound_function(self, node: Node, name: str | None = None) -> Node | None:
+        """For a JS/TS `const`/`let`/`var` declaration, the arrow function,
+        function expression or generator bound to `name` (`const f = () => {}`),
+        or, when name is None, to the only name it declares (None if it
+        declares several, or destructures). None if that value is something
+        else, or node is no such declaration. The variable_declarator holding
+        the name is the returned node's parent."""
+        if self.ext not in JS_EXTS or node.type not in ("lexical_declaration", "variable_declaration"):
+            return None
+        declarators = [c for c in node.named_children if c.type == "variable_declarator"]
+        if name is None:
+            only = declarators[0].child_by_field_name("name") if len(declarators) == 1 else None
+            if only is None or only.type != "identifier":
+                return None
+            name = self.node_text(only)
+        for decl in declarators:
+            name_node = decl.child_by_field_name("name")
+            if name_node is None or self.node_text(name_node) != name:
+                continue
+            value = decl.child_by_field_name("value")
+            return value if value is not None and value.type in JS_FUNCTION_VALUES else None
+        return None
