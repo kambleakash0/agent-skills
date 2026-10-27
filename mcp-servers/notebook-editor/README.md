@@ -1,6 +1,6 @@
 # Notebook Editor MCP Server
 
-A Model Context Protocol (MCP) server for editing Jupyter notebooks (`.ipynb`) with **cell-level primitives** and **kernel execution**. Provides 23 native tools for working with notebooks the way data scientists actually use them: cells as first-class citizens, outputs and execution state as managed data, and a real Python kernel for running code and capturing results.
+A Model Context Protocol (MCP) server for editing Jupyter notebooks (`.ipynb`) with **cell-level primitives** and **kernel execution**. Provides 23 native tools for working with notebooks the way data scientists actually use them: cells as first-class citizens, outputs and execution state as managed data, and a real Jupyter kernel (whichever one the notebook's kernelspec names: Python, R, Julia, ...) for running code and capturing results.
 
 ## Why a cell-native server?
 
@@ -21,7 +21,7 @@ All tools require `file_path` to be an **absolute path**. Every tool except `cre
 
 | Tool | Parameters | Description |
 | :--- | :--- | :--- |
-| `create_notebook` | `file_path`, `kernel_name` (default `"python3"`), `kernel_display_name`, `language` (default `"python"`), `overwrite` (default `False`) | Create a new empty `.ipynb` with a valid nbformat schema and kernelspec. Refuses to overwrite unless `overwrite=True`. |
+| `create_notebook` | `file_path`, `kernel_name` (default `"python3"`), `kernel_display_name` (default `""` = same as `kernel_name`), `language` (default `"python"`), `overwrite` (default `False`) | Create a new empty `.ipynb` with a valid nbformat schema and kernelspec. Refuses to overwrite unless `overwrite=True`. |
 
 ### Cell structure & navigation
 
@@ -29,7 +29,7 @@ All tools require `file_path` to be an **absolute path**. Every tool except `cre
 | :--- | :--- | :--- |
 | `list_cells` | `file_path` | Formatted outline of all cells: index, type, line count, execution count, preview. |
 | `get_cell` | `file_path`, `index` | Return the source text of a specific cell. |
-| `add_cell` | `file_path`, `index`, `source`, `cell_type` | Insert a new cell at the given index. `cell_type` defaults to `"code"`; other options: `"markdown"`, `"raw"`. Pass `index=-1` to append. |
+| `add_cell` | `file_path`, `index`, `source` (default `""`), `cell_type` (default `"code"`) | Insert a new cell at the given index. `cell_type` is `"code"`, `"markdown"`, or `"raw"`. Pass `index=-1` to append. |
 | `delete_cell` | `file_path`, `index` | Remove a cell by index. |
 | `move_cell` | `file_path`, `from_index`, `to_index` | Reorder: move a cell from one position to another. |
 | `split_cell` | `file_path`, `index`, `line_offset` | Split one cell into two at a line boundary. Outputs cleared on both halves. |
@@ -47,7 +47,7 @@ All tools require `file_path` to be an **absolute path**. Every tool except `cre
 
 | Tool | Parameters | Description |
 | :--- | :--- | :--- |
-| `clear_outputs` | `file_path`, `index` (optional, `-1`=all) | Clear outputs and execution_count on one code cell or all code cells. |
+| `clear_outputs` | `file_path`, `index` (default `-1` = all code cells) | Clear outputs and execution_count on one code cell or all code cells. |
 | `clear_execution_counts` | `file_path` | Reset execution numbering across all code cells. Outputs preserved. |
 | `get_outputs` | `file_path`, `index` | Formatted text view of a code cell's outputs (streams, results, errors, display data). |
 | `set_cell_metadata` | `file_path`, `index`, `key`, `value` | Set a metadata key on a cell. Value parsed as JSON (supports bools, numbers, arrays, objects). |
@@ -63,17 +63,18 @@ All tools require `file_path` to be an **absolute path**. Every tool except `cre
 
 | Tool | Parameters | Description |
 | :--- | :--- | :--- |
-| `execute_cell` | `file_path`, `index`, `timeout` | Execute a code cell using the notebook's Python kernel. Captures outputs and writes them back to the file. |
-| `execute_all_cells` | `file_path`, `timeout`, `stop_on_error` | Execute all code cells in order. Returns a summary of executed/errored/stopped counts. |
+| `execute_cell` | `file_path`, `index`, `timeout` (default `60.0` seconds) | Execute a code cell using the notebook's Jupyter kernel (from `metadata.kernelspec.name`). Captures outputs and writes them back to the file. |
+| `execute_all_cells` | `file_path`, `timeout` (default `60.0` seconds per cell), `stop_on_error` (default `True`) | Execute all code cells in order. Returns a summary of executed/errored/stopped counts. |
 | `get_kernel_state` | `file_path` | Report whether the notebook's kernel is `not started`, `alive`, or `dead`. |
 | `restart_kernel` | `file_path` | Restart the kernel. All in-memory state is lost. |
-| `interrupt_kernel` | `file_path` | Send a KeyboardInterrupt to the kernel. Stops a long-running or stuck cell. |
+| `interrupt_kernel` | `file_path` | Interrupt the running cell (SIGINT or the kernel's interrupt message; a KeyboardInterrupt in Python). Stops a long-running or stuck cell. |
 | `shutdown_kernel` | `file_path` | Shut down the kernel and release resources. |
 
 ### Kernel lifecycle notes
 
 - The kernel is **started lazily** on the first `execute_cell` / `execute_all_cells` call.
 - **One kernel per notebook file path**, cached in memory for the server's lifetime. Different notebooks get different kernels (isolated namespaces).
+- **The kernel runs in the notebook's folder**, as in Jupyter, so relative paths in cells (for example `pd.read_csv("data.csv")`) resolve against the folder that contains the `.ipynb`, not the directory the server was launched from. `restart_kernel` keeps the same working directory.
 - **Kernel-agnostic.** The kernel language is read from `metadata.kernelspec.name` in the notebook itself — works with any Jupyter kernel installed on the host: `python3`, `ir` (R via [IRkernel](https://irkernel.github.io/)), `julia-1.x` ([IJulia](https://github.com/JuliaLang/IJulia.jl)), etc. Falls back to `python3` if the notebook has no kernelspec. Set the kernel at creation time with `create_notebook(file_path, kernel_name="ir", language="R", ...)`.
 - **Symbol discovery is Python-only.** `list_notebook_symbols` uses Python's `ast` module and returns a clear "not supported for <language>" message for non-Python notebooks. Use `find_in_notebook` for text search in any language.
 - Kernels survive across tool calls, so state accumulates: `execute_cell(0)` then `execute_cell(1)` in a later call sees the variables from cell 0.
@@ -266,7 +267,7 @@ This path doesn't use uv, so the `[tool.uv]` 7-day dependency cooldown doesn't a
 
 ## Agent Configuration (Important)
 
-Coding agents are heavily biased toward their default tools. You **must** explicitly instruct them to use `notebook-editor` when working with notebooks. The agent prompt lives in [`NOTEBOOK-EDITOR.md`](./NOTEBOOK-EDITOR.md) — a standalone file you wire into your agent's system instructions.
+Coding agents are heavily biased toward their default tools. You **must** explicitly instruct them to use `notebook-editor` when working with notebooks. The agent prompt lives in [`NOTEBOOK-EDITOR.md`](./NOTEBOOK-EDITOR.md) — a standalone file you wire into your agent's system instructions. The server also sends a condensed version of this guidance as MCP server `instructions`, which some clients pass to the model automatically. Wiring in the full prompt file is still recommended.
 
 ### Claude Code / Claude Desktop (via `@`-include)
 
@@ -292,10 +293,6 @@ Copy the **contents** of [`NOTEBOOK-EDITOR.md`](./NOTEBOOK-EDITOR.md) into your 
 | **Antigravity** | `_agents/rules/` |
 | **Aider / Gemini CLI / generic** | Rules file or system prompt |
 
-### Migrating from pre-`NOTEBOOK-EDITOR.md` instructions
-
-**If your `CLAUDE.md` (or other rules file) contains an inline quoted "When working with `.ipynb` files... use notebook-editor" block from an older README version, delete that block and replace it with the `@NOTEBOOK-EDITOR.md` include (or paste the current file's contents).** The new file stays in sync with the current tool set (including `create_notebook`) — an outdated inline copy will drift as tools are added or renamed.
-
 ## Logging & Debugging
 
 The server logs all tool invocations and errors to **stderr** (safe for stdio transport — does not interfere with JSON-RPC). Logs include timestamps and severity levels.
@@ -310,7 +307,8 @@ For interactive testing, use the [MCP Inspector](https://modelcontextprotocol.io
 ### Common issues
 
 - **`No such kernel named <name>`** — the kernel named in the notebook's `metadata.kernelspec.name` isn't installed on this machine. `ipykernel` ships with the server, so `python3` notebooks normally work out of the box; for other languages, install the matching Jupyter kernel (for example IRkernel for R).
-- **"Kernel failed to start"** — the kernel process started but died or didn't become ready within 30 seconds. Check that the kernel's own runtime works (for example, that R starts and loads IRkernel), then retry.
+- **"Kernel failed to start"** — the kernelspec exists but the kernel couldn't be launched (for example, its `argv` points at a missing executable), or the process died or didn't become ready within 30 seconds. Check that the kernel's own runtime works (for example, that R starts and loads IRkernel), then retry.
+- **Retrying after either startup error** — nothing is left running: `get_kernel_state` reports `not started`, and the next `execute_cell` / `execute_all_cells` call tries to start the kernel again.
 - **"File is not a .ipynb notebook"** — every tool validates the extension. Rename your file to `.ipynb` or use a conversion tool like [`jupytext`](https://jupytext.readthedocs.io/) to convert `.py` ↔ `.ipynb`.
 - **Kernel state carries across calls** — this is intentional. If you need a clean namespace, call `restart_kernel` or `shutdown_kernel`.
 - **`execute_cell` timeouts on long-running code** — pass a larger `timeout` (in seconds) or interrupt with `interrupt_kernel`.

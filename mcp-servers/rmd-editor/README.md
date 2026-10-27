@@ -21,7 +21,7 @@ All tools require `file_path` to be an **absolute path**. Every tool except `cre
 
 | Tool | Parameters | Description |
 | :--- | :--- | :--- |
-| `create_rmd` | `file_path`, `title`, `author`, `output_format` (default `"html_document"`), `overwrite` (default `False`) | Create a new empty `.rmd` with a minimal YAML frontmatter. Refuses to overwrite unless `overwrite=True`. |
+| `create_rmd` | `file_path`, `title` (default `""`), `author` (default `""`), `output_format` (default `"html_document"`), `overwrite` (default `False`) | Create a new empty `.rmd` with a minimal YAML frontmatter. Refuses to overwrite unless `overwrite=True`. |
 
 ### Cell structure & navigation
 
@@ -29,7 +29,7 @@ All tools require `file_path` to be an **absolute path**. Every tool except `cre
 | :--- | :--- | :--- |
 | `list_cells` | `file_path` | Outline of all cells with index, type (code/markdown), language/label/option-count for chunks, line count, and a one-line preview. |
 | `get_cell` | `file_path`, `index` | Return the source text of a specific cell. |
-| `add_cell` | `file_path`, `index`, `source`, `cell_type` (`"code"` or `"markdown"`) | Insert a new cell at the given index. Pass `index=-1` to append. |
+| `add_cell` | `file_path`, `index`, `source` (default `""`), `cell_type` (`"code"` or `"markdown"`, default `"code"`) | Insert a new cell at the given index. Pass `index=-1` to append. |
 | `delete_cell` | `file_path`, `index` | Remove a cell by index. |
 | `move_cell` | `file_path`, `from_index`, `to_index` | Reorder: move a cell from one position to another. |
 | `split_cell` | `file_path`, `index`, `line_offset` | Split one cell into two at a line boundary. |
@@ -69,8 +69,8 @@ All tools require `file_path` to be an **absolute path**. Every tool except `cre
 
 | Tool | Parameters | Description |
 | :--- | :--- | :--- |
-| `execute_cell` | `file_path`, `index`, `timeout` | Execute one code chunk via a Jupyter kernel. Captured outputs are returned **inline** — never written to the `.rmd` file. |
-| `execute_all_cells` | `file_path`, `timeout`, `stop_on_error` | Execute all code chunks in order. Returns a cell-by-cell transcript. |
+| `execute_cell` | `file_path`, `index`, `timeout` (default `60.0`) | Execute one code chunk via a Jupyter kernel. Captured outputs are returned **inline** — never written to the `.rmd` file. |
+| `execute_all_cells` | `file_path`, `timeout` (default `60.0`), `stop_on_error` (default `True`) | Execute all code chunks in order. Returns a cell-by-cell transcript. |
 | `get_kernel_state` | `file_path` | Report whether this document's kernel is `not started`, `alive`, or `dead`. |
 | `restart_kernel` | `file_path` | Restart the kernel. All in-memory state is lost. |
 | `interrupt_kernel` | `file_path` | Send a signal to stop a long-running chunk. |
@@ -80,7 +80,8 @@ All tools require `file_path` to be an **absolute path**. Every tool except `cre
 
 - The kernel is **started lazily** on the first `execute_cell` / `execute_all_cells` call.
 - **One kernel per `.rmd` file path**, cached in memory for the server's lifetime.
-- **Chunk-language-aware.** `r` chunks launch IRkernel (`ir`); `python` chunks launch `python3`; `julia` chunks launch `julia-1`; other languages pass through lowercased as the kernelspec name. The matching Jupyter kernel must be installed on the host.
+- **Runs in the document's folder.** As in Jupyter, the kernel's working directory is the folder that contains the `.rmd` file, so relative paths in chunks (for example `read.csv("data/input.csv")`) resolve against that folder, not the server's install directory. `restart_kernel` keeps the same folder.
+- **Kernel chosen by the first chunk run.** The language of the first executed chunk picks the kernelspec: `r` launches IRkernel (`ir`), `python` launches `python3`, `julia` launches `julia-1`, and other languages pass through lowercased as the kernelspec name. Later chunks run in that same kernel whatever their language, so in a mixed-language document call `shutdown_kernel` before running chunks in another language (this discards the kernel's state). The matching Jupyter kernel must be installed on the host.
 - **Install IRkernel** (R): in R, run `install.packages("IRkernel"); IRkernel::installspec()`.
 - **Outputs are never persisted.** R Markdown regenerates outputs on render (`rmarkdown::render()`), so the server returns outputs inline to the caller only.
 - Kernels survive across tool calls: state accumulates across `execute_cell` invocations. Use `restart_kernel` to reset or `shutdown_kernel` to free resources.
@@ -174,7 +175,7 @@ uv --version
 For kernel execution, install the matching Jupyter kernel:
 
 - **R:** in R, run `install.packages("IRkernel"); IRkernel::installspec()`. Docs: <https://irkernel.github.io/>
-- **Python:** `pip install ipykernel` (typically installed already if `jupyter` is on the system).
+- **Python:** `pip install ipykernel`, then `python -m ipykernel install --user` with the same Python. The second step registers the kernel in your user Jupyter folder, which the server always searches. Without it, the kernelspec stays under that Python's own prefix (for example a Homebrew, pyenv or conda Python), where the server may not find it.
 - **Julia:** in Julia, `using Pkg; Pkg.add("IJulia")`.
 
 The server itself depends on `mcp`, `pyyaml`, and `jupyter-client`. `uv` handles all of these automatically on first run.
@@ -280,7 +281,7 @@ This path doesn't use uv, so the `[tool.uv]` 7-day dependency cooldown doesn't a
 
 ## Agent Configuration (Important)
 
-Coding agents are heavily biased toward their default tools. You **must** explicitly instruct them to use `rmd-editor` when working with R Markdown documents. The agent prompt lives in [`RMD-EDITOR.md`](./RMD-EDITOR.md) — a standalone file you wire into your agent's system instructions.
+Coding agents are heavily biased toward their default tools. You **must** explicitly instruct them to use `rmd-editor` when working with R Markdown documents. The agent prompt lives in [`RMD-EDITOR.md`](./RMD-EDITOR.md) — a standalone file you wire into your agent's system instructions. The server also sends a condensed version of this guidance as MCP server `instructions`, which some clients pass to the model automatically. Wiring in the full prompt file is still recommended.
 
 ### Claude Code / Claude Desktop (via `@`-include)
 
@@ -319,8 +320,8 @@ For interactive testing, use the [MCP Inspector](https://modelcontextprotocol.io
 
 ### Common issues
 
-- **`No such kernel named <name>`** — the Jupyter kernel for the chunk's language isn't installed (`ir` for R chunks, `python3` for Python chunks). Install it per the Prerequisites section.
-- **"Kernel failed to start"** — the kernel process started but died or didn't become ready within 30 seconds. Check that the kernel's own runtime works (for example, that R starts and loads IRkernel), then retry.
+- **`No such kernel named <name>`** — the Jupyter kernel for the chunk's language isn't installed (`ir` for R chunks, `python3` for Python chunks). To see the kernels the server can find, run `uv --directory /absolute/path/to/rmd-editor run jupyter kernelspec list`. Install the missing one per the Prerequisites section, then run the chunk again; `get_kernel_state` stays `not started` after this error, so the server doesn't need a restart.
+- **"Kernel failed to start"** — the kernelspec exists but the kernel couldn't be launched (for example, its command points to an R installation that has moved), or it started but died or didn't become ready within 30 seconds. The message includes the underlying error. Check that the kernel's own runtime works (for example, that R starts and loads IRkernel), then retry. `restart_kernel` reports the same kinds of problems as **"Kernel failed to restart"**.
 - **"File is not a .rmd document"** — every tool validates the extension. Rename your file to `.rmd` or use [`jupytext`](https://jupytext.readthedocs.io/) to convert `.Rmd` ↔ `.ipynb`.
 - **Outputs aren't appearing in the file** — by design. Outputs are returned inline to the caller. To persist, render with `rmarkdown::render("file.rmd")`.
 - **Adjacent markdown cells merged after a save** — by design. `.rmd` has no cell-boundary markers for prose; the model collapses consecutive markdown cells on re-parse.

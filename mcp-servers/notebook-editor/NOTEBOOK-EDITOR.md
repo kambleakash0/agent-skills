@@ -38,6 +38,7 @@ When working with `.ipynb` Jupyter notebook files, do NOT use the generic `edit`
 **Kernel lifecycle notes:**
 
 - Kernel starts lazily on first `execute_cell` / `execute_all_cells`. One kernel per notebook file path, cached for the server's lifetime.
+- The kernel runs in the notebook's folder, so relative paths in cells resolve against it (as in Jupyter).
 - State accumulates across calls: variables from an earlier `execute_cell` are visible to later ones. Use `restart_kernel` for a clean namespace or `shutdown_kernel` to release resources.
 - **Kernel-agnostic.** The kernel language follows `metadata.kernelspec.name` in the notebook (python3, ir for R, julia-1.x, etc.) — works with any Jupyter kernel installed on the host. Set it at creation: `create_notebook(path, kernel_name="ir", language="R")`.
 - **Symbol discovery is Python-only.** `list_notebook_symbols` returns a clear refusal message for non-Python notebooks. Use `find_in_notebook` instead.

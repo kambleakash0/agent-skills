@@ -42,11 +42,12 @@ When working with `.rmd` R Markdown files, do NOT use the generic `edit` or `wri
 **Format notes:**
 
 - `.rmd` has no cell-boundary markers between adjacent prose blocks (unlike `.ipynb`). Two adjacent `markdown` cells in the model will **auto-merge** on save and re-parse. Prefer inserting prose between code chunks, or append to an existing markdown cell.
-- Code chunks default to R (`cell_type="code"` creates an ` ```{r} ` chunk). Polyglot chunks (`{python}`, `{bash}`, `{sql}`) are preserved on round-trip and can be added by setting `language` via a direct chunk header edit — `set_chunk_option` adjusts the language via the special key `"language"` path is not supported in v1; use `replace_cell_source` on a freshly-added chunk if you need a non-R language.
+- Code chunks default to R (`cell_type="code"` creates an ` ```{r} ` chunk). Polyglot chunks (`{python}`, `{bash}`, `{sql}`) already in the file are preserved on round-trip, but no tool can create a non-R chunk or change a chunk's language yet: `replace_cell_source` keeps the language, and `set_chunk_option(key="language")` only adds a `language=` option to the header.
 
 **Kernel lifecycle notes:**
 
 - Kernel starts lazily on first `execute_cell` / `execute_all_cells`. One kernel per `.rmd` file path, cached for the server's lifetime.
+- The kernel runs in the `.rmd` file's folder, so relative paths in chunks resolve against that folder, not the server's directory.
 - State accumulates across calls: variables from an earlier `execute_cell` are visible to later ones. Use `restart_kernel` for a clean namespace or `shutdown_kernel` to release resources.
-- Kernel selection is driven by the chunk's language (`r` → `ir`, `python` → `python3`, `julia` → `julia-1`, others passed through lowercased). The matching Jupyter kernel must be installed on the host: install IRkernel for R via `install.packages("IRkernel"); IRkernel::installspec()`.
+- The kernel is chosen from the language of the first chunk you run (`r` → `ir`, `python` → `python3`, `julia` → `julia-1`, others passed through lowercased). Later chunks go to that same kernel whatever their language, so in a mixed-language document call `shutdown_kernel` before running chunks in another language (this discards the kernel's state). The matching Jupyter kernel must be installed on the host: install IRkernel for R via `install.packages("IRkernel"); IRkernel::installspec()`.
 - Outputs are **never** written to the `.rmd` file. They're returned inline to the caller only. Render the document with `rmarkdown::render()` if you want persisted HTML/PDF/Word output.

@@ -359,7 +359,7 @@ This path doesn't use uv, so the `[tool.uv]` 7-day dependency cooldown doesn't a
 
 ## Agent Configuration (Important)
 
-Coding agents are heavily biased toward their default tools. You **must** explicitly instruct them to use `ast-editor` when editing code and config files. The agent prompt lives in [`AST-EDITOR.md`](./AST-EDITOR.md) — a standalone file you wire into your agent's system instructions.
+Coding agents are heavily biased toward their default tools. You **must** explicitly instruct them to use `ast-editor` when editing code and config files. The agent prompt lives in [`AST-EDITOR.md`](./AST-EDITOR.md) — a standalone file you wire into your agent's system instructions. The server also sends a condensed version of this guidance as MCP server `instructions`, which some clients pass to the model automatically. Wiring in the full prompt file is still recommended.
 
 ### Claude Code / Claude Desktop (via `@`-include)
 
