@@ -1,9 +1,121 @@
+import ast
+import json
 import os
-from ast_editor.parser import TreeSitterParser
+import re
+import warnings
+from ast_editor.parser import TreeSitterParser, first_syntax_error
 
 
 class ApplierError(Exception):
     pass
+
+
+def _split_lines(text: str) -> list[str]:
+    """Split text into lines on "\\n" only. str.splitlines() also breaks on
+    form feeds, U+2028 and other separators, which would turn them into
+    newlines and shift line numbers away from tree-sitter's rows."""
+    lines = text.split("\n")
+    if lines[-1] == "":
+        lines.pop()
+    return lines
+
+
+def _trailing_blank_lines(lines: list[str]) -> int:
+    """Number of blank (empty or whitespace-only) lines that end `lines`."""
+    n = 0
+    while n < len(lines) and not lines[-1 - n].strip():
+        n += 1
+    return n
+
+
+def _python_syntax_error(source: bytes) -> SyntaxError | None:
+    """Return the error Python's own parser raises for source, or None.
+    tree-sitter-python accepts inconsistent indentation, so Python files get
+    this extra check."""
+    try:
+        with warnings.catch_warnings():
+            # SyntaxWarnings (e.g. invalid escapes) are not errors, even
+            # under -W error.
+            warnings.simplefilter("ignore")
+            ast.parse(source)
+    except SyntaxError as e:  # includes IndentationError and TabError
+        return e
+    except (ValueError, RecursionError, MemoryError) as e:
+        # Null bytes (before Python 3.12) or nesting too deep for the parser;
+        # CPython cannot compile such source either.
+        return SyntaxError(str(e) or type(e).__name__)
+    return None
+
+
+def _json_syntax_error(source: bytes) -> ValueError | None:
+    """Return the error the json module raises for source, or None. NaN and
+    Infinity, which json accepts but RFC 8259 does not, count as errors."""
+
+    def reject(name: str):
+        raise ValueError(f"{name} is not valid JSON")
+
+    try:
+        json.loads(source, parse_constant=reject)
+    except ValueError as e:  # includes JSONDecodeError and UnicodeDecodeError
+        return e
+    except RecursionError:
+        return ValueError("nesting too deep")
+    return None
+
+
+_JS_EXTS = (".js", ".jsx", ".mjs", ".cjs", ".ts", ".tsx")
+
+
+def _split_key_path(path: str) -> list[str]:
+    """Split a dotted key path into its segments: 'CONFIG."a.b".port' gives
+    ['CONFIG', '"a.b"', 'port']. Dots inside quotes or brackets do not split,
+    so quoted keys (and Python tuple keys) may contain them."""
+    parts: list[str] = []
+    buf: list[str] = []
+    quote = None
+    escaped = False
+    depth = 0
+    for ch in path:
+        if quote:
+            if escaped:
+                escaped = False
+            elif ch == "\\":
+                escaped = True
+            elif ch == quote:
+                quote = None
+        elif ch in "\"'`":
+            quote = ch
+        elif ch in "([{":
+            depth += 1
+        elif ch in ")]}":
+            depth = max(depth - 1, 0)
+        elif ch == "." and depth == 0:
+            parts.append("".join(buf).strip())
+            buf = []
+            continue
+        buf.append(ch)
+    parts.append("".join(buf).strip())
+    return parts
+
+
+def _unquote(text: str) -> str:
+    """Strip one pair of matching quotes ('x', "x" or `x`) from text."""
+    if len(text) >= 2 and text[0] == text[-1] and text[0] in "\"'`":
+        return text[1:-1]
+    return text
+
+
+def _python_keys_equal(a: str, b: str) -> bool:
+    """Whether two Python key expressions name the same dict key. Literals
+    compare by value, so "a" matches 'a' (and 1 matches 1.0, as in a dict);
+    anything else compares as source text."""
+    a, b = a.strip(), b.strip()
+    if a == b:
+        return True
+    try:
+        return ast.literal_eval(a) == ast.literal_eval(b)
+    except (ValueError, TypeError, SyntaxError, MemoryError, RecursionError):
+        return False
 
 
 class Applier:
@@ -16,8 +128,8 @@ class Applier:
             # convert to ApplierError so callers can distinguish user errors from internal ones.
             raise ApplierError(str(e)) from e
 
-        with open(filepath, "r", encoding="utf-8") as f:
-            self.lines = f.read().splitlines()
+        # LF-normalised text, so line indices match the tree's rows.
+        self.lines = _split_lines(self.parser.source_code)
 
     def _get_indent(self, line: str) -> str:
         return line[: len(line) - len(line.lstrip())]
@@ -55,6 +167,14 @@ class Applier:
 
     def replace_value(self, target: str, content: str) -> str:
         node = self.parser.find_node_by_name(target)
+        prefix = ""
+        if not node:
+            try:
+                found = self._find_entry_value(target)
+            except ApplierError as e:
+                raise ApplierError(f"Target '{target}' not found ({e})") from e
+            if found is not None:
+                node, prefix = found
         if not node:
             raise ApplierError(f"Target '{target}' not found")
 
@@ -80,7 +200,7 @@ class Applier:
                 return self._replace_yaml_block_sequence(resolved, content)
 
         source_bytes = self.parser.source_bytes
-        content_bytes = content.encode("utf-8")
+        content_bytes = (prefix + content).encode("utf-8")
 
         new_bytes = (
             source_bytes[: node.start_byte]
@@ -89,6 +209,36 @@ class Applier:
         )
         self._write_bytes(new_bytes)
         return "Update successful"
+
+    def _find_entry_value(self, target: str):
+        """
+        For replace_value in source files: resolve 'DictName.keyExpr' (a
+        Python dict literal) or 'VarName.key' (a JS/TS object literal), also
+        through nested literals, to (node to replace, text to put before the
+        new value). A JS shorthand `{ key }` is replaced whole, becoming
+        `key: <value>`. Returns None when target is no such path.
+        """
+        ext = self.parser.ext
+        if ext != ".py" and ext not in _JS_EXTS:
+            return None
+        parts = _split_key_path(target)
+        if len(parts) < 2 or not all(parts):
+            return None
+        parent = ".".join(parts[:-1])
+        if ext == ".py":
+            pair = self._find_python_pair(self._find_python_dict(parent), parts[-1])
+            if pair is None:
+                raise ApplierError(f"Key {parts[-1]} not found in dict '{parent}'")
+            return pair.child_by_field_name("value"), ""
+        entry = self._find_js_entry(self._resolve_js_object(parts[:-1]), parts[-1])
+        if entry is None:
+            raise ApplierError(f"Key '{parts[-1]}' not found in {parent}")
+        if entry.type == "shorthand_property_identifier":
+            return entry, self.parser.node_text(entry) + ": "
+        if entry.type != "pair":
+            kind = entry.type.replace("_", " ")
+            raise ApplierError(f"'{target}' is a {kind}, not a key-value pair")
+        return entry.child_by_field_name("value"), ""
 
     def replace_function_body(self, target: str, content: str) -> str:
         node = self.parser.find_node_by_name(target)
@@ -212,12 +362,136 @@ class Applier:
         return self._save()
 
     def _save(self) -> str:
-        new_source = "\n".join(self.lines)
+        """
+        Write self.lines back to the file. _split_lines dropped only the final
+        newline, so adding it back rebuilds untouched lines exactly, blank
+        lines at the end of the file included. An edit never leaves more of
+        those than the file had, though: deleting the last symbol would
+        otherwise strand the blank lines that separated it from the one
+        before.
+        """
+        lines = self.lines
+        excess = _trailing_blank_lines(lines) - _trailing_blank_lines(
+            _split_lines(self.parser.source_code)
+        )
+        if excess > 0:
+            lines = lines[: len(lines) - excess]
+        self._write_text("\n".join(lines) + "\n")
+        return "Update successful"
+
+    def _write_text(self, new_source: str) -> None:
+        """
+        Single exit point for every edit (_save and _write_bytes both end
+        here): normalise line endings, refuse a result that would not parse,
+        then write the file in its own newline style and refresh the parser.
+        """
+        # Internal text is LF (see TreeSitterParser); caller-provided content
+        # may still carry CRLF.
+        new_source = new_source.replace("\r\n", "\n")
         if not new_source.endswith("\n"):
             new_source += "\n"
-        with open(self.filepath, "w", encoding="utf-8") as f:
+        try:
+            self._check_syntax(new_source.encode("utf-8"))
+        except ApplierError:
+            # Line-based edits change self.lines before saving; undo that so
+            # this instance still mirrors the untouched file.
+            self.lines = _split_lines(self.parser.source_code)
+            raise
+        if self.parser.newline != "\n":
+            new_source = new_source.replace("\n", self.parser.newline)
+        # newline="" writes the text verbatim, without platform translation.
+        with open(self.filepath, "w", encoding="utf-8", newline="") as f:
             f.write(new_source)
-        return "Update successful"
+        self._refresh_parser_state()
+
+    def _check_syntax(self, new_bytes: bytes) -> None:
+        """
+        Raise ApplierError if new_bytes would not parse although the current
+        file does. A file that already has syntax errors is not guarded, so
+        edits to broken files are never blocked.
+
+        tree-sitter grammars lag behind their languages, so for .py and .json
+        the standard library's parser (_stdlib_syntax_error) has the last
+        word: content it accepts is never refused, even where tree-sitter
+        cannot parse it (PEP 696 type parameter defaults, JSON exponents such
+        as 1e+2). For Python it is also the judge on its own: it decides
+        whether the file was already broken, and it rejects inconsistent
+        indentation that tree-sitter accepts. json only ever lifts a refusal
+        (and lets a file tree-sitter misparses still count as clean), because
+        it also rejects the comments that JSONC files allow. The
+        error position comes from tree-sitter while the file parsed cleanly
+        there and both parsers agree on the line, else from the standard
+        library.
+        """
+        ext = self.parser.ext
+        ts_was_clean = not self.parser.tree.root_node.has_error
+        if ext == ".py" or (ext == ".json" and not ts_was_clean):
+            if self._stdlib_syntax_error(self.parser.source_bytes) is not None:
+                return
+        elif not ts_was_clean:
+            return
+
+        bad = first_syntax_error(self.parser.parser.parse(new_bytes).root_node)
+        stdlib = None
+        if ext == ".py" or (ext == ".json" and bad is not None):
+            stdlib = self._stdlib_syntax_error(new_bytes)
+            if stdlib is None:
+                return
+        elif bad is None:
+            return
+        if (
+            bad is not None
+            and ts_was_clean
+            and (stdlib is None or stdlib[0] in (None, bad.start_point[0] + 1))
+        ):
+            problem = self._describe_syntax_error(bad, new_bytes)
+        else:
+            problem = stdlib[1]
+        raise ApplierError(
+            f"Edit refused: the result would have a syntax error at {problem}. "
+            f"{self.filepath} was not modified. If you are sure the code is "
+            "valid (the parser may not support very new or macro-heavy syntax), "
+            "make this edit with your normal edit tool."
+        )
+
+    def _stdlib_syntax_error(self, data: bytes) -> tuple[int | None, str] | None:
+        """
+        Check data with the standard library's parser for a .py or .json file:
+        Python's own (that of the interpreter running the server), or json
+        with NaN and Infinity rejected as RFC 8259 requires. Return None if it
+        accepts data, else the 1-based line of the first error (None when
+        unknown) and a 'line L, column C (message)' description of it.
+        """
+        if self.parser.ext == ".py":
+            err = _python_syntax_error(data)
+            if err is None:
+                return None
+            line, column, msg = err.lineno, err.offset, err.msg
+        else:
+            err = _json_syntax_error(data)
+            if err is None:
+                return None
+            line = getattr(err, "lineno", None)
+            column = getattr(err, "colno", None)
+            msg = getattr(err, "msg", None) or str(err)
+        if not line:
+            return None, f"an unknown position ({msg})"
+        where = f"line {line}, column {column}" if column else f"line {line}"
+        return line, f"{where} ({msg})"
+
+    def _describe_syntax_error(self, node, data: bytes) -> str:
+        """Format an ERROR/MISSING node as 'line L, column C (what)', 1-based."""
+        line_start = data.rfind(b"\n", 0, node.start_byte) + 1
+        column = len(data[line_start : node.start_byte].decode("utf-8", "replace")) + 1
+        if node.is_missing:
+            what = f"missing {node.type!r}"
+        else:
+            text = data[node.start_byte : node.end_byte].decode("utf-8", "replace")
+            text = text.strip().split("\n")[0]
+            if len(text) > 40:
+                text = text[:40] + "..."
+            what = f"cannot parse {text!r}" if text else "unexpected input"
+        return f"line {node.start_point[0] + 1}, column {column} ({what})"
 
     def _import_node_types(self) -> tuple[str, ...]:
         """Return the AST node types that represent import statements for this file's language."""
@@ -339,20 +613,220 @@ class Applier:
         raise ApplierError(f"Import '{import_text}' not found in {self.filepath}")
 
     def _refresh_parser_state(self) -> None:
-        """Re-parse the file after a byte-level mutation so subsequent edits see fresh AST."""
+        """Re-parse the file after a write so subsequent edits see fresh AST."""
         from ast_editor.parser import TreeSitterParser
 
         self.parser = TreeSitterParser(self.filepath)
-        self.lines = self.parser.source_code.splitlines()
+        self.lines = _split_lines(self.parser.source_code)
 
     def _write_bytes(self, new_bytes: bytes) -> None:
-        """Write new source bytes to disk and refresh parser state."""
-        new_source = new_bytes.decode("utf-8")
-        if not new_source.endswith("\n"):
-            new_source += "\n"
-        with open(self.filepath, "w", encoding="utf-8") as f:
-            f.write(new_source)
-        self._refresh_parser_state()
+        """Write new LF source bytes to disk (via _write_text) and refresh parser state."""
+        self._write_text(new_bytes.decode("utf-8"))
+
+    def _indent_unit(self, default: str) -> str:
+        """
+        One indentation level as this file writes it: a tab if most indented
+        lines start with one, otherwise the most common step by which the
+        indentation grows from one line to the next; `default` when no line
+        is indented.
+        """
+        steps: dict[int, int] = {}
+        tabs = spaces = prev = 0
+        for line in self.lines:
+            code = line.lstrip(" \t")
+            if not code:
+                continue
+            ws = line[: len(line) - len(code)]
+            if "\t" in ws:
+                tabs += 1
+                continue
+            if ws:
+                spaces += 1
+            if len(ws) > prev:
+                steps[len(ws) - prev] = steps.get(len(ws) - prev, 0) + 1
+            prev = len(ws)
+        if tabs > spaces:
+            return "\t"
+        if not steps:
+            return default
+        return " " * max(steps, key=lambda step: (steps[step], -step))
+
+    def _own_line_indent(self, nodes, fallback: str) -> str:
+        """Indentation of the last of `nodes` that starts its own line, or
+        `fallback` if each of them follows other code on its line."""
+        src = self.parser.source_bytes
+        for node in reversed(nodes):
+            line_start = src.rfind(b"\n", 0, node.start_byte) + 1
+            prefix = src[line_start : node.start_byte]
+            if not prefix.strip():
+                return prefix.decode("utf-8")
+        return fallback
+
+    def _insert_entry(
+        self,
+        container,
+        entries: list,
+        entry: str,
+        *,
+        expand_empty: bool,
+        empty_trailing_comma: bool,
+        default_unit: str,
+    ) -> None:
+        """
+        Write `entry` (e.g. '"key": value') after the last of `entries` in a
+        brace-delimited container (JSON object, Python dict, JS/TS object
+        literal), following the container's layout: entries one per line get
+        a new line at the last entry's indentation, an inline container stays
+        inline, and a trailing comma after the last entry is kept (the new
+        entry gets one too). A comment on the last entry's line stays there.
+        An empty container becomes `{ entry }`, or with `expand_empty` is
+        opened onto separate lines (`empty_trailing_comma` adds a comma).
+        """
+        src = self.parser.source_bytes
+        open_brace, close_brace = container.children[0], container.children[-1]
+        base_indent = self._get_indent(self.lines[open_brace.start_point[0]])
+        inner_indent = base_indent + self._indent_unit(default_unit)
+        edits: list[tuple[int, int, str]] = []  # (start, end, replacement)
+
+        if entries:
+            last = entries[-1]
+            after = [
+                c
+                for c in container.children
+                if c.start_byte >= last.end_byte and c.end_byte <= close_brace.start_byte
+            ]
+            comma = after[0] if after and after[0].type == "," else None
+            end = (comma or last).end_byte
+            row = (comma or last).end_point[0]
+            for c in after[1 if comma else 0 :]:
+                if "comment" not in c.type or c.start_point[0] != row:
+                    break
+                end, row = c.end_byte, c.end_point[0]
+            if close_brace.start_point[0] > row:
+                indent = self._own_line_indent(entries, inner_indent)
+                line_end = src.find(b"\n", end)
+                new_line = "\n" + indent + entry + ("," if comma else "")
+                edits.append((line_end, line_end, new_line))
+                if comma is None:
+                    edits.append((last.end_byte, last.end_byte, ","))
+            elif comma is not None:
+                edits.append((comma.end_byte, comma.end_byte, f" {entry},"))
+            else:
+                edits.append((last.end_byte, last.end_byte, f", {entry}"))
+        else:
+            comma = "," if empty_trailing_comma else ""
+            interior = src[open_brace.end_byte : close_brace.start_byte]
+            if close_brace.start_point[0] > open_brace.end_point[0]:
+                # `{` and `}` on different lines: add a line above the `}`,
+                # indented like a comment already inside, if any.
+                comments = [c for c in container.named_children if "comment" in c.type]
+                indent = self._own_line_indent(comments, inner_indent)
+                line_start = src.rfind(b"\n", 0, close_brace.start_byte) + 1
+                if src[line_start : close_brace.start_byte].strip():
+                    text = f"\n{indent}{entry}{comma}\n{base_indent}"
+                    edits.append((close_brace.start_byte, close_brace.start_byte, text))
+                else:
+                    edits.append((line_start, line_start, f"{indent}{entry}{comma}\n"))
+            elif interior.strip():
+                # Only a comment between the braces: keep it, add after it.
+                pad = "" if interior[-1:].isspace() else " "
+                text = f"{pad}{entry} "
+                edits.append((close_brace.start_byte, close_brace.start_byte, text))
+            elif expand_empty:
+                text = f"\n{inner_indent}{entry}{comma}\n{base_indent}"
+                edits.append((open_brace.end_byte, close_brace.start_byte, text))
+            else:
+                edits.append((open_brace.end_byte, close_brace.start_byte, f" {entry} "))
+
+        # Apply back to front. The sort is stable, so of two edits at the same
+        # offset the one listed later ends up first (the comma before the new
+        # line).
+        new_bytes = src
+        for start, end, text in sorted(edits, key=lambda e: e[0], reverse=True):
+            new_bytes = new_bytes[:start] + text.encode("utf-8") + new_bytes[end:]
+        self._write_bytes(new_bytes)
+
+    def _duplicate_key(self, key: str, parent_target: str, value_target: str) -> ApplierError:
+        """The error add_key raises for a key its container already has."""
+
+        def quoted(text: str) -> str:
+            return f'"{text}"' if "'" in text else f"'{text}'"
+
+        where = quoted(parent_target) if parent_target else "the root"
+        return ApplierError(
+            f"Key {quoted(key.strip())} already exists in {where}; use replace_value "
+            f"with target {quoted(value_target)} to change its value."
+        )
+
+    def _delete_entry(self, container, entries: list, idx: int) -> None:
+        """
+        Delete entries[idx] from a brace-delimited container (JSON object,
+        Python dict, JS/TS object literal) along with one adjacent comma, and
+        write the file. An entry on lines of its own goes with those whole
+        lines, a comment on its last line included; if it was the last entry
+        and had no trailing comma, the comma after the entry before it goes
+        too (JSON rejects a trailing comma). An entry sharing a line with
+        another one is cut up to the next entry when it starts its line (or
+        is the first entry), else from the end of the one before it, so one
+        separating comma goes with it. Deleting the only entry leaves `{}`
+        (when nothing but whitespace and a trailing comma surrounds it)
+        rather than a stray comma, which JS would reject.
+        """
+        src = self.parser.source_bytes
+        entry = entries[idx]
+        open_brace, close_brace = container.children[0], container.children[-1]
+        inner = container.children[1:-1]
+        others = [
+            c
+            for c in inner
+            if c != entry and not (c.type == "," and c.start_byte >= entry.end_byte)
+        ]
+        # The entry's comma, then any comments on the same row.
+        after = [c for c in inner if c.start_byte >= entry.end_byte]
+        comma = after[0] if after and after[0].type == "," else None
+        end = (comma or entry).end_byte
+        row = (comma or entry).end_point[0]
+        for c in after[1 if comma else 0 :]:
+            if "comment" not in c.type or c.start_point[0] != row:
+                break
+            end = c.end_byte
+        line_start = src.rfind(b"\n", 0, entry.start_byte) + 1
+        line_end = src.find(b"\n", end)
+        starts_line = not src[line_start : entry.start_byte].strip()
+        own_lines = (
+            starts_line
+            and line_end != -1
+            and not src[end:line_end].strip()
+            and (comma is not None or idx == len(entries) - 1)
+        )
+
+        if not others:
+            cuts = [(open_brace.end_byte, close_brace.start_byte)]
+        elif own_lines:
+            cuts = [(line_start, line_end + 1)]
+            if comma is None and idx > 0:
+                prev_comma = next(
+                    (
+                        c
+                        for c in inner
+                        if c.type == ","
+                        and entries[idx - 1].end_byte <= c.start_byte < entry.start_byte
+                    ),
+                    None,
+                )
+                if prev_comma is not None:
+                    cuts.append((prev_comma.start_byte, prev_comma.end_byte))
+        elif (starts_line or idx == 0) and idx + 1 < len(entries):
+            cuts = [(entry.start_byte, entries[idx + 1].start_byte)]
+        elif idx > 0:
+            cuts = [(entries[idx - 1].end_byte, entry.end_byte)]
+        else:
+            cuts = [(entry.start_byte, (comma or entry).end_byte)]
+
+        new_bytes = src
+        for start, stop in sorted(cuts, reverse=True):
+            new_bytes = new_bytes[:start] + new_bytes[stop:]
+        self._write_bytes(new_bytes)
 
     def _find_json_object_at_path(self, dotted_path: str):
         """Return the JSON object node at the dotted path, or the root object if path is empty."""
@@ -367,6 +841,21 @@ class Applier:
             return value_node
         return None
 
+    def _json_key_name(self, pair) -> str | None:
+        """Decoded key of a JSON pair."""
+        key_node = pair.child_by_field_name("key")
+        if key_node is None:
+            return None
+        try:
+            name = json.loads(self.parser.node_text(key_node))
+        except ValueError:
+            name = None
+        if isinstance(name, str):
+            return name
+        return "".join(
+            self.parser.node_text(c) for c in key_node.children if c.type == "string_content"
+        )
+
     def _add_key_json(self, parent_target: str, key: str, value: str) -> str:
         parent = self._find_json_object_at_path(parent_target)
         if parent is None:
@@ -374,32 +863,32 @@ class Applier:
                 f"JSON object at '{parent_target or '<root>'}' not found"
             )
 
-        pairs = [c for c in parent.named_children if c.type == "pair"]
-        source_bytes = self.parser.source_bytes
-
-        if pairs:
-            last_pair = pairs[-1]
-            indent = self._get_indent(self.lines[last_pair.start_point[0]])
-            insertion = f',\n{indent}"{key}": {value}'
-            insert_byte = last_pair.end_byte
+        # The key is quoted (and escaped) here; one passed already quoted is
+        # used as given.
+        name = None
+        if key.strip().startswith('"'):
+            try:
+                name = json.loads(key.strip())
+            except ValueError:
+                pass
+        if isinstance(name, str):
+            key_text = key.strip()
         else:
-            # Empty object `{}` -- insert between braces
-            close_line = parent.end_point[0]
-            close_indent = (
-                self._get_indent(self.lines[close_line])
-                if close_line < len(self.lines)
-                else ""
-            )
-            inner_indent = close_indent + "  "
-            insertion = f'\n{inner_indent}"{key}": {value}\n{close_indent}'
-            insert_byte = parent.start_byte + 1  # immediately after `{`
+            name, key_text = key, json.dumps(key, ensure_ascii=False)
 
-        new_bytes = (
-            source_bytes[:insert_byte]
-            + insertion.encode("utf-8")
-            + source_bytes[insert_byte:]
+        pairs = [c for c in parent.named_children if c.type == "pair"]
+        if any(self._json_key_name(p) == name for p in pairs):
+            dotted = f"{parent_target}.{name}" if parent_target else name
+            raise self._duplicate_key(name, parent_target, dotted)
+
+        self._insert_entry(
+            parent,
+            pairs,
+            f"{key_text}: {value}",
+            expand_empty=True,
+            empty_trailing_comma=False,
+            default_unit="  ",
         )
-        self._write_bytes(new_bytes)
         return "Update successful"
 
     def _add_key_yaml(self, parent_target: str, key: str, value: str) -> str:
@@ -439,6 +928,12 @@ class Applier:
             raise ApplierError(
                 "Cannot add key to empty YAML mapping (unsupported in v1)"
             )
+        name = _unquote(key.strip())
+        for pair in pairs:
+            key_node = pair.child_by_field_name("key")
+            if key_node is not None and _unquote(self.parser.node_text(key_node).strip()) == name:
+                dotted = f"{parent_target}.{name}" if parent_target else name
+                raise self._duplicate_key(key, parent_target, dotted)
 
         last_pair = pairs[-1]
         indent = self._get_indent(self.lines[last_pair.start_point[0]])
@@ -446,6 +941,33 @@ class Applier:
         new_line = f"{indent}{key}: {value}"
         self.lines = self.lines[:insert_line] + [new_line] + self.lines[insert_line:]
         return self._save()
+
+    def _toml_key_taken(self, root, parent_target: str, pairs: list, key: str) -> bool:
+        """Whether `key` is already defined in a TOML table (or the root): as
+        one of its keys, as the start of a dotted key (`key.x = 1`), or as a
+        sub-table header (`[parent.key]`, `[[parent.key]]`). A dotted key
+        whose leading parts name a table that has its own header
+        (`a.c = 1` beside `[a]`) counts too, since TOML forbids defining that
+        table twice."""
+        new = [_unquote(p) for p in _split_key_path(key)]
+        for pair in pairs:
+            have = [_unquote(p) for p in _split_key_path(self.parser.node_text(pair.children[0]))]
+            n = min(len(have), len(new))
+            if have[:n] == new[:n]:
+                return True
+        parent = [_unquote(p) for p in _split_key_path(parent_target)] if parent_target else []
+        full = parent + new
+        stack = [root]
+        while stack:
+            node = stack.pop()
+            if node.type in ("table", "table_array_element") and node.named_children:
+                header = self.parser.node_text(node.named_children[0])
+                h = [_unquote(p) for p in _split_key_path(header)]
+                # Headers of the parent table and its ancestors do not count.
+                if len(h) > len(parent) and (h[: len(full)] == full or full[: len(h)] == h):
+                    return True
+            stack.extend(node.named_children)
+        return False
 
     def _add_key_toml(self, parent_target: str, key: str, value: str) -> str:
         root = self.parser.tree.root_node
@@ -486,6 +1008,11 @@ class Applier:
                 insert_line = 0
                 indent = ""
 
+        siblings = pairs if parent_target else top_pairs
+        if self._toml_key_taken(root, parent_target, siblings, key):
+            dotted = f"{parent_target}.{key}" if parent_target else key
+            raise self._duplicate_key(key, parent_target, dotted)
+
         new_line = f"{indent}{key} = {value}"
         self.lines = self.lines[:insert_line] + [new_line] + self.lines[insert_line:]
         return self._save()
@@ -494,7 +1021,14 @@ class Applier:
         """
         Add a new key-value pair inside a container:
           - JSON objects / YAML mappings / TOML tables (via dotted path to parent)
-          - Python module-level dict literals (parent_target is the variable name)
+          - Python dict literals (parent_target is the variable name, e.g.
+            'CONFIG', optionally followed by keys into nested dicts:
+            'CONFIG."db"')
+          - JS/TS object literals in module-level const/let/var declarations,
+            exported or not (parent_target is 'VarName', or a dotted path into
+            nested objects: 'CONFIG.server')
+        Raises ApplierError if the container already has the key (use
+        replace_value to change an existing value).
         """
         ext = self.parser.ext
         if ext == ".json":
@@ -505,6 +1039,8 @@ class Applier:
             return self._add_key_toml(parent_target, key, value)
         if ext == ".py":
             return self.add_dict_entry(parent_target, key, value)
+        if ext in _JS_EXTS:
+            return self._add_key_js(parent_target, key, value)
         raise ApplierError(f"add_key is not supported for {ext}")
 
     def _find_config_pair_by_path(self, dotted_path: str):
@@ -535,20 +1071,23 @@ class Applier:
           - Python module-level dict literals (target is 'DictName' + '.' + key-literal,
             e.g. 'CONFIG."foo"').
           - JS / TS module-level const/let/var object literals (target is
-            'VarName.keyName' or 'VarName."quoted-key"'). Handles both regular
-            `{ key: value }` pairs and shorthand `{ key }` properties, inside
-            `export const` too.
+            'VarName.keyName' or 'VarName."quoted-key"', or a longer path into
+            nested objects such as 'CONFIG.server.port'). Handles regular
+            `{ key: value }` pairs, shorthand `{ key }` properties and methods,
+            inside `export const` too.
+          - Python targets may also continue into nested dicts
+            ('CONFIG."db"."host"').
 
         For JSON and JS/TS, also removes the adjacent comma to keep the file valid.
         """
         ext = self.parser.ext
         if ext == ".py":
-            if "." not in target:
+            parts = _split_key_path(target)
+            if len(parts) < 2 or not all(parts):
                 raise ApplierError(
                     f"For Python dicts, target must be 'DictName.keyExpr' (e.g. 'CONFIG.\"foo\"'), got '{target}'"
                 )
-            dict_name, key_part = target.rsplit(".", 1)
-            return self.delete_dict_entry(dict_name, key_part)
+            return self.delete_dict_entry(".".join(parts[:-1]), parts[-1])
 
         if ext in (".js", ".jsx", ".mjs", ".cjs", ".ts", ".tsx"):
             return self._delete_key_js(target)
@@ -565,21 +1104,7 @@ class Applier:
         if ext == ".json":
             parent = pair.parent
             sibling_pairs = [c for c in parent.named_children if c.type == "pair"]
-            idx = sibling_pairs.index(pair)
-
-            source_bytes = self.parser.source_bytes
-            start = pair.start_byte
-            end = pair.end_byte
-
-            if idx > 0:
-                prev_pair = sibling_pairs[idx - 1]
-                start = prev_pair.end_byte
-            elif idx + 1 < len(sibling_pairs):
-                next_pair = sibling_pairs[idx + 1]
-                end = next_pair.start_byte
-
-            new_bytes = source_bytes[:start] + source_bytes[end:]
-            self._write_bytes(new_bytes)
+            self._delete_entry(parent, sibling_pairs, sibling_pairs.index(pair))
             return "Update successful"
 
         # YAML / TOML: remove the pair's line(s)
@@ -590,71 +1115,50 @@ class Applier:
 
     def _delete_key_js(self, target: str) -> str:
         """Delete a key from a JS/TS object literal assigned at module level.
-        Target format: 'VarName.keyName' or 'VarName."quoted-key"'."""
-        if "." not in target:
+        Target format: 'VarName.keyName' or 'VarName."quoted-key"', or a longer
+        path into nested object literals ('CONFIG.server.port')."""
+        parts = _split_key_path(target)
+        if len(parts) < 2 or not all(parts):
             raise ApplierError(
                 f"For JS/TS objects, target must be 'VarName.keyName' (e.g. 'CONFIG.port'), got '{target}'"
             )
-        var_name, key = target.rsplit(".", 1)
+        obj_node = self._resolve_js_object(parts[:-1])
+        key = parts[-1]
+        entries = self._js_entries(obj_node)
+        target_node = self._find_js_entry(obj_node, key)
+        if target_node is None:
+            raise ApplierError(f"Key '{key}' not found in {'.'.join(parts[:-1])}")
+        self._delete_entry(obj_node, entries, entries.index(target_node))
+        return "Update successful"
 
-        obj_node = self._find_js_object_literal(var_name)
-        if obj_node is None:
+    def _add_key_js(self, parent_target: str, key: str, value: str) -> str:
+        """Add `key: value` to a JS/TS object literal. parent_target is
+        'VarName' or a dotted path into nested objects ('CONFIG.server')."""
+        parts = _split_key_path(parent_target)
+        if not all(parts):
             raise ApplierError(
-                f"'{var_name}' not found as a module-level const/let/var assigned to an object literal"
+                "For JS/TS objects, parent_target must be the name of a module-level "
+                "const/let/var object literal, dotted for nested objects (e.g. "
+                f"'CONFIG' or 'CONFIG.server'), got '{parent_target}'"
             )
-
-        entries = [
-            c
-            for c in obj_node.named_children
-            if c.type in ("pair", "shorthand_property_identifier")
-        ]
-
-        key_stripped = key.strip()
-        # Normalize: strip matching quotes so 'port' matches 'port' and '"complex-key"' matches '"complex-key"'.
-        def _unquote(s: str) -> str:
-            if len(s) >= 2 and s[0] in "\"'`" and s[-1] in "\"'`":
-                return s[1:-1]
-            return s
-        target_unquoted = _unquote(key_stripped)
-
-        target_idx = None
-        for i, entry in enumerate(entries):
-            if entry.type == "shorthand_property_identifier":
-                if self.parser.node_text(entry) == key_stripped:
-                    target_idx = i
-                    break
-                continue
-            # pair node: check its key
-            key_node = entry.child_by_field_name("key")
-            if key_node is None and entry.named_children:
-                key_node = entry.named_children[0]
-            if key_node is None:
-                continue
-            k_text = self.parser.node_text(key_node).strip()
-            if k_text == key_stripped or _unquote(k_text) == target_unquoted:
-                target_idx = i
-                break
-
-        if target_idx is None:
-            raise ApplierError(f"Key '{key}' not found in {var_name}")
-
-        target_node = entries[target_idx]
-        source_bytes = self.parser.source_bytes
-        start = target_node.start_byte
-        end = target_node.end_byte
-
-        if target_idx > 0:
-            start = entries[target_idx - 1].end_byte
-        elif target_idx + 1 < len(entries):
-            end = entries[target_idx + 1].start_byte
-
-        new_bytes = source_bytes[:start] + source_bytes[end:]
-        self._write_bytes(new_bytes)
+        obj_node = self._resolve_js_object(parts)
+        key_text = self._js_key_source(key)
+        if self._find_js_entry(obj_node, key_text) is not None:
+            raise self._duplicate_key(key, parent_target, f"{parent_target}.{key_text}")
+        self._insert_entry(
+            obj_node,
+            self._js_entries(obj_node),
+            f"{key_text}: {value}",
+            expand_empty=False,
+            empty_trailing_comma=True,
+            default_unit="  ",
+        )
         return "Update successful"
 
     def _find_js_object_literal(self, var_name: str):
         """Find a module-level const/let/var assigned an object literal.
-        Handles plain declarations and ones nested inside `export` statements.
+        Handles plain declarations and ones nested inside `export` statements,
+        and TS wrappers such as `{ ... } as const` or `satisfies T`.
         Returns the `object` node or None."""
         def walk(parent):
             for child in parent.named_children:
@@ -678,6 +1182,7 @@ class Applier:
                                 if c.type == "object":
                                     value = c
                                     break
+                        value = self._unwrap_js_value(value)
                         if value is not None and value.type == "object":
                             return value
                 elif child.type == "export_statement":
@@ -686,6 +1191,109 @@ class Applier:
                         return result
             return None
         return walk(self.parser.tree.root_node)
+
+    def _unwrap_js_value(self, node):
+        """Look through parentheses and TS `as` / `satisfies` / `<T>` / `!`
+        wrappers around a value, e.g. to the object in `{ ... } as const`."""
+        while node is not None and node.type in (
+            "parenthesized_expression",
+            "as_expression",
+            "satisfies_expression",
+            "type_assertion",
+            "non_null_expression",
+        ):
+            inner = node.named_children
+            if not inner:
+                return None
+            # `<T>value` puts the type first; the others start with the value.
+            node = inner[-1] if node.type == "type_assertion" else inner[0]
+        return node
+
+    def _js_entries(self, obj_node) -> list:
+        """Entries of a JS/TS object literal (pairs, shorthand properties,
+        methods, spreads), without the comments between them."""
+        return [c for c in obj_node.named_children if "comment" not in c.type]
+
+    def _js_entry_name(self, entry) -> str | None:
+        """Property name an object-literal entry defines ('a' for a, "a" and
+        'a'; a computed key keeps its brackets), or None for a spread."""
+        if entry.type == "shorthand_property_identifier":
+            return self.parser.node_text(entry)
+        if entry.type == "pair":
+            key_node = entry.child_by_field_name("key")
+            if key_node is None and entry.named_children:
+                key_node = entry.named_children[0]
+        elif entry.type == "method_definition":
+            key_node = entry.child_by_field_name("name")
+        else:
+            return None
+        if key_node is None:
+            return None
+        return _unquote(self.parser.node_text(key_node).strip())
+
+    def _find_js_entry(self, obj_node, key: str):
+        """The entry of a JS/TS object literal that defines `key` (bare,
+        quoted, or a computed '[expr]' as written), or None."""
+        name = _unquote(key.strip())
+        for entry in self._js_entries(obj_node):
+            if self._js_entry_name(entry) == name:
+                return entry
+        return None
+
+    def _resolve_js_object(self, parts: list[str]):
+        """
+        Return the JS/TS object literal a key path names: parts[0] is a
+        module-level const/let/var (see _find_js_object_literal), and each
+        further part a key whose value is a nested object literal.
+        """
+        obj_node = self._find_js_object_literal(parts[0])
+        if obj_node is None:
+            raise ApplierError(
+                f"'{parts[0]}' not found as a module-level const/let/var assigned to an object literal"
+            )
+        for i in range(1, len(parts)):
+            entry = self._find_js_entry(obj_node, parts[i])
+            if entry is None:
+                raise ApplierError(f"Key '{parts[i]}' not found in {'.'.join(parts[:i])}")
+            value = None
+            if entry.type == "pair":
+                value = self._unwrap_js_value(entry.child_by_field_name("value"))
+            if value is None or value.type != "object":
+                raise ApplierError(f"'{'.'.join(parts[: i + 1])}' is not an object literal")
+            obj_node = value
+        return obj_node
+
+    def _js_key_source(self, key: str) -> str:
+        """
+        A key as written in a JS/TS object literal. Identifiers and plain
+        non-negative integers stay bare, a key already in quotes or a computed
+        '[expr]' key is used as given, and anything else is quoted with the
+        quote character most of the file's strings use.
+        """
+        key = key.strip()
+        if len(key) >= 2 and key[0] == key[-1] and key[0] in "\"'":
+            return key
+        if key.startswith("[") and key.endswith("]"):
+            return key
+        if len(key) >= 2 and key[0] == key[-1] == "`":
+            key = key[1:-1]  # template literals cannot be property names
+        if re.fullmatch(r"[A-Za-z_$][\w$]*|0|[1-9][0-9]*", key, re.ASCII):
+            return key
+
+        counts = {'"': 0, "'": 0}
+        stack = [self.parser.tree.root_node]
+        while stack:
+            node = stack.pop()
+            if node.type == "string":
+                quote = self.parser.node_text(node)[:1]
+                if quote in counts:
+                    counts[quote] += 1
+                continue
+            stack.extend(node.children)
+        if counts["'"] > counts['"']:
+            escaped = key.replace("\\", "\\\\").replace("'", "\\'")
+            return "'" + escaped.replace("\n", "\\n").replace("\r", "\\r") + "'"
+        return json.dumps(key, ensure_ascii=False)
 
     def _resolve_yaml_value(self, value_node):
         """Unwrap a YAML block_node/flow_node to get the underlying collection (block_sequence, flow_sequence, block_mapping, flow_mapping)."""
@@ -983,7 +1591,14 @@ class Applier:
         Replace only the signature of a function (everything before its body),
         preserving the body. The new_signature should include any trailing
         punctuation expected by the language (e.g. ':' for Python, '(' style
-        for JS/C/C++). Decorators are preserved.
+        for JS/C/C++). Indentation on the first line is ignored, so indented
+        and unindented signatures both work; continuation lines (parameters,
+        or the def after a decorator line) are re-based with the first line
+        when it is indented or when one of them is indented less than the
+        definition, and are otherwise taken as written.
+
+        Decorators (Python, JS/TS) and Java annotations are preserved when
+        new_signature has none; if it includes its own, those replace them.
         """
         node = self.parser.find_node_by_name(target)
         if not node:
@@ -1006,14 +1621,121 @@ class Applier:
                 break
             sig_end = child.end_byte
 
+        # The signature is spliced in at the definition's own column, so drop
+        # the caller's indentation from its first line (a copied
+        # "    def get(self):" used to come out doubly indented). Continuation
+        # lines keep their indentation relative to that first line when it
+        # was indented, or when one of them sits left of the definition (an
+        # unindented "@staticmethod\ndef b(x):"); otherwise they are taken
+        # as written, as read_symbol(depth="signature") returns them.
+        sig_lines = new_signature.replace("\r\n", "\n").split("\n")
+        while len(sig_lines) > 1 and not sig_lines[0].strip():
+            sig_lines.pop(0)
+        given_indent = self._get_indent(sig_lines[0])
+        file_indent = self._get_indent(self.lines[func_node.start_point[0]])
+        if given_indent or any(
+            line.strip() and len(self._get_indent(line)) < len(file_indent)
+            for line in sig_lines[1:]
+        ):
+            sig_lines = [sig_lines[0][len(given_indent) :]] + [
+                file_indent + line[len(given_indent) :]
+                if line.startswith(given_indent)
+                else line
+                for line in sig_lines[1:]
+            ]
+        new_signature = "\n".join(sig_lines).rstrip()
+
+        # Decorators and annotations stay unless new_signature brings its
+        # own, which then replace them. Python's and TS's sit outside
+        # func_node (TS's as siblings in the class body), so new ones widen
+        # the span back over them; Java annotations (in `modifiers`) and JS
+        # decorators are inside it, so keeping them narrows the span.
+        replace_from, kept = func_node.start_byte, ""
+        if node.type == "decorated_definition":
+            if new_signature.startswith("@"):
+                replace_from = node.start_byte
+        elif self._signature_has_annotations(new_signature):
+            prev = func_node.prev_named_sibling
+            while prev is not None and prev.type == "decorator":
+                replace_from = prev.start_byte
+                prev = prev.prev_named_sibling
+        else:
+            replace_from, kept = self._annotation_span(func_node)
+
         source_bytes = self.parser.source_bytes
         new_bytes = (
-            source_bytes[: func_node.start_byte]
-            + new_signature.encode("utf-8")
+            source_bytes[:replace_from]
+            + (kept + new_signature).encode("utf-8")
             + source_bytes[sig_end:]
         )
         self._write_bytes(new_bytes)
         return "Update successful"
+
+    def _signature_has_annotations(self, signature: str) -> bool:
+        """
+        Whether a Java signature has annotations among its modifiers, or a
+        JS/TS one its own decorators. The signature is parsed as a method of a
+        stub class, so annotations and decorators on parameters do not count.
+        """
+        ext = self.parser.ext
+        if ext != ".java" and ext not in _JS_EXTS:
+            return False
+        stub = f"class __Signature__ {{\n{signature}\n{{}}\n}}\n".encode("utf-8")
+        stack = [self.parser.parser.parse(stub).root_node]
+        while stack:
+            node = stack.pop()
+            if ext == ".java":
+                if node.type in (
+                    "method_declaration",
+                    "constructor_declaration",
+                    "compact_constructor_declaration",
+                ):
+                    mods = next((c for c in node.children if c.type == "modifiers"), None)
+                    return mods is not None and any(
+                        c.type in ("marker_annotation", "annotation") for c in mods.children
+                    )
+            elif node.type == "decorator":
+                # JS puts a method's decorators inside method_definition,
+                # TS beside it in the class body; either way before the
+                # parameters, which are skipped below.
+                return True
+            if node.type != "formal_parameters":
+                stack.extend(reversed(node.named_children))
+        # Not parseable as a method: go by its first character.
+        return signature.lstrip().startswith("@")
+
+    def _annotation_span(self, func_node) -> tuple[int, str]:
+        """
+        For replace_signature on Java and JS: the byte where the replaced span
+        starts, just after the definition's leading annotations or decorators
+        (and any comments among them), so they stay as written; and the text
+        of annotations that only follow other modifiers (`public @Deprecated
+        String f()`), which is put in front of the new signature.
+        """
+        ext = self.parser.ext
+        if ext == ".java":
+            mods = next((c for c in func_node.children if c.type == "modifiers"), None)
+            if mods is None:
+                return func_node.start_byte, ""
+            tokens = list(mods.children) + [
+                c for c in func_node.children if c.start_byte >= mods.end_byte
+            ]
+            kinds = ("marker_annotation", "annotation")
+        elif ext in _JS_EXTS:
+            tokens = list(func_node.children)
+            kinds = ("decorator",)
+        else:
+            return func_node.start_byte, ""
+        i = 0
+        while i < len(tokens) and (
+            tokens[i].type in kinds or (i > 0 and "comment" in tokens[i].type)
+        ):
+            i += 1
+        start = func_node.start_byte
+        if 0 < i < len(tokens):
+            start = tokens[i].start_byte
+        later = [t for t in tokens[i:] if t.type in kinds]
+        return start, "".join(self.parser.node_text(t) + " " for t in later)
 
     def list_symbols(self) -> str:
         """
@@ -1230,7 +1952,8 @@ class Applier:
         body_start, body_end = self._body_search_range(body_node)
         source_bytes = self.parser.source_bytes
         body_bytes = source_bytes[body_start:body_end]
-        old_bytes = old_snippet.encode("utf-8")
+        # Source text is LF internally, so a snippet copied with CRLF still matches.
+        old_bytes = old_snippet.replace("\r\n", "\n").encode("utf-8")
         if not old_bytes:
             raise ApplierError("Empty snippet cannot be matched")
 
@@ -1259,7 +1982,8 @@ class Applier:
         body_start, body_end = self._body_search_range(body_node)
         source_bytes = self.parser.source_bytes
         body_bytes = source_bytes[body_start:body_end]
-        anchor_bytes = anchor_snippet.encode("utf-8")
+        # Source text is LF internally, so an anchor copied with CRLF still matches.
+        anchor_bytes = anchor_snippet.replace("\r\n", "\n").encode("utf-8")
         if not anchor_bytes:
             raise ApplierError("Empty anchor cannot be matched")
 
@@ -1298,37 +2022,76 @@ class Applier:
                 start_byte -= 1
         return start_byte, end_byte
 
+    def _body_insert_point(self, target: str, at: str) -> tuple[int, str]:
+        """
+        Line index and indentation for inserting at the top or bottom of a
+        function body. The indentation comes from the body's own statements, not
+        from whichever line happens to be first or last, so a body that ends in a
+        nested block still gets the new lines at body level. In Python the new
+        lines go after a leading docstring so it stays the docstring; in Ruby a
+        bottom insert goes before any rescue/else/ensure clause. A body that
+        shares a line with its signature or braces has no line to insert on and
+        is refused.
+        """
+        func_node, body = self._get_function_body_node(target)
+        ext = self.parser.ext
+        stmts = list(body.named_children)
+        if len(stmts) == 1 and stmts[0].type == "statement_list":
+            # Go wraps a block's statements in a statement_list that ends on the `}` line
+            stmts = list(stmts[0].named_children)
+        sig_line = func_node.start_point[0]
+        braced = ext not in (".py", ".rb")
+        clause = None
+        if ext == ".rb":
+            clauses = [c for c in stmts if c.type in ("rescue", "else", "ensure")]
+            clause = clauses[0] if clauses else None
+            stmts = [c for c in stmts if c.type not in ("rescue", "else", "ensure")]
+        if braced:
+            compact = body.start_point[0] == body.end_point[0] or bool(
+                stmts
+                and (
+                    stmts[0].start_point[0] == body.start_point[0]
+                    or stmts[-1].end_point[0] == body.end_point[0]
+                )
+            )
+        else:
+            compact = bool(stmts) and stmts[0].start_point[0] == sig_line
+        if compact:
+            raise ApplierError(
+                f"The body of '{target}' shares a line with its signature or braces, so "
+                f"at='{at}' has no line of its own to insert on. Use replace_function_body "
+                f"to rewrite the body over several lines."
+            )
+        if stmts:
+            anchor = stmts[0] if at == "top" else stmts[-1]
+            indent = self._get_indent(self.lines[anchor.start_point[0]])
+        else:
+            unit = self._indent_unit({".py": "    ", ".go": "\t"}.get(ext, "  "))
+            indent = self._get_indent(self.lines[sig_line]) + unit
+        if at == "top":
+            if braced:
+                return body.start_point[0] + 1, indent
+            if ext == ".py" and stmts and self._is_docstring_node(stmts[0]):
+                return stmts[0].end_point[0] + 1, indent
+            return (stmts[0].start_point[0] if stmts else body.start_point[0]), indent
+        if braced:
+            return body.end_point[0], indent
+        if clause is not None:
+            return clause.start_point[0], indent
+        return (stmts[-1].end_point[0] + 1 if stmts else body.end_point[0] + 1), indent
+
+    @staticmethod
+    def _is_docstring_node(node) -> bool:
+        """True for a Python statement that is just a string literal (a docstring)."""
+        if node.type != "expression_statement" or node.named_child_count != 1:
+            return False
+        return node.named_children[0].type in ("string", "concatenated_string")
+
     def _prepend_to_body(self, target: str, content: str) -> str:
         """
         Insert content at the top of a function body, preserving existing statements.
         """
-        func_node, body = self._get_function_body_node(target)
-
-        if self.parser.ext == ".py":
-            # Python: body is a block. First statement determines the indent.
-            # Insert before body.start_point[0] (the first statement's line).
-            insert_line = body.start_point[0]
-            target_indent = (
-                self._get_indent(self.lines[insert_line])
-                if insert_line < len(self.lines)
-                else ""
-            )
-            if not target_indent:
-                sig_indent = self._get_indent(self.lines[func_node.start_point[0]])
-                target_indent = sig_indent + "    "
-        else:
-            # JS/TS/C/C++: body is `{...}`. Insert after the opening brace line.
-            insert_line = body.start_point[0] + 1
-            target_indent = ""
-            for i in range(insert_line, min(len(self.lines), body.end_point[0])):
-                stripped = self.lines[i].strip()
-                if stripped and stripped not in ("{", "}"):
-                    target_indent = self._get_indent(self.lines[i])
-                    break
-            if not target_indent:
-                sig_indent = self._get_indent(self.lines[func_node.start_point[0]])
-                target_indent = sig_indent + "  "
-
+        insert_line, target_indent = self._body_insert_point(target, "top")
         content_lines = self._reindent(content.splitlines(), target_indent)
         self.lines = self.lines[:insert_line] + content_lines + self.lines[insert_line:]
         return self._save()
@@ -1337,36 +2100,7 @@ class Applier:
         """
         Insert content at the bottom of a function body, preserving existing statements.
         """
-        func_node, body = self._get_function_body_node(target)
-
-        if self.parser.ext == ".py":
-            # Python: body is a block. Last statement's end_point gives the last line of body.
-            insert_line = body.end_point[0] + 1
-            # Infer indent from the last non-blank line of the body
-            target_indent = ""
-            for i in range(body.end_point[0], body.start_point[0] - 1, -1):
-                if 0 <= i < len(self.lines) and self.lines[i].strip():
-                    target_indent = self._get_indent(self.lines[i])
-                    break
-            if not target_indent:
-                sig_indent = self._get_indent(self.lines[func_node.start_point[0]])
-                target_indent = sig_indent + "    "
-        else:
-            # JS/TS/C/C++: body is `{...}`. Insert before the closing brace line.
-            insert_line = body.end_point[0]
-            target_indent = ""
-            for i in range(insert_line - 1, body.start_point[0], -1):
-                if (
-                    0 <= i < len(self.lines)
-                    and self.lines[i].strip()
-                    and self.lines[i].strip() not in ("{", "}")
-                ):
-                    target_indent = self._get_indent(self.lines[i])
-                    break
-            if not target_indent:
-                sig_indent = self._get_indent(self.lines[func_node.start_point[0]])
-                target_indent = sig_indent + "  "
-
+        insert_line, target_indent = self._body_insert_point(target, "bottom")
         content_lines = self._reindent(content.splitlines(), target_indent)
         self.lines = self.lines[:insert_line] + content_lines + self.lines[insert_line:]
         return self._save()
@@ -1475,72 +2209,88 @@ class Applier:
             )
         return value
 
+    def _find_python_pair(self, dict_node, key: str):
+        """The pair of a Python dict literal whose key is `key` (a key
+        expression such as '"foo"'; literals compare by value, so 'foo' in
+        either quote style matches), or None."""
+        for pair in dict_node.named_children:
+            if pair.type != "pair":
+                continue
+            key_node = pair.child_by_field_name("key")
+            if key_node is None and pair.named_children:
+                key_node = pair.named_children[0]
+            if key_node is not None and _python_keys_equal(self.parser.node_text(key_node), key):
+                return pair
+        return None
+
+    def _find_python_dict(self, target: str):
+        """
+        Resolve a Python dict target to its dictionary node: the name of a
+        module-level (or class-level, 'Settings.DEFAULTS') assignment,
+        optionally followed by keys into nested dict literals
+        ('CONFIG."db"').
+        """
+        parts = _split_key_path(target)
+        if not all(parts):
+            raise ApplierError(f"Invalid dict target '{target}'")
+        # The longest prefix that names an assignment is the variable; the
+        # rest are keys.
+        n = len(parts)
+        while n > 1:
+            node = self.parser.find_node_by_name(".".join(parts[:n]))
+            if node is not None and node.type == "expression_statement":
+                break
+            n -= 1
+        dict_node = self._find_python_literal(".".join(parts[:n]), "dictionary")
+        for i in range(n, len(parts)):
+            pair = self._find_python_pair(dict_node, parts[i])
+            if pair is None:
+                raise ApplierError(f"Key {parts[i]} not found in dict '{'.'.join(parts[:i])}'")
+            value = pair.child_by_field_name("value")
+            if value is None or value.type != "dictionary":
+                raise ApplierError(f"'{'.'.join(parts[: i + 1])}' is not a dict literal")
+            dict_node = value
+        return dict_node
+
     def add_dict_entry(self, target: str, key: str, value: str) -> str:
         """
-        Add a new key-value pair to a Python dictionary literal at a module-level assignment.
-        key and value should be literal source expressions (e.g. key='"foo"', value='42').
+        Add a new key-value pair to a Python dictionary literal at a module-level
+        assignment (target may continue into nested dicts, see _find_python_dict).
+        key and value should be literal source expressions (e.g. key='"foo"',
+        value='42'). Raises ApplierError if the dict already has the key.
         """
-        dict_node = self._find_python_literal(target, "dictionary")
-        pairs = [c for c in dict_node.named_children if c.type == "pair"]
-
-        source_bytes = self.parser.source_bytes
-        if pairs:
-            last_pair = pairs[-1]
-            indent = self._get_indent(self.lines[last_pair.start_point[0]])
-            insertion = f",\n{indent}{key}: {value}"
-            insert_byte = last_pair.end_byte
-        else:
-            close_line = dict_node.end_point[0]
-            close_indent = (
-                self._get_indent(self.lines[close_line])
-                if close_line < len(self.lines)
-                else ""
-            )
-            inner_indent = close_indent + "    "
-            insertion = f"\n{inner_indent}{key}: {value},\n{close_indent}"
-            insert_byte = dict_node.start_byte + 1  # after `{`
-
-        new_bytes = (
-            source_bytes[:insert_byte]
-            + insertion.encode("utf-8")
-            + source_bytes[insert_byte:]
+        dict_node = self._find_python_dict(target)
+        key = key.strip()
+        if self._find_python_pair(dict_node, key) is not None:
+            raise self._duplicate_key(key, target, f"{target}.{key}")
+        entries = [
+            c for c in dict_node.named_children if c.type in ("pair", "dictionary_splat")
+        ]
+        self._insert_entry(
+            dict_node,
+            entries,
+            f"{key}: {value}",
+            expand_empty=True,
+            empty_trailing_comma=True,
+            default_unit="    ",
         )
-        self._write_bytes(new_bytes)
         return "Update successful"
 
     def delete_dict_entry(self, target: str, key: str) -> str:
         """
-        Delete a key-value pair from a Python dictionary literal. key should be the
-        literal source expression of the key as it appears in source (e.g. '"foo"').
+        Delete a key-value pair from a Python dictionary literal (target may
+        continue into nested dicts, see _find_python_dict). key should be the
+        literal source expression of the key (e.g. '"foo"'); literal keys also
+        match when written with the other quote style.
         """
-        dict_node = self._find_python_literal(target, "dictionary")
-        pairs = [c for c in dict_node.named_children if c.type == "pair"]
-
-        stripped_key = key.strip()
-        idx = None
-        for i, pair in enumerate(pairs):
-            key_node = pair.child_by_field_name("key")
-            if key_node is None and pair.named_children:
-                key_node = pair.named_children[0]
-            if (
-                key_node is not None
-                and self.parser.node_text(key_node).strip() == stripped_key
-            ):
-                idx = i
-                break
-        if idx is None:
+        dict_node = self._find_python_dict(target)
+        pair = self._find_python_pair(dict_node, key)
+        if pair is None:
             raise ApplierError(f"Key {key} not found in dict '{target}'")
-
-        source_bytes = self.parser.source_bytes
-        start = pairs[idx].start_byte
-        end = pairs[idx].end_byte
-        if idx > 0:
-            start = pairs[idx - 1].end_byte
-        elif idx + 1 < len(pairs):
-            end = pairs[idx + 1].start_byte
-
-        new_bytes = source_bytes[:start] + source_bytes[end:]
-        self._write_bytes(new_bytes)
+        entries = [
+            c for c in dict_node.named_children if c.type in ("pair", "dictionary_splat")
+        ]
+        self._delete_entry(dict_node, entries, entries.index(pair))
         return "Update successful"
 
     def append_to_list(self, target: str, value: str) -> str:
@@ -1873,10 +2623,15 @@ class Applier:
 
     def add_parameter(self, target: str, parameter: str, position: str = "end") -> str:
         """
-        Add a parameter to a function signature. position may be 'end' (default) or
-        'start'. parameter should be the literal source text of the new parameter
-        (e.g. 'default=None' or 'const int* buf').
+        Add a parameter to a function signature. position must be 'end' (default)
+        or 'start'; anything else raises ApplierError. parameter should be the
+        literal source text of the new parameter (e.g. 'default=None' or
+        'const int* buf').
         """
+        if position not in ("start", "end"):
+            raise ApplierError(
+                f"add_parameter: position must be 'start' or 'end', got '{position}'"
+            )
         params = self._find_parameter_list(target)
         existing = [c for c in params.named_children]
 
@@ -1955,16 +2710,34 @@ class Applier:
         """
         Insert comment line(s) immediately before a named symbol. The comment must
         include its own comment marker (e.g. '# foo' for Python/YAML/TOML, '// foo'
-        for JS/C/C++). Existing content is shifted down.
+        for JS/C/C++). Existing content is shifted down. Raises ApplierError if
+        the symbol already has a leading comment, which the new lines would
+        merge into.
         """
         if not self._comment_prefixes():
-            raise ApplierError(f"add_comment_before not supported for {self.parser.ext}")
+            raise ApplierError(
+                f"edit_leading_comment is not supported for {self.parser.ext} files"
+            )
 
         node = self._find_symbol_for_comment(target)
         if not node:
             raise ApplierError(f"Target '{target}' not found in {self.filepath}")
 
         insert_line = node.start_point[0]
+        existing = self._find_leading_comment_range(insert_line)
+        if existing is not None:
+            first, stop = existing
+            where = f"line {first + 1}" if stop - first == 1 else f"lines {first + 1}-{stop}"
+            # Show the lines: they may be tool directives
+            # (// eslint-disable-next-line, //go:noinline) that a replace
+            # must carry over.
+            text = "\n".join(line.strip() for line in self.lines[first:stop])
+            raise ApplierError(
+                f"'{target}' already has a leading comment ({where}):\n{text}\n"
+                "Use op='replace' with a comment block that includes any of these "
+                "lines you want to keep (e.g. lint or compiler directives), or "
+                "op='remove' first"
+            )
         target_indent = self._get_indent(self.lines[insert_line]) if insert_line < len(self.lines) else ""
         comment_lines = self._reindent(comment.splitlines(), target_indent)
         self.lines = self.lines[:insert_line] + comment_lines + self.lines[insert_line:]
@@ -1977,7 +2750,9 @@ class Applier:
         the first blank line or non-comment code line.
         """
         if not self._comment_prefixes():
-            raise ApplierError(f"remove_leading_comment not supported for {self.parser.ext}")
+            raise ApplierError(
+                f"edit_leading_comment is not supported for {self.parser.ext} files"
+            )
 
         node = self._find_symbol_for_comment(target)
         if not node:
@@ -1999,7 +2774,9 @@ class Applier:
         If no leading comment exists, inserts new_comment.
         """
         if not self._comment_prefixes():
-            raise ApplierError(f"replace_leading_comment not supported for {self.parser.ext}")
+            raise ApplierError(
+                f"edit_leading_comment is not supported for {self.parser.ext} files"
+            )
 
         node = self._find_symbol_for_comment(target)
         if not node:
@@ -2026,9 +2803,10 @@ class Applier:
         """
         Unified entry point for editing the contiguous leading-comment block
         above a named symbol. Dispatches by op:
-          - "add"     -> add_comment_before(target, comment)
-          - "replace" -> replace_leading_comment(target, comment)
-          - "remove"  -> remove_leading_comment(target)
+          - "add"     -> _add_comment_before(target, comment); refused if the
+                         symbol already has a leading comment
+          - "replace" -> _replace_leading_comment(target, comment)
+          - "remove"  -> _remove_leading_comment(target)
         For "add" and "replace", `comment` must be a non-empty string including
         the language's comment marker (e.g. "# foo", "// bar", "/** ... */").
         For "remove", `comment` is ignored.
@@ -2204,7 +2982,7 @@ class Applier:
 
         ext = self.parser.ext
         if ext in (".json", ".yml", ".yaml", ".toml"):
-            raise ApplierError(f"read_interface is not supported for {ext}")
+            raise ApplierError(f"read_symbol(depth='interface') is not supported for {ext}")
 
         func_types = self._interface_func_types()
 
@@ -2438,7 +3216,9 @@ class Applier:
         None if no leading comment exists. Handles:
           - Line comments: `#` (Python/YAML/TOML), `//` (JS/TS/C/C++)
           - C-style block comments: /* ... */ (single-line and multi-line)
-        Stops at the first blank line or non-comment code line.
+        Stops at the first blank line or non-comment code line; a line with
+        code before or between block comments (`int x = 1; /* n */`) counts
+        as code.
         """
         prefixes = self._comment_prefixes()
         if not prefixes:
@@ -2447,6 +3227,7 @@ class Applier:
         supports_block = self._supports_block_comments()
         i = start_line - 1
         in_block = False
+        block_end = i  # line of the `*/` that opened in_block
 
         while i >= 0:
             line = self.lines[i]
@@ -2457,6 +3238,11 @@ class Applier:
                 if "/*" in stripped:
                     # Reached the start of the block
                     in_block = False
+                    if not stripped.startswith("/*"):
+                        # `code; /* ...` -- the block trails code, so it is
+                        # not part of the leading comment.
+                        i = block_end
+                        break
                 i -= 1
                 continue
 
@@ -2471,19 +3257,31 @@ class Applier:
 
             # C-style block comment handling
             if supports_block:
-                # Pure single-line block comment: /* ... */
-                if stripped.startswith("/*") and stripped.endswith("*/"):
+                # Pure single-line block comment: /* ... */ (but not
+                # `/* a */ code(); /* b */`, whose first `*/` comes earlier)
+                if (
+                    stripped.startswith("/*")
+                    and stripped.endswith("*/")
+                    and stripped.find("*/", 2) == len(stripped) - 2
+                ):
                     i -= 1
                     continue
-                # End of a multi-line block comment
                 if stripped.endswith("*/"):
+                    if "/*" in stripped:
+                        # Code followed by a /* ... */ on the same line
+                        break
+                    # End of a multi-line block comment
                     in_block = True
+                    block_end = i
                     i -= 1
                     continue
 
             # Not a comment line -- stop
             break
 
+        if in_block:
+            # No `/*` above the `*/` (e.g. a JS regex /a*/): not a comment.
+            i = block_end
         first_comment_line = i + 1
         if first_comment_line >= start_line:
             return None
@@ -2491,12 +3289,25 @@ class Applier:
 
     def _find_symbol_for_comment(self, target: str):
         """
-        Resolve a comment target like find_node_by_name, but with a TOML-specific
+        Resolve a comment target like find_node_by_name, but anchored on the
+        whole key-value pair for YAML/TOML keys, and with a TOML-specific
         fallback: if the target doesn't match a pair, try matching a [table] header.
         Comment tools operate on positional anchors, so tables are valid targets.
         """
         node = self.parser.find_node_by_name(target)
         if node is not None:
+            # Config lookups return the value, but the comment belongs above
+            # its key: a YAML mapping value starts on the line after `key:`.
+            if self.parser.ext in (".yml", ".yaml", ".toml"):
+                pair = node
+                while pair is not None and pair.type not in (
+                    "block_mapping_pair",
+                    "flow_pair",
+                    "pair",
+                ):
+                    pair = pair.parent
+                if pair is not None:
+                    node = pair
             return node
 
         if self.parser.ext == ".toml" and "." not in target:

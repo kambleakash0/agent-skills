@@ -37,15 +37,20 @@ _INSTRUCTIONS = (
     "replace_cell_source (it keeps the chunk language, label, and options), not add_cell. "
     "Edit chunk options with set_chunk_option and remove_chunk_option, using key=\"label\" "
     "for the chunk label; these tools reject markdown cells. Edit the YAML header with "
-    "set_frontmatter_key and remove_frontmatter_key (values are parsed as YAML). Adjacent "
-    "markdown cells merge on save, so put new prose between chunks or append to an "
-    "existing markdown cell. execute_cell and execute_all_cells lazily start one Jupyter "
-    "kernel per file, chosen from the language of the first chunk run (r uses ir, python "
-    "uses python3, julia uses julia-1); that kernel must be installed. The kernel runs "
+    "set_frontmatter_key and remove_frontmatter_key: values are parsed as YAML, and only "
+    "that key's lines change, so comments, quoting, and R tags such as !r elsewhere in the "
+    "header are kept. Adjacent markdown cells merge on save, so put new prose between "
+    "chunks or append to an existing markdown cell. execute_cell and execute_all_cells "
+    "lazily start one Jupyter kernel per file, chosen from the language of the first "
+    "chunk run (r uses ir, python "
+    "uses python3, julia uses the installed IJulia kernelspec: julia, julia-1, or the "
+    "newest julia-X.Y); that kernel must be installed. The kernel runs "
     "in the .rmd file's folder, so relative paths in chunks resolve there. State "
     "persists across calls: use interrupt_kernel to stop a runaway chunk, restart_kernel "
-    "for a clean namespace, and shutdown_kernel to free resources. Outputs are returned "
-    "inline and never written to the .rmd file."
+    "for a clean namespace, and shutdown_kernel to free resources. A chunk that runs "
+    "past its timeout is interrupted with the kernel's state kept; if the error says "
+    "the kernel is still busy, use restart_kernel. Outputs are returned "
+    "inline (errors with their traceback) and never written to the .rmd file."
 )
 
 
@@ -91,11 +96,17 @@ def _err(e: Exception) -> str:
 @mcp.tool(annotations=_DESTRUCTIVE)
 def create_rmd(
     file_path: Annotated[str, Field(description="Absolute path for the new .rmd file; its parent directory must already exist.")],
-    title: Annotated[str, Field(description="Document title for the YAML frontmatter; an empty string omits the title key.")] = "",
-    author: Annotated[str, Field(description="Author for the YAML frontmatter; an empty string omits the author key.")] = "",
+    title: Annotated[
+        str,
+        Field(description="Document title for the YAML frontmatter, written as a quoted YAML string so any characters are safe; an empty string omits the title key."),
+    ] = "",
+    author: Annotated[
+        str,
+        Field(description="Author for the YAML frontmatter, written as a quoted YAML string so any characters are safe; an empty string omits the author key."),
+    ] = "",
     output_format: Annotated[
         str,
-        Field(description="rmarkdown output format for the output key, e.g. html_document, pdf_document, word_document, or github_document."),
+        Field(description="rmarkdown output format for the output key, e.g. html_document, pdf_document, word_document, or github_document; an empty string omits the output key."),
     ] = "html_document",
     overwrite: Annotated[bool, Field(description="Replace an existing file at file_path; when false, an existing file is an error.")] = False,
 ) -> str:
@@ -109,8 +120,10 @@ def create_rmd(
             Other common values: pdf_document, word_document, github_document.
         overwrite: If True, overwrite an existing file. Defaults to False.
 
-    Refuses to overwrite unless overwrite=True. Fails if the parent directory
-    does not exist.
+    Title and author are written as escaped, double-quoted YAML strings, so
+    quotes, backslashes, and newlines in them are safe. An empty title, author,
+    or output_format leaves that key out. Refuses to overwrite unless
+    overwrite=True. Fails if the parent directory does not exist.
     """
     try:
         logger.info("create_rmd: path=%s", file_path)
@@ -388,6 +401,10 @@ def remove_chunk_option(
 def get_frontmatter(file_path: FilePath) -> str:
     """Return the YAML frontmatter as a formatted YAML string.
 
+    R Markdown tags such as !r and !expr are shown as tags. A header that is not
+    valid YAML is returned as its raw text, after a note saying why it could not
+    be parsed.
+
     Args:
         file_path: Absolute path to a .rmd file.
     """
@@ -400,20 +417,29 @@ def get_frontmatter(file_path: FilePath) -> str:
 @mcp.tool(annotations=_DESTRUCTIVE)
 def set_frontmatter_key(
     file_path: FilePath,
-    key: Annotated[str, Field(description="Top-level YAML frontmatter key such as title, author, date, or output.")],
+    key: Annotated[
+        str,
+        Field(description="Top-level YAML frontmatter key such as title, author, date, or output; a new key is added at the end of the header."),
+    ],
     value: Annotated[
         str,
-        Field(description='Value parsed as YAML when possible ("true" becomes a bool, "42" an int); quote it to keep it a string.'),
+        Field(description='Value parsed as YAML when possible ("true" becomes a bool, "42" an int); quote it to keep it a string. A one-line value is written as given when that means the same, keeping its quotes and tags such as !r; nested values may span several lines.'),
     ],
 ) -> str:
     """Set or overwrite one top-level YAML frontmatter key. Value is parsed as YAML when possible.
+
+    Only that key's lines change (the key line and its indented lines): comments,
+    quoting, tags such as !r, and key order elsewhere in the header are kept. A
+    new key goes just before the closing ---; a document without a header gets
+    one. A header that is not valid YAML is still edited line by line.
 
     Args:
         file_path: Absolute path to a .rmd file.
         key: Top-level YAML key (e.g. title, author, output).
         value: Value as a string; parsed as YAML where possible (so "true" becomes
             bool, "42" becomes int). Quote strings that look like numbers to keep
-            them as strings.
+            them as strings. When the value means the same written as given, it
+            is written that way, so "!r Sys.Date()" stays an R tag.
     """
     try:
         return RmdManager(file_path).set_frontmatter_key(key, value)
@@ -427,6 +453,9 @@ def remove_frontmatter_key(
     key: Annotated[str, Field(description="Top-level YAML frontmatter key to remove; it must exist.")],
 ) -> str:
     """Remove one top-level YAML frontmatter key.
+
+    Removes the key line and its indented lines; the rest of the header is kept
+    byte for byte.
 
     Args:
         file_path: Absolute path to a .rmd file.
@@ -471,15 +500,19 @@ def execute_cell(
     index: ChunkIndex,
     timeout: Annotated[
         float,
-        Field(description="Seconds to wait for the chunk to finish before returning a timeout error; the chunk keeps running (use interrupt_kernel to stop it)."),
+        Field(gt=0, description="Seconds the chunk may run (must be positive); a chunk still running then is interrupted and a timeout error is returned, with the kernel's state kept."),
     ] = 60.0,
 ) -> str:
     """Execute one code chunk via a Jupyter kernel and return the captured outputs INLINE. Outputs are NOT written to the .rmd file.
 
+    A chunk that runs past `timeout` is interrupted (as interrupt_kernel does) so
+    the kernel is free for the next call. Concurrent executions on one file run
+    one at a time. An error output includes the kernel's traceback.
+
     Args:
         file_path: Absolute path to a .rmd file.
         index: Zero-based index of a CODE cell.
-        timeout: Seconds to wait for execution; default 60.
+        timeout: Seconds the chunk may run before it is interrupted; default 60.
     """
     try:
         return RmdManager(file_path).execute_cell(index, timeout=timeout)
@@ -490,7 +523,7 @@ def execute_cell(
 @mcp.tool(annotations=_RUNS_CODE)
 def execute_all_cells(
     file_path: FilePath,
-    timeout: Annotated[float, Field(description="Seconds to wait for each chunk; a timeout aborts the run with an error.")] = 60.0,
+    timeout: Annotated[float, Field(gt=0, description="Seconds each chunk may run (must be positive); a chunk still running then is interrupted and the run stops with an error.")] = 60.0,
     stop_on_error: Annotated[
         bool,
         Field(description="Stop after the first chunk that produces an error output; when false, every chunk runs."),
@@ -500,7 +533,7 @@ def execute_all_cells(
 
     Args:
         file_path: Absolute path to a .rmd file.
-        timeout: Per-cell timeout in seconds; default 60.
+        timeout: Per-cell timeout in seconds, after which the cell is interrupted; default 60.
         stop_on_error: If True, stop at the first cell that errors. Default True.
     """
     try:
@@ -523,6 +556,10 @@ def get_kernel_state(file_path: KernelFilePath) -> str:
 def restart_kernel(file_path: KernelFilePath) -> str:
     """Restart the kernel; in-memory state is lost.
 
+    A chunk that is running is not waited for: the kernel is killed, and that
+    execute call fails with "Kernel died during execution". Execute calls waiting
+    behind it run afterwards, on the restarted kernel.
+
     Args:
         file_path: Absolute path to a .rmd file.
     """
@@ -537,6 +574,10 @@ def restart_kernel(file_path: KernelFilePath) -> str:
 def interrupt_kernel(file_path: KernelFilePath) -> str:
     """Send an interrupt signal to stop a long-running cell.
 
+    Acts at once, even while an execute call is waiting on that cell. If the
+    kernel process has died (get_kernel_state reports 'dead'), returns an error
+    saying the kernel is not running; the next execute_cell starts a new one.
+
     Args:
         file_path: Absolute path to a .rmd file.
     """
@@ -550,6 +591,10 @@ def interrupt_kernel(file_path: KernelFilePath) -> str:
 @mcp.tool(annotations=_DESTRUCTIVE)
 def shutdown_kernel(file_path: KernelFilePath) -> str:
     """Shut down the kernel and release its resources.
+
+    A chunk that is running is not waited for: the kernel is killed, and that
+    execute call fails with "Kernel died during execution"; execute calls waiting
+    behind it fail with "Kernel was shut down".
 
     Args:
         file_path: Absolute path to a .rmd file.

@@ -3,21 +3,31 @@ Test suite for rmd-editor MCP server.
 
 Uses programmatic fixtures — no static files. Actual R kernel execution is not
 exercised (IRkernel isn't guaranteed to be installed), but kernel_name mapping
-is verified.
+is verified. Every file the tests write lives in a temporary directory that
+__main__ creates and always removes, so a crash can't leave files behind in tests/.
 """
 from __future__ import annotations
 
+import contextlib
+import io
+import json
+import logging
 import os
 import queue
+import shutil
 import sys
+import tempfile
+import threading
+import time
 
 sys.path.insert(0, os.path.abspath(os.path.join(os.path.dirname(__file__), '..')))
 
 from rmd_editor.manager import RmdManager, RmdManagerError, create_rmd, _language_to_kernel_name
 from rmd_editor.parser import parse, serialize
 
-TESTS_DIR = os.path.dirname(__file__)
-FIXTURE_PATH = os.path.join(TESTS_DIR, "test_fixture.rmd")
+# Scratch directory for every file the tests write; set in __main__ via tempfile.mkdtemp()
+WORK_DIR = None
+FIXTURE_PATH = None
 
 PASS = 0
 FAIL = 0
@@ -37,6 +47,97 @@ def check(label: str, result, expected) -> None:
         print(f"     Expected: {expected!r}")
         print(f"     Got:      {result!r}")
         FAIL += 1
+
+@contextlib.contextmanager
+def captured_logs(*names: str):
+    """
+    Send every log record to a buffer instead of stderr while the block runs, with
+    the named loggers (some are quieted in __main__) at their default level.
+    Yields the buffer; each record is formatted as "LEVEL logger: message".
+    """
+    buf = io.StringIO()
+    handler = logging.StreamHandler(buf)
+    handler.setFormatter(logging.Formatter("%(levelname)s %(name)s: %(message)s"))
+    root = logging.getLogger()
+    saved_handlers, saved_level = root.handlers[:], root.level
+    loggers = [logging.getLogger(name) for name in names]
+    saved_levels = [lg.level for lg in loggers]
+    root.handlers = [handler]
+    root.setLevel(logging.INFO)
+    for lg in loggers:
+        lg.setLevel(logging.NOTSET)
+    try:
+        yield buf
+    finally:
+        root.handlers = saved_handlers
+        root.setLevel(saved_level)
+        for lg, level in zip(loggers, saved_levels):
+            lg.setLevel(level)
+
+
+def wait_until(predicate, timeout: float = 10.0) -> bool:
+    """Poll predicate() until it is true or timeout seconds pass; returns its last value."""
+    deadline = time.time() + timeout
+    while not predicate():
+        if time.time() > deadline:
+            return False
+        time.sleep(0.02)
+    return True
+
+
+def in_thread(fn, *args, **kwargs):
+    """Run fn in a new thread; returns (thread, result) where result gets 'value' or 'error'."""
+    result: dict = {}
+
+    def target():
+        try:
+            result["value"] = fn(*args, **kwargs)
+        except Exception as e:
+            result["error"] = e
+
+    thread = threading.Thread(target=target, daemon=True)
+    thread.start()
+    return thread, result
+
+def check_same(label: str, got: str, want: str) -> None:
+    """Exact text comparison (check() only tests substrings); prints a line diff when they differ."""
+    check(label, got == want, True)
+    if got != want:
+        import difflib
+        for line in difflib.unified_diff(want.splitlines(True), got.splitlines(True), "expected", "got"):
+            print(f"     {line.rstrip(chr(10))}")
+
+
+def write_doc(name: str, text: str) -> str:
+    """Write text to WORK_DIR/name and return the path."""
+    path = os.path.join(WORK_DIR, name)
+    with open(path, "w", encoding="utf-8") as f:
+        f.write(text)
+    return path
+
+
+def read_doc(path: str) -> str:
+    with open(path, encoding="utf-8") as f:
+        return f.read()
+
+
+@contextlib.contextmanager
+def env_vars(**values):
+    """Set environment variables for the block (None unsets one), then restore them."""
+    saved = {name: os.environ.get(name) for name in values}
+
+    def apply(settings):
+        for name, value in settings.items():
+            if value is None:
+                os.environ.pop(name, None)
+            else:
+                os.environ[name] = value
+
+    apply(values)
+    try:
+        yield
+    finally:
+        apply(saved)
 
 
 SAMPLE = """---
@@ -138,6 +239,78 @@ def test_parser_complex_options():
     out = serialize(fm, cells)
     check("complex: round-trip", out, src)
 
+def test_no_trailing_newline():
+    print("\n═══ documents without a trailing newline ═══")
+
+    def cells_of(path):
+        return [(c.cell_type, c.source) for c in RmdManager(path).cells]
+
+    # Untouched documents still round-trip byte for byte
+    for text in ("# Intro\n\n```{r}\nx <- 1\n```", "```{r}\nx\n```\n\nlast prose", "---\ntitle: x\n---", "---\ntitle: x\n---\nprose"):
+        fm, cells = parse(text)
+        check(f"no newline: untouched {text!r} round-trips", serialize(fm, cells) == text, True)
+
+    # move_cell: the newline-less last chunk moves to the front
+    path = write_doc("no_newline.rmd", "# Intro\n\n```{r}\nx <- 1\n```")
+    RmdManager(path).move_cell(1, 0)
+    check_same("no newline: move last to first keeps the fence on its own line", read_doc(path), "```{r}\nx <- 1\n```\n# Intro\n\n")
+    check("no newline: move last to first reparses", cells_of(path), [("code", "x <- 1"), ("markdown", "# Intro\n\n")])
+    # move_cell: another cell moves past newline-less prose
+    path = write_doc("no_newline.rmd", "```{r}\na\n```\n\ntail")
+    RmdManager(path).move_cell(0, -1)
+    check("no newline: move first to last reparses", cells_of(path), [("markdown", "\ntail\n"), ("code", "a")])
+
+    # add_cell(-1) after a newline-less chunk, prose, or header
+    path = write_doc("no_newline.rmd", "```{r}\nx\n```")
+    RmdManager(path).add_cell(-1, "y")
+    check_same("no newline: add after last chunk", read_doc(path), "```{r}\nx\n```\n```{r}\ny\n```\n")
+    check("no newline: add after last chunk reparses", cells_of(path), [("code", "x"), ("code", "y")])
+    path = write_doc("no_newline.rmd", "```{r}\nx\n```\n\nlast prose")
+    RmdManager(path).add_cell(-1, "y")
+    check("no newline: add after last prose reparses", cells_of(path), [("code", "x"), ("markdown", "\nlast prose\n"), ("code", "y")])
+    path = write_doc("no_newline.rmd", "```{r}\nx\n```")
+    RmdManager(path).add_cell(-1, "More prose", cell_type="markdown")
+    check("no newline: markdown added after last chunk reparses", cells_of(path), [("code", "x"), ("markdown", "More prose\n")])
+    path = write_doc("no_newline.rmd", "---\ntitle: x\n---")
+    RmdManager(path).add_cell(-1, "y")
+    check_same("no newline: add after a header at end of file", read_doc(path), "---\ntitle: x\n---\n```{r}\ny\n```\n")
+    mgr = RmdManager(path)
+    check("no newline: header kept after add", (mgr.frontmatter.data, cells_of(path)), ({"title": "x"}, [("code", "y")]))
+
+    # split_cell / merge_cells next to a newline-less last cell
+    path = write_doc("no_newline.rmd", "```{r}\na\nb\n```\n```{r}\nc\n```")
+    RmdManager(path).split_cell(0, 1)
+    check("no newline: split before the last cell reparses", cells_of(path), [("code", "a"), ("code", "b"), ("code", "c")])
+    check("no newline: untouched last cell keeps its missing newline", read_doc(path).endswith("```{r}\nc\n```"), True)
+    path = write_doc("no_newline.rmd", "```{r}\na\nb\n```")
+    RmdManager(path).split_cell(0, 1)
+    check("no newline: split of the last cell reparses", cells_of(path), [("code", "a"), ("code", "b")])
+    path = write_doc("no_newline.rmd", "```{r}\na\n```\n```{r}\nb\n```")
+    RmdManager(path).merge_cells(0, 1)
+    check("no newline: merge into the last cell reparses", cells_of(path), [("code", "a\nb")])
+    path = write_doc("no_newline.rmd", "```{r}\na\n```\n```{r}\nb\n```\ntail")
+    RmdManager(path).merge_cells(0, 1)
+    check_same("no newline: merge before newline-less prose", read_doc(path), "```{r}\na\nb\n```\ntail")
+
+
+def test_line_breaks():
+    print("\n═══ only a newline ends a line ═══")
+    # As for knitr: the other breaks str.splitlines knows (vertical tab, form feed, U+001C, NEL,
+    # U+2028, U+2029) stay inside the line, so a fence after one is not a chunk
+    for code in (0x0B, 0x0C, 0x1C, 0x85, 0x2028, 0x2029):
+        text = "---\ntitle: x\n---\n\nIntro" + chr(code) + "```{r}\nx\n```\n"
+        fm, cells = parse(text)
+        check(f"line breaks: U+{code:04X} doesn't end a line", [c.cell_type for c in cells], ["markdown"])
+        check(f"line breaks: untouched document with U+{code:04X} round-trips", serialize(fm, cells) == text, True)
+    # Editing a chunk leaves such prose byte for byte
+    text = "Intro" + chr(0x0C) + "```{r}\n1\n```\n\nPage" + chr(0x2028) + "\n```{r}\n2\n```\n"
+    path = write_doc("line_breaks.rmd", text)
+    mgr = RmdManager(path)
+    check("line breaks: one chunk, after the real line break", [c.cell_type for c in mgr.cells], ["markdown", "code"])
+    mgr.set_chunk_option(1, "echo", "FALSE")
+    check_same("line breaks: editing the chunk leaves the prose alone", read_doc(path),
+               text.replace("```{r}\n2", "```{r echo=FALSE}\n2"))
+
 
 # ──────────────────────────────────────────────
 # create_rmd
@@ -146,7 +319,7 @@ def test_parser_complex_options():
 
 def test_create_rmd():
     print("\n═══ create_rmd ═══")
-    new_path = os.path.join(TESTS_DIR, "test_created.rmd")
+    new_path = os.path.join(WORK_DIR, "test_created.rmd")
     if os.path.exists(new_path):
         os.remove(new_path)
     result = create_rmd(new_path, title="Hello", author="Akash")
@@ -174,11 +347,54 @@ def test_create_rmd():
         check("create: rejects relative path", str(e), "absolute")
     # Rejects wrong extension
     try:
-        create_rmd(os.path.join(TESTS_DIR, "wrong.txt"))
+        create_rmd(os.path.join(WORK_DIR, "wrong.txt"))
         check("create: rejects non-rmd extension", "FAIL", "PASS")
     except RmdManagerError as e:
         check("create: rejects non-rmd extension", str(e), ".rmd")
     os.remove(new_path)
+
+def test_create_rmd_quoting():
+    print("\n═══ create_rmd: title and author quoting ═══")
+    import yaml
+    path = os.path.join(WORK_DIR, "quoted.rmd")
+    values = {
+        "double quote": 'He said "hi"',
+        "backslash": "C:\\Users\\akash\\",
+        "newline": "Line one\nLine two\n",
+        "colon and hash": "Results: 95% # of runs",
+        "yaml-looking": "true",
+        "leading space, unicode and line separators": "  Caf" + chr(0xE9) + chr(0x2028) + "end" + chr(0x85) + "\r",
+    }
+    for label, value in values.items():
+        create_rmd(path, title=value, author=value, overwrite=True)
+        fm = RmdManager(path).frontmatter
+        check(f"quoting {label}: header is valid YAML", fm.error, None)
+        check(f"quoting {label}: title and author load back exactly", (fm.data.get("title"), fm.data.get("author")), (value, value))
+        check(f"quoting {label}: safe_load agrees", yaml.safe_load(fm.text()).get("title"), value)
+        check(f"quoting {label}: one line per key", fm.text().count("\n"), 3)
+    create_rmd(path, title="Hello", overwrite=True)
+    check("quoting: plain title still double-quoted", read_doc(path), 'title: "Hello"\noutput: html_document\n')
+    # output_format: plain when that is safe, quoted otherwise, left out when empty
+    create_rmd(path, output_format="rmarkdown::html_vignette", overwrite=True)
+    check("output_format: plain when safe", read_doc(path), "output: rmarkdown::html_vignette\n")
+    create_rmd(path, output_format="html_document: default", overwrite=True)
+    check("output_format: quoted when plain would change it", RmdManager(path).frontmatter.data, {"output": "html_document: default"})
+    create_rmd(path, title="T", output_format="", overwrite=True)
+    check_same("output_format: empty leaves the key out", read_doc(path), '---\ntitle: "T"\n---\n\n')
+
+
+def test_extension_case():
+    print("\n═══ .rmd extension check ignores case ═══")
+    for name in ("Report.Rmd", "REPORT.RMD"):
+        path = os.path.join(WORK_DIR, name)
+        check(f"extension: create_rmd accepts {name}", create_rmd(path, title="x", overwrite=True), "Created")
+        check(f"extension: tools open {name}", RmdManager(path).get_frontmatter(), "title: x")
+    for name in ("report.qmd", "report.md"):
+        try:
+            create_rmd(os.path.join(WORK_DIR, name))
+            check(f"extension: {name} rejected", "no error", "File is not a .rmd document")
+        except RmdManagerError as e:
+            check(f"extension: {name} rejected", str(e), "File is not a .rmd document")
 
 
 # ──────────────────────────────────────────────
@@ -276,6 +492,42 @@ def test_merge_cells():
         check("merge: rejects cross-type", "FAIL", "PASS")
     except RmdManagerError as e:
         check("merge: rejects cross-type", str(e), "different types")
+
+def test_empty_document_indexes():
+    print("\n═══ index -1 on a document with no cells ═══")
+    from rmd_editor import kernel as _k
+    from rmd_editor import server
+    for label, text in (("empty file", ""), ("header only", "---\ntitle: x\n---\n")):
+        path = write_doc("no_cells.rmd", text)
+        calls = {
+            "get_cell": lambda: server.get_cell(path, -1),
+            "delete_cell": lambda: server.delete_cell(path, -1),
+            "move_cell": lambda: server.move_cell(path, -1, 0),
+            "split_cell": lambda: server.split_cell(path, -1, 1),
+            "merge_cells": lambda: server.merge_cells(path, -1, -1),
+            "replace_cell_source": lambda: server.replace_cell_source(path, -1, "x"),
+            "prepend_to_cell": lambda: server.prepend_to_cell(path, -1, "x"),
+            "append_to_cell": lambda: server.append_to_cell(path, -1, "x"),
+            "get_chunk_options": lambda: server.get_chunk_options(path, -1),
+            "set_chunk_option": lambda: server.set_chunk_option(path, -1, "echo", "FALSE"),
+            "remove_chunk_option": lambda: server.remove_chunk_option(path, -1, "echo"),
+            "execute_cell": lambda: server.execute_cell(path, -1),
+        }
+        for name, call in calls.items():
+            try:
+                out = call()
+            except Exception as e:
+                out = f"raised {type(e).__name__}: {e}"
+            check(f"{label}: {name}(-1) returns the manager's error", out,
+                  "Error: Cell index -1 out of range: the document has no cells")
+        check(f"{label}: index 0 gets the same error", server.get_cell(path, 0), "Error: Cell index 0 out of range: the document has no cells")
+        check(f"{label}: failed calls leave the file unchanged", read_doc(path) == text, True)
+        check(f"{label}: execute_cell(-1) started no kernel", _k.kernel_state(path), "not started")
+        check(f"{label}: add_cell(-1) still appends", server.add_cell(path, -1, "x <- 1"), "Saved")
+        check(f"{label}: appended chunk is the only cell", [c.source for c in RmdManager(path).cells], ["x <- 1"])
+    # -1 still means the last cell when there are cells
+    reset_fixture()
+    check("non-empty: get_cell(-1) is the last cell", RmdManager(FIXTURE_PATH).get_cell(-1), "Final prose.")
 
 
 # ──────────────────────────────────────────────
@@ -380,6 +632,214 @@ def test_frontmatter():
     except RmdManagerError as e:
         check("remove_fm: raises on missing", str(e), "no key")
 
+RICH_HEADER = """---
+# Report settings
+title: "Quarterly: report"   # quoted, with a comment
+author: 'A. Person'
+date: !r Sys.Date()
+params:
+  n: !r 1 + 1
+  region: "EU"   # default region
+output:
+  html_document:
+    toc: true
+
+    toc_depth: 2
+  pdf_document: default
+abstract: |
+  First line.
+
+  Third line.
+tags:
+- a
+- b
+# trailing comment
+---
+
+Body text.
+"""
+
+
+def test_frontmatter_line_level():
+    print("\n═══ frontmatter: line-level edits ═══")
+    from rmd_editor.parser import TaggedScalar, load_yaml
+    # The reported case: R tags made the header unreadable, and a set rewrote it with only the new key
+    path = write_doc("tagged.rmd", '---\ntitle: "T"\nparams:\n  n: !r 1 + 1\noutput: html_document\n---\n\nbody\n')
+    check("tags: get_frontmatter shows the content", RmdManager(path).get_frontmatter(),
+          "title: T\nparams:\n  n: !r 1 + 1\noutput: html_document")
+    RmdManager(path).set_frontmatter_key("author", "A")
+    check_same("tags: set keeps every other key and line", read_doc(path),
+               '---\ntitle: "T"\nparams:\n  n: !r 1 + 1\noutput: html_document\nauthor: A\n---\n\nbody\n')
+
+    path = write_doc("header.rmd", RICH_HEADER)
+    original = RmdManager(path).frontmatter
+    check("read: header with comments, tags and blocks parses", original.error, None)
+    n = original.data["params"]["n"]
+    check("read: !r value kept as a tagged string", (isinstance(n, TaggedScalar), n, n.tag, n.value), (True, "!r 1 + 1", "!r", "1 + 1"))
+    shown = RmdManager(path).get_frontmatter()
+    check("read: get_frontmatter shows quoted values", shown, "title: 'Quarterly: report'")
+    check("read: get_frontmatter shows tags as tags", shown, "date: !r Sys.Date()\nparams:\n  n: !r 1 + 1\n")
+    check("read: get_frontmatter shows a block scalar as a | block", shown, "abstract: |\n  First line.\n\n  Third line.\n")
+
+    cases = [
+        ("set existing key", "set_frontmatter_key", ("author", "B. Person"),
+         "author: 'A. Person'\n", "author: B. Person\n"),
+        ("set tagged value", "set_frontmatter_key", ("date", "!r format(Sys.Date())"),
+         "date: !r Sys.Date()\n", "date: !r format(Sys.Date())\n"),
+        ("set quoted value", "set_frontmatter_key", ("title", '"2026: final"'),
+         'title: "Quarterly: report"   # quoted, with a comment\n', 'title: "2026: final"\n'),
+        ("set nested-block key", "set_frontmatter_key", ("output", "html_document:\n  toc: false"),
+         "output:\n  html_document:\n    toc: true\n\n    toc_depth: 2\n  pdf_document: default\n",
+         "output:\n  html_document:\n    toc: false\n"),
+        ("set block with tags and a comment", "set_frontmatter_key", ("params", 'n: !r 2 * 3\nregion: "US"  # changed'),
+         'params:\n  n: !r 1 + 1\n  region: "EU"   # default region\n', 'params:\n  n: !r 2 * 3\n  region: "US"  # changed\n'),
+        ("set block scalar to one line", "set_frontmatter_key", ("abstract", "Short."),
+         "abstract: |\n  First line.\n\n  Third line.\n", "abstract: Short.\n"),
+        ("add new key", "set_frontmatter_key", ("subtitle", "Draft"),
+         "# trailing comment\n---\n", "# trailing comment\nsubtitle: Draft\n---\n"),
+        ("remove key with a block", "remove_frontmatter_key", ("output",),
+         "output:\n  html_document:\n    toc: true\n\n    toc_depth: 2\n  pdf_document: default\n", ""),
+        ("remove block scalar key", "remove_frontmatter_key", ("abstract",),
+         "abstract: |\n  First line.\n\n  Third line.\n", ""),
+        ("remove column-0 sequence key", "remove_frontmatter_key", ("tags",), "tags:\n- a\n- b\n", ""),
+    ]
+    for label, op, args, old, new in cases:
+        write_doc("header.rmd", RICH_HEADER)
+        getattr(RmdManager(path), op)(*args)
+        after = read_doc(path)
+        check_same(f"{label}: only that key's lines change", after, RICH_HEADER.replace(old, new, 1))
+        fm = RmdManager(path).frontmatter
+        check(f"{label}: result parses with the tolerant loader", (fm.error, isinstance(load_yaml(fm.text()), dict)), (None, True))
+        key = args[0]
+        others = {k: v for k, v in original.data.items() if k != key}
+        check(f"{label}: other keys' values unchanged", repr({k: v for k, v in fm.data.items() if k != key}), repr(others))
+        if op == "set_frontmatter_key":
+            check(f"{label}: key holds the parsed value", repr(fm.data.get(key)), repr(load_yaml(args[1])))
+        else:
+            check(f"{label}: key gone", key in fm.data, False)
+
+
+def test_frontmatter_edge_cases():
+    print("\n═══ frontmatter: edge cases ═══")
+    from rmd_editor import server
+
+    def after_set(text, key, value, name="edge.rmd"):
+        path = write_doc(name, text)
+        RmdManager(path).set_frontmatter_key(key, value)
+        return read_doc(path)
+
+    # No header: one is created, with a blank line before the body
+    check_same("no header: created above prose", after_set("# Title\n\nText.\n", "title", "My Report"),
+               "---\ntitle: My Report\n---\n\n# Title\n\nText.\n")
+    check_same("no header: no second blank line", after_set("\n# Title\n", "title", "X"), "---\ntitle: X\n---\n\n# Title\n")
+    check_same("no header: empty document", after_set("", "title", "X"), "---\ntitle: X\n---\n")
+    check("no header: created above a chunk",
+          [c.cell_type for c in parse(after_set("```{r}\nx\n```\n", "title", "X"))[1]], ["markdown", "code"])
+    # Header closing at the end of the file
+    check_same("end of file: new key before the fence", after_set("---\ntitle: x\n---", "author", "A"), "---\ntitle: x\nauthor: A\n---")
+    # Repeated key: the first copy is replaced, later copies removed
+    check_same("repeated key: one copy left", after_set("---\ntitle: a\nauthor: b\ntitle: c\n---\n", "title", "d"),
+               "---\ntitle: d\nauthor: b\n---\n")
+    # Keys keep their spelling, so a numeric key stays numeric
+    text = after_set("---\n2020: old\n---\n", "2020", "new")
+    check_same("key spelling: numeric key kept", text, "---\n2020: new\n---\n")
+    check("key spelling: still an int key", parse(text)[0].data, {2020: "new"})
+    check_same("key spelling: quoted key kept", after_set('---\n"my key" : 1\n---\n', "my key", "2"), '---\n"my key" : 2\n---\n')
+    check_same("new key: quoted when YAML needs it", after_set("---\na: 1\n---\n", "fig: cap", "x"), '---\na: 1\n"fig: cap": x\n---\n')
+    # Values
+    text = after_set("---\ntitle: x\n---\n", "title", "a: b: c")
+    check_same("value: invalid YAML is written as a quoted string", text, "---\ntitle: 'a: b: c'\n---\n")
+    check("value: invalid YAML loads back as that string", parse(text)[0].data["title"], "a: b: c")
+    check_same("value: empty is null", after_set("---\ntitle: x\n---\n", "draft", ""), "---\ntitle: x\ndraft: null\n---\n")
+    check_same("value: impossible date kept as a string", after_set("---\ntitle: x\n---\n", "date", "2026-13-45"),
+               "---\ntitle: x\ndate: '2026-13-45'\n---\n")
+    # A document end marker stays last
+    check_same("doc end marker: new key goes before it", after_set("---\ntitle: x\n...\n---\n", "z", "1"),
+               "---\ntitle: x\nz: 1\n...\n---\n")
+    # Comments-only header
+    check_same("comments-only header: key added after them", after_set("---\n# notes\n---\n", "title", "x"),
+               "---\n# notes\ntitle: x\n---\n")
+    # Removing a missing key, or with no header
+    path = write_doc("edge.rmd", "---\ntitle: x\n---\n")
+    check("remove: missing key", server.remove_frontmatter_key(path, "nope"), "Error: Frontmatter has no key 'nope'")
+    path = write_doc("edge.rmd", "Just prose.\n")
+    check("remove: no header", server.remove_frontmatter_key(path, "title"), "Error: Frontmatter has no key 'title'")
+    # An edit that would break another key is refused and the file left alone
+    text = "---\nbase: &b\n  a: 1\nother: *b\n---\n"
+    path = write_doc("edge.rmd", text)
+    check("guard: breaking an alias is refused", server.set_frontmatter_key(path, "base", "a: 5"), "would break the rest of the header")
+    check("guard: file unchanged", read_doc(path) == text, True)
+    check("guard: removing the alias user is fine", server.remove_frontmatter_key(path, "other"), "Saved")
+    check_same("guard: anchor kept after removing the alias user", read_doc(path), "---\nbase: &b\n  a: 1\n---\n")
+    # A quoted value's continuation line starting with "#" belongs to the value; real comments stay put
+    text = '---\ntitle: "foo\n# not a comment"\ndate: x\n# a real comment\n---\n'
+    check("quoted continuation: it is part of the value", parse(text)[0].data["title"], "foo # not a comment")
+    check_same("quoted continuation: set replaces the whole value", after_set(text, "title", "bar"),
+               "---\ntitle: bar\ndate: x\n# a real comment\n---\n")
+    path = write_doc("edge.rmd", text)
+    RmdManager(path).remove_frontmatter_key("title")
+    check_same("quoted continuation: remove takes the whole value", read_doc(path), "---\ndate: x\n# a real comment\n---\n")
+    text = "---\nparams:\n  a: 1\n# about params\n\nabstract: |\n  x\n\n# after abstract\ndate: x\n---\n"
+    check_same("block then comment: set keeps the comment", after_set(text, "params", "a: 2"), text.replace("  a: 1\n", "  a: 2\n"))
+    path = write_doc("edge.rmd", text)
+    RmdManager(path).remove_frontmatter_key("abstract")
+    check_same("block scalar then comment: remove keeps the blank line and comment", read_doc(path),
+               text.replace("abstract: |\n  x\n", ""))
+    # A short value whose aliases nest is cheap to set: 7 levels stand for 10^7 leaves
+    value = "&l0 [" + ", ".join(["x"] * 10) + "]"
+    for level in range(1, 7):
+        value = f"&l{level} [{value}" + f", *l{level - 1}" * 9 + "]"
+    started = time.time()
+    text = after_set("---\ntitle: x\n---\n", "nested", value)
+    check("nested aliases: set returns at once", time.time() - started < 0.4, True)
+    check_same("nested aliases: value written as given", text, f"---\ntitle: x\nnested: {value}\n---\n")
+
+
+def test_frontmatter_unreadable():
+    print("\n═══ frontmatter: headers that don't parse ═══")
+    from rmd_editor import server
+    # A tab used for indentation: invalid YAML, but the keys are still editable line by line
+    text = "---\ntitle: Report\nparams:\n\tn: 1\noutput: html_document\n---\n\nBody\n"
+    path = write_doc("broken.rmd", text)
+    shown = server.get_frontmatter(path)
+    check("broken: get_frontmatter says why", shown, "(the YAML header could not be parsed: found character '\\t'")
+    check("broken: get_frontmatter gives the line", shown, "(line 4 of the file)")
+    check("broken: get_frontmatter returns the raw text", shown, "title: Report\nparams:\n\tn: 1\noutput: html_document")
+    check("broken: set works", server.set_frontmatter_key(path, "title", "New"), "Saved")
+    check_same("broken: set changes only that line", read_doc(path), text.replace("title: Report", "title: New"))
+    check("broken: remove works", server.remove_frontmatter_key(path, "output"), "Saved")
+    check_same("broken: remove takes only that line", read_doc(path), text.replace("title: Report", "title: New").replace("output: html_document\n", ""))
+    check("broken: set the broken key", server.set_frontmatter_key(path, "params", "n: 2"), "Saved")
+    fm = RmdManager(path).frontmatter
+    check("broken: header parses once fixed", (fm.error, fm.data), (None, {"title": "New", "params": {"n": 2}}))
+    # Well-formed YAML holding an impossible date: no crash, and still editable
+    path = write_doc("broken.rmd", "---\ndate: 2026-13-45\ntitle: x\n---\n\n```{r}\n1\n```\n")
+    check("bad date: other tools still work", server.list_cells(path), "[1] code (r)")
+    check("bad date: get_frontmatter says why", server.get_frontmatter(path), "month must be in 1..12")
+    check("bad date: set works", server.set_frontmatter_key(path, "title", "y"), "Saved")
+    check_same("bad date: set changes only that line", read_doc(path), "---\ndate: 2026-13-45\ntitle: y\n---\n\n```{r}\n1\n```\n")
+    # Not a mapping: shown raw, and edits are refused without touching the file
+    text = "---\n- a\n- b\n---\n\nBody\n"
+    path = write_doc("broken.rmd", text)
+    check("list header: get_frontmatter shows the raw text", server.get_frontmatter(path),
+          "(the YAML header could not be parsed: it is not a mapping of key: value lines; its raw text follows)\n- a\n- b")
+    check("list header: set refused", server.set_frontmatter_key(path, "title", "x"), "Error: Frontmatter can't be edited key by key")
+    check("list header: remove refused", server.remove_frontmatter_key(path, "a"), "Error: Frontmatter can't be edited key by key")
+    check("list header: file unchanged", read_doc(path) == text, True)
+    # Flow-style mapping: readable, but not line-editable
+    text = "---\n{title: x, author: y}\n---\n"
+    path = write_doc("broken.rmd", text)
+    check("flow header: get_frontmatter shows the keys", server.get_frontmatter(path), "title: x\nauthor: y")
+    check("flow header: set refused", server.set_frontmatter_key(path, "title", "z"), "flow mapping")
+    check("flow header: file unchanged", read_doc(path) == text, True)
+    # Indented keys: valid YAML and readable, but not line-editable (as the README says)
+    text = "---\n  title: x\n  author: y\n---\nB\n"
+    path = write_doc("broken.rmd", text)
+    check("indented header: get_frontmatter shows the keys", server.get_frontmatter(path), "title: x\nauthor: y")
+    check("indented header: set refused", server.set_frontmatter_key(path, "title", "z"), "not one per line at column 0")
+    check("indented header: remove refused", server.remove_frontmatter_key(path, "title"), "not one per line at column 0")
+    check("indented header: file unchanged", read_doc(path) == text, True)
+
 
 # ──────────────────────────────────────────────
 # Discovery
@@ -410,7 +870,6 @@ def test_kernel_name_mapping():
     check("r → ir", _language_to_kernel_name("r"), "ir")
     check("R → ir", _language_to_kernel_name("R"), "ir")
     check("python → python3", _language_to_kernel_name("python"), "python3")
-    check("julia → julia-1", _language_to_kernel_name("julia"), "julia-1")
     check("unknown → lowercase passthrough", _language_to_kernel_name("Foo"), "foo")
 
 
@@ -463,6 +922,13 @@ class _FakeKernelManager:
     """Stands in for jupyter_client.KernelManager and records the launch kwargs."""
 
     instances: list = []
+    # Make start_kernel() / restart_kernel() fail like a missing kernel binary.
+    fail_start = False
+    fail_restart = False
+    # Client type handed out by client(); None means _FakeKernelClient.
+    client_class = None
+    # Real managers have a log trait; the kernel module filters it during starts.
+    log = logging.getLogger("tests.fake_kernel_manager")
 
     def __init__(self, kernel_name=""):
         self.kernel_name = kernel_name
@@ -470,23 +936,42 @@ class _FakeKernelManager:
         self.restart_kwargs = None
         self.alive = False
         self.cleaned_up = False
+        self.interrupts = 0
+        self.signals: list = []
+        # Called by interrupt_kernel(); _ScriptedKernelClient uses it to end a "sleep" request.
+        self.on_interrupt = None
         _FakeKernelManager.instances.append(self)
 
     def start_kernel(self, **kw):
         self.start_kwargs = kw
+        if _FakeKernelManager.fail_start:
+            raise FileNotFoundError(2, "No such file or directory", "fake-kernel-binary")
         self.alive = True
 
     def restart_kernel(self, **kw):
         self.restart_kwargs = kw
+        if _FakeKernelManager.fail_restart:
+            self.alive = False
+            raise FileNotFoundError(2, "No such file or directory", "fake-kernel-binary")
+        self.alive = True
 
     def is_alive(self):
         return self.alive
 
     def client(self):
+        if _FakeKernelManager.client_class is not None:
+            return _FakeKernelManager.client_class(self)
         return _FakeKernelClient()
 
     def interrupt_kernel(self):
-        pass
+        self.interrupts += 1
+        if self.on_interrupt is not None:
+            self.on_interrupt()
+
+    def signal_kernel(self, signum):
+        # The kernel module only signals to kill the process.
+        self.signals.append(signum)
+        self.alive = False
 
     def shutdown_kernel(self, **kw):
         self.alive = False
@@ -506,6 +991,103 @@ class _DyingKernelClient(_FakeKernelClient):
         self._km.alive = False
         return "fake-msg"
 
+class _ErrorKernelClient(_FakeKernelClient):
+    """Answers every execute() with an error output that has a traceback, then idle."""
+
+    def __init__(self, km):
+        super().__init__()
+
+    def execute(self, code):
+        parent = {"msg_id": "fake-msg"}
+        error = {"ename": "simpleError", "evalue": "boom", "traceback": ["\x1b[31mError in f(): boom\x1b[0m", "Traceback:", "1. f()"]}
+        self._iopub = [
+            {"parent_header": parent, "msg_type": "error", "content": error},
+            {"parent_header": parent, "msg_type": "status", "content": {"execution_state": "idle"}},
+        ]
+        return "fake-msg"
+
+class _ScriptedKernelClient:
+    """
+    Thread-safe fake client with one shared iopub queue, like the real one. Each
+    execute() gets its own msg_id, an execute_input at once, and its code echoed
+    as stdout shortly after; code "sleep" only finishes once the kernel is
+    interrupted, "stubborn" never does, and "late" starts (execute_input) only
+    after 0.3s, ignoring interrupts until then, and then acts like "sleep".
+    Records the most requests ever in flight at once.
+    """
+
+    def __init__(self, km):
+        self._km = km
+        self._iopub: queue.Queue = queue.Queue()
+        self._lock = threading.Lock()
+        self._count = 0
+        self._in_flight = 0
+        self.max_in_flight = 0
+
+    def start_channels(self):
+        pass
+
+    def stop_channels(self):
+        pass
+
+    def wait_for_ready(self, timeout=None):
+        pass
+
+    def execute(self, code):
+        with self._lock:
+            self._count += 1
+            msg_id = f"msg-{self._count}"
+            self._in_flight += 1
+            self.max_in_flight = max(self.max_in_flight, self._in_flight)
+        if code == "late":
+            # Ignores interrupts until it starts, as ipykernel does
+            self._km.on_interrupt = None
+            threading.Timer(0.3, self._start, (msg_id, lambda: self._reply(msg_id, "interrupted"))).start()
+        elif code == "sleep":
+            self._start(msg_id, lambda: self._reply(msg_id, "interrupted"))
+        else:
+            self._start(msg_id, None)
+            if code != "stubborn":
+                threading.Timer(0.05, self._reply, (msg_id, code)).start()
+        return msg_id
+
+    def _start(self, msg_id, on_interrupt):
+        """Begin running a request: install its interrupt handler, if it has one, then send execute_input."""
+        if on_interrupt is not None:
+            self._km.on_interrupt = on_interrupt
+        self._iopub.put({"parent_header": {"msg_id": msg_id}, "msg_type": "execute_input", "content": {"code": ""}})
+
+    def _reply(self, msg_id, text):
+        parent = {"msg_id": msg_id}
+        self._iopub.put({"parent_header": parent, "msg_type": "stream", "content": {"name": "stdout", "text": text}})
+        self._iopub.put({"parent_header": parent, "msg_type": "status", "content": {"execution_state": "idle"}})
+
+    def get_iopub_msg(self, timeout=None):
+        msg = self._iopub.get(timeout=timeout)
+        if msg["msg_type"] == "status":
+            with self._lock:
+                self._in_flight -= 1
+        return msg
+
+
+@contextlib.contextmanager
+def _fake_kernels(client_class=None):
+    """Run the block with _FakeKernelManager (handing out client_class clients) in place of KernelManager."""
+    from rmd_editor import kernel as _k
+    real_km = _k.KernelManager
+    _FakeKernelManager.instances.clear()
+    _FakeKernelManager.client_class = client_class
+    _k.KernelManager = _FakeKernelManager
+    try:
+        yield
+    finally:
+        for path in list(_k._kernels):
+            _k.shutdown_kernel(path)
+        _k.KernelManager = real_km
+        _FakeKernelManager.client_class = None
+        _FakeKernelManager.fail_start = False
+        _FakeKernelManager.fail_restart = False
+
 
 def test_kernel_cwd():
     print("\n═══ kernel cwd (fake KernelManager) ═══")
@@ -523,7 +1105,7 @@ def test_kernel_cwd():
         km = _FakeKernelManager.instances[-1]
         check("cwd: kernel name from chunk language", km.kernel_name, "ir")
         cwd = (km.start_kwargs or {}).get("cwd") or ""
-        check("cwd: kernel starts in the .rmd folder", os.path.realpath(cwd) == os.path.realpath(TESTS_DIR), True)
+        check("cwd: kernel starts in the .rmd folder", os.path.realpath(cwd) == os.path.realpath(WORK_DIR), True)
         check("cwd: restart_kernel returns Restarted", server.restart_kernel(FIXTURE_PATH), "Restarted")
         check("cwd: restart keeps the same KernelManager", _k.get_kernel(FIXTURE_PATH).km is km, True)
         # jupyter_client relaunches with the original start_kernel() kwargs unless
@@ -561,6 +1143,189 @@ def test_kernel_dead_session():
         _k.shutdown_kernel(FIXTURE_PATH)
         _k.KernelManager = real_km
 
+def _scripted_doc(root: str) -> tuple[str, list[int]]:
+    """Write an .rmd whose chunks are the _ScriptedKernelClient commands; returns (path, code cell indices)."""
+    path = os.path.join(root, "scripted.rmd")
+    with open(path, "w", encoding="utf-8") as f:
+        f.write("```{r}\nsleep\n```\n\n```{r}\nafter\n```\n\n```{r}\nstubborn\n```\n\n```{r}\nlate\n```\n")
+    return path, [i for i, c in enumerate(RmdManager(path).cells) if c.cell_type == "code"]
+
+
+def test_kernel_timeout_interrupts():
+    print("\n═══ timeout interrupts the chunk (fake KernelManager) ═══")
+    from rmd_editor import kernel as _k
+    from rmd_editor import server
+    root = tempfile.mkdtemp(dir=WORK_DIR)
+    path, code = _scripted_doc(root)
+    old_grace = _k._INTERRUPT_GRACE
+    _k._INTERRUPT_GRACE = 0.5
+    try:
+        with _fake_kernels(_ScriptedKernelClient):
+            started = time.time()
+            out = server.execute_cell(path, code[0], timeout=0.3)
+            check("timeout: error says the chunk timed out", out, "Error: Execution failed: Execution timed out after 0.3s")
+            check("timeout: error says it was interrupted", out, "the cell was interrupted and the kernel is ready")
+            check("timeout: kernel interrupted once", _FakeKernelManager.instances[-1].interrupts, 1)
+            check("timeout: returns right after the interrupt", time.time() - started < 2, True)
+            started = time.time()
+            check("timeout: next chunk runs", server.execute_cell(path, code[1]), "[stream:stdout] after")
+            check("timeout: next chunk runs promptly", time.time() - started < 2, True)
+            check("timeout: same kernel kept", len(_FakeKernelManager.instances), 1)
+            started = time.time()
+            out = server.execute_cell(path, code[2], timeout=0.3)
+            check("timeout: ignored interrupt reported as still busy", out, "still busy 0.5s later")
+            check("timeout: still-busy error suggests restart_kernel", out, "Use restart_kernel")
+            check("timeout: still-busy error comes after the grace period", time.time() - started < 3, True)
+            # A chunk that times out before the kernel has started it is interrupted once it starts
+            # (an interrupt that comes earlier is ignored)
+            started = time.time()
+            out = server.execute_cell(path, code[3], timeout=0.05)
+            check("timeout: chunk that starts late is still interrupted", out, "the cell was interrupted and the kernel is ready")
+            # It starts after 0.3s; waiting out the 0.5s grace period instead would take longer
+            check("timeout: late chunk interrupted as soon as it starts", time.time() - started < 0.5, True)
+            # A timeout that isn't positive is refused before anything runs
+            interrupts = _FakeKernelManager.instances[-1].interrupts
+            for bad in (0, -1):
+                check(f"timeout: execute_cell refuses timeout={bad}", server.execute_cell(path, code[1], timeout=bad),
+                      f"Error: timeout must be a positive number of seconds, got {bad}")
+            check("timeout: execute_all_cells refuses timeout=0", server.execute_all_cells(path, timeout=0),
+                  "Error: timeout must be a positive number of seconds, got 0")
+            check("timeout: refused timeouts interrupt nothing", _FakeKernelManager.instances[-1].interrupts, interrupts)
+            out = server.execute_all_cells(path, timeout=0.3)
+            check("timeout: execute_all_cells names the interrupted chunk", out,
+                  f"Execution failed at cell {code[0]}: Execution timed out after 0.3s; the cell was interrupted")
+    finally:
+        _k._INTERRUPT_GRACE = old_grace
+        shutil.rmtree(root, ignore_errors=True)
+
+
+def test_kernel_concurrency():
+    print("\n═══ concurrent kernel calls (fake KernelManager) ═══")
+    from rmd_editor import kernel as _k
+    from rmd_editor import server
+    root = tempfile.mkdtemp(dir=WORK_DIR)
+    path, _ = _scripted_doc(root)
+    try:
+        with _fake_kernels(_ScriptedKernelClient):
+            # Concurrent first calls start one kernel
+            barrier = threading.Barrier(4)
+
+            def first_call():
+                barrier.wait()
+                return _k.get_or_start_kernel(path)
+
+            starts = [in_thread(first_call) for _ in range(4)]
+            for thread, _ in starts:
+                thread.join(10)
+            sessions = {id(result.get("value")) for _, result in starts}
+            check("concurrent: one session for concurrent first calls", len(sessions), 1)
+            check("concurrent: one kernel started", len(_FakeKernelManager.instances), 1)
+
+            # Many executes at once: one request in flight at a time, each gets its own output
+            sess = _k.get_kernel(path)
+            barrier = threading.Barrier(6)
+
+            def run(i):
+                barrier.wait()
+                return sess.execute(f"out-{i}", timeout=3)
+
+            runs = [in_thread(run, i) for i in range(6)]
+            for thread, _ in runs:
+                thread.join(30)
+            texts = [result["value"][0]["text"] if "value" in result else repr(result) for _, result in runs]
+            check("concurrent: each execute gets exactly its own output", texts, [f"out-{i}" for i in range(6)])
+            check("concurrent: requests never overlap on the client", sess.kc.max_in_flight, 1)
+
+            # interrupt_kernel doesn't wait for the running execute
+            thread, result = in_thread(sess.execute, "sleep", timeout=30)
+            check("concurrent: chunk is running", wait_until(lambda: sess._executing), True)
+            started = time.time()
+            check("concurrent: interrupt_kernel during a running chunk", server.interrupt_kernel(path), "Interrupted")
+            check("concurrent: interrupt_kernel returns at once", time.time() - started < 1, True)
+            thread.join(5)
+            check("concurrent: interrupted chunk's call returns its output",
+                  result.get("value", [{}])[0].get("text"), "interrupted")
+
+            # restart_kernel kills a running execute instead of waiting for it
+            km = sess.km
+            thread, result = in_thread(sess.execute, "stubborn", timeout=30)
+            check("concurrent: chunk is running before restart", wait_until(lambda: sess._executing), True)
+            started = time.time()
+            check("concurrent: restart_kernel during a running chunk", server.restart_kernel(path), "Restarted")
+            check("concurrent: restart_kernel doesn't wait for the chunk", time.time() - started < 5, True)
+            thread.join(5)
+            check("concurrent: running chunk fails when restarted", str(result.get("error")), "Kernel died during execution")
+            check("concurrent: restart killed the kernel process", len(km.signals) >= 1, True)
+            check("concurrent: kernel alive after restart", _k.kernel_state(path), "alive")
+
+            # restart_kernel goes ahead of a call queued behind the running chunk, which then
+            # runs on the restarted kernel: only the running chunk is lost
+            kernels_before = len(_FakeKernelManager.instances)
+            thread, result = in_thread(sess.execute, "stubborn", timeout=30)
+            check("concurrent: chunk is running before restart with a call queued", wait_until(lambda: sess._executing), True)
+            queued, queued_result = in_thread(sess.execute, "queued", timeout=30)
+            time.sleep(0.3)  # let the second call queue up on the session lock
+            check("concurrent: restart_kernel with a call queued", server.restart_kernel(path), "Restarted")
+            thread.join(5)
+            queued.join(5)
+            check("concurrent: running chunk fails when restarted with a call queued",
+                  str(result.get("error")), "Kernel died during execution")
+            check("concurrent: queued call runs on the restarted kernel",
+                  queued_result["value"][0]["text"] if "value" in queued_result else repr(queued_result), "queued")
+            check("concurrent: no extra kernel started for the queued call", len(_FakeKernelManager.instances), kernels_before)
+            check("concurrent: the restart reused the kernel", sess.km is km, True)
+
+            # shutdown_kernel kills a running execute instead of waiting for it
+            thread, result = in_thread(sess.execute, "stubborn", timeout=30)
+            check("concurrent: chunk is running before shutdown", wait_until(lambda: sess._executing), True)
+            started = time.time()
+            check("concurrent: shutdown_kernel during a running chunk", server.shutdown_kernel(path), "Shutdown")
+            check("concurrent: shutdown_kernel doesn't wait for the chunk", time.time() - started < 5, True)
+            thread.join(5)
+            check("concurrent: running chunk fails when shut down", str(result.get("error")), "Kernel died during execution")
+            check("concurrent: state 'not started' after shutdown", _k.kernel_state(path), "not started")
+            kernels_before = len(_FakeKernelManager.instances)
+            try:
+                sess.execute("late")
+                check("concurrent: shut-down session refuses to execute", "no error", "Kernel was shut down")
+            except _k.KernelError as e:
+                check("concurrent: shut-down session refuses to execute", str(e), "Kernel was shut down")
+            check("concurrent: shut-down session started no new kernel", len(_FakeKernelManager.instances), kernels_before)
+    finally:
+        shutil.rmtree(root, ignore_errors=True)
+
+
+def test_dead_kernel_cleanup():
+    print("\n═══ dead kernel: interrupt and failed restarts (fake KernelManager) ═══")
+    from rmd_editor import kernel as _k
+    from rmd_editor import server
+    reset_fixture()
+    _k.shutdown_kernel(FIXTURE_PATH)
+    with _fake_kernels():
+        sess = _k.get_or_start_kernel(FIXTURE_PATH)
+        sess.km.alive = False
+        check("dead: state is dead", _k.kernel_state(FIXTURE_PATH), "dead")
+        check("dead: interrupt_kernel reports the kernel is not running", server.interrupt_kernel(FIXTURE_PATH),
+              "Error: Kernel is not running (its process has exited)")
+        check("dead: no interrupt sent to the dead kernel", sess.km.interrupts, 0)
+
+        # execute() finds its kernel dead and its own start attempt fails
+        _FakeKernelManager.fail_start = True
+        try:
+            sess.execute("1 + 1")
+            check("dead: failed start inside execute raises", "no error", "Kernel failed to start")
+        except _k.KernelError as e:
+            check("dead: failed start inside execute raises", str(e), "Kernel failed to start: [Errno 2]")
+        check("dead: failed start inside execute leaves 'not started'", _k.kernel_state(FIXTURE_PATH), "not started")
+        _FakeKernelManager.fail_start = False
+
+        # A failed restart_kernel drops the session too
+        _k.get_or_start_kernel(FIXTURE_PATH)
+        _FakeKernelManager.fail_restart = True
+        check("dead: failed restart error string", server.restart_kernel(FIXTURE_PATH),
+              "Error: Kernel failed to restart: [Errno 2]")
+        check("dead: failed restart leaves 'not started'", _k.kernel_state(FIXTURE_PATH), "not started")
+
 
 def _wait_for_lines(path: str, n: int, timeout: float = 10.0) -> list:
     import time
@@ -585,7 +1350,7 @@ def test_jupyter_restart_keeps_cwd():
     import tempfile
     from jupyter_client import KernelManager
     from jupyter_client.kernelspec import KernelSpecManager
-    root = tempfile.mkdtemp()
+    root = tempfile.mkdtemp(dir=WORK_DIR)
     km = None
     try:
         kernels_dir = os.path.join(root, "kernels")
@@ -617,17 +1382,12 @@ def test_jupyter_restart_keeps_cwd():
 def test_kernel_start_failures():
     print("\n═══ kernel start failures ═══")
     import json
-    import logging
     import shutil
     import tempfile
     from rmd_editor import kernel as _k
     from rmd_editor import server
     reset_fixture()
     _k.shutdown_kernel(FIXTURE_PATH)
-    # jupyter_client logs every failed start with a full traceback; keep the output readable.
-    jc_log = logging.getLogger("traitlets")
-    jc_log_level = jc_log.level
-    jc_log.setLevel(logging.CRITICAL)
     # Missing kernelspec, straight from the kernel module
     try:
         _k.get_or_start_kernel(FIXTURE_PATH, kernel_name="nosuchkernel-xyz")
@@ -650,7 +1410,7 @@ def test_kernel_start_failures():
     check("server restart_kernel: error string", server.restart_kernel(FIXTURE_PATH), "Error: No kernel running")
     check("server interrupt_kernel: error string", server.interrupt_kernel(FIXTURE_PATH), "Error: No kernel running")
     # Broken kernelspec (argv points at a missing binary)
-    root = tempfile.mkdtemp()
+    root = tempfile.mkdtemp(dir=WORK_DIR)
     doc = os.path.join(root, "broken.rmd")
     old_jupyter_path = os.environ.get("JUPYTER_PATH")
     try:
@@ -672,7 +1432,117 @@ def test_kernel_start_failures():
         else:
             os.environ["JUPYTER_PATH"] = old_jupyter_path
         shutil.rmtree(root, ignore_errors=True)
-        jc_log.setLevel(jc_log_level)
+
+def test_kernel_start_failure_logging():
+    print("\n═══ kernel start failure logging ═══")
+    # Real jupyter_client with stand-in kernelspecs; no kernel ever runs.
+    from rmd_editor import kernel as _k
+    root = tempfile.mkdtemp(dir=WORK_DIR)
+    argvs = {
+        "missingbinaryxyz": [os.path.join(root, "missing-binary"), "{connection_file}"],
+        # A NUL byte makes Popen raise ValueError, which is not an expected start failure.
+        "nulbytexyz": ["/bin/sh\x00", "{connection_file}"],
+    }
+    for name, argv in argvs.items():
+        os.makedirs(os.path.join(root, "kernels", name))
+        with open(os.path.join(root, "kernels", name, "kernel.json"), "w", encoding="utf-8") as f:
+            json.dump({"argv": argv, "display_name": name, "language": "r"}, f)
+    docs = {name: os.path.join(root, f"{name}.rmd") for name in ("nosuchkernelxyz", *argvs)}
+
+    def start_logs(name: str) -> str:
+        with captured_logs("rmd_editor.kernel", "traitlets") as logs:
+            try:
+                _k.get_or_start_kernel(docs[name], kernel_name=name)
+            except _k.KernelError:
+                pass
+        return logs.getvalue()
+
+    old_jupyter_path = os.environ.get("JUPYTER_PATH")
+    os.environ["JUPYTER_PATH"] = root
+    try:
+        missing = start_logs("nosuchkernelxyz")
+        check("logging: missing kernelspec logs one line", len(missing.strip().splitlines()), 1)
+        check("logging: missing kernelspec line is the kernel module's warning", missing,
+              "WARNING rmd_editor.kernel: No such kernel named nosuchkernelxyz")
+        check("logging: missing kernelspec logs no traceback", "Traceback" in missing, False)
+
+        binary = start_logs("missingbinaryxyz")
+        check("logging: missing kernel binary logs one line", len(binary.strip().splitlines()), 1)
+        check("logging: missing kernel binary line is the kernel module's warning", binary,
+              "WARNING rmd_editor.kernel: Kernel failed to start: [Errno 2]")
+        check("logging: missing kernel binary logs no traceback", "Traceback" in binary, False)
+        check("logging: missing kernel binary skips the launcher dump", "Failed to run command" in binary, False)
+
+        unexpected = start_logs("nulbytexyz")
+        check("logging: unexpected start error keeps jupyter_client's traceback", unexpected, "Traceback")
+        check("logging: unexpected start error names the exception", unexpected, "ValueError: embedded null byte")
+        check("logging: unexpected start error keeps the launcher dump", unexpected, "Failed to run command")
+        check("logging: unexpected start error also gets the warning line", unexpected,
+              "WARNING rmd_editor.kernel: Kernel failed to start: embedded null byte")
+        check("logging: states are 'not started'", [_k.kernel_state(d) for d in docs.values()], ["not started"] * 3)
+    finally:
+        if old_jupyter_path is None:
+            os.environ.pop("JUPYTER_PATH", None)
+        else:
+            os.environ["JUPYTER_PATH"] = old_jupyter_path
+        for doc in docs.values():
+            _k.shutdown_kernel(doc)
+        shutil.rmtree(root, ignore_errors=True)
+
+    # Only those calls were filtered: jupyter_client's logger still reports the same kinds of errors.
+    traitlets_log = logging.getLogger("traitlets")
+    check("logging: no filter left on jupyter_client's logger",
+          [f for f in traitlets_log.filters if isinstance(f, _k._QuietExpectedStartFailure)], [])
+    with captured_logs("traitlets") as logs:
+        try:
+            raise FileNotFoundError("unrelated")
+        except FileNotFoundError:
+            traitlets_log.exception("unrelated diagnostic")
+    check("logging: unrelated jupyter_client diagnostics still logged", logs.getvalue(), "unrelated diagnostic")
+
+def _fake_kernelspec(root: str, name: str) -> None:
+    """Write a stand-in kernelspec (never launched) to root/kernels/name."""
+    os.makedirs(os.path.join(root, "kernels", name))
+    with open(os.path.join(root, "kernels", name, "kernel.json"), "w", encoding="utf-8") as f:
+        json.dump({"argv": ["false", "{connection_file}"], "display_name": name, "language": "julia"}, f)
+
+
+def test_julia_kernel_resolution():
+    print("\n═══ julia kernelspec resolution ═══")
+    from jupyter_client.kernelspec import KernelSpecManager
+    from rmd_editor import kernel as _k
+    from rmd_editor import server
+    root = tempfile.mkdtemp(dir=WORK_DIR)
+    empty = os.path.join(root, "empty")
+    specs = os.path.join(root, "specs")
+    os.makedirs(empty)
+    for name in ("julia-1.9", "julia-1.10", "julia-1.11", "julia-dev"):
+        _fake_kernelspec(specs, name)
+    doc = os.path.join(root, "julia.rmd")
+    with open(doc, "w", encoding="utf-8") as f:
+        f.write("```{julia}\n1 + 1\n```\n")
+    # JUPYTER_DATA_DIR hides the user's own kernelspecs; JUPYTER_PATH adds the fakes.
+    with env_vars(JUPYTER_PATH=empty, JUPYTER_DATA_DIR=empty):
+        elsewhere = sorted(n for n in KernelSpecManager(ensure_native_kernel=False).find_kernel_specs() if n.startswith("julia"))
+    if elsewhere:
+        print(f"  [SKIP] julia resolution: system-wide Julia kernelspecs {elsewhere} would change the answers")
+        return
+    with env_vars(JUPYTER_PATH=empty, JUPYTER_DATA_DIR=empty):
+        check("julia: none installed falls back to julia-1", _language_to_kernel_name("julia"), "julia-1")
+        check("julia: the error names julia-1", server.execute_cell(doc, 0), "Error: No such kernel named julia-1")
+        check("julia: nothing left running", _k.kernel_state(doc), "not started")
+    with env_vars(JUPYTER_PATH=specs, JUPYTER_DATA_DIR=empty):
+        with captured_logs("traitlets") as logs:
+            check("julia: highest version wins, compared as numbers", _k.julia_kernel_name(), "julia-1.11")
+        check("julia: the lookup logs nothing", logs.getvalue() == "", True)
+        check("julia: chunk language is case-insensitive", _language_to_kernel_name("Julia"), "julia-1.11")
+        with _fake_kernels():
+            RmdManager(doc).execute_cell(0)
+            check("julia: execute_cell starts the resolved kernelspec", _FakeKernelManager.instances[-1].kernel_name, "julia-1.11")
+        _fake_kernelspec(specs, "julia-1")
+        check("julia: julia-1 preferred over versioned names", _k.julia_kernel_name(), "julia-1")
+        _fake_kernelspec(specs, "julia")
+        check("julia: julia preferred over julia-1", _k.julia_kernel_name(), "julia")
 
 
 def test_format_outputs_strips_ansi():
@@ -693,9 +1563,46 @@ def test_format_outputs_strips_ansi():
     check("ansi: result text kept", text, "[result] [1] 42")
     check("ansi: display text kept", text, "[display] ok")
     check("ansi: error text kept", text, "[error] Error: boom")
+    check("ansi: error traceback kept, without codes", text, "[error] Error: boom\ntraceback")
     check("ansi: captured outputs left untouched", outputs == before, True)
     stream_only = _k.format_outputs([{"output_type": "stream", "name": "stdout", "text": "\x1b[2K\x1b[1Gdone\n"}])
     check("ansi: cursor codes stripped from stream-only output", stream_only, "[stream:stdout] done\n")
+
+def test_format_outputs_traceback():
+    print("\n═══ format_outputs: error tracebacks ═══")
+    from rmd_editor import kernel as _k
+    from rmd_editor import server
+    python_error = {
+        "output_type": "error", "ename": "ZeroDivisionError", "evalue": "division by zero",
+        "traceback": [
+            "\x1b[0;31m" + "-" * 20 + "\x1b[0m",
+            "\x1b[0;31mZeroDivisionError\x1b[0m  Traceback (most recent call last)\nCell In[1], line 1\n----> 1 1/0",
+            "\x1b[0;31mZeroDivisionError\x1b[0m: division by zero",
+        ],
+    }
+    check_same("traceback: error line, then every traceback line without ANSI codes", _k.format_outputs([python_error]),
+               "[error] ZeroDivisionError: division by zero\n" + "-" * 20
+               + "\nZeroDivisionError  Traceback (most recent call last)\nCell In[1], line 1\n----> 1 1/0"
+               + "\nZeroDivisionError: division by zero")
+    check_same("traceback: none means just the error line",
+               _k.format_outputs([{"output_type": "error", "ename": "E", "evalue": "v"}]), "[error] E: v")
+    check_same("traceback: empty list means just the error line",
+               _k.format_outputs([{"output_type": "error", "ename": "E", "evalue": "v", "traceback": []}]), "[error] E: v")
+    check_same("traceback: a string traceback is kept",
+               _k.format_outputs([{"output_type": "error", "ename": "E", "evalue": "v", "traceback": "line 1\nline 2"}]),
+               "[error] E: v\nline 1\nline 2")
+    mixed = [{"output_type": "stream", "name": "stdout", "text": "partial\n"},
+             {"output_type": "error", "ename": "E", "evalue": "v", "traceback": ["tb"]}]
+    check_same("traceback: after other outputs", _k.format_outputs(mixed), "[stream:stdout] partial\n\n[error] E: v\ntb")
+    # Through the tools, with a fake kernel that answers with an R-style error
+    reset_fixture()
+    _k.shutdown_kernel(FIXTURE_PATH)
+    with _fake_kernels(_ErrorKernelClient):
+        check("traceback: execute_cell returns it", server.execute_cell(FIXTURE_PATH, 3),
+              "[error] simpleError: boom\nError in f(): boom\nTraceback:\n1. f()")
+        out = server.execute_all_cells(FIXTURE_PATH)
+        check("traceback: execute_all_cells returns it", out, "── cell[1] ──\n[error] simpleError: boom\nError in f(): boom\nTraceback:\n1. f()")
+        check("traceback: execute_all_cells still stops at the error", out, "Executed 1 cell(s), 1 error(s), stopped at cell 1")
 
 
 # ──────────────────────────────────────────────
@@ -732,6 +1639,9 @@ def test_server_schema():
     check("schema: only execution tools are open-world", open_world, ["execute_all_cells", "execute_cell"])
     by_name = {t.name: t for t in tools}
     check("schema: defaults kept", by_name["create_rmd"].input_schema["properties"]["output_format"].get("default"), "html_document")
+    check("schema: timeouts must be positive",
+          [by_name[n].input_schema["properties"]["timeout"].get("exclusiveMinimum") for n in ("execute_cell", "execute_all_cells")],
+          [0, 0])
     check("schema: instructions non-empty", bool((server.mcp.instructions or "").strip()), True)
     check("schema: version matches package metadata", server.mcp.version == pkg_version("rmd-editor-mcp"), True)
 
@@ -742,33 +1652,57 @@ def test_server_schema():
 
 
 if __name__ == "__main__":
-    test_parser_round_trip()
-    test_parser_edge_cases()
-    test_parser_complex_options()
-    test_create_rmd()
-    test_list_cells()
-    test_get_cell()
-    test_add_cell()
-    test_delete_cell()
-    test_move_cell()
-    test_split_cell()
-    test_merge_cells()
-    test_replace_cell_source()
-    test_prepend_append_to_cell()
-    test_chunk_options()
-    test_frontmatter()
-    test_find_in_rmd()
-    test_kernel_name_mapping()
-    test_kernel_state_not_started()
-    test_kernel_cwd()
-    test_kernel_dead_session()
-    test_jupyter_restart_keeps_cwd()
-    test_kernel_start_failures()
-    test_format_outputs_strips_ansi()
-    test_server_schema()
+    # The kernel module logs one warning line per deliberately failed kernel start
+    # (test_kernel_start_failure_logging checks those lines, and that jupyter_client adds nothing).
+    logging.getLogger("rmd_editor.kernel").setLevel(logging.ERROR)
 
-    if os.path.exists(FIXTURE_PATH):
-        os.remove(FIXTURE_PATH)
+    WORK_DIR = tempfile.mkdtemp(prefix="rmd-editor-tests-")
+    FIXTURE_PATH = os.path.join(WORK_DIR, "test_fixture.rmd")
+    try:
+        test_parser_round_trip()
+        test_parser_edge_cases()
+        test_parser_complex_options()
+        test_no_trailing_newline()
+        test_line_breaks()
+        test_create_rmd()
+        test_create_rmd_quoting()
+        test_extension_case()
+        test_list_cells()
+        test_get_cell()
+        test_add_cell()
+        test_delete_cell()
+        test_move_cell()
+        test_split_cell()
+        test_merge_cells()
+        test_empty_document_indexes()
+        test_replace_cell_source()
+        test_prepend_append_to_cell()
+        test_chunk_options()
+        test_frontmatter()
+        test_frontmatter_line_level()
+        test_frontmatter_edge_cases()
+        test_frontmatter_unreadable()
+        test_find_in_rmd()
+        test_kernel_name_mapping()
+        test_kernel_state_not_started()
+        test_kernel_cwd()
+        test_kernel_dead_session()
+        test_kernel_timeout_interrupts()
+        test_kernel_concurrency()
+        test_dead_kernel_cleanup()
+        test_jupyter_restart_keeps_cwd()
+        test_kernel_start_failures()
+        test_kernel_start_failure_logging()
+        test_julia_kernel_resolution()
+        test_format_outputs_strips_ansi()
+        test_format_outputs_traceback()
+        test_server_schema()
+    finally:
+        # Runs even if a test crashed: stop any kernel still registered, then drop every file
+        from rmd_editor import kernel as _kernel
+        for kernel_path in list(_kernel._kernels):
+            _kernel.shutdown_kernel(kernel_path)
+        shutil.rmtree(WORK_DIR, ignore_errors=True)
 
     print(f"\n{'═' * 40}")
     print(f"Results: {PASS} passed, {FAIL} failed")

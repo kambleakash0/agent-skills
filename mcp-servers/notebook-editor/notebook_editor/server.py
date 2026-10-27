@@ -36,7 +36,9 @@ _INSTRUCTIONS = (
     "metadata.kernelspec.name (any installed Jupyter kernel), in the notebook's "
     "folder so relative paths resolve there. State persists across calls; use "
     "interrupt_kernel to stop a stuck cell, restart_kernel for a clean namespace, "
-    "and shutdown_kernel to release resources."
+    "and shutdown_kernel to release resources. A cell that runs past its timeout "
+    "is interrupted with the kernel's state kept; if the error says the kernel is "
+    "still busy, use restart_kernel."
 )
 
 
@@ -592,7 +594,7 @@ def find_in_notebook(
 def execute_cell(
     file_path: FilePath,
     index: Annotated[int, Field(description="Zero-based index of the code cell to run; markdown and raw cells are rejected.")],
-    timeout: Annotated[float, Field(description="Maximum seconds to wait for the cell to finish (default 60).")] = 60.0,
+    timeout: Annotated[float, Field(gt=0, description="Maximum seconds the cell may run (default 60; must be positive); a cell still running then is interrupted and an error is returned, with the kernel's state kept.")] = 60.0,
 ) -> str:
     """
     Execute a single code cell using the notebook's Jupyter kernel (named by
@@ -600,7 +602,10 @@ def execute_cell(
     Captures outputs (stdout, results, errors, display data) and writes them back
     to the notebook file along with the execution_count. The kernel is started
     lazily on first execute, in the notebook's folder (relative paths resolve
-    there), and kept alive for the server's lifetime.
+    there), and kept alive for the server's lifetime. A cell that runs past
+    `timeout` is interrupted (as interrupt_kernel does) so the kernel is free for
+    the next call. Concurrent executions on one notebook run one at a time, and
+    outputs are written into the file as it is when the cell finishes.
 
     Use this when: You want to run a specific cell and capture its output.
     Don't use this when: The cell isn't a code cell (markdown/raw cannot execute).
@@ -629,7 +634,7 @@ def execute_cell(
 @mcp.tool(annotations=_RUNS_CODE)
 def execute_all_cells(
     file_path: FilePath,
-    timeout: Annotated[float, Field(description="Maximum seconds to wait for each cell to finish (default 60).")] = 60.0,
+    timeout: Annotated[float, Field(gt=0, description="Maximum seconds each cell may run (default 60; must be positive); a cell still running then is interrupted and the run stops with an error.")] = 60.0,
     stop_on_error: Annotated[bool, Field(description="Stop at the first cell that raises an error (default true); false runs the remaining cells too.")] = True,
 ) -> str:
     """
@@ -691,7 +696,9 @@ def restart_kernel(file_path: FilePath) -> str:
     All in-memory state (imports, variables, defined functions) is lost. Outputs
     in the notebook file are preserved -- they are only cleared if you
     subsequently re-execute. The restarted kernel keeps the notebook's folder as
-    its working directory.
+    its working directory. A cell that is running is not waited for: the kernel
+    is killed, and that execute call fails with "Kernel died during execution".
+    Execute calls waiting behind it run afterwards, on the restarted kernel.
 
     Use this when: The kernel is in a bad state, or you want to start from a
     clean namespace without re-running all cells.
@@ -722,8 +729,11 @@ def interrupt_kernel(file_path: FilePath) -> str:
     Send an interrupt (SIGINT, or an interrupt message if the kernelspec asks
     for one; a KeyboardInterrupt in Python) to the notebook's Jupyter kernel
     (named by metadata.kernelspec.name). Use this to stop a long-running or
-    stuck cell without restarting the kernel.
-    Variable state in the kernel is preserved.
+    stuck cell without restarting the kernel; it acts at once, even while an
+    execute call is waiting on that cell. Variable state in the kernel is
+    preserved. If the kernel process has died (get_kernel_state reports 'dead'),
+    returns an error saying the kernel is not running; the next execute_cell
+    starts a new one.
 
     Use this when: A cell is taking too long, appears stuck in an infinite loop,
     or you want to abort the current execution.
@@ -753,7 +763,10 @@ def shutdown_kernel(file_path: FilePath) -> str:
     """
     Shut down the notebook's Jupyter kernel (named by metadata.kernelspec.name).
     Frees the process and releases resources. A new kernel will be started
-    automatically if you call `execute_cell` again.
+    automatically if you call `execute_cell` again. A cell that is running is not
+    waited for: the kernel is killed, and that execute call fails with "Kernel
+    died during execution"; execute calls waiting behind it fail with "Kernel was
+    shut down".
 
     Use this when: You're done with a notebook and want to release kernel
     resources, or you want a completely fresh start next time you execute.

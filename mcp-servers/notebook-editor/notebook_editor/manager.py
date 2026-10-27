@@ -8,6 +8,7 @@ import ast as pyast
 import json as _json
 import os
 import re
+import threading
 from typing import Any
 
 import nbformat
@@ -17,6 +18,10 @@ from nbformat.v4 import new_code_cell, new_markdown_cell, new_notebook, new_raw_
 # and some stream output. Stripped from text returned to the caller only; outputs
 # stored in the notebook keep them so Jupyter can still render the colors.
 _ANSI_CSI = re.compile(r"\x1b\[[0-?]*[ -/]*[@-~]")
+
+# Tools run in worker threads: serializes notebook writes, and execution's
+# re-read before its write, within this process
+_write_lock = threading.Lock()
 
 
 class NotebookManagerError(Exception):
@@ -62,6 +67,12 @@ def create_notebook(
     return f"Created empty notebook: {filepath}"
 
 
+def _check_timeout(timeout: float) -> None:
+    """Reject a timeout that is not a positive number of seconds; 0 does not mean "no limit"."""
+    if not timeout > 0:
+        raise NotebookManagerError(f"timeout must be a positive number of seconds, got {timeout}")
+
+
 class NotebookManager:
     def __init__(self, filepath: str):
         self.filepath = filepath
@@ -77,8 +88,50 @@ class NotebookManager:
     # ──────────────────────────────────────────────
 
     def _save(self) -> str:
-        nbformat.write(self.nb, self.filepath)
+        with _write_lock:
+            nbformat.write(self.nb, self.filepath)
         return "Update successful"
+
+    def _save_outputs(self, indices: list[int]) -> str:
+        """
+        Save the outputs and execution counts of the cells at `indices` (positions
+        in self.nb). A cell can run for minutes, so the file is re-read first and
+        only those cells change: edits saved meanwhile, such as another execute_cell
+        on a different cell, are kept instead of being overwritten by this
+        manager's stale copy. A cell is found by id, else by position with
+        unchanged source; if neither matches (deleted, changed to markdown or raw,
+        or moved or edited in a file without cell ids), its outputs are not written.
+        """
+        with _write_lock:
+            try:
+                fresh = nbformat.read(self.filepath, as_version=4)
+            except Exception:
+                # Gone or unreadable now: write this manager's copy, as before
+                fresh = self.nb
+            if fresh is not self.nb:
+                for index in indices:
+                    cell = self.nb.cells[index]
+                    target = self._find_cell(fresh, index, cell)
+                    if target is not None:
+                        target.outputs = cell.outputs
+                        target.execution_count = cell.execution_count
+            nbformat.write(fresh, self.filepath)
+        return "Update successful"
+
+    def _find_cell(self, nb, index: int, cell):
+        """Return the cell in nb matching `cell` (taken from position `index` of self.nb), or None."""
+        cell_id = cell.get("id")
+        if cell_id:
+            for candidate in nb.cells:
+                if candidate.get("id") == cell_id:
+                    # Changed to markdown or raw while it ran: outputs there would make the file invalid
+                    return candidate if candidate.cell_type == "code" else None
+        # No id match: files without stored ids get fresh random ones on every read
+        if index < len(nb.cells):
+            candidate = nb.cells[index]
+            if candidate.cell_type == "code" and self._cell_source_as_string(candidate) == self._cell_source_as_string(cell):
+                return candidate
+        return None
 
     def _validate_index(self, index: int, *, allow_end: bool = False) -> int:
         n = len(self.nb.cells)
@@ -462,10 +515,12 @@ class NotebookManager:
         Execute a single code cell using the notebook's Jupyter kernel. The kernel
         language follows `metadata.kernelspec.name` (python3, ir, julia-1.x, ...) —
         works with any installed Jupyter kernel, not just Python. Updates the cell's
-        outputs and execution_count with the results, then saves the notebook.
+        outputs and execution_count with the results, then writes them into the
+        file as it is now, keeping edits saved while the cell ran (_save_outputs).
         Non-code cells are rejected.
         """
         from notebook_editor import kernel as _kernel
+        _check_timeout(timeout)
         self._validate_index(index)
         cell = self.nb.cells[index]
         if cell.cell_type != "code":
@@ -480,21 +535,24 @@ class NotebookManager:
             raise NotebookManagerError(f"Execution failed: {e}") from e
         cell.outputs = outputs
         cell.execution_count = exec_count
-        return self._save()
+        return self._save_outputs([index])
 
     def execute_all_cells(self, timeout: float = 60.0, stop_on_error: bool = True) -> str:
         """
         Execute all code cells in order using the notebook's Jupyter kernel
         (language driven by metadata.kernelspec.name — works with any installed
-        kernel). Updates outputs and execution_count on each. Non-code cells are
+        kernel). Updates outputs and execution_count on each, written into the file
+        as it is at the end of the run (_save_outputs). Non-code cells are
         skipped. If stop_on_error is True, execution stops at the first cell that
         raises an error. Returns a summary string.
         """
         from notebook_editor import kernel as _kernel
+        _check_timeout(timeout)
         sess = self._kernel_session()
         executed = 0
         errored = 0
         stopped_at: int | None = None
+        ran: list[int] = []
         for i, cell in enumerate(self.nb.cells):
             if cell.cell_type != "code":
                 continue
@@ -507,6 +565,7 @@ class NotebookManager:
                 raise NotebookManagerError(f"Execution failed at cell {i}: {e}") from e
             cell.outputs = outputs
             cell.execution_count = exec_count
+            ran.append(i)
             executed += 1
             # Did the cell error out?
             has_error = any(o.get("output_type") == "error" for o in outputs)
@@ -515,7 +574,7 @@ class NotebookManager:
                 if stop_on_error:
                     stopped_at = i
                     break
-        self._save()
+        self._save_outputs(ran)
         summary_parts = [f"Executed {executed} cells"]
         if errored:
             summary_parts.append(f"{errored} errored")

@@ -11,7 +11,7 @@ import os
 from collections import OrderedDict
 from typing import Optional
 
-from rmd_editor.parser import Cell, Frontmatter, parse, serialize
+from rmd_editor.parser import Cell, Frontmatter, FrontmatterError, dump_yaml, parse, serialize, yaml_string
 
 
 class RmdManagerError(Exception):
@@ -26,7 +26,8 @@ def create_rmd(
     overwrite: bool = False,
 ) -> str:
     """
-    Create a new empty .rmd file with a minimal YAML frontmatter.
+    Create a new empty .rmd file with a minimal YAML frontmatter. An empty
+    title, author or output_format leaves that key out.
 
     Refuses to overwrite an existing file unless overwrite=True.
     Fails if the parent directory does not exist.
@@ -37,12 +38,14 @@ def create_rmd(
     parent = os.path.dirname(file_path) or "."
     if not os.path.isdir(parent):
         raise RmdManagerError(f"Parent directory does not exist: {parent}")
+    # Quoted and escaped as YAML, so any string (quotes, backslashes, newlines) stays valid.
     fm_lines = ["---\n"]
     if title:
-        fm_lines.append(f'title: "{title}"\n')
+        fm_lines.append(f"title: {yaml_string(title, quote=True)}\n")
     if author:
-        fm_lines.append(f'author: "{author}"\n')
-    fm_lines.append(f"output: {output_format}\n")
+        fm_lines.append(f"author: {yaml_string(author, quote=True)}\n")
+    if output_format:
+        fm_lines.append(f"output: {yaml_string(output_format)}\n")
     fm_lines.append("---\n\n")
     with open(file_path, "w", encoding="utf-8") as f:
         f.write("".join(fm_lines))
@@ -56,6 +59,12 @@ def _validate_path(file_path: str, *, must_exist: bool = True) -> None:
         raise RmdManagerError(f"File is not a .rmd document: {file_path}")
     if must_exist and not os.path.isfile(file_path):
         raise RmdManagerError(f"File does not exist: {file_path}")
+
+
+def _check_timeout(timeout: float) -> None:
+    """Reject a timeout that is not a positive number of seconds; 0 does not mean "no limit"."""
+    if not timeout > 0:
+        raise RmdManagerError(f"timeout must be a positive number of seconds, got {timeout}")
 
 
 class RmdManager:
@@ -86,8 +95,10 @@ class RmdManager:
         n = len(self.cells)
         if allow_end and index == n:
             return n
-        if index == -1:
-            return n - 1 if n > 0 else 0
+        if index == -1 and n > 0:
+            return n - 1
+        if n == 0:
+            raise RmdManagerError(f"Cell index {index} out of range: the document has no cells")
         if index < 0 or index >= n:
             raise RmdManagerError(f"Cell index {index} out of range (0..{n-1})")
         return index
@@ -278,32 +289,37 @@ class RmdManager:
     # ──────────────────────────────────────────────
 
     def get_frontmatter(self) -> str:
-        if not self.frontmatter.present:
+        fm = self.frontmatter
+        if not fm.present:
             return "(no frontmatter)"
-        if not self.frontmatter.data:
+        if fm.error is not None:
+            return f"(the YAML header could not be parsed: {fm.error}; its raw text follows)\n{fm.text()}".rstrip("\n")
+        if not fm.data:
             return "(empty frontmatter)"
-        import yaml as _yaml
-        return _yaml.safe_dump(self.frontmatter.data, sort_keys=False, default_flow_style=False, allow_unicode=True).rstrip("\n")
+        return dump_yaml(fm.data).rstrip("\n")
 
     def set_frontmatter_key(self, key: str, value: str) -> str:
         key = key.strip()
         if not key:
             raise RmdManagerError("Frontmatter key must not be empty")
-        import yaml as _yaml
+        had_header = self.frontmatter.present
         try:
-            parsed_value = _yaml.safe_load(value)
-        except _yaml.YAMLError:
-            parsed_value = value
-        self.frontmatter.data[key] = parsed_value
-        self.frontmatter.present = True
-        self.frontmatter.mark_dirty()
+            # Rewrites only this key's lines; the rest of the header is kept byte for byte.
+            self.frontmatter.set_key(key, value)
+        except FrontmatterError as e:
+            raise RmdManagerError(str(e)) from e
+        if not had_header:
+            # A new header gets a blank line before the body, as create_rmd writes it.
+            body = serialize(Frontmatter(), self.cells)
+            if body and not body.startswith("\n"):
+                self.frontmatter.raw += "\n"
         return self._save()
 
     def remove_frontmatter_key(self, key: str) -> str:
-        if not self.frontmatter.present or key not in self.frontmatter.data:
-            raise RmdManagerError(f"Frontmatter has no key {key!r}")
-        del self.frontmatter.data[key]
-        self.frontmatter.mark_dirty()
+        try:
+            self.frontmatter.remove_key(key.strip())
+        except FrontmatterError as e:
+            raise RmdManagerError(str(e)) from e
         return self._save()
 
     # ──────────────────────────────────────────────
@@ -337,6 +353,7 @@ class RmdManager:
         language.
         """
         from rmd_editor import kernel as _kernel
+        _check_timeout(timeout)
         cell = self._require_code_cell(index)
         kernel_name = _language_to_kernel_name(cell.language)
         try:
@@ -355,6 +372,7 @@ class RmdManager:
         persisted. Returns a cell-by-cell transcript.
         """
         from rmd_editor import kernel as _kernel
+        _check_timeout(timeout)
         transcript: list[str] = []
         executed = 0
         errored = 0
@@ -388,9 +406,13 @@ class RmdManager:
 
 def _language_to_kernel_name(lang: str) -> str:
     """Map .rmd chunk language identifiers to Jupyter kernelspec names."""
+    lang = lang.lower()
+    if lang == "julia":
+        # IJulia installs versioned kernelspecs (julia-1.11), so look up the installed one.
+        from rmd_editor import kernel as _kernel
+        return _kernel.julia_kernel_name()
     mapping = {
         "r": "ir",
         "python": "python3",
-        "julia": "julia-1",
     }
-    return mapping.get(lang.lower(), lang.lower())
+    return mapping.get(lang, lang)

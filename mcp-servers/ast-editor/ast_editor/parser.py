@@ -19,6 +19,27 @@ RUBY_EXTS = (".rb",)
 GO_EXTS = (".go",)
 
 
+def detect_newline(data: bytes) -> str:
+    """Return the file's line-ending style: "\\r\\n" when most of its line
+    breaks are CRLF, otherwise "\\n" (also for files with no line breaks)."""
+    crlf = data.count(b"\r\n")
+    return "\r\n" if crlf * 2 > data.count(b"\n") else "\n"
+
+
+def first_syntax_error(root: Node) -> Node | None:
+    """Return the first ERROR or MISSING node under root in document order,
+    or None if the tree parsed cleanly. Iterative, so deeply nested trees
+    cannot hit the recursion limit."""
+    stack = [root]
+    while stack:
+        node = stack.pop()
+        if node.is_error or node.is_missing:
+            return node
+        if node.has_error:
+            stack.extend(reversed(node.children))
+    return None
+
+
 class TreeSitterParser:
     def __init__(self, filepath: str):
         self.filepath = filepath
@@ -29,8 +50,12 @@ class TreeSitterParser:
                 self.language = Language(tree_sitter_python.language())
             elif self.ext in (".js", ".jsx", ".mjs", ".cjs"):
                 self.language = Language(tree_sitter_javascript.language())
-            elif self.ext in (".ts", ".tsx"):
+            elif self.ext == ".ts":
                 self.language = Language(tree_sitter_typescript.language_typescript())
+            elif self.ext == ".tsx":
+                # The plain TypeScript grammar rejects JSX, which would make
+                # the save-time syntax check refuse valid .tsx edits.
+                self.language = Language(tree_sitter_typescript.language_tsx())
             elif self.ext == ".json":
                 self.language = Language(tree_sitter_json.language())
             elif self.ext in (".yml", ".yaml"):
@@ -68,7 +93,12 @@ class TreeSitterParser:
         self.parser = Parser(self.language)
 
         with open(filepath, "rb") as f:
-            self.source_bytes = f.read()
+            raw = f.read()
+        # Everything works on LF text internally (node positions, caller
+        # snippets, inserted code); the Applier writes the file back with
+        # its own `newline` style.
+        self.newline = detect_newline(raw)
+        self.source_bytes = raw.replace(b"\r\n", b"\n")
         self.source_code = self.source_bytes.decode("utf-8")
         self.tree = self.parser.parse(self.source_bytes)
 
@@ -189,7 +219,10 @@ class TreeSitterParser:
         return None
 
     def _find_child_with_name(self, node: Node, name: str, valid_types: list[str]) -> Node | None:
-        queue = [node]
+        # Search below `node` only: the container must not match itself, or
+        # a Java constructor target such as `LRUCache.LRUCache` would resolve
+        # to the class.
+        queue = list(node.named_children)
         while queue:
             curr = queue.pop(0)
             if curr.type in valid_types:

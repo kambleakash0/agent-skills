@@ -7,13 +7,17 @@ the tests write lives in a temporary directory that __main__ creates and always
 removes, so a crash can't leave files behind in tests/.
 """
 import asyncio
+import contextlib
 import importlib.metadata
+import io
 import json
 import logging
 import os
 import shutil
 import sys
 import tempfile
+import threading
+import time
 
 sys.path.insert(0, os.path.abspath(os.path.join(os.path.dirname(__file__), '..')))
 
@@ -69,6 +73,57 @@ def reset_fixture() -> str:
 
 def read_notebook(path: str):
     return nbformat.read(path, as_version=4)
+
+@contextlib.contextmanager
+def captured_logs(*names: str):
+    """
+    Send every log record to a buffer instead of stderr while the block runs, with
+    the named loggers (some are quieted in __main__) at their default level.
+    Yields the buffer; each record is formatted as "LEVEL logger: message".
+    """
+    buf = io.StringIO()
+    handler = logging.StreamHandler(buf)
+    handler.setFormatter(logging.Formatter("%(levelname)s %(name)s: %(message)s"))
+    root = logging.getLogger()
+    saved_handlers, saved_level = root.handlers[:], root.level
+    loggers = [logging.getLogger(name) for name in names]
+    saved_levels = [lg.level for lg in loggers]
+    root.handlers = [handler]
+    root.setLevel(logging.INFO)
+    for lg in loggers:
+        lg.setLevel(logging.NOTSET)
+    try:
+        yield buf
+    finally:
+        root.handlers = saved_handlers
+        root.setLevel(saved_level)
+        for lg, level in zip(loggers, saved_levels):
+            lg.setLevel(level)
+
+
+def wait_until(predicate, timeout: float = 10.0) -> bool:
+    """Poll predicate() until it is true or timeout seconds pass; returns its last value."""
+    deadline = time.time() + timeout
+    while not predicate():
+        if time.time() > deadline:
+            return False
+        time.sleep(0.05)
+    return True
+
+
+def in_thread(fn, *args, **kwargs):
+    """Run fn in a new thread; returns (thread, result) where result gets 'value' or 'error'."""
+    result: dict = {}
+
+    def target():
+        try:
+            result["value"] = fn(*args, **kwargs)
+        except Exception as e:
+            result["error"] = e
+
+    thread = threading.Thread(target=target, daemon=True)
+    thread.start()
+    return thread, result
 
 
 # ──────────────────────────────────────────────
@@ -586,6 +641,391 @@ def test_kernel_dies_during_execution():
     finally:
         _kernel.shutdown_kernel(path)
 
+def test_kernel_timeout_interrupts():
+    print("\n═══ timeout interrupts the cell ═══")
+    from notebook_editor import kernel as _kernel
+    from notebook_editor import server
+
+    nb = new_notebook()
+    nb.cells = [
+        new_code_cell("x = 41"),
+        new_code_cell("import time\ntime.sleep(30)"),
+        new_code_cell("print(x + 1)"),
+        # Ignores the interrupt, so it is still running after the grace period
+        new_code_cell("import signal, time\nsignal.signal(signal.SIGINT, signal.SIG_IGN)\ntime.sleep(30)"),
+        new_code_cell("print('fresh', 'x' in globals())"),
+    ]
+    path = os.path.join(WORK_DIR, "test_timeout.ipynb")
+    nbformat.write(nb, path)
+    old_grace = _kernel._INTERRUPT_GRACE
+    try:
+        NotebookManager(path).execute_cell(0)
+        started = time.time()
+        try:
+            NotebookManager(path).execute_cell(1, timeout=2)
+            check("timeout: error raised", "no error", "Execution timed out")
+        except NotebookManagerError as e:
+            check("timeout: error says the cell timed out", str(e), "Execution timed out after 2s")
+            check("timeout: error says the cell was interrupted", str(e), "the cell was interrupted")
+        check("timeout: returns soon after the timeout, not after the cell", time.time() - started < 6, True)
+        started = time.time()
+        NotebookManager(path).execute_cell(2)
+        check("timeout: next cell runs promptly", time.time() - started < 5, True)
+        check("timeout: earlier variables survive", NotebookManager(path).get_outputs(2), "42")
+        check("timeout: kernel still alive", _kernel.kernel_state(path), "alive")
+        check("timeout: execute_cell tool error string", server.execute_cell(path, 1, timeout=1),
+              "Cannot execute cell: Execution failed: Execution timed out after 1s; the cell was interrupted")
+
+        # A cell that times out before the kernel has started it is interrupted once it starts
+        # (ipykernel ignores an interrupt that comes earlier)
+        started = time.time()
+        check("timeout: tiny timeout still interrupts the cell", server.execute_cell(path, 1, timeout=0.001),
+              "Execution timed out after 0.001s; the cell was interrupted and the kernel is ready")
+        check("timeout: tiny timeout doesn't wait out the grace period", time.time() - started < 4, True)
+        started = time.time()
+        NotebookManager(path).execute_cell(2)
+        check("timeout: next cell runs promptly after a tiny timeout", time.time() - started < 3, True)
+        # The same when the cell times out while queued in the kernel behind a request sent
+        # directly here: the interrupt waits for the cell instead of stopping that request
+        # (sent with stop_on_error=False, so an interrupt there wouldn't abort the queued cell)
+        _kernel.get_kernel(path).kc.execute("import time; time.sleep(1)", stop_on_error=False)
+        started = time.time()
+        check("timeout: cell queued in the kernel is interrupted once it starts",
+              server.execute_cell(path, 1, timeout=0.2), "the cell was interrupted and the kernel is ready")
+        check("timeout: queued cell's call returns soon after it starts", time.time() - started < 4, True)
+
+        # A timeout that isn't positive is refused before anything runs
+        for bad in (0, -1):
+            check(f"timeout: execute_cell refuses timeout={bad}", server.execute_cell(path, 1, timeout=bad),
+                  f"Cannot execute cell: timeout must be a positive number of seconds, got {bad}")
+        check("timeout: execute_all_cells refuses timeout=0", server.execute_all_cells(path, timeout=0),
+              "Cannot execute all cells: timeout must be a positive number of seconds, got 0")
+
+        _kernel._INTERRUPT_GRACE = 1.0
+        try:
+            NotebookManager(path).execute_cell(3, timeout=1)
+            check("timeout: ignored interrupt raises", "no error", "still busy")
+        except NotebookManagerError as e:
+            check("timeout: ignored interrupt reported as still busy", str(e), "still busy 1s later")
+            check("timeout: still-busy error suggests restart_kernel", str(e), "Use restart_kernel")
+        check("timeout: restart_kernel recovers a still-busy kernel", server.restart_kernel(path), "Restarted")
+        started = time.time()
+        NotebookManager(path).execute_cell(4)
+        check("timeout: runs promptly after the restart", time.time() - started < 5, True)
+        check("timeout: restarted kernel has a fresh namespace", NotebookManager(path).get_outputs(4), "fresh False")
+    finally:
+        _kernel._INTERRUPT_GRACE = old_grace
+        _kernel.shutdown_kernel(path)
+
+
+def test_kernel_concurrency():
+    print("\n═══ concurrent kernel calls ═══")
+    from notebook_editor import kernel as _kernel
+    from notebook_editor import server
+
+    nb = new_notebook()
+    nb.cells = [
+        new_code_cell("import time\ntime.sleep(1)\nprint('first')"),
+        new_code_cell("print('second')"),
+        new_code_cell("import time\ntime.sleep(30)"),
+        new_code_cell("y = 1"),
+        # Runs long enough that a restart polling for running cells would catch it
+        new_code_cell("import time\ntime.sleep(1)\nprint('queued ran')"),
+    ]
+    path = os.path.join(WORK_DIR, "test_concurrency.ipynb")
+    nbformat.write(nb, path)
+
+    starts = []
+    real_km = _kernel.KernelManager
+
+    class CountingKernelManager(real_km):
+        def start_kernel(self, **kw):
+            starts.append(kw)
+            return super().start_kernel(**kw)
+
+    _kernel.KernelManager = CountingKernelManager
+    try:
+        # Two tools at once on a notebook with no kernel yet
+        barrier = threading.Barrier(2)
+
+        def run(index):
+            barrier.wait()
+            return server.execute_cell(path, index)
+
+        t0, r0 = in_thread(run, 0)
+        t1, r1 = in_thread(run, 1)
+        t0.join(60)
+        t1.join(60)
+        out0, out1 = r0.get("value", repr(r0)), r1.get("value", repr(r1))
+        check("concurrent: first call gets its own output", out0, "Successfully executed cell 0")
+        check("concurrent: first call output", "first" in out0 and "second" not in out0, True)
+        check("concurrent: second call gets its own output", out1, "Successfully executed cell 1")
+        check("concurrent: second call output", "second" in out1 and "first" not in out1, True)
+        check("concurrent: one kernel started for both calls", len(starts), 1)
+        loaded = read_notebook(path)
+        stored = ["".join(o.get("text", "") for o in loaded.cells[i].outputs) for i in (0, 1)]
+        check("concurrent: both outputs saved to the file", stored, ["first\n", "second\n"])
+
+        # Many executes on one session at once: none reads another's messages
+        sess = _kernel.get_kernel(path)
+        runs = [in_thread(sess.execute, f"print({i})", timeout=20) for i in range(6)]
+        for thread, _ in runs:
+            thread.join(60)
+        texts = [
+            "".join(o.get("text", "") for o in result["value"][0]) if "value" in result else repr(result)
+            for _, result in runs
+        ]
+        check("concurrent: each execute gets exactly its own output", texts, [f"{i}\n" for i in range(6)])
+
+        # interrupt_kernel doesn't wait for the running execute
+        thread, result = in_thread(server.execute_cell, path, 2, timeout=60)
+        check("concurrent: cell is running", wait_until(lambda: sess._executing), True)
+        time.sleep(0.5)
+        started = time.time()
+        check("concurrent: interrupt_kernel during a running cell", server.interrupt_kernel(path), "Interrupted")
+        check("concurrent: interrupt_kernel returns at once", time.time() - started < 2, True)
+        thread.join(10)
+        check("concurrent: interrupted cell's call returns", thread.is_alive(), False)
+        check("concurrent: interrupted cell reports KeyboardInterrupt", result.get("value", repr(result)), "KeyboardInterrupt")
+
+        # restart_kernel kills a running cell instead of waiting for it
+        thread, result = in_thread(server.execute_cell, path, 2, timeout=60)
+        check("concurrent: cell is running before restart", wait_until(lambda: sess._executing), True)
+        started = time.time()
+        check("concurrent: restart_kernel during a running cell", server.restart_kernel(path), "Restarted")
+        check("concurrent: restart_kernel doesn't wait for the cell", time.time() - started < 15, True)
+        thread.join(10)
+        check("concurrent: running cell fails when restarted", result.get("value", repr(result)), "Kernel died during execution")
+        check("concurrent: kernel alive after restart", _kernel.kernel_state(path), "alive")
+
+        # restart_kernel goes ahead of a call queued behind the running cell, which then
+        # runs on the restarted kernel: only the running cell is lost
+        starts_before = len(starts)
+        thread, result = in_thread(server.execute_cell, path, 2, timeout=60)
+        check("concurrent: cell is running before restart with a call queued", wait_until(lambda: sess._executing), True)
+        queued, queued_result = in_thread(server.execute_cell, path, 4)
+        time.sleep(0.3)  # let the second call queue up on the session lock
+        check("concurrent: restart_kernel with a call queued", server.restart_kernel(path), "Restarted")
+        thread.join(10)
+        queued.join(30)
+        check("concurrent: running cell fails when restarted with a call queued",
+              result.get("value", repr(result)), "Kernel died during execution")
+        check("concurrent: queued call runs on the restarted kernel",
+              queued_result.get("value", repr(queued_result)), "Successfully executed cell 4")
+        check("concurrent: queued call gets its output", queued_result.get("value", ""), "queued ran")
+        check("concurrent: no extra kernel started for the queued call", len(starts), starts_before)
+        check("concurrent: same session after the restart", _kernel.get_kernel(path) is sess, True)
+
+        # Edits saved while a cell runs are kept when its outputs are written
+        thread, result = in_thread(NotebookManager(path).execute_cell, 0)
+        check("concurrent: cell is running before the edit", wait_until(lambda: sess._executing), True)
+        NotebookManager(path).replace_cell_source(3, "y = 2")
+        thread.join(30)
+        loaded = read_notebook(path)
+        check("concurrent: edit made during execution kept", loaded.cells[3].source, "y = 2")
+        check("concurrent: outputs of the running cell saved",
+              "".join(o.get("text", "") for o in loaded.cells[0].outputs), "first\n")
+
+        # A running cell changed to markdown meanwhile, keeping its id (as JupyterLab does), gets no outputs
+        thread, result = in_thread(NotebookManager(path).execute_cell, 0)
+        check("concurrent: cell is running before its type changes", wait_until(lambda: sess._executing), True)
+        changed = read_notebook(path)
+        changed.cells[0] = new_markdown_cell(changed.cells[0].source, id=changed.cells[0].id)
+        nbformat.write(changed, path)
+        thread.join(30)
+        check("concurrent: execute finishes after the type change", result.get("value", repr(result)), "Update successful")
+        saved = read_notebook(path)
+        check("concurrent: cell changed to markdown stays markdown", saved.cells[0].cell_type, "markdown")
+        check("concurrent: no outputs written to the markdown cell",
+              [k for k in ("outputs", "execution_count") if k in saved.cells[0]], [])
+        try:
+            nbformat.validate(saved)
+            valid = True
+        except nbformat.ValidationError as e:
+            valid = str(e).split("\n")[0]
+        check("concurrent: file still valid after the type change", valid, True)
+
+        # shutdown_kernel kills a running cell instead of waiting for it
+        thread, result = in_thread(server.execute_cell, path, 2, timeout=60)
+        check("concurrent: cell is running before shutdown", wait_until(lambda: sess._executing), True)
+        started = time.time()
+        check("concurrent: shutdown_kernel during a running cell", server.shutdown_kernel(path), "Shut down")
+        check("concurrent: shutdown_kernel doesn't wait for the cell", time.time() - started < 15, True)
+        thread.join(10)
+        check("concurrent: running cell fails when shut down", result.get("value", repr(result)), "Kernel died during execution")
+        check("concurrent: state 'not started' after shutdown", _kernel.kernel_state(path), "not started")
+        try:
+            sess.execute("1")
+            check("concurrent: shut-down session refuses to execute", "no error", "Kernel was shut down")
+        except _kernel.KernelError as e:
+            check("concurrent: shut-down session refuses to execute", str(e), "Kernel was shut down")
+        check("concurrent: shut-down session started no new kernel", _kernel.kernel_state(path), "not started")
+    finally:
+        _kernel.KernelManager = real_km
+        _kernel.shutdown_kernel(path)
+
+    # A file without stored cell ids (nbformat 4.4) still gets its outputs
+    legacy_path = os.path.join(WORK_DIR, "test_no_ids.ipynb")
+    with open(legacy_path, "w", encoding="utf-8") as f:
+        json.dump({
+            "nbformat": 4, "nbformat_minor": 4, "metadata": {},
+            "cells": [{"cell_type": "code", "source": "print('legacy')", "metadata": {},
+                       "outputs": [], "execution_count": None}],
+        }, f)
+    try:
+        NotebookManager(legacy_path).execute_cell(0)
+        check("no ids: outputs saved by position",
+              "".join(o.get("text", "") for o in read_notebook(legacy_path).cells[0].outputs), "legacy\n")
+    finally:
+        _kernel.shutdown_kernel(legacy_path)
+
+
+def test_dead_kernel_cleanup():
+    print("\n═══ dead kernel: interrupt and failed restarts ═══")
+    from notebook_editor import kernel as _kernel
+    from notebook_editor import server
+
+    nb = new_notebook()
+    nb.cells = [new_code_cell("z = 1"), new_code_cell("print('alive again')")]
+    path = os.path.join(WORK_DIR, "test_dead_kernel.ipynb")
+    nbformat.write(nb, path)
+    try:
+        NotebookManager(path).execute_cell(0)
+        sess = _kernel.get_kernel(path)
+        sess._kill()
+        check("dead: kernel process killed", wait_until(lambda: not sess.is_alive()), True)
+        check("dead: get_kernel_state reports dead", server.get_kernel_state(path), "dead")
+        check("dead: interrupt_kernel reports the kernel is not running", server.interrupt_kernel(path),
+              "Cannot interrupt kernel: Kernel is not running (its process has exited)")
+        NotebookManager(path).execute_cell(1)
+        check("dead: next execute starts a new kernel", NotebookManager(path).get_outputs(1), "alive again")
+
+        # execute() finds its kernel dead and its own start attempt fails
+        sess = _kernel.get_kernel(path)
+        sess._kill()
+        wait_until(lambda: not sess.is_alive())
+        sess.kernel_name = "nosuchkernel-xyz"
+        with captured_logs():
+            try:
+                sess.execute("1")
+                check("dead: failed start inside execute raises", "no error", "No such kernel named")
+            except _kernel.KernelError as e:
+                check("dead: failed start inside execute raises", str(e), "No such kernel named nosuchkernel-xyz")
+        check("dead: failed start inside execute leaves 'not started'", _kernel.kernel_state(path), "not started")
+    finally:
+        _kernel.shutdown_kernel(path)
+
+    # restart_kernel when the kernel's executable has gone away
+    jupyter_dir = os.path.join(WORK_DIR, "jupyter-restart")
+    spec_dir = os.path.join(jupyter_dir, "kernels", "wrapped-xyz")
+    os.makedirs(spec_dir)
+    launcher = os.path.join(jupyter_dir, "launch-python")
+    with open(launcher, "w") as f:
+        f.write(f'#!/bin/sh\nexec "{sys.executable}" "$@"\n')
+    os.chmod(launcher, 0o755)
+    with open(os.path.join(spec_dir, "kernel.json"), "w") as f:
+        json.dump({
+            "argv": [launcher, "-m", "ipykernel_launcher", "-f", "{connection_file}"],
+            "display_name": "Wrapped",
+            "language": "python",
+        }, f)
+    wrapped_path = os.path.join(WORK_DIR, "test_wrapped_kernel.ipynb")
+    create_notebook(wrapped_path, kernel_name="wrapped-xyz")
+    NotebookManager(wrapped_path).add_cell(0, "w = 1")
+    old_jupyter_path = os.environ.get("JUPYTER_PATH")
+    os.environ["JUPYTER_PATH"] = jupyter_dir
+    try:
+        NotebookManager(wrapped_path).execute_cell(0)
+        check("failed restart: kernel started through the launcher", _kernel.kernel_state(wrapped_path), "alive")
+        os.remove(launcher)
+        # With the tool's own logger too, as a real server logs
+        with captured_logs("notebook_editor.kernel", "notebook-editor", "traitlets") as logs:
+            out = server.restart_kernel(wrapped_path)
+        check("failed restart: tool error string", out, "Cannot restart kernel: Kernel failed to restart: [Errno 2]")
+        check("failed restart: state 'not started'", _kernel.kernel_state(wrapped_path), "not started")
+        lines = logs.getvalue().strip().splitlines()
+        check("failed restart: one-line warnings only, from the kernel module and the tool",
+              [line.split(":")[0] for line in lines if not line.startswith("INFO ")],
+              ["WARNING notebook_editor.kernel", "WARNING notebook-editor"])
+        check("failed restart: the kernel module's warning", logs.getvalue(),
+              "WARNING notebook_editor.kernel: Kernel failed to restart: [Errno 2]")
+        check("failed restart: no traceback logged", "Traceback" in logs.getvalue(), False)
+    finally:
+        if old_jupyter_path is None:
+            os.environ.pop("JUPYTER_PATH", None)
+        else:
+            os.environ["JUPYTER_PATH"] = old_jupyter_path
+        _kernel.shutdown_kernel(wrapped_path)
+
+
+def test_kernel_start_failure_logging():
+    print("\n═══ kernel start failure logging ═══")
+    from notebook_editor import kernel as _kernel
+
+    jupyter_dir = os.path.join(WORK_DIR, "jupyter-logging")
+    argvs = {
+        "missing-binary-xyz": [os.path.join(WORK_DIR, "no-such-kernel-binary"), "-f", "{connection_file}"],
+        # A NUL byte makes Popen raise ValueError, which is not an expected start failure
+        "nul-byte-xyz": ["/bin/sh\x00", "-f", "{connection_file}"],
+    }
+    for name, argv in argvs.items():
+        os.makedirs(os.path.join(jupyter_dir, "kernels", name))
+        with open(os.path.join(jupyter_dir, "kernels", name, "kernel.json"), "w") as f:
+            json.dump({"argv": argv, "display_name": name, "language": "python"}, f)
+    paths = {}
+    for name in ("nosuchkernel-xyz", *argvs):
+        paths[name] = os.path.join(WORK_DIR, f"test_logging_{name}.ipynb")
+        create_notebook(paths[name], kernel_name=name)
+
+    def start_logs(name: str) -> str:
+        with captured_logs("notebook_editor.kernel", "traitlets") as logs:
+            try:
+                _kernel.get_or_start_kernel(paths[name])
+            except _kernel.KernelError:
+                pass
+        return logs.getvalue()
+
+    old_jupyter_path = os.environ.get("JUPYTER_PATH")
+    os.environ["JUPYTER_PATH"] = jupyter_dir
+    try:
+        missing = start_logs("nosuchkernel-xyz")
+        check("logging: missing kernelspec logs one line", len(missing.strip().splitlines()), 1)
+        check("logging: missing kernelspec line is the kernel module's warning", missing,
+              "WARNING notebook_editor.kernel: No such kernel named nosuchkernel-xyz")
+        check("logging: missing kernelspec logs no traceback", "Traceback" in missing, False)
+
+        binary = start_logs("missing-binary-xyz")
+        check("logging: missing kernel binary logs one line", len(binary.strip().splitlines()), 1)
+        check("logging: missing kernel binary line is the kernel module's warning", binary,
+              "WARNING notebook_editor.kernel: Kernel failed to start: [Errno 2]")
+        check("logging: missing kernel binary logs no traceback", "Traceback" in binary, False)
+        check("logging: missing kernel binary skips the launcher dump", "Failed to run command" in binary, False)
+
+        unexpected = start_logs("nul-byte-xyz")
+        check("logging: unexpected start error keeps jupyter_client's traceback", unexpected, "Traceback")
+        check("logging: unexpected start error names the exception", unexpected, "ValueError: embedded null byte")
+        check("logging: unexpected start error keeps the launcher dump", unexpected, "Failed to run command")
+        check("logging: unexpected start error also gets the warning line", unexpected,
+              "WARNING notebook_editor.kernel: Kernel failed to start: embedded null byte")
+    finally:
+        if old_jupyter_path is None:
+            os.environ.pop("JUPYTER_PATH", None)
+        else:
+            os.environ["JUPYTER_PATH"] = old_jupyter_path
+        for path in paths.values():
+            _kernel.shutdown_kernel(path)
+
+    # Only those calls were filtered: jupyter_client's logger still reports the same kinds of errors
+    traitlets_log = logging.getLogger("traitlets")
+    check("logging: no filter left on jupyter_client's logger",
+          [f for f in traitlets_log.filters if isinstance(f, _kernel._QuietExpectedStartFailure)], [])
+    with captured_logs("traitlets") as logs:
+        try:
+            raise FileNotFoundError("unrelated")
+        except FileNotFoundError:
+            traitlets_log.exception("unrelated diagnostic")
+    check("logging: unrelated jupyter_client diagnostics still logged", logs.getvalue(), "unrelated diagnostic")
+
 
 def test_list_notebook_symbols():
     print("\n═══ list_notebook_symbols ═══")
@@ -754,6 +1194,10 @@ def test_server_schema():
         if not prop.get("description")
     ]
     check("schema: every parameter has a description", undescribed, [])
+    by_name = {t.name: t for t in tools}
+    check("schema: timeouts must be positive",
+          [by_name[n].input_schema["properties"]["timeout"].get("exclusiveMinimum") for n in ("execute_cell", "execute_all_cells")],
+          [0, 0])
 
     # (read_only_hint, destructive_hint, open_world_hint) -> tools expected to carry it
     expected_hints = {
@@ -788,8 +1232,9 @@ def test_server_schema():
 if __name__ == "__main__":
     # Keep the server's info/warning logs for expected errors out of the output; crashes still show
     logging.getLogger("notebook-editor").setLevel(logging.ERROR)
-    # jupyter_client logs a traceback for each deliberately failed kernel start
-    logging.getLogger("traitlets").setLevel(logging.CRITICAL)
+    # ...and the kernel module's one warning line per deliberately failed kernel start
+    # (test_kernel_start_failure_logging checks those lines, and that jupyter_client adds nothing)
+    logging.getLogger("notebook_editor.kernel").setLevel(logging.ERROR)
 
     WORK_DIR = tempfile.mkdtemp(prefix="notebook-editor-tests-")
     FIXTURE_PATH = os.path.join(WORK_DIR, "test_fixture.ipynb")
@@ -818,6 +1263,10 @@ if __name__ == "__main__":
         test_kernel_start_failures()
         test_ansi_stripped_from_returned_text()
         test_kernel_dies_during_execution()
+        test_kernel_timeout_interrupts()
+        test_kernel_concurrency()
+        test_dead_kernel_cleanup()
+        test_kernel_start_failure_logging()
         test_create_notebook()
         test_non_python_kernel()
         test_server_schema()

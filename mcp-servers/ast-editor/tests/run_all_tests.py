@@ -3,7 +3,7 @@ import sys
 import shutil
 
 sys.path.insert(0, os.path.abspath(os.path.join(os.path.dirname(__file__), "..")))
-from ast_editor.applier import Applier
+from ast_editor.applier import Applier, ApplierError
 
 TESTS_DIR = os.path.dirname(__file__)
 PASS = 0
@@ -1729,6 +1729,16 @@ def test_java():
         result,
         "this.capacity = capacity * 2",
     )
+    # `LRUCache.LRUCache` used to resolve to the class itself, so the whole
+    # class body was replaced (and the file left unparsable).
+    check(
+        "java replace_function_body: constructor target is not the class",
+        result,
+        "    public LRUCache(int capacity) {\n"
+        "        this.capacity = capacity * 2;\n"
+        "        this.items = new HashMap<>();\n"
+        "    }\n\n    @Override",
+    )
 
     # add_method to a class
     path = reset_fixture("java")
@@ -2874,6 +2884,23 @@ int keep(int x) {
     check("py delete_symbol (no comment): bar intact", result, "def bar")
     _os.remove(py_path)
 
+    # A /* ... */ that trails code on the line above is not a leading
+    # comment, so the code stays; real block comments still go.
+    for label, name, content, target, expected in [
+        ("c trailing block comment", "test_delcmt.c",
+         "int x = 1; /* trailing */\nint f(void) { return 0; }\n", "f",
+         "int x = 1; /* trailing */\n"),
+        ("java field with trailing block comment", "test_delcmt.java",
+         "class A {\n    int x = 1; /* n */\n    void f() {}\n}\n", "A.f",
+         "class A {\n    int x = 1; /* n */\n}\n"),
+        ("c single-line block comment", "test_delcmt.c",
+         "int x = 1;\n/* doc */\nint f(void) { return 0; }\n", "f", "int x = 1;\n"),
+        ("c multi-line block comment", "test_delcmt.c",
+         "int x = 1;\n/*\n * doc\n */\nint f(void) { return 0; }\n", "f", "int x = 1;\n"),
+    ]:
+        result = _edit_result(name, content, lambda a: a.delete_symbol(target))
+        _exact(f"delete_symbol ({label})", result, expected)
+
 
 # ──────────────────────────────────────────────
 # AST Reader tests (read_symbol, read_imports, read_interface)
@@ -3104,6 +3131,1509 @@ def test_tool_schemas():
 
 
 # ──────────────────────────────────────────────
+# Save-time syntax guard, line endings, signature indentation
+# ──────────────────────────────────────────────
+
+
+def _write_temp(name: str, content: str, newline: str = "\n") -> str:
+    """Write LF `content` to tests/<name> as raw bytes with the given line endings."""
+    path = os.path.join(TESTS_DIR, name)
+    with open(path, "wb") as f:
+        f.write(content.replace("\n", newline).encode("utf-8"))
+    return path
+
+
+def _read_bytes(path: str) -> bytes:
+    with open(path, "rb") as f:
+        return f.read()
+
+
+def _line_endings(data: bytes) -> str:
+    """Classify the line breaks in data as 'crlf', 'lf', 'mixed' or 'none'."""
+    crlf = data.count(b"\r\n")
+    lf = data.count(b"\n") - crlf
+    if b"\r\r" in data or (crlf and lf):
+        return "mixed"
+    if crlf:
+        return "crlf"
+    return "lf" if lf else "none"
+
+
+def _refusal(action) -> str:
+    """Run action() and return the ApplierError message, or 'NOT REFUSED'."""
+    try:
+        action()
+    except ApplierError as e:
+        return str(e)
+    return "NOT REFUSED"
+
+
+def test_syntax_guard():
+    print("\n═══ Save-time syntax guard ═══")
+
+    # One edit per language family that would break the parse. Each must be
+    # refused, name the first error's position, and leave the file untouched.
+    # (fixture, label, edit, substrings expected in the error message)
+    cases = [
+        (
+            "js",
+            "replace_in_body: unclosed block",
+            lambda a: a.replace_in_body(
+                "LRUCache.get",
+                "return this.items.get(key);",
+                "if (key) {\n            return this.items.get(key);",
+            ),
+            ("at line 11, column 2 (missing '}')",),
+        ),
+        (
+            "ts",
+            "add_method: unclosed method",
+            lambda a: a.add_method(
+                "LRUCache", "    clear(): void {\n        this.items.clear();"
+            ),
+            ("at line 17, column 2 (missing '}')",),
+        ),
+        (
+            "c",
+            "insert_in_body: unclosed if",
+            lambda a: a.insert_in_body("add", "    if (a) {", at="bottom"),
+            ("at line 10, column 2 (missing '}')",),
+        ),
+        (
+            "cpp",
+            "add_top_level: unclosed class",
+            lambda a: a.add_top_level("class Broken {\npublic:\n    int x;"),
+            ("at line 18, column 1 (cannot parse 'class Broken {')",),
+        ),
+        (
+            "java",
+            "add_method: unclosed method",
+            lambda a: a.add_method(
+                "LRUCache", "    public void clear() {\n        items.clear();"
+            ),
+            ("at line 27, column 2 (missing '}')",),
+        ),
+        (
+            "go",
+            "add_top_level: unclosed func",
+            lambda a: a.add_top_level("func broken() {\n\treturn"),
+            ("at line 27, column 1 (missing '}')",),
+        ),
+        (
+            "rb",
+            "add_top_level: def without end",
+            lambda a: a.add_top_level("def broken\n  1"),
+            ("at line 18, column 1 (cannot parse 'def broken')",),
+        ),
+        (
+            "py",
+            "replace_in_body: inconsistent dedent",
+            lambda a: a.replace_in_body(
+                "LRUCache.get",
+                "        return self.items.get(key)",
+                "        x = 1\n      return x",
+            ),
+            ("at line 8, column ", "(unindent does not match any outer indentation level)"),
+        ),
+        (
+            "py",
+            "replace_in_body: unexpected indent",
+            lambda a: a.replace_in_body(
+                "LRUCache.get",
+                "        return self.items.get(key)",
+                "        x = 1\n            return x",
+            ),
+            ("at line 8, column ", "(unexpected indent)"),
+        ),
+        (
+            "py",
+            "add_top_level: unclosed parenthesis",
+            lambda a: a.add_top_level("def broken(:\n    pass"),
+            ("at line 9, column 12 (missing ')')",),
+        ),
+        (
+            "json",
+            "replace_value: invalid literal",
+            lambda a: a.replace_value("project.version", "tru e"),
+            # tree-sitter puts its error on the comma ending line 3; json's
+            # position wins when the two disagree on the line.
+            ("at line 4, column 20 (Expecting value)",),
+        ),
+        (
+            "json",
+            "add_key: unterminated string",
+            lambda a: a.add_key("project", "license", '"MIT'),
+            ("at line 5, column 24 (missing '\"')",),
+        ),
+        (
+            "yaml",
+            "add_key: unclosed flow sequence",
+            lambda a: a.add_key("project", "tags", "[a, b"),
+            ("at line 4, column 9 (cannot parse '[a, b')",),
+        ),
+        (
+            "yaml",
+            "replace_value: unclosed flow mapping",
+            lambda a: a.replace_value("project.version", "{x: 1"),
+            ("at line 3, column 12 (cannot parse '{x: 1')",),
+        ),
+        (
+            "toml",
+            "replace_value: unterminated string",
+            lambda a: a.replace_value("project.version", '"2.0.0'),
+            ("at line 3, column 1 (cannot parse 'version = \"2.0.0')",),
+        ),
+        (
+            "toml",
+            "add_key: missing value",
+            lambda a: a.add_key("project", "license", ""),
+            ("at line 4, column 1 (cannot parse 'license =')",),
+        ),
+    ]
+    for lang, label, action, expected in cases:
+        path = reset_fixture(lang)
+        before = _read_bytes(path)
+        message = _refusal(lambda: action(Applier(path)))
+        check(f"{lang} {label}: refused", message, "Edit refused: the result would have a syntax error ")
+        for fragment in expected:
+            check(f"{lang} {label}: names the error position", message, fragment)
+        check(f"{lang} {label}: says the file was not modified", message, f"{path} was not modified.")
+        check(
+            f"{lang} {label}: points to the normal edit tool for valid code",
+            message,
+            "If you are sure the code is valid (the parser may not support very new "
+            "or macro-heavy syntax), make this edit with your normal edit tool.",
+        )
+        check(
+            f"{lang} {label}: file byte-identical",
+            "PASS" if _read_bytes(path) == before else "FAIL",
+            "PASS",
+        )
+
+    # The MCP tool surfaces the refusal as a normal "Cannot perform edit" reply.
+    from ast_editor import server
+
+    path = reset_fixture("py")
+    reply = server.add_top_level(path, "def broken(:\n    pass")
+    check("server add_top_level: refusal reported", reply, "Cannot perform edit: Edit refused: ")
+    check("server add_top_level: file untouched", read_file(path), FIXTURES["py"]["content"])
+
+    # After a refusal the same Applier still mirrors the untouched file, so a
+    # following valid edit does not carry the refused lines along.
+    path = reset_fixture("py")
+    app = Applier(path)
+    _refusal(lambda: app.add_top_level("def broken(:\n    pass"))
+    app.add_top_level("def fine():\n    return 1")
+    result = read_file(path)
+    check("after a refusal: valid edit on the same Applier applies", result, "\n\ndef fine():\n    return 1\n")
+    check(
+        "after a refusal: refused content not written",
+        "PASS" if "broken" not in result else "FAIL",
+        "PASS",
+    )
+
+    # A valid edit goes straight through (the rest of the suite exercises
+    # valid edits in every language, all under the guard).
+    path = reset_fixture("go")
+    Applier(path).add_top_level("func ok() int {\n\treturn 1\n}")
+    check("valid go edit: applied", read_file(path), "func ok() int {\n\treturn 1\n}\n")
+
+    # .tsx files use the TSX grammar, so adding JSX to a clean file is valid.
+    path = _write_temp("test_guard.tsx", "function add(a: number, b: number): number {\n  return a + b;\n}\n")
+    message = _refusal(lambda: Applier(path).add_top_level("export const Hello = () => <div className=\"x\">hi</div>;"))
+    check("tsx: JSX edit on a clean file allowed", message, "NOT REFUSED")
+    check("tsx: JSX edit written", read_file(path), "<div className=\"x\">hi</div>")
+    check("tsx: symbols still resolve", Applier(path).list_symbols(), "function add")
+    os.remove(path)
+
+    # Files that already fail to parse are not guarded, so work on them is
+    # never blocked -- even edits that add further errors.
+    path = _write_temp("test_broken.js", "function broken() {\n  return 1;\n")
+    message = _refusal(lambda: Applier(path).add_top_level("const added = [1, 2;"))
+    check("already-broken js: edit allowed", message, "NOT REFUSED")
+    check("already-broken js: edit written", read_file(path), "const added = [1, 2;")
+    os.remove(path)
+
+    # Python that only Python's own parser rejects (bad dedent) counts as
+    # already broken too.
+    path = _write_temp("test_broken.py", "def f():\n    a = 1\n  b = 2\n")
+    message = _refusal(lambda: Applier(path).add_top_level("def g(:\n    pass"))
+    check("already-broken py: edit allowed", message, "NOT REFUSED")
+    check("already-broken py: edit written", read_file(path), "def g(:")
+    os.remove(path)
+
+    # Valid Python that the tree-sitter grammar misparses (PEP 696 type
+    # parameter defaults, Python 3.13+) is still guarded by Python's parser.
+    if sys.version_info >= (3, 13):
+        path = _write_temp("test_guard_pep696.py", "def f[T = int](x: T) -> T:\n    return x\n")
+        message = _refusal(lambda: Applier(path).add_top_level("def g():\n    a = 1\n  b = 2"))
+        check("py misparsed by tree-sitter: bad dedent refused", message, "(unindent does not match any outer indentation level)")
+        message = _refusal(lambda: Applier(path).add_top_level("def h():\n    return 1"))
+        check("py misparsed by tree-sitter: valid edit allowed", message, "NOT REFUSED")
+        os.remove(path)
+
+        # Python's parser also lets such syntax into a clean file, and when
+        # both parsers object on different lines its position is reported.
+        path = _write_temp("test_guard_pep696.py", "import os\n\n\ndef a():\n    return 1\n")
+        message = _refusal(lambda: Applier(path).add_top_level("def g[T = int](x: T) -> T:\n    return x"))
+        check("py PEP 696 into a clean file: allowed", message, "NOT REFUSED")
+        check("py PEP 696 into a clean file: written", read_file(path), "\ndef g[T = int](x: T) -> T:\n    return x\n")
+        path = _write_temp("test_guard_pep696.py", "import os\n\n\ndef a():\n    return 1\n")
+        message = _refusal(
+            lambda: Applier(path).add_top_level("def g[T = int](x: T) -> T:\n    return x\n\ndef h(:\n    pass")
+        )
+        check("py PEP 696 plus a real error: refused at the real error", message, "syntax error at line 10, column ")
+        os.remove(path)
+
+    # JSON that tree-sitter-json rejects but RFC 8259 allows (an exponent
+    # with an explicit +) is allowed; NaN and real errors are still refused.
+    # (label, edit, text written, or None if the edit must be refused)
+    for label, action, written in [
+        ("exponent with + via replace_value", lambda a: a.replace_value("a", "1e+2"), '"a": 1e+2\n'),
+        ("exponent with + via add_key", lambda a: a.add_key("", "b", "6.02E+23"), '"b": 6.02E+23\n'),
+        ("NaN", lambda a: a.replace_value("a", "NaN"), None),
+        ("unclosed array", lambda a: a.replace_value("a", "[1,"), None),
+    ]:
+        path = _write_temp("test_guard.json", '{\n  "a": 1\n}\n')
+        before = _read_bytes(path)
+        message = _refusal(lambda: action(Applier(path)))
+        if written is not None:
+            check(f"json {label}: allowed", message, "NOT REFUSED")
+            check(f"json {label}: written", read_file(path), written)
+        else:
+            check(f"json {label}: refused", message, "Edit refused: ")
+            check(f"json {label}: file untouched", "PASS" if _read_bytes(path) == before else "FAIL", "PASS")
+    path = _write_temp("test_guard.json", '{\n  "a": 1\n}\n')
+    Applier(path).add_key("", "b", "6.02E+23")
+    # Such a file still counts as clean (json accepts it), so a later
+    # broken edit is refused, at json's position.
+    message = _refusal(lambda: Applier(path).replace_value("a", "[1,"))
+    check("json with + exponents: broken edit refused", message,
+          "Edit refused: the result would have a syntax error at line 2, column 11 (Expecting value)")
+    os.remove(path)
+    # JSONC: comments stay allowed (json rejects them, but tree-sitter
+    # accepts the result), and a real error is still refused.
+    path = _write_temp("test_guard.json", '{\n  // settings\n  "a": 1\n}\n')
+    check("jsonc: valid edit allowed", _refusal(lambda: Applier(path).add_key("", "b", "2")), "NOT REFUSED")
+    check("jsonc: broken edit refused", _refusal(lambda: Applier(path).add_key("", "c", "[1,")), "Edit refused: ")
+    os.remove(path)
+
+    # An already-broken config file is not guarded either.
+    path = _write_temp("test_broken.toml", 'a = \n[t]\nb = 1\n')
+    message = _refusal(lambda: Applier(path).add_key("t", "c", "2"))
+    check("already-broken toml: edit allowed", message, "NOT REFUSED")
+    check("already-broken toml: edit written", read_file(path), "b = 1\nc = 2\n")
+    os.remove(path)
+
+
+def test_line_endings():
+    print("\n═══ Line endings ═══")
+
+    # Every fixture is rewritten with CRLF endings; each edit must keep CRLF
+    # on every line (no LF-only or doubled endings). Snippets and anchors are
+    # written with \n, as callers normally send them.
+    # (fixture, label, edit, text expected in the result once CRLF -> LF)
+    cases = [
+        # Line-based tools
+        (
+            "py",
+            "add_top_level bottom",
+            lambda a: a.add_top_level("def helper():\n    return 1"),
+            "        return self.items.get(key)\n\ndef helper():\n    return 1\n",
+        ),
+        (
+            "py",
+            "add_top_level top",
+            lambda a: a.add_top_level("SIZE = 1", position="top"),
+            "SIZE = 1\n\nclass LRUCache:\n",
+        ),
+        (
+            "py",
+            "add_method",
+            lambda a: a.add_method(
+                "LRUCache", "    def clear(self):\n        self.items.clear()"
+            ),
+            "        return self.items.get(key)\n\n    def clear(self):\n        self.items.clear()\n",
+        ),
+        (
+            "py",
+            "insert_sibling before",
+            lambda a: a.insert_sibling("LRUCache", "SIZE = 1", "before"),
+            "SIZE = 1\n\nclass LRUCache:\n",
+        ),
+        (
+            "py",
+            "insert_sibling after",
+            lambda a: a.insert_sibling("LRUCache", "def after():\n    pass", "after"),
+            "        return self.items.get(key)\n\ndef after():\n    pass\n",
+        ),
+        (
+            "py",
+            "insert_in_body at=top",
+            lambda a: a.insert_in_body(
+                "LRUCache.get", "        print(key)\n        key = str(key)", at="top"
+            ),
+            "    def get(self, key):\n        print(key)\n        key = str(key)\n        return",
+        ),
+        (
+            "py",
+            "insert_in_body at=bottom",
+            lambda a: a.insert_in_body("LRUCache.get", "        # end", at="bottom"),
+            "        return self.items.get(key)\n        # end\n",
+        ),
+        (
+            "js",
+            "add_method",
+            lambda a: a.add_method(
+                "LRUCache", "    clear() {\n        this.items.clear();\n    }"
+            ),
+            "clear() {\n",
+        ),
+        (
+            "go",
+            "add_method",
+            lambda a: a.add_method(
+                "Cache", "func (c *Cache) Len() int {\n\treturn len(c.items)\n}"
+            ),
+            "}\n\nfunc (c *Cache) Len() int {\n\treturn len(c.items)\n}\n",
+        ),
+        (
+            "c",
+            "add_top_level",
+            lambda a: a.add_top_level("int sub(int a, int b) {\n    return a - b;\n}"),
+            "\n\nint sub(int a, int b) {\n    return a - b;\n}\n",
+        ),
+        (
+            "java",
+            "add_field",
+            lambda a: a.add_field("LRUCache", "    private int hits;"),
+            "public class LRUCache {\n    private int hits;\n",
+        ),
+        (
+            "yaml",
+            "add_key",
+            lambda a: a.add_key("project", "license", '"MIT"'),
+            'version: "1.0.0"\n  license: "MIT"\n',
+        ),
+        (
+            "toml",
+            "add_key",
+            lambda a: a.add_key("project", "license", '"MIT"'),
+            'version = "1.0.0"\nlicense = "MIT"\n',
+        ),
+        # Byte-based tools
+        (
+            "py",
+            "replace_in_body",
+            lambda a: a.replace_in_body(
+                "LRUCache.__init__",
+                "self.capacity = 10\n        self.items = {}",
+                "self.capacity = 20\n        self.items = dict()",
+            ),
+            "        self.capacity = 20\n        self.items = dict()\n",
+        ),
+        (
+            "py",
+            "replace_in_body with CRLF snippets",
+            lambda a: a.replace_in_body(
+                "LRUCache.__init__",
+                "self.capacity = 10\r\n        self.items = {}",
+                "self.capacity = 30\r\n        self.hits = 0\r\n        self.items = {}",
+            ),
+            "        self.capacity = 30\n        self.hits = 0\n        self.items = {}\n",
+        ),
+        (
+            "py",
+            "insert_in_body after",
+            lambda a: a.insert_in_body(
+                "LRUCache.__init__", "\n        self.hits = 0", after="self.items = {}"
+            ),
+            "        self.items = {}\n        self.hits = 0\n\n    def get",
+        ),
+        (
+            "py",
+            "replace_signature",
+            lambda a: a.replace_signature(
+                "LRUCache.get", "    def get(\n        self,\n        key,\n    ):"
+            ),
+            "    def get(\n        self,\n        key,\n    ):\n        return",
+        ),
+        (
+            "py",
+            "add_parameter",
+            lambda a: a.add_parameter("LRUCache.get", "default=None"),
+            "    def get(self, key, default=None):\n",
+        ),
+        (
+            "py",
+            "replace_docstring",
+            lambda a: a.replace_docstring(
+                "LRUCache.get", '"""Return the item.\n\n        Or None.\n        """'
+            ),
+            '        """Return the item.\n\n        Or None.\n        """\n        return',
+        ),
+        (
+            "js",
+            "insert_in_body at=top",
+            lambda a: a.insert_in_body("LRUCache.get", "        console.log(key);", at="top"),
+            "    get(key) {\n        console.log(key);\n        return",
+        ),
+        (
+            "json",
+            "add_key",
+            lambda a: a.add_key("project", "license", '"MIT"'),
+            '"version": "1.0.0",\n        "license": "MIT"\n    },',
+        ),
+        (
+            "json",
+            "replace_value",
+            lambda a: a.replace_value("project.version", '"2.0.0"'),
+            '        "version": "2.0.0"\n',
+        ),
+        (
+            "yaml",
+            "replace_value",
+            lambda a: a.replace_value("project.version", '"2.0.0"'),
+            '  version: "2.0.0"\n',
+        ),
+        (
+            "toml",
+            "replace_value",
+            lambda a: a.replace_value("project.version", '"2.0.0"'),
+            'version = "2.0.0"\n',
+        ),
+    ]
+    for lang, label, action, expected in cases:
+        ext = os.path.splitext(FIXTURES[lang]["file"])[1]
+        path = _write_temp("test_crlf" + ext, FIXTURES[lang]["content"], "\r\n")
+        try:
+            action(Applier(path))
+        except ApplierError as e:
+            check(f"crlf {lang} {label}: edit applied", f"REFUSED: {e}", expected)
+            os.remove(path)
+            continue
+        data = _read_bytes(path)
+        endings = _line_endings(data)
+        check(
+            f"crlf {lang} {label}: CRLF on every line",
+            "PASS" if endings == "crlf" else f"FAIL: {endings}",
+            "PASS",
+        )
+        check(
+            f"crlf {lang} {label}: edit applied",
+            data.decode("utf-8").replace("\r\n", "\n"),
+            expected,
+        )
+        os.remove(path)
+
+    # Lines the edit did not touch come back byte-identical.
+    original = FIXTURES["go"]["content"].replace("\n", "\r\n").encode("utf-8")
+    path = _write_temp("test_crlf.go", FIXTURES["go"]["content"], "\r\n")
+    Applier(path).add_top_level("func ok() int {\r\n\treturn 1\r\n}")
+    check(
+        "crlf go: original bytes untouched",
+        "PASS" if _read_bytes(path).startswith(original) else "FAIL",
+        "PASS",
+    )
+    os.remove(path)
+
+    # LF files stay LF, even when caller content arrives with CRLF.
+    path = reset_fixture("py")
+    Applier(path).add_method("LRUCache", "    def clear(self):\r\n        self.items.clear()")
+    endings = _line_endings(_read_bytes(path))
+    check("lf py add_method with CRLF content: LF only", "PASS" if endings == "lf" else f"FAIL: {endings}", "PASS")
+    check("lf py add_method with CRLF content: applied", read_file(path), "    def clear(self):\n        self.items.clear()\n")
+
+    path = reset_fixture("js")
+    Applier(path).replace_in_body(
+        "LRUCache.get",
+        "return this.items.get(key);",
+        "const v = this.items.get(key);\r\n        return v;",
+    )
+    endings = _line_endings(_read_bytes(path))
+    check("lf js replace_in_body with CRLF content: LF only", "PASS" if endings == "lf" else f"FAIL: {endings}", "PASS")
+
+    # A mixed file is written back in its majority style.
+    path = _write_temp("test_mixed.py", "a = 1\r\nb = 2\r\nc = 3\n")
+    Applier(path).add_top_level("d = 4")
+    check("mixed endings: normalised to the majority (CRLF)", _read_bytes(path).decode("utf-8"), "a = 1\r\nb = 2\r\nc = 3\r\n\r\nd = 4\r\n")
+    os.remove(path)
+
+    # str.splitlines() also splits on form feeds; the file must keep them and
+    # line-based edits must still land on the right line.
+    path = _write_temp("test_formfeed.py", "import os\n\x0c\ndef f():\n    return 1\n")
+    Applier(path).insert_in_body("f", "    x = 2", at="top")
+    check(
+        "form feed: kept, and insert lands inside f",
+        _read_bytes(path).decode("utf-8"),
+        "import os\n\x0c\ndef f():\n    x = 2\n    return 1\n",
+    )
+    os.remove(path)
+
+    # Blank lines at the end of the file survive line-based edits elsewhere,
+    # in either style; an edit never leaves more of them than there were.
+    trailing = "import os\n\n\ndef f():\n    return 1\n\n\n"
+    for label, newline in (("lf", "\n"), ("crlf", "\r\n")):
+        result = _edit_result("test_trailing.py", trailing, lambda a: a.add_import("import sys"), newline)
+        _exact(f"{label} trailing blank lines kept (add_import)", result,
+               trailing.replace("import os\n", "import os\nimport sys\n").replace("\n", newline))
+        result = _edit_result(
+            "test_trailing.py", trailing, lambda a: a.insert_in_body("f", "    x = 2", at="top"), newline
+        )
+        _exact(f"{label} trailing blank lines kept (insert_in_body)", result,
+               trailing.replace("    return 1", "    x = 2\n    return 1").replace("\n", newline))
+    for label, content, action, expected in [
+        ("delete the last function", "a = 1\n\n\ndef f():\n    pass\n",
+         lambda a: a.delete_symbol("f"), "a = 1\n"),
+        ("delete the last method", "class A:\n    def f(self):\n        pass\n\n    def g(self):\n        pass\n",
+         lambda a: a.delete_symbol("A.g"), "class A:\n    def f(self):\n        pass\n"),
+        ("delete the last function, one trailing blank line", "a = 1\n\n\ndef f():\n    pass\n\n",
+         lambda a: a.delete_symbol("f"), "a = 1\n\n"),
+        ("content ending in blank lines at the end", "a = 1\n",
+         lambda a: a.add_top_level("def g():\n    pass\n\n"), "a = 1\n\ndef g():\n    pass\n"),
+    ]:
+        _exact(f"trailing blank lines not added ({label})", _edit_result("test_trailing.py", content, action), expected)
+
+
+def test_replace_signature_indentation():
+    print("\n═══ replace_signature: caller indentation ═══")
+
+    # Signatures given with or without the method's own indentation must
+    # land at the definition's column (indented input used to double it).
+    # (fixture, label, target, new signature, text expected in the result)
+    py_get = "\n\n    def get(self, key, default=None):\n        return self.items.get(key)\n"
+    py_multiline = "\n\n    def get(\n        self,\n        key,\n    ):\n        return self.items.get(key)\n"
+    js_get = "\n\n    get(key, fallback) {\n        return this.items.get(key);\n    }\n}\n"
+    cases = [
+        ("py", "indented", "LRUCache.get", "    def get(self, key, default=None):", py_get),
+        ("py", "unindented", "LRUCache.get", "def get(self, key, default=None):", py_get),
+        (
+            "py",
+            "over-indented with blank lines around it",
+            "LRUCache.get",
+            "\n        def get(self, key, default=None):\n",
+            py_get,
+        ),
+        (
+            "py",
+            "indented multi-line",
+            "LRUCache.get",
+            "    def get(\n        self,\n        key,\n    ):",
+            py_multiline,
+        ),
+        (
+            "py",
+            "multi-line as read_symbol returns it",
+            "LRUCache.get",
+            "def get(\n        self,\n        key,\n    ):",
+            py_multiline,
+        ),
+        (
+            "py_decorated",
+            "indented, decorated",
+            "MyApp.name",
+            "    def name(self) -> str:",
+            "    @property\n    def name(self) -> str:\n        return self._name\n",
+        ),
+        ("js", "indented", "LRUCache.get", "    get(key, fallback)", js_get),
+        ("js", "unindented", "LRUCache.get", "get(key, fallback)", js_get),
+        (
+            "ts",
+            "indented",
+            "LRUCache.get",
+            "    get(key: string, fallback?: number): number | undefined",
+            "\n\n    get(key: string, fallback?: number): number | undefined {\n        return",
+        ),
+        (
+            "java",
+            "indented",
+            "LRUCache.get",
+            "    public String get(String key, String fallback)",
+            "\n\n    public String get(String key, String fallback) {\n        return items.get(key);",
+        ),
+        (
+            "java",
+            "indented, with annotation",
+            "LRUCache.toString",
+            "    @Override\n    public synchronized String toString()",
+            "\n\n    @Override\n    public synchronized String toString() {\n        return",
+        ),
+        (
+            "cpp",
+            "indented",
+            "Calculator.add",
+            "    int add(int a, int b, int c)",
+            "public:\n    int add(int a, int b, int c) {\n        return a + b;",
+        ),
+        (
+            "go",
+            "indented",
+            "Cache.Get",
+            "\tfunc (c *Cache) Get(key string, fallback string) string",
+            "\n\nfunc (c *Cache) Get(key string, fallback string) string {\n\treturn c.items[key]",
+        ),
+    ]
+    for lang, label, target, signature, expected in cases:
+        path = reset_fixture(lang)
+        try:
+            Applier(path).replace_signature(target, signature)
+            result = read_file(path)
+        except ApplierError as e:
+            result = f"REFUSED: {e}"
+        check(f"{lang} replace_signature ({label})", result, expected)
+
+    # Unindented signatures whose later lines sit left of the definition
+    # (a decorator line, or parameters written relative to the def) are
+    # re-based onto the method's column as a whole.
+    py_class = (
+        "class C:\n    @cached\n    def a(self):\n        return 1\n\n"
+        "    def b(self, x):\n        return x\n"
+    )
+    for label, name, content, target, signature, expected in [
+        ("py new decorator", "s.py", py_class, "C.b", "@staticmethod\ndef b(x):",
+         py_class.replace("    def b(self, x):", "    @staticmethod\n    def b(x):")),
+        ("py replacing the decorator", "s.py", py_class, "C.a", "@memo\ndef a(self):",
+         py_class.replace("@cached", "@memo")),
+        ("py multi-line parameters", "s.py", py_class, "C.b", "def b(\n    self,\n    x,\n):",
+         py_class.replace("    def b(self, x):", "    def b(\n        self,\n        x,\n    ):")),
+        ("java new annotation", "s.java",
+         "class A {\n    @Override\n    public String toString() {\n        return \"\";\n    }\n}\n",
+         "A.toString", "@Nonnull\npublic String toString()",
+         "class A {\n    @Nonnull\n    public String toString() {\n        return \"\";\n    }\n}\n"),
+        ("ts new decorator", "s.ts",
+         "class K {\n  @Old()\n  name(a: string): void {\n    return;\n  }\n}\n",
+         "K.name", "@New()\nname(a: string): void",
+         "class K {\n  @New()\n  name(a: string): void {\n    return;\n  }\n}\n"),
+        ("ts multi-line parameters", "s.ts",
+         "class K {\n  name(a: string): void {\n    return;\n  }\n}\n",
+         "K.name", "name(\n  a: string,\n  b: number,\n): void",
+         "class K {\n  name(\n    a: string,\n    b: number,\n  ): void {\n    return;\n  }\n}\n"),
+    ]:
+        result = _edit_result(name, content, lambda a: a.replace_signature(target, signature))
+        _exact(f"replace_signature unindented ({label})", result, expected)
+
+# ──────────────────────────────────────────────
+# add_key on JS/TS objects, duplicate keys, entry layout; Java annotations;
+# edit_leading_comment / add_parameter validation; tool names in the docs
+# ──────────────────────────────────────────────
+
+
+def _exact(label: str, result: str, expected: str):
+    """check() that result equals expected exactly."""
+    check(label, "PASS" if result == expected else f"FAIL, got:\n{result!r}", "PASS")
+
+
+def _edit_result(name: str, content: str, action, newline: str = "\n") -> str:
+    """Write tests/<name>, run action(Applier) on it and return the new file
+    text (CRLF kept), or 'REFUSED: <error>' with the file left untouched;
+    the file is removed afterwards."""
+    path = _write_temp(name, content, newline)
+    before = _read_bytes(path)
+    try:
+        action(Applier(path))
+        result = _read_bytes(path).decode("utf-8")
+    except ApplierError as e:
+        result = f"REFUSED: {e}"
+        if _read_bytes(path) != before:
+            result += " [FILE CHANGED]"
+    os.remove(path)
+    return result
+
+
+def test_add_key_jsts():
+    print("\n═══ add_key (JS/TS object literals) ═══")
+
+    # (label, file name, content, parent_target, key, value, expected file)
+    cases = [
+        (
+            "ts multi-line, trailing comma",
+            "t.ts",
+            "const CONFIG = {\n  port: 3000,\n  debug: true,\n};\n",
+            "CONFIG", "host", '"localhost"',
+            'const CONFIG = {\n  port: 3000,\n  debug: true,\n  host: "localhost",\n};\n',
+        ),
+        (
+            "js multi-line, no trailing comma",
+            "t.js",
+            "const CONFIG = {\n    port: 3000,\n    debug: true\n};\n",
+            "CONFIG", "host", "'h'",
+            "const CONFIG = {\n    port: 3000,\n    debug: true,\n    host: 'h'\n};\n",
+        ),
+        (
+            "js single-line",
+            "t.js",
+            "const C = { a: 1, b: 2 };\n",
+            "C", "c", "3",
+            "const C = { a: 1, b: 2, c: 3 };\n",
+        ),
+        (
+            "ts single-line, trailing comma",
+            "t.ts",
+            "const C = { a: 1, };\n",
+            "C", "b", "2",
+            "const C = { a: 1, b: 2, };\n",
+        ),
+        (
+            "ts empty object in export const",
+            "t.ts",
+            "export const C = {};\n",
+            "C", "a", "1",
+            "export const C = { a: 1 };\n",
+        ),
+        (
+            "js empty multi-line object",
+            "t.js",
+            "function f() {\n  return 1;\n}\nlet C = {\n};\n",
+            "C", "a", "1",
+            "function f() {\n  return 1;\n}\nlet C = {\n  a: 1,\n};\n",
+        ),
+        (
+            "js empty multi-line object, tab-indented file",
+            "t.js",
+            "function f() {\n\treturn 1;\n}\nvar C = {\n};\n",
+            "C", "a", "1",
+            "function f() {\n\treturn 1;\n}\nvar C = {\n\ta: 1,\n};\n",
+        ),
+        (
+            "ts key needing quotes, double-quote file",
+            "t.ts",
+            'import x from "x";\nconst C = {\n  a: 1,\n};\n',
+            "C", "my-key", "2",
+            'import x from "x";\nconst C = {\n  a: 1,\n  "my-key": 2,\n};\n',
+        ),
+        (
+            "js key needing quotes, single-quote file",
+            "t.js",
+            "const C = { a: 'x', b: 'y' };\n",
+            "C", "my key", "1",
+            "const C = { a: 'x', b: 'y', 'my key': 1 };\n",
+        ),
+        (
+            "js numeric key stays bare",
+            "t.js",
+            "const C = { a: 1 };\n",
+            "C", "42", "'n'",
+            "const C = { a: 1, 42: 'n' };\n",
+        ),
+        (
+            "js $ identifier stays bare",
+            "t.js",
+            'const C = { a: "x" };\n',
+            "C", "$el", "1",
+            'const C = { a: "x", $el: 1 };\n',
+        ),
+        (
+            "js leading-zero number is quoted",
+            "t.js",
+            'const C = { a: "x" };\n',
+            "C", "007", "1",
+            'const C = { a: "x", "007": 1 };\n',
+        ),
+        (
+            "ts key given in quotes is kept",
+            "t.ts",
+            "const C = { a: 1 };\n",
+            "C", "'x-y'", "2",
+            "const C = { a: 1, 'x-y': 2 };\n",
+        ),
+        (
+            "ts nested object",
+            "t.ts",
+            'export const CONFIG = {\n  port: 3000,\n  server: {\n    host: "h",\n  },\n};\n',
+            "CONFIG.server", "port", "80",
+            'export const CONFIG = {\n  port: 3000,\n  server: {\n    host: "h",\n    port: 80,\n  },\n};\n',
+        ),
+        (
+            "js deeply nested, quoted segment",
+            "t.js",
+            "const C = {\n  'dev-server': {\n    tls: { cert: 'c' },\n  },\n};\n",
+            "C.\"dev-server\".tls", "key", "'k'",
+            "const C = {\n  'dev-server': {\n    tls: { cert: 'c', key: 'k' },\n  },\n};\n",
+        ),
+        (
+            "js comment on the last entry's line stays there",
+            "t.js",
+            "const C = {\n  a: 1, // first\n  b: 2, // second\n};\n",
+            "C", "c", "3",
+            "const C = {\n  a: 1, // first\n  b: 2, // second\n  c: 3,\n};\n",
+        ),
+        (
+            "ts `as const` object",
+            "t.ts",
+            "export const C = {\n  a: 1,\n} as const;\n",
+            "C", "b", "2",
+            "export const C = {\n  a: 1,\n  b: 2,\n} as const;\n",
+        ),
+        (
+            "ts `satisfies` object",
+            "t.ts",
+            "const C = {\n  a: 1\n} satisfies Record<string, number>;\n",
+            "C", "b", "2",
+            "const C = {\n  a: 1,\n  b: 2\n} satisfies Record<string, number>;\n",
+        ),
+        (
+            "js after a spread and a method",
+            "t.js",
+            "const C = {\n  ...base,\n  get(k) {\n    return k;\n  },\n};\n",
+            "C", "a", "1",
+            "const C = {\n  ...base,\n  get(k) {\n    return k;\n  },\n  a: 1,\n};\n",
+        ),
+        (
+            ".mjs file",
+            "t.mjs",
+            "export const C = { a: 1 };\n",
+            "C", "b", "2",
+            "export const C = { a: 1, b: 2 };\n",
+        ),
+        (
+            ".tsx file",
+            "t.tsx",
+            "const C = { a: 1 };\nexport const App = () => <div />;\n",
+            "C", "b", "2",
+            "const C = { a: 1, b: 2 };\nexport const App = () => <div />;\n",
+        ),
+    ]
+    for label, name, content, parent, key, value, expected in cases:
+        result = _edit_result(name, content, lambda a: a.add_key(parent, key, value))
+        _exact(f"add_key {label}", result, expected)
+
+    result = _edit_result(
+        "t.ts",
+        "const C = {\n  a: 1,\n};\n",
+        lambda a: a.add_key("C", "b", "2"),
+        newline="\r\n",
+    )
+    _exact("add_key ts: CRLF file stays CRLF", result, "const C = {\r\n  a: 1,\r\n  b: 2,\r\n};\r\n")
+
+    # Targets that do not name an object literal are refused, file untouched.
+    content = "const CONFIG = {\n  port: 3000,\n  server: { host: 'h' },\n};\n"
+    refusals = [
+        ("missing variable", "MISSING", "not found as a module-level const/let/var"),
+        ("nested value is not an object", "CONFIG.port", "'CONFIG.port' is not an object literal"),
+        ("missing nested key", "CONFIG.nope", "Key 'nope' not found in CONFIG"),
+        ("empty parent_target", "", "parent_target must be the name of a module-level"),
+    ]
+    for label, parent, fragment in refusals:
+        result = _edit_result("t.js", content, lambda a: a.add_key(parent, "x", "1"))
+        check(f"add_key js refused ({label})", result, "REFUSED: ")
+        check(f"add_key js refused ({label}): message", result, fragment)
+        check(
+            f"add_key js refused ({label}): file untouched",
+            "PASS" if "[FILE CHANGED]" not in result else "FAIL",
+            "PASS",
+        )
+
+    # Through the MCP tool.
+    from ast_editor import server
+
+    path = _write_temp("t.ts", "export const CONFIG = {\n  port: 3000,\n};\n")
+    check("server add_key ts: reply", server.add_key(path, "CONFIG", "host", '"h"'), "Added")
+    check("server add_key ts: key written", read_file(path), '  port: 3000,\n  host: "h",\n};')
+    os.remove(path)
+
+
+def test_add_key_duplicates():
+    print("\n═══ add_key: refuses keys that already exist ═══")
+
+    # (label, file name, content, parent_target, key, fragments of the error)
+    cases = [
+        ("json nested", "d.json", '{\n  "deps": {\n    "mcp": "1"\n  }\n}\n',
+         "deps", "mcp", ("Key 'mcp' already exists in 'deps'", "target 'deps.mcp'")),
+        ("json root", "d.json", '{"a": 1}\n',
+         "", "a", ("already exists in the root", "target 'a'")),
+        ("json key given quoted", "d.json", '{"a": 1}\n',
+         "", '"a"', ("already exists",)),
+        ("yaml", "d.yaml", "project:\n  name: x\n  version: '1'\n",
+         "project", "version", ("Key 'version' already exists in 'project'", "target 'project.version'")),
+        ("yaml quoted key in file", "d.yaml", 'project:\n  "name": x\n',
+         "project", "name", ("already exists",)),
+        ("toml table", "d.toml", '[project]\nname = "x"\n',
+         "project", "name", ("Key 'name' already exists in 'project'", "target 'project.name'")),
+        ("toml root", "d.toml", 'title = "t"\n\n[project]\nname = "x"\n',
+         "", "title", ("already exists in the root", "target 'title'")),
+        ("toml dotted key", "d.toml", '[project]\nurls.home = "h"\n',
+         "project", "urls", ("already exists",)),
+        ("toml sub-table", "d.toml", '[project]\nname = "x"\n\n[project.urls]\nhome = "h"\n',
+         "project", "urls", ("already exists",)),
+        # A dotted key may not reopen a table that has its own [header].
+        ("toml dotted key into a [table]'s key", "d.toml", "x = 1\n\n[a]\nc = 2\n",
+         "", "a.c", ("Key 'a.c' already exists in the root",)),
+        ("toml dotted key into a [table]", "d.toml", "x = 1\n\n[a]\nc = 2\n",
+         "", "a.b", ("already exists",)),
+        ("toml dotted key into a [sub.table]", "d.toml", "[p]\nx = 1\n\n[p.q]\ns = 1\n",
+         "p", "q.r", ("Key 'q.r' already exists in 'p'", "target 'p.q.r'")),
+        ("python same quotes", "d.py", 'CONFIG = {"a": 1}\n',
+         "CONFIG", '"a"', ("Key '\"a\"' already exists in 'CONFIG'", "target 'CONFIG.\"a\"'")),
+        ("python other quotes", "d.py", 'CONFIG = {"a": 1}\n',
+         "CONFIG", "'a'", ("already exists",)),
+        ("python nested dict", "d.py", 'CONFIG = {"db": {"host": "h"}}\n',
+         'CONFIG."db"', '"host"', ("already exists in 'CONFIG.\"db\"'",)),
+        ("js identifier vs quoted", "d.js", "const C = { port: 1 };\n",
+         "C", '"port"', ("already exists in 'C'", "target 'C.\"port\"'")),
+        ("js quoted vs bare", "d.js", "const C = { 'my-key': 1 };\n",
+         "C", "my-key", ("already exists",)),
+        ("js shorthand", "d.js", "const C = { name };\n",
+         "C", "name", ("already exists",)),
+        ("js method", "d.js", "const C = { run() { return 1; } };\n",
+         "C", "run", ("already exists",)),
+        ("ts nested", "d.ts", "export const C = {\n  server: { port: 1 },\n};\n",
+         "C.server", "port", ("already exists in 'C.server'", "target 'C.server.port'")),
+    ]
+    for label, name, content, parent, key, fragments in cases:
+        result = _edit_result(name, content, lambda a: a.add_key(parent, key, "2"))
+        check(f"add_key duplicate ({label}): refused", result, "REFUSED: ")
+        check(f"add_key duplicate ({label}): suggests replace_value", result, "use replace_value")
+        for fragment in fragments:
+            check(f"add_key duplicate ({label}): {fragment}", result, fragment)
+        check(
+            f"add_key duplicate ({label}): file untouched",
+            "PASS" if "[FILE CHANGED]" not in result else "FAIL",
+            "PASS",
+        )
+
+    # Dotted keys that only share a prefix with a table, or that sit beside
+    # an unrelated one, are still allowed, and the result is valid TOML.
+    import tomllib
+
+    for label, content, parent, key, expected in [
+        ("beside [a.y]", "x = 1\n\n[a.y]\nz = 1\n", "", "a.x", "x = 1\na.x = 1\n\n[a.y]\n"),
+        ("beside [p.q.t]", "[p]\nx = 1\n\n[p.q.t]\nz = 1\n", "p", "q.r", "[p]\nx = 1\nq.r = 1\n\n[p.q.t]\n"),
+        ("beside a.b", "a.b = 1\n", "", "a.c", "a.b = 1\na.c = 1\n"),
+        ("beside [pp.a]", "x = 1\n\n[pp.a]\nz = 1\n", "", "a", "x = 1\na = 1\n\n[pp.a]\n"),
+    ]:
+        result = _edit_result("d.toml", content, lambda a: a.add_key(parent, key, "1"))
+        check(f"add_key toml {key} {label}: allowed", result, expected)
+        try:
+            tomllib.loads(result)
+            valid = "PASS"
+        except tomllib.TOMLDecodeError as e:
+            valid = f"FAIL: {e}"
+        check(f"add_key toml {key} {label}: valid TOML", valid, "PASS")
+
+    # The suggested replace_value target works, including for dict and
+    # object literals.
+    for name, content, target, expected in [
+        ("r.py", 'CONFIG = {"db": {"host": "h"}}\n', 'CONFIG."db"."host"',
+         'CONFIG = {"db": {"host": "new"}}\n'),
+        ("r.js", "const C = {\n  server: { port: 1 },\n};\n", "C.server.port",
+         "const C = {\n  server: { port: \"new\" },\n};\n"),
+        ("r.ts", "const C = { name };\n", "C.name", 'const C = { name: "new" };\n'),
+        ("r.toml", '[project]\nname = "x"\n', "project.name", '[project]\nname = "new"\n'),
+    ]:
+        result = _edit_result(name, content, lambda a: a.replace_value(target, '"new"'))
+        _exact(f"replace_value {name} {target}", result, expected)
+
+    for name, content, target, fragment in [
+        ("r.js", "const C = { a: 1 };\n", "C.nope", "Target 'C.nope' not found (Key 'nope' not found in C)"),
+        ("r.ts", "class K {\n  a() {}\n}\n", "K.b", "Target 'K.b' not found ('K' not found as a module-level"),
+        ("r.py", 'C = {"a": 1}\n', 'C."b"', "Target 'C.\"b\"' not found (Key \"b\" not found in dict 'C')"),
+    ]:
+        result = _edit_result(name, content, lambda a: a.replace_value(target, "2"))
+        check(f"replace_value {name} {target}: refused", result, fragment)
+
+    from ast_editor import server
+
+    path = _write_temp("d.json", '{"a": 1}\n')
+    reply = server.add_key(path, "", "a", "2")
+    check("server add_key duplicate: reply", reply, "Cannot perform edit: Key 'a' already exists")
+    check("server add_key duplicate: file untouched", read_file(path), '{"a": 1}\n')
+    os.remove(path)
+
+
+def test_add_key_layout():
+    print("\n═══ add_key / delete_key: layout of JSON objects and Python dicts ═══")
+
+    # add_key follows the container's layout in JSON and Python too.
+    cases = [
+        ("json single-line object", "l.json", '{"a": 1}\n', "", "b", "2", '{"a": 1, "b": 2}\n'),
+        ("json key is escaped", "l.json", '{\n  "a": 1\n}\n', "", 'say "hi"', "2",
+         '{\n  "a": 1,\n  "say \\"hi\\"": 2\n}\n'),
+        ("json empty object, 4-space file", "l.json", '{\n    "deps": {}\n}\n', "deps", "x", '"1"',
+         '{\n    "deps": {\n        "x": "1"\n    }\n}\n'),
+        ("json empty object on two lines", "l.json", '{\n  "deps": {\n  }\n}\n', "deps", "x", "1",
+         '{\n  "deps": {\n    "x": 1\n  }\n}\n'),
+        ("python single-line dict", "l.py", 'CONFIG = {"a": 1, "b": 2}\n', "CONFIG", '"c"', "3",
+         'CONFIG = {"a": 1, "b": 2, "c": 3}\n'),
+        ("python multi-line, trailing comma", "l.py", 'CONFIG = {\n    "a": 1,\n}\n', "CONFIG", '"b"', "2",
+         'CONFIG = {\n    "a": 1,\n    "b": 2,\n}\n'),
+        ("python comment after the last entry", "l.py", 'CONFIG = {\n    "a": 1,  # one\n}\n',
+         "CONFIG", '"b"', "2", 'CONFIG = {\n    "a": 1,  # one\n    "b": 2,\n}\n'),
+        ("python after a ** spread", "l.py", 'CONFIG = {"a": 1, **BASE}\n', "CONFIG", '"b"', "2",
+         'CONFIG = {"a": 1, **BASE, "b": 2}\n'),
+        ("python empty dict", "l.py", "CONFIG = {}\n", "CONFIG", '"a"', "1", 'CONFIG = {\n    "a": 1,\n}\n'),
+        ("python nested dict", "l.py", 'CONFIG = {\n    "db": {\n        "host": "h"\n    },\n}\n',
+         'CONFIG."db"', '"port"', "5432",
+         'CONFIG = {\n    "db": {\n        "host": "h",\n        "port": 5432\n    },\n}\n'),
+        ("python class attribute dict", "l.py", 'class S:\n    D = {"a": 1}\n', "S.D", '"b"', "2",
+         'class S:\n    D = {"a": 1, "b": 2}\n'),
+    ]
+    for label, name, content, parent, key, value, expected in cases:
+        result = _edit_result(name, content, lambda a: a.add_key(parent, key, value))
+        _exact(f"add_key {label}", result, expected)
+
+    # delete_key resolves the same nested paths, and deleting the only entry
+    # leaves `{}` instead of a stray trailing comma (invalid JS that the
+    # grammar accepts).
+    deletes = [
+        ("js nested", "x.js", "const C = {\n  server: { host: 'h', port: 1 },\n};\n", "C.server.host",
+         "const C = {\n  server: { port: 1 },\n};\n"),
+        ("ts only entry, trailing comma", "x.ts", "const C = {\n  a: 1,\n};\n", "C.a", "const C = {};\n"),
+        ("ts only entry of a nested object", "x.ts", "const C = { s: { a: 1 } };\n", "C.s.a",
+         "const C = { s: {} };\n"),
+        ("js quoted key containing a dot", "x.js", "const C = { 'a.b': 1, c: 2 };\n", "C.\"a.b\"",
+         "const C = { c: 2 };\n"),
+        ("python only entry, trailing comma", "x.py", 'C = {\n    "a": 1,\n}\n', 'C."a"', "C = {}\n"),
+        ("python nested", "x.py", 'C = {"db": {"host": "h", "port": 1}}\n', 'C."db"."port"',
+         'C = {"db": {"host": "h"}}\n'),
+        ("json only entry", "x.json", '{\n  "d": {\n    "a": 1\n  }\n}\n', "d.a", '{\n  "d": {}\n}\n'),
+    ]
+    for label, name, content, target, expected in deletes:
+        result = _edit_result(name, content, lambda a: a.delete_key(target))
+        _exact(f"delete_key {label}", result, expected)
+
+    # An entry on its own line goes with that whole line, its same-line
+    # comment included, so the neighbours keep their own comments; a last
+    # entry without a trailing comma also takes the comma before it.
+    deletes = [
+        ("js last entry, same-line comments", "x.js", "const C = {\n  a: 1, // one\n  b: 2, // two\n};\n",
+         "C.b", "const C = {\n  a: 1, // one\n};\n"),
+        ("js first entry, same-line comments", "x.js", "const C = {\n  a: 1, // one\n  b: 2, // two\n};\n",
+         "C.a", "const C = {\n  b: 2, // two\n};\n"),
+        ("js last entry, no trailing comma", "x.js", "const C = {\n  a: 1, // one\n  b: 2 // two\n};\n",
+         "C.b", "const C = {\n  a: 1 // one\n};\n"),
+        ("js only entry below a comment", "x.js", "const C = {\n  // c\n  a: 1,\n};\n", "C.a",
+         "const C = {\n  // c\n};\n"),
+        ("js multi-line value", "x.js", "const C = {\n  a: 1,\n  b: {\n    x: 1,\n  }, // obj\n  c: 3,\n};\n",
+         "C.b", "const C = {\n  a: 1,\n  c: 3,\n};\n"),
+        ("js entry sharing its line", "x.js", "const C = {\n  a: 1,\n  b: 2, c: 3\n};\n", "C.b",
+         "const C = {\n  a: 1,\n  c: 3\n};\n"),
+        ("python same-line comments", "x.py", 'C = {\n    "a": 1,  # one\n    "b": 2,  # two\n}\n',
+         'C."b"', 'C = {\n    "a": 1,  # one\n}\n'),
+        ("python no trailing comma", "x.py", 'C = {\n    "a": 1,  # one\n    "b": 2  # two\n}\n',
+         'C."b"', 'C = {\n    "a": 1  # one\n}\n'),
+        ("json last entry", "x.json", '{\n  "a": 1,\n  "b": 2\n}\n', "b", '{\n  "a": 1\n}\n'),
+        ("jsonc same-line comments", "x.json", '{\n  "a": 1, // one\n  "b": 2 // two\n}\n', "b",
+         '{\n  "a": 1 // one\n}\n'),
+    ]
+    for label, name, content, target, expected in deletes:
+        result = _edit_result(name, content, lambda a: a.delete_key(target))
+        _exact(f"delete_key {label}", result, expected)
+
+
+def test_java_signature_annotations():
+    print("\n═══ replace_signature: decorators and annotations ═══")
+
+    def java(body: str) -> str:
+        return "class B {\n" + body + "}\n"
+
+    # (label, file, content, target, new signature, expected file)
+    cases = [
+        (
+            "java annotation on its own line kept",
+            "s.java",
+            java("    @Override\n    public String toString() {\n        return \"\";\n    }\n"),
+            "B.toString",
+            "public synchronized String toString()",
+            java("    @Override\n    public synchronized String toString() {\n        return \"\";\n    }\n"),
+        ),
+        (
+            "java several annotations on their own lines kept",
+            "s.java",
+            java("    @Override\n    @Deprecated\n    public String a() {\n        return \"\";\n    }\n"),
+            "B.a",
+            "    public String a(int x)",
+            java("    @Override\n    @Deprecated\n    public String a(int x) {\n        return \"\";\n    }\n"),
+        ),
+        (
+            "java annotations on the same line kept",
+            "s.java",
+            java("    @Override @Deprecated public String a() { return \"\"; }\n"),
+            "B.a",
+            "public String a(int x)",
+            java("    @Override @Deprecated public String a(int x) { return \"\"; }\n"),
+        ),
+        (
+            "java annotation with arguments and a comment kept",
+            "s.java",
+            java("    @SuppressWarnings(\"unchecked\") // legacy\n    B(int x) { }\n"),
+            "B.B",
+            "public B(int x, int y)",
+            java("    @SuppressWarnings(\"unchecked\") // legacy\n    public B(int x, int y) { }\n"),
+        ),
+        (
+            "java annotation after a modifier moved in front",
+            "s.java",
+            java("    public @Deprecated String a() { return \"\"; }\n"),
+            "B.a",
+            "public String a(int x)",
+            java("    @Deprecated public String a(int x) { return \"\"; }\n"),
+        ),
+        (
+            "java new annotation replaces the old one",
+            "s.java",
+            java("    @Override\n    public String a() { return \"\"; }\n"),
+            "B.a",
+            "@Deprecated\n    public String a(int x)",
+            java("    @Deprecated\n    public String a(int x) { return \"\"; }\n"),
+        ),
+        (
+            "java new annotations on the same line replace the old ones",
+            "s.java",
+            java("    @Override\n    @Deprecated\n    public String a() { return \"\"; }\n"),
+            "B.a",
+            "@Override public String a(int x)",
+            java("    @Override public String a(int x) { return \"\"; }\n"),
+        ),
+        (
+            "java parameter annotations do not count as the method's",
+            "s.java",
+            java("    @Override\n    public String a() { return \"\"; }\n"),
+            "B.a",
+            "public String a(@Deprecated String x)",
+            java("    @Override\n    public String a(@Deprecated String x) { return \"\"; }\n"),
+        ),
+        (
+            "js decorator kept",
+            "s.js",
+            "class A {\n  @dec()\n  foo(x) {\n    return x;\n  }\n}\n",
+            "A.foo",
+            "foo(x, y)",
+            "class A {\n  @dec()\n  foo(x, y) {\n    return x;\n  }\n}\n",
+        ),
+        (
+            "js new decorator replaces the old one",
+            "s.js",
+            "class A {\n  @dec()\n  foo(x) {\n    return x;\n  }\n}\n",
+            "A.foo",
+            "@other\n  foo(x, y)",
+            "class A {\n  @other\n  foo(x, y) {\n    return x;\n  }\n}\n",
+        ),
+        (
+            "ts decorator kept",
+            "s.ts",
+            "class A {\n  @dec()\n  foo(x: number): void {\n    return;\n  }\n}\n",
+            "A.foo",
+            "foo(x: number, y: number): void",
+            "class A {\n  @dec()\n  foo(x: number, y: number): void {\n    return;\n  }\n}\n",
+        ),
+        (
+            "ts new decorator replaces the old ones",
+            "s.ts",
+            "class A {\n  @a()\n  @b\n  foo(x: number): void {\n    return;\n  }\n}\n",
+            "A.foo",
+            "  @c\n  foo(x: number): void",
+            "class A {\n  @c\n  foo(x: number): void {\n    return;\n  }\n}\n",
+        ),
+        (
+            "ts parameter decorators do not count as the method's",
+            "s.ts",
+            "class A {\n  @dec()\n  foo(x: number): void {\n    return;\n  }\n}\n",
+            "A.foo",
+            "foo(@Inject() x: number): void",
+            "class A {\n  @dec()\n  foo(@Inject() x: number): void {\n    return;\n  }\n}\n",
+        ),
+        (
+            "python new decorator replaces the old one",
+            "s.py",
+            "class A:\n    @property\n    def n(self):\n        return 1\n",
+            "A.n",
+            "    @cached_property\n    def n(self):",
+            "class A:\n    @cached_property\n    def n(self):\n        return 1\n",
+        ),
+        (
+            "python decorator kept without one in the signature",
+            "s.py",
+            "class A:\n    @property\n    def n(self):\n        return 1\n",
+            "A.n",
+            "def n(self) -> int:",
+            "class A:\n    @property\n    def n(self) -> int:\n        return 1\n",
+        ),
+    ]
+    for label, name, content, target, signature, expected in cases:
+        result = _edit_result(name, content, lambda a: a.replace_signature(target, signature))
+        _exact(f"replace_signature {label}", result, expected)
+
+    # The shared fixture: @Override on toString survives a plain signature.
+    path = reset_fixture("java")
+    Applier(path).replace_signature("LRUCache.toString", "public synchronized String toString()")
+    check(
+        "java fixture: @Override kept",
+        read_file(path),
+        "    @Override\n    public synchronized String toString() {\n",
+    )
+
+
+def test_comment_and_parameter_validation():
+    print("\n═══ edit_leading_comment op='add' / add_parameter position checks ═══")
+
+    # op="add" is refused when the symbol already has a leading comment.
+    refusals = [
+        ("python # comment", "c.py", "# Existing\ndef f():\n    pass\n", "f", "# New",
+         "'f' already has a leading comment (line 1)"),
+        ("js block comment", "c.js", "/**\n * Doc\n */\nfunction f() {}\n", "f", "// New",
+         "(lines 1-3)"),
+        ("java javadoc on a method", "c.java",
+         "class B {\n    /** Doc */\n    @Override\n    public String toString() { return \"\"; }\n}\n",
+         "B.toString", "// New", "already has a leading comment (line 2)"),
+        ("yaml", "c.yaml", "# Section\nproject:\n  name: x\n", "project", "# New",
+         "already has a leading comment"),
+    ]
+    for label, name, content, target, comment, fragment in refusals:
+        result = _edit_result(name, content, lambda a: a.edit_leading_comment(target, "add", comment))
+        check(f"edit_leading_comment add refused ({label})", result, "REFUSED: ")
+        check(f"edit_leading_comment add refused ({label}): message", result, fragment)
+        check(f"edit_leading_comment add refused ({label}): suggests replace", result, "Use op='replace'")
+        check(
+            f"edit_leading_comment add refused ({label}): file untouched",
+            "PASS" if "[FILE CHANGED]" not in result else "FAIL",
+            "PASS",
+        )
+
+    # The refusal quotes the existing lines, so a directive such as
+    # eslint-disable-next-line can be carried over into op="replace".
+    for label, name, content, target, quoted in [
+        ("eslint directive", "c.js", "// eslint-disable-next-line no-unused-vars\nfunction f() {}\n",
+         "f", "(line 1):\n// eslint-disable-next-line no-unused-vars\nUse op='replace'"),
+        ("go directive", "c.go", "package main\n\n//go:noinline\nfunc f() {}\n",
+         "f", "(line 3):\n//go:noinline\nUse op='replace'"),
+        ("indented javadoc", "c.java", "class B {\n    /**\n     * Doc\n     */\n    void f() {}\n}\n",
+         "B.f", "(lines 2-4):\n/**\n* Doc\n*/\nUse op='replace'"),
+    ]:
+        result = _edit_result(name, content, lambda a: a.edit_leading_comment(target, "add", "// New"))
+        check(f"edit_leading_comment add refused ({label}): quotes the lines", result, quoted)
+        check(f"edit_leading_comment add refused ({label}): mentions directives", result,
+              "includes any of these lines you want to keep (e.g. lint or compiler directives)")
+
+    # A /* ... */ after code on the line above is that code's comment, not
+    # the symbol's leading comment: add goes ahead and the code is kept.
+    for label, name, content, target, expected in [
+        ("c", "c.c", "int x = 1; /* trailing */\nint f(void) { return 0; }\n", "f",
+         "int x = 1; /* trailing */\n// New\nint f(void) { return 0; }\n"),
+        ("js", "c.js", "const x = 1; /* note */\nfunction f() {}\n", "f",
+         "const x = 1; /* note */\n// New\nfunction f() {}\n"),
+        ("java field", "c.java", "class A {\n    int x = 1; /* n */\n    void f() {}\n}\n", "A.f",
+         "class A {\n    int x = 1; /* n */\n    // New\n    void f() {}\n}\n"),
+        ("c block opened after code", "c.c",
+         "int x = 1; /* starts here\n   ends here */\nint f(void) { return 0; }\n", "f",
+         "int x = 1; /* starts here\n   ends here */\n// New\nint f(void) { return 0; }\n"),
+        ("block comments around code", "c.c", "/* a */ int x = 1; /* b */\nint f(void) { return 0; }\n", "f",
+         "/* a */ int x = 1; /* b */\n// New\nint f(void) { return 0; }\n"),
+        ("js regex ending in */", "c.js", "import x from \"y\";\nconst r = /a*/\nfunction f() {}\n", "f",
+         "import x from \"y\";\nconst r = /a*/\n// New\nfunction f() {}\n"),
+    ]:
+        result = _edit_result(name, content, lambda a: a.edit_leading_comment(target, "add", "// New"))
+        _exact(f"edit_leading_comment add after trailing block comment ({label})", result, expected)
+    for op, comment in (("replace", "// New"), ("remove", "")):
+        result = _edit_result(
+            "c.c",
+            "int x = 1; /* trailing */\nint f(void) { return 0; }\n",
+            lambda a: a.edit_leading_comment("f", op, comment),
+        )
+        expected = (
+            "int x = 1; /* trailing */\n// New\nint f(void) { return 0; }\n"
+            if op == "replace"
+            else "REFUSED: No leading comment found above 'f'"
+        )
+        _exact(f"edit_leading_comment {op} after trailing block comment: code kept", result, expected)
+
+    # A comment separated by a blank line is not the symbol's own.
+    result = _edit_result(
+        "c.py",
+        "# Section header\n\ndef f():\n    pass\n",
+        lambda a: a.edit_leading_comment("f", "add", "# Does f"),
+    )
+    _exact("edit_leading_comment add: blank line separates", result,
+           "# Section header\n\n# Does f\ndef f():\n    pass\n")
+
+    # A YAML key whose value is a mapping gets its comment above the key,
+    # not inside the mapping (the value node starts on the next line).
+    result = _edit_result(
+        "c.yaml",
+        "project:\n  name: x\n  urls:\n    home: h\n",
+        lambda a: a.edit_leading_comment("project", "add", "# Project"),
+    )
+    _exact("edit_leading_comment add yaml: above a mapping key", result,
+           "# Project\nproject:\n  name: x\n  urls:\n    home: h\n")
+    result = _edit_result(
+        "c.yaml",
+        "project:\n  name: x\n  urls:\n    home: h\n",
+        lambda a: a.edit_leading_comment("project.urls", "add", "# Links"),
+    )
+    _exact("edit_leading_comment add yaml: above a nested mapping key", result,
+           "project:\n  name: x\n  # Links\n  urls:\n    home: h\n")
+    result = _edit_result(
+        "c.yaml",
+        "# Old\nproject:\n  name: x\n",
+        lambda a: a.edit_leading_comment("project", "replace", "# New"),
+    )
+    _exact("edit_leading_comment replace yaml: mapping key", result, "# New\nproject:\n  name: x\n")
+
+    # The unsupported-format message names the real tool.
+    result = _edit_result("c.json", '{"a": 1}\n', lambda a: a.edit_leading_comment("a", "add", "# x"))
+    check("edit_leading_comment json: names the tool", result,
+          "edit_leading_comment is not supported for .json files")
+
+    from ast_editor import server
+
+    path = _write_temp("c.py", "# Existing\ndef f():\n    pass\n")
+    reply = server.edit_leading_comment(path, "f", "add", "# New")
+    check("server edit_leading_comment add: refusal reply", reply,
+          "Cannot perform edit: 'f' already has a leading comment")
+    os.remove(path)
+
+    # add_parameter accepts only "start" and "end".
+    for position in ("middle", "Start", ""):
+        result = _edit_result("p.py", "def f(a):\n    pass\n",
+                              lambda a: a.add_parameter("f", "b", position))
+        check(f"add_parameter position {position!r}: refused", result,
+              f"add_parameter: position must be 'start' or 'end', got '{position}'")
+        check(
+            f"add_parameter position {position!r}: file untouched",
+            "PASS" if "[FILE CHANGED]" not in result else "FAIL",
+            "PASS",
+        )
+    for position, expected in (("start", "def f(b, a):"), ("end", "def f(a, b):")):
+        result = _edit_result("p.py", "def f(a):\n    pass\n",
+                              lambda a: a.add_parameter("f", "b", position))
+        check(f"add_parameter position {position!r}: applied", result, expected)
+
+    path = _write_temp("p.py", "def f(a):\n    pass\n")
+    reply = server.add_parameter(path, "f", "b", "middle")
+    check("server add_parameter bad position: reply", reply, "Cannot perform edit: add_parameter: position")
+    os.remove(path)
+
+
+def test_body_insert_placement():
+    print("\n═══ insert_in_body at=top/bottom: placement ═══")
+    import tempfile
+
+    # New lines must land at body level whatever the last statement is (a
+    # nested block used to pull bottom inserts into its innermost level), and
+    # a body sharing a line with its signature or braces is refused.
+    # (file, source, target, at, snippet, expected file text or None = refused)
+    cases = [
+        ("nested.py", "def f(x):\n    if x:\n        for i in range(3):\n            print(i)\n",
+         "f", "bottom", "done = 1",
+         "def f(x):\n    if x:\n        for i in range(3):\n            print(i)\n    done = 1\n"),
+        ("doc.py", 'def f():\n    """Doc."""\n    return 1\n', "f", "top", "x = 1",
+         'def f():\n    """Doc."""\n    x = 1\n    return 1\n'),
+        ("oneline.py", "def f(): return 1\n", "f", "bottom", "x = 2", None),
+        ("nested.js", "function f(x) {\n  if (x) {\n    for (const i of x) {\n      log(i);\n    }\n  }\n}\n",
+         "f", "bottom", "done();",
+         "function f(x) {\n  if (x) {\n    for (const i of x) {\n      log(i);\n    }\n  }\n  done();\n}\n"),
+        ("oneline.js", "function f() { return 1; }\n", "f", "top", "done();", None),
+        ("inline_empty.js", "function f() {}\n", "f", "bottom", "done();", None),
+        ("empty.js", "function f() {\n}\n", "f", "bottom", "x();", "function f() {\n  x();\n}\n"),
+        ("method.ts", "class A {\n  m(): void {\n    if (a) {\n      b();\n    }\n  }\n}\n",
+         "A.m", "bottom", "c();",
+         "class A {\n  m(): void {\n    if (a) {\n      b();\n    }\n    c();\n  }\n}\n"),
+        ("nested.go", "package main\n\nfunc f(x int) {\n\tif x > 0 {\n\t\tprintln(x)\n\t}\n}\n",
+         "f", "bottom", 'println("done")',
+         'package main\n\nfunc f(x int) {\n\tif x > 0 {\n\t\tprintln(x)\n\t}\n\tprintln("done")\n}\n'),
+        ("empty.go", "package main\n\nfunc f() {\n}\n", "f", "top", "x()",
+         "package main\n\nfunc f() {\n\tx()\n}\n"),
+        ("Nested.java", "class A {\n    void f(int x) {\n        if (x > 0) {\n            g(x);\n        }\n    }\n}\n",
+         "A.f", "bottom", "done();",
+         "class A {\n    void f(int x) {\n        if (x > 0) {\n            g(x);\n        }\n        done();\n    }\n}\n"),
+        ("nested.c", "void f(int x) {\n    if (x) {\n        g(x);\n    }\n}\n", "f", "bottom", "done();",
+         "void f(int x) {\n    if (x) {\n        g(x);\n    }\n    done();\n}\n"),
+        ("nested_top.rb", "def f(x)\n  if x\n    puts x\n  end\nend\n", "f", "top", "puts 'start'",
+         "def f(x)\n  puts 'start'\n  if x\n    puts x\n  end\nend\n"),
+        ("nested_bottom.rb", "def f(x)\n  if x\n    puts x\n  end\nend\n", "f", "bottom", "puts 'done'",
+         "def f(x)\n  if x\n    puts x\n  end\n  puts 'done'\nend\n"),
+        ("flat.rb", "def f(x)\n  a = 1\n  b = 2\nend\n", "f", "top", "puts 'start'",
+         "def f(x)\n  puts 'start'\n  a = 1\n  b = 2\nend\n"),
+        ("rescue.rb", "def f\n  work\nrescue => e\n  log e\nend\n", "f", "bottom", "more",
+         "def f\n  work\n  more\nrescue => e\n  log e\nend\n"),
+    ]
+    work = tempfile.mkdtemp(prefix="ast-editor-body-")
+    try:
+        for name, source, target, at, snippet, expected in cases:
+            path = os.path.join(work, name)
+            with open(path, "w", encoding="utf-8", newline="") as f:
+                f.write(source)
+            try:
+                Applier(path).insert_in_body(target, snippet, at=at)
+                outcome = "inserted"
+            except ApplierError as e:
+                outcome = str(e)
+            with open(path, encoding="utf-8", newline="") as f:
+                after = f.read()
+            if expected is None:
+                check(f"body insert {name} at={at}: refused", outcome, "shares a line with its signature or braces")
+                check(f"body insert {name} at={at}: file unchanged",
+                      "<exact match>" if after == source else after, "<exact match>")
+            else:
+                check(f"body insert {name} at={at}: placed at body level",
+                      "<exact match>" if after == expected else after, "<exact match>")
+    finally:
+        shutil.rmtree(work, ignore_errors=True)
+
+def test_docs_name_real_tools():
+    print("\n═══ docs and tool metadata only name tools that exist ═══")
+
+    import asyncio
+    import re
+
+    from ast_editor.server import mcp
+
+    tools = asyncio.run(mcp.list_tools())
+    names = {t.name for t in tools}
+    texts = {"_INSTRUCTIONS": mcp.instructions or ""}
+    for t in tools:
+        texts[f"{t.name} docstring"] = t.description or ""
+        for prop, spec in t.input_schema.get("properties", {}).items():
+            texts[f"{t.name}.{prop} description"] = str(spec.get("description", ""))
+    root = os.path.join(TESTS_DIR, "..")
+    for doc in ("README.md", "AST-EDITOR.md"):
+        with open(os.path.join(root, doc), encoding="utf-8") as f:
+            texts[doc] = f.read()
+
+    # Tool-shaped words; `delete_group` is named in AST-EDITOR.md only to say
+    # it does not exist.
+    pattern = re.compile(
+        r"\b(?:add|append|delete|edit|find|get|insert|list|prepend|read|remove|replace)_[a-z_]+\b"
+    )
+    allowed = {"delete_group"}
+    unknown = sorted(
+        f"{where}: {word}"
+        for where, text in texts.items()
+        for word in set(pattern.findall(text))
+        if word not in names and word not in allowed
+    )
+    check(
+        "docs: every tool-like name is a registered tool",
+        "PASS" if not unknown else "FAIL: " + "; ".join(unknown),
+        "PASS",
+    )
+
+    # Error messages reach the caller too, so they must not name removed
+    # tools either: check the text of every ApplierError raised in applier.py.
+    import ast as _ast
+
+    with open(os.path.join(root, "ast_editor", "applier.py"), encoding="utf-8") as f:
+        tree = _ast.parse(f.read())
+    unknown = set()
+    for node in _ast.walk(tree):
+        if isinstance(node, _ast.Call) and getattr(node.func, "id", None) == "ApplierError":
+            for part in _ast.walk(node):
+                if isinstance(part, _ast.Constant) and isinstance(part.value, str):
+                    unknown.update(
+                        f"line {node.lineno}: {word}"
+                        for word in pattern.findall(part.value)
+                        if word not in names and word not in allowed
+                    )
+    check(
+        "error messages: every tool-like name is a registered tool",
+        "PASS" if not unknown else "FAIL: " + "; ".join(sorted(unknown)),
+        "PASS",
+    )
+    result = _edit_result("r.json", '{"a": 1}\n', lambda a: a.read_symbol("a", depth="interface"))
+    check("read_symbol(depth='interface') on json: names the real tool", result,
+          "REFUSED: read_symbol(depth='interface') is not supported for .json")
+
+
+# ──────────────────────────────────────────────
 # Main
 # ──────────────────────────────────────────────
 
@@ -3147,6 +4677,16 @@ if __name__ == "__main__":
     test_merged_apis()
     test_ast_reader()
     test_tool_schemas()
+    test_syntax_guard()
+    test_line_endings()
+    test_replace_signature_indentation()
+    test_add_key_jsts()
+    test_add_key_duplicates()
+    test_add_key_layout()
+    test_java_signature_annotations()
+    test_comment_and_parameter_validation()
+    test_body_insert_placement()
+    test_docs_name_real_tools()
 
     # Reset all fixtures to clean state after tests
     for lang in FIXTURES:

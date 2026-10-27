@@ -23,7 +23,9 @@ _INSTRUCTIONS = (
     "For source files, start with list_symbols to get exact, case-sensitive "
     "target names (dotted for nesting, e.g. Class.method); for config files, "
     "address keys by dotted path (e.g. project.version) in read_symbol, "
-    "replace_value and add_key. Read only what you need with read_symbol "
+    "replace_value and add_key. add_key, replace_value and delete_key also "
+    "edit Python dict and JS/TS object literals named by a module-level "
+    "variable (e.g. CONFIG.server). Read only what you need with read_symbol "
     "(depth \"full\", \"interface\" or \"signature\") and read_imports, and call "
     "find_references before renaming anything.\n\n"
     "Pick the narrowest tool. To change a few lines inside a function, use "
@@ -32,9 +34,17 @@ _INSTRUCTIONS = (
     "replace_function_body; snippets and anchors must match byte for byte and "
     "occur once in the target's body. Use add_parameter/remove_parameter rather "
     "than replace_signature for one parameter, add_key rather than replace_value "
-    "for a new key, and add_import_name rather than add_import to extend an "
-    "existing named import. delete_symbol also removes the symbol's leading doc "
-    "comment unless include_leading_comments=False.\n\n"
+    "for a new key (add_key refuses a key that already exists), and "
+    "add_import_name rather than add_import to extend an existing named "
+    "import. delete_symbol also removes the symbol's leading doc comment "
+    "unless include_leading_comments=False.\n\n"
+    "Every edit is parse-checked before it is saved: one that would introduce "
+    "a syntax error into a file that parsed cleanly is refused with the "
+    "error's line and column, and the file is left unchanged. If you are sure "
+    "the code is valid (the parser may not support very new or macro-heavy "
+    "syntax), make that edit with your normal edit tool. Line endings are "
+    "preserved (CRLF files stay CRLF); write content, snippets and anchors "
+    "with \\n line breaks.\n\n"
     "For arbitrary sub-expression surgery or whole-file rewrites, fall back to "
     "the client's normal edit or write tools."
 )
@@ -52,9 +62,9 @@ mcp = MCPServer(
 )
 
 # Tool annotation presets. Every tool works on one local file, so none is
-# open-world; additive tools only insert code (line-based edits still rewrite
-# the file with LF line endings), destructive ones can also overwrite or
-# delete existing text.
+# open-world; additive tools only insert code (the file is rewritten, keeping
+# its line endings), destructive ones can also overwrite or delete existing
+# text.
 _READ_ONLY = ToolAnnotations(read_only_hint=True, destructive_hint=False, open_world_hint=False)
 _ADDITIVE = ToolAnnotations(read_only_hint=False, destructive_hint=False, open_world_hint=False)
 _DESTRUCTIVE = ToolAnnotations(read_only_hint=False, destructive_hint=True, open_world_hint=False)
@@ -86,7 +96,8 @@ BodySnippet = Annotated[
     str,
     Field(
         description="Exact text to match, byte-identical including indentation "
-        "and newlines; it must occur exactly once in the target's body."
+        "and newlines (\\n also matches CRLF line breaks); it must occur "
+        "exactly once in the target's body."
     ),
 ]
 LiteralValue = Annotated[
@@ -321,8 +332,10 @@ def insert_in_body(
     at: Annotated[
         str,
         Field(
-            description="'top' or 'bottom' of the body; '' (default) leaves this "
-            "mode unused, and exactly one of at, after or before must be set."
+            description="'top' or 'bottom' of the body, at the body's own "
+            "indentation level (top goes after a Python docstring); '' (default) "
+            "leaves this mode unused, and exactly one of at, after or before must "
+            "be set. Refused for a body written on one line with its signature or braces."
         ),
     ] = "",
 ) -> str:
@@ -331,8 +344,12 @@ def insert_in_body(
     of `at`, `after`, or `before` -- this one tool covers four placement
     modes that used to be spread across three separate tools.
 
-      - at="top":    insert at the top of the body.
-      - at="bottom": insert at the bottom of the body.
+      - at="top":    insert at the top of the body (after a Python docstring).
+      - at="bottom": insert at the bottom of the body, at body level even when
+        the last statement is a nested block.
+    `at` needs the body on its own lines: a one-line body such as
+    `def f(): return 1` or `function f() { return 1; }` is refused; rewrite
+    it with `replace_function_body` instead.
       - after=<snippet>:  insert immediately after a byte-identical anchor.
       - before=<snippet>: insert immediately before a byte-identical anchor.
 
@@ -491,14 +508,20 @@ def replace_value(
     target: Annotated[
         str,
         Field(
-            description="Dotted path to an existing key in a JSON, YAML, or TOML "
-            "file (e.g. 'project.version')."
+            description="Existing key: dotted path in a JSON, YAML, or TOML file "
+            "(e.g. 'project.version'), 'DictName.keyExpr' for a Python "
+            "module-level dict (e.g. 'CONFIG.\"timeout\"'), or 'VarName.key' for "
+            "a JS/TS module-level object literal; Python and JS/TS paths may "
+            "continue into nested literals."
         ),
     ],
     content: LiteralValue,
 ) -> str:
     """
-    Replace the value of an existing key in a JSON, YAML, or TOML file.
+    Replace the value of an existing key in a JSON, YAML, or TOML file, or of an
+    entry in a Python module-level dict literal or JS/TS module-level object
+    literal (same target forms as `delete_key`). A JS/TS shorthand `{ key }`
+    becomes `key: <content>`.
 
     Use this when: A key already exists and you want to update its value.
     Don't use this when: The key doesn't exist yet -> use `add_key`. You're modifying
@@ -507,6 +530,12 @@ def replace_value(
     Example:
         target="project.version"
         content='"2.0.0"'
+    Example (Python):
+        target='CONFIG."timeout"'
+        content="60"
+    Example (TS):
+        target="CONFIG.server.port"
+        content="8080"
     """
     if err := _validate_file(file_path):
         return err
@@ -609,27 +638,39 @@ def add_key(
         Field(
             description="Parent container: dotted path to a JSON object or YAML "
             "mapping, a TOML table name as in its [header], '' for a config "
-            "file's root, or the name of a Python module-level dict."
+            "file's root; in source files the name of a Python module-level "
+            "dict or JS/TS module-level object literal, dotted further into "
+            "nested literals (e.g. 'CONFIG.\"db\"', 'CONFIG.server')."
         ),
     ],
     key: Annotated[
         str,
         Field(
-            description="Key to add: a bare name for JSON (quoted for you), YAML "
-            "and TOML; for Python a key expression, so quote string keys (e.g. "
-            "'\"timeout\"')."
+            description="Key to add, refused if the container already has it: a "
+            "bare name for JSON (quoted for you), YAML and TOML; for JS/TS a "
+            "name, quoted for you only if it is not a valid identifier; for "
+            "Python a key expression, so quote string keys (e.g. '\"timeout\"')."
         ),
     ],
     value: LiteralValue,
 ) -> str:
     """
     Add a new key-value pair inside a dict-like container. Works for JSON objects,
-    YAML mappings, TOML tables, AND Python module-level dict literals.
+    YAML mappings, TOML tables, Python dict literals, AND JS/TS object literals.
 
     For JSON/YAML/TOML: parent_target is the dotted path to the parent (use "" for root).
-    For Python (.py): parent_target is the module-level variable name (e.g. 'CONFIG').
+    For Python (.py): parent_target is the module-level variable name (e.g. 'CONFIG'),
+    optionally followed by keys into nested dicts (e.g. 'CONFIG."db"').
+    For JS/TS: parent_target names a module-level `const`/`let`/`var` (exported
+    or not; `as const` and `satisfies` are fine) assigned an object literal,
+    optionally followed by keys into nested objects (e.g. 'CONFIG.server').
     value should be a literal source expression in the target file's syntax (e.g.
     JSON '"foo"' or '42'; Python '"foo"' or '42').
+
+    The new entry follows the container's layout: one key per line stays one
+    per line, an inline object stays inline, and a trailing comma is kept. An
+    empty JS/TS `{}` becomes `{ key: value }`. A key the container already has
+    is refused.
 
     Use this when: The key does not exist yet and you want to add it.
     Don't use this when: The key already exists -> use `replace_value`. You're
@@ -643,6 +684,10 @@ def add_key(
         parent_target="CONFIG"    # module-level CONFIG = {...}
         key='"timeout"'            # include quotes if key is a string literal
         value="30"
+    Example (TS):
+        parent_target="CONFIG.server"   # const CONFIG = { server: { ... } }
+        key="port"                       # quoted for you only when needed
+        value="8080"
     """
     if err := _validate_file(file_path):
         return err
@@ -670,7 +715,8 @@ def delete_key(
             description="Key to delete: dotted path for JSON/YAML/TOML (e.g. "
             "'dependencies.tree-sitter'), 'DictName.keyExpr' for a Python "
             "module-level dict (e.g. 'CONFIG.\"timeout\"'), or 'VarName.key' for "
-            "a JS/TS module-level object literal."
+            "a JS/TS module-level object literal; Python and JS/TS paths may "
+            "continue into nested literals (e.g. 'CONFIG.server.port')."
         ),
     ],
 ) -> str:
@@ -678,19 +724,22 @@ def delete_key(
     Delete a key-value pair from a dict-like container.
       - JSON / YAML / TOML: dotted path to the key.
       - Python (.py) module-level dict literals: target is 'DictName.keyExpr'
-        (e.g. 'CONFIG."timeout"').
+        (e.g. 'CONFIG."timeout"'), or a longer path into nested dicts
+        (e.g. 'CONFIG."db"."host"').
       - JS / TS module-level `const` / `let` / `var` object literals
         (including `export const ... = { ... }`): target is 'VarName.keyName'
-        or 'VarName."quoted-key"'. Handles both regular `{ key: value }` pairs
-        and shorthand `{ key }` properties.
+        or 'VarName."quoted-key"', or a longer path into nested objects
+        (e.g. 'CONFIG.server.port'). Handles regular `{ key: value }` pairs,
+        shorthand `{ key }` properties and methods.
 
-    For JSON and JS/TS, the adjacent comma is also removed to keep the file valid.
+    For JSON, Python and JS/TS, the adjacent comma is also removed to keep the
+    file valid; deleting the only entry leaves `{}`.
 
     Use this when: You want to remove an entire entry.
     Don't use this when: You want to remove an item from a list/array -> use
     `remove_from_array`. You need to edit an inline object literal passed as a
-    function argument (`foo({ x })`) -- use `delete_in_body` (Phase 3) scoped
-    to the enclosing function instead.
+    function argument (`foo({ x })`) -- use `delete_in_body` scoped to the
+    enclosing function instead.
 
     Example (JSON):
         target="dependencies.tree-sitter"
@@ -700,6 +749,7 @@ def delete_key(
         target="CONFIG.port"             # regular pair
         target="CONFIG.name"              # shorthand `{ name }`
         target='CONFIG."complex-key"'     # quoted key
+        target="CONFIG.server.port"       # nested object
     """
     if err := _validate_file(file_path):
         return err
@@ -852,14 +902,26 @@ def replace_signature(
         str,
         Field(
             description="Everything from the start of the definition up to its "
-            "body, without leading indentation (e.g. 'def get(self, key, "
-            "default=None):' or JS 'get(key, d)' without the '{'); Java "
-            "annotations count as part of it."
+            "body (e.g. 'def get(self, key, default=None):' or JS 'get(key, d)' "
+            "without the '{'); indentation on its first line is ignored, and "
+            "following lines (parameters, or the def after a decorator line) "
+            "may be indented relative to it. The existing decorators and Java "
+            "annotations are kept unless it includes its own, which then "
+            "replace them."
         ),
     ],
 ) -> str:
     """
     Replace only the signature of a function, preserving its body and decorators.
+
+    Decorators (Python, JS/TS) and Java annotations such as `@Override` are kept
+    when new_signature has none, in their original layout. If new_signature
+    includes decorators or annotations, they replace the existing ones.
+
+    The signature lands at the definition's own column: indentation on its
+    first line is ignored, and the lines after it may be indented relative
+    to that line (as in the decorator example below) or written as
+    read_symbol(depth="signature") returns them.
 
     Use this when: You're changing parameters, return type, or function name
     without modifying the implementation.
@@ -869,6 +931,12 @@ def replace_signature(
     Example:
         target="LRUCache.get"
         new_signature="def get(self, key, default=None):"
+    Example (Python method; the new decorator replaces any existing ones):
+        target="LRUCache.get"
+        new_signature="@staticmethod\\ndef get(key):"
+    Example (Java; the method's existing @Override line stays):
+        target="LRUCache.toString"
+        new_signature="public synchronized String toString()"
     """
     if err := _validate_file(file_path):
         return err
@@ -889,7 +957,8 @@ def replace_signature(
 def list_symbols(file_path: FilePath) -> str:
     """
     Return a formatted outline of all top-level functions, classes, and methods in
-    a source file (Python, JS, TS, C, C++), with line numbers. Read-only.
+    a source file (Python, JS, TS, C, C++, Ruby, Go, Java), with line numbers.
+    Read-only.
 
     Use this when: You're about to edit an unfamiliar file and want to see its
     structure and exact symbol names. ALWAYS a good first call before editing --
@@ -1025,13 +1094,13 @@ def add_parameter(
         str,
         Field(
             description="'end' (default) appends after the last parameter; "
-            "'start' inserts before the first."
+            "'start' inserts before the first. Any other value is refused."
         ),
     ] = "end",
 ) -> str:
     """
-    Add a parameter to a function signature at position 'end' (default) or 'start'.
-    Leaves the body untouched.
+    Add a parameter to a function signature at position 'end' (default) or 'start'
+    (any other position is refused). Leaves the body untouched.
 
     Use this when: You need to add one or two parameters without retyping the whole
     signature.
@@ -1107,12 +1176,6 @@ def remove_parameter(
         return f"Internal error in remove_parameter: {type(e).__name__}: {e}"
 
 
-
-
-
-
-
-
 @mcp.tool(annotations=_DESTRUCTIVE)
 def replace_docstring(
     file_path: FilePath,
@@ -1140,7 +1203,7 @@ def replace_docstring(
     Use this when: You want to add or update a Python docstring without touching
     the function body.
     Don't use this when: You're editing a `#` comment above the symbol -> use
-    `replace_leading_comment`. You're in a non-Python file -> no equivalent tool.
+    `edit_leading_comment`. You're in a non-Python file -> no equivalent tool.
 
     Example:
         target="LRUCache.get"
@@ -1230,11 +1293,11 @@ def add_top_level(
 
     Use this when: You're adding any kind of top-level code. Use position="top"
     when inserting multiple declarations at the top of a file without the
-    `insert_before <target>` reverse-order problem.
+    reverse-order problem of repeated `insert_sibling(position="before")` calls.
     Don't use this when: You need placement relative to a specific symbol ->
-    use `insert_before` / `insert_after`. You're adding to a class body -> use
+    use `insert_sibling`. You're adding to a class body -> use
     `add_method` / `add_field`. You're adding a line inside an existing
-    function body -> use `prepend_to_body` / `append_to_body`.
+    function body -> use `insert_in_body` (`at="top"` / `at="bottom"`).
 
     Example:
         content="def parse_version(text):\\n    return tuple(int(x) for x in text.split('.'))"
@@ -1361,8 +1424,10 @@ def edit_leading_comment(
     op: Annotated[
         str,
         Field(
-            description="'add' inserts a new comment, 'replace' swaps the existing "
-            "block (or inserts one if none), 'remove' deletes the block."
+            description="'add' inserts a new comment (refused if the symbol "
+            "already has one; the error quotes it so that a 'replace' can keep "
+            "lines such as lint or compiler directives), 'replace' swaps the "
+            "existing block (or inserts one if none), 'remove' deletes the block."
         ),
     ],
     comment: Annotated[
@@ -1380,8 +1445,12 @@ def edit_leading_comment(
 
     Supported values for `op`:
       - "add":     Insert a new comment block above the symbol. Requires
-                   `comment`. Raises if a leading comment already exists and
-                   would be pushed down as a separate block.
+                   `comment`. Refused if the symbol already has a leading
+                   comment, which the new lines would merge into; the error
+                   quotes those lines -> use "replace" with a block that
+                   repeats any you want to keep (lint or compiler
+                   directives such as `// eslint-disable-next-line` or
+                   `//go:noinline`), or "remove" first.
       - "replace": Replace the existing leading comment block with `comment`;
                    if no leading comment exists, inserts one. Requires
                    `comment`.
