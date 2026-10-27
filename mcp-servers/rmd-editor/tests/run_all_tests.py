@@ -1076,6 +1076,152 @@ def test_chunk_header_values():
     check("fence already in a chunk: append works", server.append_to_cell(path, 0, "b"), "Saved")
     check_same("fence already in a chunk: appended", read_doc(path), "```{r}\na\n  ```\nb\n```\n")
 
+def test_chunk_label_spellings():
+    print("\n═══ chunk labels: label= options and #| label: lines ═══")
+    from rmd_editor import server
+    # knitr reads a label= option as the chunk label
+    doc = '```{r label="setup", echo=FALSE}\nx\n```\n'
+    path = write_doc("label.rmd", doc)
+    check("label=: list_cells shows it", server.list_cells(path), "[0] code (r label=setup opts=1) 1L  x")
+    check_same("label=: get_chunk_options shows it", server.get_chunk_options(path, 0),
+               'language: r\nlabel: setup (from label="setup")\n  echo=FALSE')
+    path = write_doc("label.rmd", "```{r label=setup}\nx\n```\n")
+    check_same("label= name: get_chunk_options shows it", server.get_chunk_options(path, 0),
+               "language: r\nlabel: setup (from label=setup)\noptions: (none)")
+    # With a bare label too, knitr takes label=: parse_params names the bare one the label only when there is no label=
+    path = write_doc("label.rmd", '```{r setup, label="other"}\nx\n```\n')
+    check("bare and label=: list_cells shows the label= one", server.list_cells(path), "[0] code (r label=other) 1L  x")
+    check("bare and label=: get_chunk_options says which counts", server.get_chunk_options(path, 0),
+          'label: other (from label="other", which knitr reads over the bare label setup)')
+    # Quarto and knitr read a "#| label:" line at the top of the chunk as its label, over the header's
+    path = write_doc("label.rmd", "```{r}\n#| label: setup\n#| echo: false\nx\n```\n")
+    check("#| label: list_cells shows it", server.list_cells(path), "[0] code (r label=setup) 3L  #| label: setup")
+    check("#| label: get_chunk_options shows it", server.get_chunk_options(path, 0), "label: setup (from #| label: setup)")
+    path = write_doc("label.rmd", '```{r a, label="b"}\n#| label: "my label"\nx\n```\n')
+    check("#| label over both header spellings", server.get_chunk_options(path, 0),
+          'label: my label (from #| label: "my label", which knitr reads over label="b" and the bare label a)')
+    for text in ["```{r}\nx\n#| label: s\n```\n", "```{r}\n#|label: s\nx\n```\n", "```{r}\n\n#| label: s\nx\n```\n", "```{r}\n#| echo=FALSE\n#| label: s\n```\n"]:
+        path = write_doc("label.rmd", text)
+        check(f"not an option line {text!r}: no label", server.get_chunk_options(path, 0), "label: (none)")
+    path = write_doc("label.rmd", "```{python}\n#| label: p\nx\n```\n")
+    check("#| label: in a python chunk", server.list_cells(path), "[0] code (python label=p) 2L")
+
+    # Edits change the label where it is written; setting it drops the spellings knitr reads it over, and removing
+    # it drops every spelling
+    pipe = "```{r}\n#| label: setup\n#| echo: false\nx\n```\n"
+    for name, (text, call, out, written) in {
+        "label=: set rewrites it as an R string": (doc, lambda p: server.set_chunk_option(p, 0, "label", "L"), "Saved",
+                                                   '```{r label="L", echo=FALSE}\nx\n```\n'),
+        "label=: remove": (doc, lambda p: server.remove_chunk_option(p, 0, "label"), "Saved", "```{r echo=FALSE}\nx\n```\n"),
+        "label=: empty value clears it": (doc, lambda p: server.set_chunk_option(p, 0, "label", ""), "Saved", "```{r echo=FALSE}\nx\n```\n"),
+        "label=: single quotes kept": ("```{r echo=FALSE, label='a'}\nx\n```\n", lambda p: server.set_chunk_option(p, 0, "label", "b"),
+                                       "Saved", "```{r echo=FALSE, label='b'}\nx\n```\n"),
+        "label=: a name becomes a string": ("```{r label=setup}\nx\n```\n", lambda p: server.set_chunk_option(p, 0, "label", "L"),
+                                            "Saved", '```{r label="L"}\nx\n```\n'),
+        "label=: quotes and backslashes escaped": (doc, lambda p: server.set_chunk_option(p, 0, "label", 'a"b\\c'), "Saved",
+                                                   '```{r label="a\\"b\\\\c", echo=FALSE}\nx\n```\n'),
+        "label=: comma and = inside the string": (doc, lambda p: server.set_chunk_option(p, 0, "label", "a, b=c"), "Saved",
+                                                  '```{r label="a, b=c", echo=FALSE}\nx\n```\n'),
+        "label=: line break refused": (doc, lambda p: server.set_chunk_option(p, 0, "label", "a\nb"),
+                                       "Error: Chunk label 'a\\nb' contains a line break", doc),
+        "bare and label=: set": ('```{r setup, label="other"}\nx\n```\n', lambda p: server.set_chunk_option(p, 0, "label", "L"),
+                                 "Saved", '```{r label="L"}\nx\n```\n'),
+        "bare and label=: remove takes both": ('```{r setup, label="other", echo=FALSE}\nx\n```\n',
+                                               lambda p: server.remove_chunk_option(p, 0, "label"), "Saved", "```{r echo=FALSE}\nx\n```\n"),
+        "#|: set rewrites the line": (pipe, lambda p: server.set_chunk_option(p, 0, "label", "L"), "Saved",
+                                      "```{r}\n#| label: L\n#| echo: false\nx\n```\n"),
+        "#|: quoted when YAML needs it": (pipe, lambda p: server.set_chunk_option(p, 0, "label", "a: b"), "Saved",
+                                          '```{r}\n#| label: "a: b"\n#| echo: false\nx\n```\n'),
+        "#|: remove takes the line": (pipe, lambda p: server.remove_chunk_option(p, 0, "label"), "Saved", "```{r}\n#| echo: false\nx\n```\n"),
+        "#|: line break refused": (pipe, lambda p: server.set_chunk_option(p, 0, "label", "a\nb"), "contains a line break", pipe),
+        "#| over the header: set": ('```{r a, label="b", echo=FALSE}\n#| label: c\nx\n```\n',
+                                    lambda p: server.set_chunk_option(p, 0, "label", "L"), "Saved", "```{r echo=FALSE}\n#| label: L\nx\n```\n"),
+        "#| over the header: remove takes all": ('```{r a, label="b", echo=FALSE}\n#| label: c\nx\n```\n',
+                                                lambda p: server.remove_chunk_option(p, 0, "label"), "Saved", "```{r echo=FALSE}\nx\n```\n"),
+        "bare: set": ("```{r a, echo=FALSE}\nx\n```\n", lambda p: server.set_chunk_option(p, 0, "label", "L"), "Saved",
+                      "```{r L, echo=FALSE}\nx\n```\n"),
+        "none: set": ("```{r}\nx\n```\n", lambda p: server.set_chunk_option(p, 0, "label", "L"), "Saved", "```{r L}\nx\n```\n"),
+        "none: remove": ("```{r}\nx\n```\n", lambda p: server.remove_chunk_option(p, 0, "label"), "Error: Cell 0 has no label to remove",
+                         "```{r}\nx\n```\n"),
+    }.items():
+        path = write_doc("label.rmd", text)
+        check(f"{name}: result", call(path), out)
+        check_same(f"{name}: file", read_doc(path), written)
+    # The label read back is the one set, written where it was
+    for text, values in [
+        (doc, {"L": 'L (from label="L")', 'a"b\\c': 'a"b\\c (from label="a\\"b\\\\c")', "a, b=c": 'a, b=c (from label="a, b=c")',
+               "my label": 'my label (from label="my label")'}),
+        (pipe, {"L": "L (from #| label: L)", 'a"b\\c': 'a"b\\c (from #| label: a"b\\c)', "a, b=c": "a, b=c (from #| label: a, b=c)",
+                "my label": "my label (from #| label: my label)", "'q'": "'q' (from #| label: \"'q'\")"}),
+        ('```{r setup, label="other"}\nx\n```\n', {"L": 'L (from label="L")', "a, b": 'a, b (from label="a, b")'}),
+        ("```{r}\nx\n```\n", {"L": "L", "my label": "my label"}),
+    ]:
+        for value, shown in values.items():
+            path = write_doc("label.rmd", text)
+            server.set_chunk_option(path, 0, "label", value)
+            check_same(f"label {value!r} set on {text[:20]!r}: reads back", server.get_chunk_options(path, 0).split("\n")[1], f"label: {shown}")
+    # A CRLF chunk keeps its line breaks when its #| label: line is rewritten
+    path = write_raw("label.rmd", "```{r}\r\n#| label: a\r\nx\r\n```\r\n")
+    server.set_chunk_option(path, 0, "label", "L")
+    check_same("#| label: CRLF kept", read_raw(path), "```{r}\r\n#| label: L\r\nx\r\n```\r\n")
+
+    # The #| lines are read as one YAML document, as knitr reads them: a value can run over several lines, and an
+    # id: key is the label when there is no label: key. An empty label: value is no label, so the header's counts.
+    for text, shown in {
+        "```{r}\n#| label: plain\n#|   continued\nx\n```\n": "plain continued (from #| label: plain\\n#|   continued)",
+        "```{r}\n#| label: >\n#|   my label\n#| echo: false\nx\n```\n": "my label\\n (from #| label: >\\n#|   my label)",
+        "```{r}\n#| id: setup\nx\n```\n": "setup (from #| id: setup)",
+        "```{r}\n#| id: b\n#| label: a\nx\n```\n": "a (from #| label: a, which knitr reads over #| id: b)",
+        "```{r a}\n#| label:\n#| echo: false\nx\n```\n": "a",
+        "```{r a}\n#| label:\n#| id: b\nx\n```\n": "b (from #| id: b, which knitr reads over the bare label a)",
+    }.items():
+        path = write_doc("label.rmd", text)
+        check_same(f"#| YAML {text!r}: label", server.get_chunk_options(path, 0).split("\n")[1], f"label: {shown}")
+    path = write_doc("label.rmd", "```{r}\n#| id: setup\nx\n```\n")
+    check_same("#| id: list_cells", server.list_cells(path), "[0] code (r label=setup) 2L  #| id: setup")
+    # A label with a line break is shown with the break escaped, so each cell stays on one line
+    for text, listed, shown in [
+        ('```{r label="a\\nb"}\nx\n```\n', "[0] code (r label=a\\nb) 1L  x", 'label: a\\nb (from label="a\\nb")'),
+        ('```{r}\n#| label: "a\\nb"\nx\n```\n', '[0] code (r label=a\\nb) 2L  #| label: "a\\nb"', 'label: a\\nb (from #| label: "a\\nb")'),
+    ]:
+        path = write_doc("label.rmd", text)
+        check_same(f"escaped break {text!r}: list_cells", server.list_cells(path), listed)
+        check_same(f"escaped break {text!r}: get_chunk_options", server.get_chunk_options(path, 0).split("\n")[1], shown)
+    # A bare name "label" after other options is not a label= option
+    path = write_doc("label.rmd", "```{r, echo=FALSE, label}\nx\n```\n")
+    check_same("bare name label: list_cells", server.list_cells(path), "[0] code (r opts=2) 1L  x")
+    check_same("bare name label: get_chunk_options", server.get_chunk_options(path, 0), "language: r\nlabel: (none)\n  echo=FALSE\n  label")
+
+    # Editing a #| label changes only its lines: the header line, the other lines and their line breaks stay as they are
+    for name, (text, call, written) in {
+        "set keeps the rest": ("```{r, echo = FALSE, fig.cap = 'A, B'}\n#| label: a\nx  \n```   \n",
+                               lambda p: server.set_chunk_option(p, 0, "label", "L"),
+                               "```{r, echo = FALSE, fig.cap = 'A, B'}\n#| label: L\nx  \n```   \n"),
+        "remove keeps the rest": ("```{r, echo = FALSE}\n#| label: a\n#| echo: false\nx  \n```   \n",
+                                  lambda p: server.remove_chunk_option(p, 0, "label"), "```{r, echo = FALSE}\n#| echo: false\nx  \n```   \n"),
+        "set in a mixed-ending chunk": ("```{r}\r\n#| label: a\nx\r\ny\n```\r\nT\r\n", lambda p: server.set_chunk_option(p, 0, "label", "L"),
+                                        "```{r}\r\n#| label: L\r\nx\r\ny\n```\r\nT\r\n"),
+        "remove in a mixed-ending chunk": ("```{r}\r\n#| label: a\nx\r\ny\n```\r\nT\r\n", lambda p: server.remove_chunk_option(p, 0, "label"),
+                                           "```{r}\r\nx\r\ny\n```\r\nT\r\n"),
+        "set a value of two lines": ("```{r}\n#| label: >\n#|   my label\n#| echo: false\nx\n```\n",
+                                     lambda p: server.set_chunk_option(p, 0, "label", "L"), "```{r}\n#| label: L\n#| echo: false\nx\n```\n"),
+        "remove a value of two lines": ("```{r}\n#| label: plain\n#|   continued\nx\n```\n",
+                                        lambda p: server.remove_chunk_option(p, 0, "label"), "```{r}\nx\n```\n"),
+        "set an id:": ("```{r}\n#| id: setup\nx\n```\n", lambda p: server.set_chunk_option(p, 0, "label", "L"), "```{r}\n#| id: L\nx\n```\n"),
+        "remove an id:": ("```{r}\n#| id: setup\nx\n```\n", lambda p: server.remove_chunk_option(p, 0, "label"), "```{r}\nx\n```\n"),
+        "set drops the id: label: is read over": ("```{r}\n#| id: b\n#| label: a\nx\n```\n",
+                                                 lambda p: server.set_chunk_option(p, 0, "label", "L"), "```{r}\n#| label: L\nx\n```\n"),
+        "set with two label: lines keeps one": ("```{r}\n#| label: a\n#| echo: false\n#| label: b\nx\n```\n",
+                                                lambda p: server.set_chunk_option(p, 0, "label", "L"), "```{r}\n#| label: L\n#| echo: false\nx\n```\n"),
+        "remove with two label: lines takes both": ("```{r}\n#| label: a\n#| echo: false\n#| label: b\nx\n```\n",
+                                                    lambda p: server.remove_chunk_option(p, 0, "label"), "```{r}\n#| echo: false\nx\n```\n"),
+        "empty label: set goes to the header": ("```{r a}\n#| label:\nx\n```\n", lambda p: server.set_chunk_option(p, 0, "label", "L"),
+                                                "```{r L}\n#| label:\nx\n```\n"),
+    }.items():
+        path = write_raw("label.rmd", text)
+        check(f"#| edit {name}: saved", call(path), "Saved")
+        check_same(f"#| edit {name}: file", read_raw(path), written)
+
 
 def test_chunk_body_lines():
     print("\n═══ chunk bodies: every line kept ═══")
@@ -1178,6 +1324,113 @@ def test_chunk_body_lines():
     server.set_frontmatter_key(path, "a", "1")
     server.remove_frontmatter_key(path, "a")
     check_same("front matter: blank line before the fence kept", read_doc(path), "---\ntitle: y\n\n---\nB\n")
+
+def test_prose_keeps_cells():
+    print("\n═══ prose: what it can hold and keep the cells ═══")
+    from rmd_editor import server
+    doc = "```{r}\na\n```\n\n```{r b}\nz\n```\n"
+
+    def refused(label, call, error, text=doc):
+        """call(path) on a fresh copy of text returns an error holding error, and leaves the file alone."""
+        path = write_doc("prose.rmd", text)
+        check(f"prose {label}: refused", call(path), error)
+        check(f"prose {label}: file unchanged", read_doc(path) == text, True)
+
+    # A line that opens a chunk, for this parser or for knitr, would make the prose after it chunk code
+    refused("unclosed chunk header", lambda p: server.add_cell(p, 1, "Intro\n```{python}", "markdown"),
+            "Error: Line 2 of the new text, '```{python}', opens a code chunk")
+    path = write_doc("prose.rmd", doc)
+    check_same("unclosed chunk header: the whole error", server.add_cell(path, 1, "Intro\n```{python}", "markdown"),
+               "Error: Line 2 of the new text, '```{python}', opens a code chunk (backticks, then {engine} or {engine options}), "
+               "which would make the prose after it chunk code: add a chunk with add_cell(cell_type=\"code\"), or put `r ''` "
+               "before the backticks to show the line as text")
+    refused("whole chunk", lambda p: server.add_cell(p, 1, "Intro\n```{r}\ny\n```\nOutro", "markdown"),
+            "Line 2 of the new text, '```{r}', opens a code chunk")
+    for line in ["```{r}", "```{r setup, echo=FALSE}", "```{r, echo=FALSE}", "```{python}", "```{r}  ", "```{r_x}", "```{1a}",
+                 "  ```{r}", "\t```{r}", "> ```{r}", " > > ```{r}", "````{r}", "``` {r}", "```{ r}", "```{r-x}"]:
+        refused(f"chunk opening {line!r}", lambda p: server.replace_cell_source(p, 1, f"x\n{line}\ny"),
+                f"Line 2 of the new text, {line!r}, opens a code chunk")
+    refused("prepended", lambda p: server.prepend_to_cell(p, 1, "```{r}\n"), "Line 1 of the new text, '```{r}'")
+    refused("appended", lambda p: server.append_to_cell(p, 1, "t\n```{r}"), "Line 2 of the new text, '```{r}'")
+    refused("new last cell", lambda p: server.add_cell(p, -1, "```{r}", "markdown"), "Line 1 of the new text, '```{r}'")
+    refused("CRLF text", lambda p: server.add_cell(p, 1, "Intro\r\n```{r}\r\n", "markdown"), "Line 2 of the new text, '```{r}'")
+    # Plain code blocks, other fences and inline code stay prose
+    fine = ("Inline `r x` and `r 1 + 1`.\n```r\nplot(x)\n```\n````markdown\nraw\n````\n```{.r}\nx\n```\n```{=html}\n<b>\n```\n"
+            "`r ''````{r}\n~~~{r}\n~~~\n```\n")
+    for name, call in {
+        "replace_cell_source": lambda p: server.replace_cell_source(p, 1, fine),
+        "add_cell": lambda p: server.add_cell(p, 1, fine, "markdown"),
+        "append_to_cell": lambda p: server.append_to_cell(p, 1, fine),
+        "prepend_to_cell": lambda p: server.prepend_to_cell(p, 1, fine),
+    }.items():
+        path = write_doc("prose.rmd", doc)
+        check(f"plain fences in prose: {name} saved", call(path), "Saved")
+        cells = RmdManager(path).cells
+        check(f"plain fences in prose: {name} keeps three cells", [c.cell_type for c in cells], ["code", "markdown", "code"])
+        check(f"plain fences in prose: {name} text", fine in cells[1].source, True)
+
+    # A --- block first in a document without a header would read back as the header
+    refused("--- block at the top", lambda p: server.add_cell(p, 0, "---\ntitle: x\n---\nIntro", "markdown"),
+            "Error: Saving would make lines 1 to 3 of the file read back as the YAML header")
+    refused("--- block at the top: the error says what to do", lambda p: server.add_cell(p, 0, "---\ntitle: x\n---\nIntro", "markdown"),
+            "set_frontmatter_key")
+    text = "```{r}\na\n```\n\nText\n\n---\n\nMore\n"
+    refused("--- line at the top closed by a rule further down", lambda p: server.add_cell(p, 0, "---\nIntro\n", "markdown"),
+            "Saving would make lines 1 to 9 of the file read back as the YAML header", text=text)
+    refused("first cell rewritten to start with ---", lambda p: server.replace_cell_source(p, 0, "---\nIntro\n"),
+            "Saving would make lines 1 to 7 of the file read back as the YAML header", text="Intro\n\n```{r}\na\n```\n\n---\n")
+    text = "```{r}\na\n```\n---\nfoo\n---\n"
+    refused("delete_cell bringing a --- block to the top", lambda p: server.delete_cell(p, 0), "read back as the YAML header", text=text)
+    refused("move_cell bringing a --- block to the top", lambda p: server.move_cell(p, 1, 0), "read back as the YAML header", text=text)
+    for name, (text, call, written) in {
+        "after a header": ("---\ntitle: t\n---\n```{r}\na\n```\n", lambda p: server.add_cell(p, 0, "---\nfoo: 1\n---\n", "markdown"),
+                           "---\ntitle: t\n---\n---\nfoo: 1\n---\n```{r}\na\n```\n"),
+        "not first": (doc, lambda p: server.add_cell(p, 1, "---\nx\n---\n", "markdown"), "```{r}\na\n```\n---\nx\n---\n\n```{r b}\nz\n```\n"),
+        "first but never closed": ("```{r}\na\n```\n", lambda p: server.add_cell(p, 0, "---\nIntro\n", "markdown"),
+                                   "---\nIntro\n```{r}\na\n```\n"),
+    }.items():
+        path = write_doc("prose.rmd", text)
+        check(f"--- block {name}: saved", call(path), "Saved")
+        check_same(f"--- block {name}: file", read_doc(path), written)
+    check("--- block first but never closed: no header", RmdManager(path).frontmatter.present, False)
+    # A refused save leaves the manager as the file is, so its next edit doesn't write the refused one
+    text = "```{r}\na\n```\n---\nfoo\n---\n"
+    path = write_doc("prose.rmd", text)
+    mgr = RmdManager(path)
+    try:
+        mgr.delete_cell(0)
+        check("refused save: raises", "FAIL", "PASS")
+    except RmdManagerError as e:
+        check("refused save: raises", str(e), "read back as the YAML header")
+    check("refused save: manager keeps both cells", [c.cell_type for c in mgr.cells], ["code", "markdown"])
+    mgr.append_to_cell(1, "bar")
+    check_same("refused save: the next edit writes only itself", read_doc(path), text + "bar\n")
+
+    # A chunk header that nothing closes is prose, read as one cell with the prose before it
+    for text, cells in {
+        "Intro\n```{r}\nx\n": [("markdown", "Intro\n```{r}\nx\n")],
+        "```{r}\na\n```\nIntro\n```{r}\nx": [("code", "a"), ("markdown", "Intro\n```{r}\nx")],
+        "```{r}\nx\n": [("markdown", "```{r}\nx\n")],
+    }.items():
+        fm, parsed = parse(text)
+        check(f"unclosed header {text!r}: one prose cell", [(c.cell_type, c.source) for c in parsed], cells)
+        check(f"unclosed header {text!r}: round-trips", serialize(fm, parsed), text)
+    # Lines already in a file parse as before: knitr-only chunk openings stay prose
+    fm, parsed = parse("  ```{r}\nx\n  ```\n````{r}\ny\n````\n")
+    check("knitr-only openings in a file: still prose", [c.cell_type for c in parsed], ["markdown"])
+    # Edits that would close a chunk header left open in the prose are refused
+    text = "Intro\n```{r}\nx\n"
+    path = write_doc("prose.rmd", text)
+    check_same("new chunk closing an open header: the whole error", server.add_cell(path, -1, "y"),
+               "Error: Saving would change the document's cells, so the file was left unchanged: read back, cell 0 would be "
+               "markdown of 1 line starting 'Intro' instead of markdown of 3 lines starting 'Intro'. A line that opens or closes "
+               "a chunk (such as ```{r} or ```) in the prose next to the edit does this")
+    check("new chunk closing an open header: file unchanged", read_doc(path) == text, True)
+    refused("new prose closing an open header", lambda p: server.add_cell(p, -1, "```", "markdown"),
+            "Saving would change the document's cells", text=text)
+    path = write_doc("prose.rmd", text)
+    check("prose after an open header: append works", server.append_to_cell(path, 0, "more"), "Saved")
+    check_same("prose after an open header: appended", read_doc(path), text + "more\n")
 
 
 # ──────────────────────────────────────────────
@@ -1447,6 +1700,205 @@ def test_frontmatter_unreadable():
     check("indented header: set refused", server.set_frontmatter_key(path, "title", "z"), "not one per line at column 0")
     check("indented header: remove refused", server.remove_frontmatter_key(path, "title"), "not one per line at column 0")
     check("indented header: file unchanged", read_doc(path) == text, True)
+
+def test_frontmatter_unbuildable_values():
+    print("\n═══ frontmatter: values PyYAML can't build ═══")
+    from rmd_editor import server
+    from rmd_editor import parser as rmd_parser
+    body = "\n```{r}\nx\n```\n"
+    long_float = ":".join(["1"] + ["59"] * 300) + ".5"
+    # An explicit tag on a value it can't hold (or a 60-based float too big for a float): the header can't be
+    # read, but every tool works, and get_frontmatter says what and where
+    cases = {
+        "!!bool maybe": "can't read 'maybe' as !!bool",
+        "!!bool": "can't read '' as !!bool",
+        '!!int ""': "can't read '' as !!int",
+        '!!int "-"': "can't read '-' as !!int",
+        "!!float": "can't read '' as !!float",
+        "!!timestamp hello": "can't read 'hello' as !!timestamp",
+        long_float: f"can't read {long_float[:37] + '...'!r} as !!float",
+    }
+    for value, error in cases.items():
+        label = f"unbuildable {value[:20]!r}"
+        text = f"---\na: {value}\nb: 1\n---\n" + body
+        path = write_doc("unbuildable.rmd", text)
+        check(f"{label}: list_cells", server.list_cells(path), "[1] code (r) 1L  x")
+        check(f"{label}: get_cell", server.get_cell(path, 1), "x")
+        shown = server.get_frontmatter(path)
+        check(f"{label}: get_frontmatter says what and where", shown,
+              f"(the YAML header could not be parsed: {error} (line 2, column 4 of the file); its raw text follows)\n")
+        check(f"{label}: get_frontmatter returns the raw text", shown.endswith(f"\na: {value}\nb: 1"), True)
+        check(f"{label}: add_cell", server.add_cell(path, -1, "y"), "Saved")
+        check(f"{label}: append_to_cell", server.append_to_cell(path, 1, "z"), "Saved")
+        check(f"{label}: set_chunk_option", server.set_chunk_option(path, 1, "echo", "FALSE"), "Saved")
+        check(f"{label}: set another key", server.set_frontmatter_key(path, "b", "2"), "Saved")
+        check_same(f"{label}: set another key changes only its line", read_doc(path),
+                   f"---\na: {value}\nb: 2\n---\n\n```{{r echo=FALSE}}\nx\nz\n```\n```{{r}}\ny\n```\n")
+        check(f"{label}: set this key", server.set_frontmatter_key(path, "a", "true"), "Saved")
+        check(f"{label}: header reads once fixed", (RmdManager(path).frontmatter.error, RmdManager(path).frontmatter.data),
+              (None, {"a": True, "b": 2}))
+        path = write_doc("unbuildable.rmd", text)
+        check(f"{label}: remove this key", server.remove_frontmatter_key(path, "a"), "Saved")
+        check_same(f"{label}: removed", read_doc(path), "---\nb: 1\n---\n" + body)
+
+    # Values nested deeper than the tool reads: refused with the position of the first level too deep
+    def unreadable(problem: str, head: str) -> str:
+        """What get_frontmatter returns for the header head (fences included) that can't be read for problem."""
+        return f"(the YAML header could not be parsed: {problem}; its raw text follows)\n" + head[len("---\n"):-len("\n---\n")]
+
+    head = "---\na: " + "[" * 100 + "]" * 100 + "\nb: 1\n---\n"
+    path = write_doc("unbuildable.rmd", head + body)
+    check_same("too deep: get_frontmatter says where", server.get_frontmatter(path),
+               unreadable("values are nested more than 100 levels deep, deeper than this tool reads (line 2, column 103 of the file)", head))
+    check("too deep: list_cells", server.list_cells(path), "[1] code (r) 1L  x")
+    check("too deep: set another key", server.set_frontmatter_key(path, "b", "2"), "Saved")
+    path = write_doc("unbuildable.rmd", "---\na: " + "[" * 99 + "]" * 99 + "\n---\n")
+    check("deep: 100 levels are read", server.get_frontmatter(path).startswith("a:\n- - - "), True)
+    # Nesting reached through aliases counts too: each value an alias stands for, and each merge key (<<), is a level
+    # (PyYAML merges and writes values recursively), so these are refused where the 101st level starts
+    nest = lambda inner: "[" * 90 + inner + "]" * 90
+    lists = [f"{name}: &{name} " + nest(f"*{inner}" if inner else "x") for name, inner in zip("abcde", ["", "a", "b", "c", "d"])]
+    merges = ["m0: &m0 " + "{<<: " * 95 + "{k: 1}" + "}" * 95] + [
+        f"m{i}: &m{i} " + "{<<: " * 95 + f"*m{i - 1}" + "}" * 95 for i in range(1, 12)]
+    chain = ["a0: &a0 {k: 1}"] + [f"a{i}: &a{i} {{<<: *a{i - 1}}}" for i in range(1, 991)]
+    tagged = [f"{name}: &{name} " + "!foo [" * 90 + (f"*{inner}" if inner else "x") + "]" * 90
+              for name, inner in zip("abcde", ["", "a", "b", "c", "d"])]
+    deep = "values are nested more than 100 levels deep (counting the values aliases stand for), deeper than this tool reads"
+    for name, (lines, where) in {
+        "aliased lists": (lists + ["<<: {z: *e}"], "line 5, column 15"),
+        "aliased lists, no merge": (lists, "line 5, column 16"),
+        "merges of merges": (merges + ["<<: *m11"], "line 12, column 31"),
+        "a chain of merges": (chain + ["<<: *a990"], "line 893, column 7"),
+        "aliased tagged lists": (tagged + ["<<: {z: *e}"], "line 5, column 55"),
+    }.items():
+        head = "---\n" + "\n".join(lines) + "\n---\n"
+        path = write_doc("unbuildable.rmd", head + body)
+        check_same(f"deep through aliases, {name}: get_frontmatter says where", server.get_frontmatter(path),
+                   unreadable(f"{deep} ({where} of the file)", head))
+        check(f"deep through aliases, {name}: list_cells", server.list_cells(path), "[1] code (r) 1L  x")
+        check(f"deep through aliases, {name}: get_cell", server.get_cell(path, 1), "x")
+        check(f"deep through aliases, {name}: add_cell", server.add_cell(path, -1, "y"), "Saved")
+        check(f"deep through aliases, {name}: set_chunk_option", server.set_chunk_option(path, 1, "echo", "FALSE"), "Saved")
+        check(f"deep through aliases, {name}: set a key", server.set_frontmatter_key(path, "zz", "1"), "Saved")
+        check_same(f"deep through aliases, {name}: only the new key's line is added", read_doc(path),
+                   head[:-len("---\n")] + "zz: 1\n---\n\n```{r echo=FALSE}\nx\n```\n```{r}\ny\n```\n")
+    # As a value to set, such a value is written as a quoted string, as one nested too deep is
+    value = "{" + ", ".join(lists) + ", <<: {z: *e}}"
+    path = write_doc("unbuildable.rmd", "---\nb: 1\n---\n")
+    check("deep through aliases: value set", server.set_frontmatter_key(path, "k", value), "Saved")
+    check("deep through aliases: value kept as that string", parse(read_doc(path))[0].data, {"b": 1, "k": value})
+    # A value is one level deeper in the header than on its own: 99 levels are written as YAML, 100 as a string
+    for levels, written in [(99, None), (100, "string"), (101, "string")]:
+        value = "[" * levels + "]" * levels
+        path = write_doc("unbuildable.rmd", "---\nb: 1\n---\n")
+        check(f"value {levels} levels deep: set", server.set_frontmatter_key(path, "k", value), "Saved")
+        if written is None:
+            check_same(f"value {levels} levels deep: written as given", read_doc(path), f"---\nb: 1\nk: {value}\n---\n")
+        else:
+            check(f"value {levels} levels deep: kept as that string", parse(read_doc(path))[0].data, {"b": 1, "k": value})
+    # An escape past the last Unicode character (U+10FFFF), in a value or a key: refused with its position
+    for name, (head, problem) in {
+        "value": ('---\na: "\\U00110000"\nb: 1\n---\n', "found an escape past U+10FFFF, the last Unicode character (line 2, column 7 of the file)"),
+        "!!binary value": ('---\na: !!binary "\\UFFFFFFFF"\nb: 1\n---\n',
+                           "found an escape past U+10FFFF, the last Unicode character (line 2, column 16 of the file)"),
+        "key": ('---\n"\\U00110000": 1\nb: 1\n---\n', "found an escape past U+10FFFF, the last Unicode character (line 2, column 4 of the file)"),
+    }.items():
+        path = write_doc("unbuildable.rmd", head + body)
+        check_same(f"escape past U+10FFFF in a {name}: get_frontmatter says where", server.get_frontmatter(path), unreadable(problem, head))
+        check(f"escape past U+10FFFF in a {name}: list_cells", server.list_cells(path), "[1] code (r) 1L  x")
+        check(f"escape past U+10FFFF in a {name}: set another key", server.set_frontmatter_key(path, "c", "1"), "Saved")
+        check_same(f"escape past U+10FFFF in a {name}: only the new key's line is added", read_doc(path),
+                   head[:-len("---\n")] + "c: 1\n---\n" + body)
+    # A header that doesn't parse for another reason, with such a key further down: its keys are still found
+    head = '---\na: ]\n"\\U00110000": 1\n---\n'
+    path = write_doc("unbuildable.rmd", head + body)
+    check("escape past U+10FFFF after a syntax error: list_cells", server.list_cells(path), "[1] code (r) 1L  x")
+    check("escape past U+10FFFF after a syntax error: remove a key", server.remove_frontmatter_key(path, "a"), "Saved")
+    check_same("escape past U+10FFFF after a syntax error: removed", read_doc(path), '---\n"\\U00110000": 1\n---\n' + body)
+    # An int too long to print (from hex digits) is reported, as a decimal one is
+    try:
+        str(int("F" * 5000, 16))
+    except ValueError as e:
+        too_long = str(e)
+    head = "---\na: 0x" + "F" * 5000 + "\nb: 1\n---\n"
+    path = write_doc("unbuildable.rmd", head + body)
+    check_same("long hex int: get_frontmatter says what and where", server.get_frontmatter(path),
+               unreadable(f"{too_long} (line 2, column 4 of the file)", head))
+
+    # Fuzz: no tag, content, merge key or size makes a tool raise
+    values = [
+        "!!bool ''", "!!bool [1]", "!!int", "!!int '+'", "!!int 0x", "!!int 0b2", "!!int 0o9", "!!int 1:x", "!!int 0x_",
+        "!!float '-'", "!!float .", "!!float {a: 1}", "!!timestamp", "!!timestamp 2026-13-45", "!!timestamp '2026-01-01 25:00:00'",
+        "!!timestamp 2026-01-01T10:00:00+99:00", "0000-01-01", "!!binary", "!!binary '@@@'", "!!binary abc", "!!binary \u00e9",
+        "!!binary [1]", "!!set 3", "!!set [1, 2]", "!!set {[1]: 2}", "!!set {a, b}", "!!omap [1, 2]", "!!omap {a: 1}",
+        "!!omap [{a: 1, b: 2}]", "!!omap [[1]]", "!!omap [{a: 1}, {b: 2}]", "!!pairs [1]", "!!pairs {a: 1}", "!!pairs [{a: 1}, {a: 2}]",
+        "!!python/object:os.system x", "!!python/object/apply:os.system [ls]", "!!python/name:os.system ''", "!!map [1]",
+        "!!seq {a: 1}", "!!str [1]", "!!null [1]", "!!merge x", "!!value x", "!!float 1e9999", "!!int 0x" + "F" * 5000,
+        "0b" + "1" * 20000, ":".join(["1"] + ["59"] * 3000), "9" * 5000, "!!int " + "9" * 5000, "[" * 5000 + "]" * 5000,
+        "{a: " * 3000 + "1" + "}" * 3000, "!foo " + "[" * 400 + "]" * 400, "!foo {a: " * 400 + "1" + "}" * 400, "&x [*x]",
+        "*nope", "x" * 200_000,
+    ]
+    docs = {f"a: {value[:30]}": f"---\na: {value}\nb: 1\n---\n" for value in values}
+    docs.update({
+        "merge key 1": "---\n<<: 1\na: 2\n---\n", "merge key list of scalars": "---\n<<: [1, 2]\na: 2\n---\n",
+        "nested merge key": "---\na:\n  <<: x\n---\n", "merge of a merge": "---\nb: &b {<<: {c: 1}}\na: {<<: *b}\n---\n",
+        "unhashable key": "---\n? [1, 2]\n: x\na: 1\n---\n", "deep block mapping": "---\na:\n" + "".join(
+            "  " * (i + 1) + f"k{i}:\n" for i in range(600)) + "  " * 601 + "v\n---\n",
+        "escape past U+10FFFF": '---\na: "\\UFFFFFFFF"\n---\n', "escape past U+10FFFF in a key": '---\n"\\U00110000": 1\n---\n',
+        "escape past U+10FFFF after a syntax error": '---\na: ]\n"\\U00110000": 1\n---\n',
+        "surrogate escape": '---\na: "\\uD800"\n---\n', "merge chain": "---\n" + "\n".join(chain + ["<<: *a990"]) + "\n---\n",
+        "aliased lists": "---\n" + "\n".join(lists + ["<<: {z: *e}"]) + "\n---\n",
+        "aliased tagged maps": "---\n" + "\n".join(f"{n}: &{n} " + "!foo {k: " * 90 + (f"*{i}" if i else "1") + "}" * 90
+                                                  for n, i in zip("abcde", ["", "a", "b", "c", "d"])) + "\n<<: {z: *e}\n---\n",
+    })
+    for name, head in docs.items():
+        path = write_doc("unbuildable.rmd", head + body)
+        raised = []
+        for tool, call in [
+            ("list_cells", lambda: server.list_cells(path)), ("get_frontmatter", lambda: server.get_frontmatter(path)),
+            ("get_cell", lambda: server.get_cell(path, -1)), ("get_chunk_options", lambda: server.get_chunk_options(path, -1)),
+            ("find_in_rmd", lambda: server.find_in_rmd(path, "x")), ("add_cell", lambda: server.add_cell(path, -1, "z")),
+            ("set_chunk_option", lambda: server.set_chunk_option(path, -1, "echo", "FALSE")),
+            ("set_frontmatter_key", lambda: server.set_frontmatter_key(path, "c", "1")),
+            ("set_frontmatter_key a", lambda: server.set_frontmatter_key(path, "a", "2")),
+            ("remove_frontmatter_key", lambda: server.remove_frontmatter_key(path, "a")),
+            ("replace_cell_source", lambda: server.replace_cell_source(path, -1, "y")),
+        ]:
+            try:
+                call()
+            except Exception as e:
+                raised.append(f"{tool}: {type(e).__name__}: {str(e)[:80]}")
+        check(f"fuzz {name!r}: no tool raises", raised, [])
+
+    # Values and keys passed to the tools are YAML too: one that can't be built is written as a quoted string
+    for value in ["!!bool maybe", "!!float", "!!timestamp x", "[" * 500 + "]" * 500, "0x" + "F" * 5000]:
+        path = write_doc("unbuildable.rmd", "---\nb: 1\n---\n")
+        check(f"value {value[:20]!r}: set", server.set_frontmatter_key(path, "a", value), "Saved")
+        check(f"value {value[:20]!r}: kept as that string", parse(read_doc(path))[0].data, {"b": 1, "a": value})
+        # A plain key line holds at most 1024 characters (YAML's limit for an implicit key)
+        if len(value) <= 1000:
+            path = write_doc("unbuildable.rmd", "---\nb: 1\n---\n")
+            check(f"key {value[:20]!r}: set", server.set_frontmatter_key(path, value, "1"), "Saved")
+            check(f"key {value[:20]!r}: kept as that string", parse(read_doc(path))[0].data, {"b": 1, value: 1})
+        path = os.path.join(WORK_DIR, "created.rmd")
+        check(f"create_rmd output {value[:20]!r}", create_rmd(path, output_format=value, overwrite=True), "Created")
+        check(f"create_rmd output {value[:20]!r}: kept as that string", parse(read_doc(path))[0].data, {"output": value})
+
+    # Only PyYAML's own scalar constructors are guarded: an exception from other code still surfaces
+    saved = rmd_parser._TolerantLoader.yaml_constructors[None]
+
+    def broken(loader, node):
+        raise KeyError("bug")
+
+    rmd_parser._TolerantLoader.yaml_constructors[None] = broken
+    try:
+        parse("---\na: !r x\n---\n")
+        raised = None
+    except KeyError as e:
+        raised = e
+    finally:
+        rmd_parser._TolerantLoader.yaml_constructors[None] = saved
+    check("guard: a bug in a constructor still raises", repr(raised), "KeyError('bug')")
 
 
 # ──────────────────────────────────────────────
@@ -2291,11 +2743,14 @@ if __name__ == "__main__":
         test_prepend_append_to_cell()
         test_chunk_options()
         test_chunk_header_values()
+        test_chunk_label_spellings()
         test_chunk_body_lines()
+        test_prose_keeps_cells()
         test_frontmatter()
         test_frontmatter_line_level()
         test_frontmatter_edge_cases()
         test_frontmatter_unreadable()
+        test_frontmatter_unbuildable_values()
         test_find_in_rmd()
         test_kernel_name_mapping()
         test_kernel_state_not_started()

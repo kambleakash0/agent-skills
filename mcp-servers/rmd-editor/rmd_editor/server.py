@@ -186,6 +186,13 @@ def add_cell(
 ) -> str:
     """Insert a new cell at the given index.
 
+    Markdown text with a line that would open a chunk (```{r}, or for knitr also
+    indented, after >, or with more backticks) is refused, since the prose after
+    it would become chunk code; the error gives its line in the text passed. So
+    is markdown that would put a --- line at the top of a document without a
+    header, with another --- line further down, which would read back as the
+    YAML header.
+
     Args:
         file_path: Absolute path to a .rmd file.
         index: Zero-based insertion position. Pass -1 to append at the end.
@@ -301,6 +308,8 @@ def replace_cell_source(
     as it was. In a chunk's text, a line knitr reads as a closing fence
     (backticks alone on a line, after nothing but spaces, tabs or >) would close
     the chunk, so it is refused; the error gives its line in the text passed.
+    In a markdown cell's text, a line that would open a chunk is refused the
+    same way (prepend_to_cell and append_to_cell check the text they add).
 
     Args:
         file_path: Absolute path to a .rmd file.
@@ -360,6 +369,11 @@ def append_to_cell(
 def get_chunk_options(file_path: FilePath, index: ChunkIndex) -> str:
     """Return the chunk's language, label, and all key=value options.
 
+    The label is the one knitr uses: a #| label: (else #| id:) line at the top
+    of the chunk, else a label= option, else the bare name first in the header.
+    One not written as that bare name is shown with where it is written, and
+    label= is not listed among the options. A line break in a label shows as \\n.
+
     Args:
         file_path: Absolute path to a .rmd file.
         index: Zero-based index of a CODE cell (chunk). Markdown cells raise.
@@ -393,6 +407,11 @@ def set_chunk_option(
     value, a backtick left open or a # or "=" outside quotes and brackets
     (x == 1 is fine). So is an empty value for any key but "label".
 
+    The label is set where knitr reads it from: a #| label: (or #| id:) line at
+    the top of the chunk, whose lines alone are rewritten, else a label= option
+    (kept as an R string, any text allowed but a line break), else the bare name
+    first in the header. Spellings knitr reads it over are removed, so one is left.
+
     Args:
         file_path: Absolute path to a .rmd file.
         index: Zero-based index of a CODE cell (chunk).
@@ -412,6 +431,10 @@ def remove_chunk_option(
     key: Annotated[str, Field(description='Name of the option to remove; the special key "label" clears the chunk label.')],
 ) -> str:
     """Remove one chunk option. Use key="label" to clear the chunk label.
+
+    Clearing the label removes it wherever it is written (the bare name first in
+    the header, a label= option, #| label: and #| id: lines at the top of the
+    chunk), so no other spelling becomes the label.
 
     Args:
         file_path: Absolute path to a .rmd file.
@@ -435,7 +458,11 @@ def get_frontmatter(file_path: FilePath) -> str:
 
     R Markdown tags such as !r and !expr are shown as tags. A header that is not
     valid YAML is returned as its raw text, after a note saying why it could not
-    be parsed and, when known, at which line and column of the file.
+    be parsed and, when known, at which line and column of the file. So is one
+    holding a value that can't be built, such as !!bool maybe ("can't read
+    'maybe' as !!bool"), an impossible date, an escape past U+10FFFF, or values
+    nested more than 100 levels deep (counting the values aliases stand for);
+    the other tools still work on such a file.
 
     Args:
         file_path: Absolute path to a .rmd file.
@@ -463,7 +490,9 @@ def set_frontmatter_key(
     Only that key's lines change (the key line and its indented lines): comments,
     quoting, tags such as !r, and key order elsewhere in the header are kept. A
     new key goes just before the closing ---; a document without a header gets
-    one. A header that is not valid YAML is still edited line by line.
+    one. A header that is not valid YAML is still edited line by line. A value
+    that can't be built (such as !!bool maybe, or nested too deep to sit under
+    a key) is written as a quoted string, like other text that isn't YAML.
 
     Args:
         file_path: Absolute path to a .rmd file.

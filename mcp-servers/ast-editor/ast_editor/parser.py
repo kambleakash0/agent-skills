@@ -37,11 +37,76 @@ JS_FUNCTION_VALUES = ("arrow_function", "function_expression", "function", "gene
 # siblings are the declaration's own (see _refuse_ambiguous_ts).
 _TS_DECLARATION_WRAPPERS = ("export_statement", "ambient_declaration")
 
+# TS declarations that declare one kind of symbol under different node
+# types (see _refuse_ambiguous_ts): a function's overload signatures and its
+# implementation.
+_TS_KINDS = {"function_signature": "function_declaration"}
+
+# The C++ and TS namespace nodes: a namespace is one container with the
+# other blocks of its name in its scope and, in TS, with the class, function
+# or enum of its name (merged_containers).
+NAMESPACES = ("namespace_definition", "internal_module", "module")
+
+# The C/C++ class, struct, union and enum nodes.
+C_TYPE_SPECIFIERS = ("class_specifier", "struct_specifier", "union_specifier", "enum_specifier")
+
+# The C/C++ nodes that name what a declarator declares: a variable, field,
+# function or typedef name, a namespace, a destructor (`~A`) or operator
+# (`operator==`, the conversion `operator bool`).
+_C_NAMES = (
+    "identifier",
+    "field_identifier",
+    "type_identifier",
+    "namespace_identifier",
+    "destructor_name",
+    "operator_name",
+    "operator_cast",
+)
+
+# The nodes between a declaration and the scope it declares its name in
+# (see TreeSitterParser._scope): C preprocessor conditionals, `extern "C"`,
+# C++ templates, the C/C++ declarations around a struct (`struct S {...}
+# s;`, `typedef struct N {...} N;`) and the TS `export` and `declare`.
+_SCOPE_WRAPPERS = (
+    "preproc_if",
+    "preproc_ifdef",
+    "preproc_else",
+    "preproc_elif",
+    "preproc_elifdef",
+    "linkage_specification",
+    "template_declaration",
+    "declaration",
+    "field_declaration",
+    "type_definition",
+    "export_statement",
+    "ambient_declaration",
+)
+
+
+def c_name(text: str) -> str:
+    """A C++ destructor or operator name as list_symbols shows it and a
+    target may write it: with the spaces between words only, so `~ A` is
+    `~A`, `operator ==` is `operator==`, `operator new []` is `operator
+    new[]` and `operator const char *` is `operator const char*`."""
+    return re.sub(r" (?=\W)|(?<=\W) ", "", " ".join(text.split()))
+
 
 class ApplierError(Exception):
     """An edit or lookup the tools refuse, with a message for the caller.
     Defined here so that find_node_by_name can refuse an ambiguous target;
     ast_editor.applier, whose edits raise it, imports it from here."""
+
+
+# The UTF-8 byte order mark, which TreeSitterParser takes off the text and
+# the Applier writes back, and the marks of the encodings the tools cannot
+# read (UTF-32 first, as its little-endian mark starts with UTF-16's).
+UTF8_BOM = b"\xef\xbb\xbf"
+_OTHER_BOMS = (
+    (b"\xff\xfe\x00\x00", "UTF-32"),
+    (b"\x00\x00\xfe\xff", "UTF-32"),
+    (b"\xff\xfe", "UTF-16"),
+    (b"\xfe\xff", "UTF-16"),
+)
 
 
 def detect_newline(data: bytes) -> str:
@@ -245,12 +310,32 @@ class TreeSitterParser:
 
         with open(filepath, "rb") as f:
             raw = f.read()
+        # A UTF-8 byte order mark is not text: tree-sitter would read it as
+        # code, Python accepts it only as the very first character, and new
+        # lines above the first one would move it into the file. It is taken
+        # off here, so that node positions, lines and the syntax check start
+        # after it, and the Applier writes it back first (`bom`).
+        self.bom = raw.startswith(UTF8_BOM)
+        if self.bom:
+            raw = raw[len(UTF8_BOM) :]
         # Everything works on LF text internally (node positions, caller
         # snippets, inserted code); the Applier writes the file back with
         # its own `newline` style.
         self.newline = detect_newline(raw)
         self.source_bytes = raw.replace(b"\r\n", b"\n")
-        self.source_code = self.source_bytes.decode("utf-8")
+        try:
+            self.source_code = self.source_bytes.decode("utf-8")
+        except UnicodeDecodeError as e:
+            encoding = next((name for mark, name in _OTHER_BOMS if raw.startswith(mark)), None)
+            what = (
+                f"{encoding} text (it starts with a {encoding} byte order mark)"
+                if encoding
+                else f"not UTF-8 text ({e})"
+            )
+            raise ValueError(
+                f"{filepath} is {what}; ast-editor reads and writes UTF-8 files only. "
+                "Convert it to UTF-8, or make this edit with your normal edit tool."
+            ) from e
         self.tree = self.parse(self.source_bytes)
 
     def parse(self, data: bytes):
@@ -273,13 +358,23 @@ class TreeSitterParser:
         JS/TS exported declarations are found by their own names (the
         declaration inside the export statement is returned); an anonymous
         `export default function/class` is named `default`. Generator
-        functions, TS abstract classes and their abstract methods, enums and
-        type aliases are found like other declarations, and a `const`/`let`/
-        `var` by the name it declares (the whole declaration is returned;
-        js_bound_function gets the function bound to it). A TS name that two
-        kinds of declaration in one scope declare (a type and a value: `const
-        User` and `type User`) is refused as ambiguous with an ApplierError
-        (_refuse_ambiguous_ts).
+        functions, TS abstract classes and their abstract methods, enums,
+        type aliases, namespaces and functions declared without a body
+        (`declare function f(): void;`) are found like other declarations,
+        and a `const`/`let`/`var` by the name it declares (the whole
+        declaration is returned; js_bound_function gets the function bound
+        to it). A TS name that two kinds of declaration in one scope declare
+        (a type and a value: `const User` and `type User`) is refused as
+        ambiguous with an ApplierError (_refuse_ambiguous_ts).
+        C/C++ variables, fields, typedefs, `using` aliases, macros, function
+        prototypes and methods declared in their class are found as well,
+        by every name a declaration declares (`b` of `int a, *b;`, the whole
+        declaration being returned), destructors as `~A` and operators as
+        c_name writes them (`operator==`, `operator bool`); so are Java
+        fields and Go type aliases and every name of a Go `var`/`const`
+        spec. Where one scope declares a name more than once, a definition
+        is found rather than its forward declaration, prototype, `extern`
+        declaration or TS overload signature (definition_rank).
         In JSON, YAML and TOML files the target is a key path followed from
         the top level, a segment in double quotes (in TOML also single
         quotes) being one key with any dots in it (split_config_path), and
@@ -298,10 +393,17 @@ class TreeSitterParser:
                 closure = self._find_js_closure_by_var(parts[0], parts[1])
                 if closure is not None:
                     return closure
-            class_types = ["class_declaration", "abstract_class_declaration", "interface_declaration"]
+            class_types = [
+                "class_declaration",
+                "abstract_class_declaration",
+                "interface_declaration",
+                "internal_module",
+                "module",
+            ]
             func_types = [
                 "function_declaration",
                 "generator_function_declaration",
+                "function_signature",
                 "method_definition",
                 "abstract_method_signature",
                 "arrow_function",
@@ -324,13 +426,22 @@ class TreeSitterParser:
             ]
             var_types = ["variable_declaration", "lexical_declaration"]
         elif self.ext in C_EXTS:
-            class_types = ["struct_specifier", "union_specifier", "enum_specifier"]
+            # A typedef of a struct holds its fields (`P.x` of `typedef
+            # struct {...} P;`).
+            class_types = ["struct_specifier", "union_specifier", "enum_specifier", "type_definition"]
             func_types = ["function_definition"]
-            var_types = []
+            var_types = ["declaration", "field_declaration", "preproc_def", "preproc_function_def"]
         elif self.ext in CPP_EXTS:
-            class_types = ["class_specifier", "struct_specifier", "union_specifier", "enum_specifier", "namespace_definition"]
+            class_types = [
+                "class_specifier",
+                "struct_specifier",
+                "union_specifier",
+                "enum_specifier",
+                "namespace_definition",
+                "type_definition",
+            ]
             func_types = ["function_definition"]
-            var_types = []
+            var_types = ["declaration", "field_declaration", "alias_declaration", "preproc_def", "preproc_function_def"]
         elif self.ext in RUBY_EXTS:
             class_types = ["class", "module"]
             func_types = ["method", "singleton_method"]
@@ -347,11 +458,11 @@ class TreeSitterParser:
                     return go_closure
             class_types = ["type_spec"]
             func_types = ["function_declaration", "method_declaration"]
-            var_types = ["const_spec", "var_spec"]
+            var_types = ["const_spec", "var_spec", "type_alias"]
         elif self.ext == ".java":
             class_types = ["class_declaration", "interface_declaration", "enum_declaration", "record_declaration"]
             func_types = ["method_declaration", "constructor_declaration"]
-            var_types = ["field_declaration"]
+            var_types = ["field_declaration", "constant_declaration"]
         elif self.ext == ".json":
             return self._search_json_dotted(self.tree.root_node, target_name)
         elif self.ext in (".yml", ".yaml"):
@@ -371,23 +482,73 @@ class TreeSitterParser:
         func_types: list[str],
         var_types: list[str],
     ) -> Node | None:
+        """
+        The node for the dotted target `target_name` under `root`: each part
+        but the last a container (class_types) found in the ones before it,
+        the last a symbol of any of the types (_find_child_with_name). A C++
+        or TS namespace opened more than once in its scope, and a TS
+        namespace merged with the class, function or enum of its name, are
+        one container that holds the members of all of their blocks
+        (merged_containers): of the nodes that declare a name in them, the
+        target is the first of the lowest definition_rank, so a definition
+        in a later block wins over a forward declaration in an earlier one.
+        """
         parts = target_name.split(".")
-        current_node = root
+        containers = [root]
 
         for i, part in enumerate(parts):
-            if i < len(parts) - 1:
-                found = self._find_child_with_name(current_node, part, class_types)
-                if not found:
-                    return None
-                current_node = found
-            else:
-                valid_types = class_types + func_types + var_types
-                found = self._find_child_with_name(current_node, part, valid_types)
-                if not found:
-                    return None
-                return found
+            last = i == len(parts) - 1
+            types = class_types + func_types + var_types if last else class_types
+            found = [self._find_child_with_name(c, part, types) for c in containers]
+            found = [node for node in found if node is not None]
+            if not found:
+                return None
+            best = min(found, key=lambda node: self._rank(node, part))
+            if last:
+                return best
+            containers = self.merged_containers(best, part, class_types)
 
         return None
+
+    def _rank(self, node: Node, name: str) -> int:
+        """The definition_rank of `node`, found for `name` (a Python
+        decorated definition by its function's name)."""
+        inner = node
+        if node.type == "decorated_definition":
+            inner = next((c for c in node.named_children if c.type == "function_definition"), node)
+        declared = self.declared_name(inner, name)
+        return self.definition_rank(node, declared) if declared is not None else 0
+
+    def merged_containers(self, found: Node, name: str, class_types: list[str]) -> list[Node]:
+        """
+        `found`, the container that one part of a dotted target names, with
+        the other declarations of `name` in its scope that are one container
+        with it, in document order, when one of them is a namespace: the
+        blocks of a C++ or TS namespace opened again (`namespace n {...}`
+        twice), and in TS a namespace merged with the class, function or enum
+        of its name. Else [found].
+        """
+        if self.ext not in CPP_EXTS + (".ts", ".tsx"):
+            return [found]
+        scope = self._scope(found)
+        if scope is None:
+            return [found]
+        merged, stack = [], list(scope.named_children)
+        while stack:
+            curr = stack.pop()
+            if curr.type in _SCOPE_WRAPPERS + ("expression_statement",) or (
+                curr.type == "declaration_list" and curr.parent.type == "linkage_specification"
+            ):
+                stack.extend(curr.named_children)
+            elif (
+                curr.type in tuple(class_types) + ("function_declaration", "enum_declaration")
+                and self._scope(curr) == scope
+                and self.declared_name(curr, name) is not None
+            ):
+                merged.append(curr)
+        if found not in merged or not any(node.type in NAMESPACES for node in merged):
+            return [found]
+        return sorted(merged, key=lambda node: node.start_byte)
 
     def _extract_c_function_name(self, func_node: Node) -> Node | None:
         """
@@ -395,27 +556,261 @@ class TreeSitterParser:
         function_definition -> declarator (function_declarator) -> declarator (identifier/field_identifier/qualified_identifier)
         Handles pointer/reference declarators, qualified names (Class::method)
         and C++ explicit specializations (`template <> int id<int>(int)`),
-        which are named for the template they specialize (`id`).
+        which are named for the template they specialize (`id`). See
+        c_declarator_name.
         """
-        declarator = func_node.child_by_field_name("declarator")
-        while declarator:
-            if declarator.type in ("identifier", "field_identifier", "type_identifier"):
+        return self.c_declarator_name(func_node.child_by_field_name("declarator"))
+
+    def c_declarator_name(self, declarator: Node | None) -> Node | None:
+        """
+        The node that names what a C/C++ declarator declares (one of
+        _C_NAMES), found through the declarators around it (`*p`, `&r`,
+        `a[3]`, `f(int)`, `(*fp)(int)`, `x = 1`), a qualified name (the `f`
+        of `A::f`, the `~A` of `A::~A`) and a template's arguments (the `id`
+        of `id<int>`), or None.
+        """
+        while declarator is not None:
+            if declarator.type in _C_NAMES:
                 return declarator
-            if declarator.type == "template_function":
-                return declarator.child_by_field_name("name")
-            if declarator.type == "qualified_identifier":
-                # For Class::method, return the inner name
-                inner = declarator.child_by_field_name("name")
-                if inner is not None and inner.type == "template_function":
-                    inner = inner.child_by_field_name("name")
-                return inner if inner else declarator
-            declarator = declarator.child_by_field_name("declarator")
+            if declarator.type in ("qualified_identifier", "template_function"):
+                declarator = declarator.child_by_field_name("name")
+                continue
+            inner = declarator.child_by_field_name("declarator")
+            if inner is None and declarator.type.endswith("declarator"):
+                # `&r`, `(*fp)` and `x [[maybe_unused]]` hold theirs unnamed.
+                inner = next(
+                    (
+                        c
+                        for c in declarator.named_children
+                        if c.type.endswith("declarator")
+                        or c.type in _C_NAMES + ("qualified_identifier", "template_function")
+                    ),
+                    None,
+                )
+            declarator = inner
         return None
+
+    def c_declared_names(self, node: Node) -> list[Node]:
+        """
+        The nodes naming what a C/C++ node declares, in order: a function
+        definition's name, a class, struct, union, enum or namespace name
+        (a type without a body only when it stands alone, `struct S;`, not
+        where it is just used, `struct S *p;`), a `using` alias or macro
+        name, and the names of the declarators of a declaration, field or
+        typedef (`a` and `b` of `int a, *b;`, `x` and `y` of a C++ `auto [x,
+        y] = p;`).
+        """
+        if node.type == "function_definition":
+            name = self._extract_c_function_name(node)
+            return [name] if name is not None else []
+        if node.type in C_TYPE_SPECIFIERS + ("namespace_definition", "alias_declaration", "preproc_def", "preproc_function_def"):
+            name = node.child_by_field_name("name")
+            if name is None or (node.type in C_TYPE_SPECIFIERS and not self.c_declares_type(node)):
+                return []
+            return [name]
+        if node.type in ("declaration", "field_declaration", "type_definition"):
+            names = []
+            for declarator in node.children_by_field_name("declarator"):
+                binding = declarator
+                while binding is not None and binding.type in ("init_declarator", "reference_declarator"):
+                    binding = binding.child_by_field_name("declarator") or next(
+                        (c for c in binding.named_children if c.type.endswith("declarator")), None
+                    )
+                if binding is not None and binding.type == "structured_binding_declarator":
+                    # `auto [x, y] = p;`
+                    names.extend(c for c in binding.named_children if c.type == "identifier")
+                    continue
+                name = self.c_declarator_name(declarator)
+                if name is not None:
+                    names.append(name)
+            return names
+        return []
+
+    @staticmethod
+    def c_declares_type(node: Node) -> bool:
+        """Whether a C/C++ class, struct, union or enum node declares its
+        type: it has a body, or stands alone as a forward declaration
+        (`struct S;`, `class B;` in a class, `template <class T> class X;`).
+        Without a body, the type of a declaration, parameter or cast only
+        refers to it (`struct S *p;`)."""
+        if node.child_by_field_name("body") is not None:
+            return True
+        parent = node.parent
+        if parent is None or parent.child_by_field_name("declarator") is not None:
+            return False
+        return parent.type in (
+            "translation_unit",
+            "declaration_list",
+            "field_declaration_list",
+            "field_declaration",
+            "declaration",
+            "template_declaration",
+            "linkage_specification",
+            "preproc_if",
+            "preproc_ifdef",
+            "preproc_else",
+            "preproc_elif",
+            "preproc_elifdef",
+        )
+
+    def c_declares_function(self, name: Node) -> bool:
+        """Whether the declarator that `name` names (c_declarator_name)
+        declares a function: a prototype `int f(int);`, a method declared in
+        its class, a conversion operator. A pointer to a function (`int
+        (*fp)(int);`) is a variable."""
+        if name.type == "operator_cast":
+            return True
+        parent = name.parent
+        while parent is not None and parent.type in ("qualified_identifier", "template_function"):
+            parent = parent.parent
+        return parent is not None and parent.type == "function_declarator"
+
+    def symbol_name(self, name: Node) -> str:
+        """The name a name node gives its symbol as a target: its text, a
+        C++ destructor or operator name written as c_name writes it, and a
+        conversion operator without its parameters (`operator bool`)."""
+        if self.ext not in C_EXTS + CPP_EXTS or name.type not in ("destructor_name", "operator_name", "operator_cast"):
+            return self.node_text(name)
+        end = name.end_byte
+        if name.type == "operator_cast":
+            stack = [name]
+            while stack:
+                node = stack.pop()
+                if node.type == "parameter_list":
+                    end = node.start_byte
+                    break
+                stack.extend(reversed(node.named_children))
+        return c_name(self.source_bytes[name.start_byte : end].decode("utf-8"))
+
+    def declared_names(self, node: Node) -> list[Node]:
+        """
+        The nodes naming what `node`, a node of a type that targets find,
+        declares, in order: its name field; in C/C++ the names
+        c_declared_names finds; a Python or Ruby assignment's left side;
+        every name of a Go `var`/`const` spec (`a, b = 1, 2`); and the
+        declarators of a JS/TS `const`/`let`/`var` or a Java field (`int x,
+        y;`).
+        """
+        if self.ext in C_EXTS + CPP_EXTS:
+            return self.c_declared_names(node)
+        if node.type in ("const_spec", "var_spec") and self.ext in GO_EXTS:
+            return [c for c in node.children_by_field_name("name") if c.type == "identifier"]
+        name = node.child_by_field_name("name")
+        if name is not None:
+            return [name]
+        if node.type == "expression_statement":
+            assignment = node.named_children[0] if node.named_children else None
+            if assignment is not None and assignment.type == "assignment":
+                return assignment.named_children[:1]
+            return []
+        if node.type == "assignment" and self.ext in RUBY_EXTS:
+            first = node.named_children[0] if node.named_children else None
+            return [first] if first is not None and first.type in ("constant", "identifier") else []
+        if node.type in ("variable_declaration", "lexical_declaration", "field_declaration", "constant_declaration"):
+            names = (
+                c.child_by_field_name("name")
+                for c in node.named_children
+                if c.type == "variable_declarator"
+            )
+            return [name for name in names if name is not None]
+        return []
+
+    def declared_name(self, node: Node, name: str) -> Node | None:
+        """The node of declared_names(node) that names `name` (a C/C++
+        destructor or operator name compared as c_name writes it), or
+        None."""
+        if self.ext in C_EXTS + CPP_EXTS and name.lstrip().startswith(("~", "operator")):
+            name = c_name(name)
+        return next((n for n in self.declared_names(node) if self.symbol_name(n) == name), None)
+
+    def definition_rank(self, node: Node, name: Node) -> int:
+        """
+        How `node`, found for the name node `name`, ranks among the nodes
+        that declare one name in one scope, the lowest being the target
+        (_find_child_with_name): 0 for a definition with a body (a C/C++
+        function, class, struct, union, enum or namespace, a Java method or
+        class) and for any symbol outside C, C++, Java and TS; 1 for another
+        definition (a C/C++ variable, field, typedef, `using` alias or macro,
+        a Java field, which shares its name with an accessor method, `int
+        size;` and `int size()`, a TS namespace, which merges with the class,
+        function or enum of its name); 2 for a declaration that only announces a
+        definition: a C/C++ forward declaration (`struct S;`), a prototype
+        or a method declared in its class, an `extern` variable without a
+        value, and a TS overload signature or function declared without a
+        body (`declare function f(): void;`).
+        """
+        if self.ext in (".ts", ".tsx"):
+            if node.type in NAMESPACES:
+                return 1
+            return 2 if node.type == "function_signature" else 0
+        if self.ext == ".java":
+            return 1 if node.type in ("field_declaration", "constant_declaration") else 0
+        if self.ext not in C_EXTS + CPP_EXTS:
+            return 0
+        if node.type in C_TYPE_SPECIFIERS:
+            return 0 if node.child_by_field_name("body") is not None else 2
+        if node.type in ("function_definition", "namespace_definition"):
+            return 0
+        if node.type in ("declaration", "field_declaration"):
+            if self.c_declares_function(name):
+                return 2
+            extern = any(c.type == "storage_class_specifier" and self.node_text(c) == "extern" for c in node.children)
+            valued = name
+            while valued is not None and valued != node and valued.type != "init_declarator":
+                valued = valued.parent
+            if extern and valued is not None and valued.type != "init_declarator":
+                return 2
+        return 1
+
+    @staticmethod
+    def _scope(node: Node) -> Node | None:
+        """The node whose scope `node` declares its name in: its parent,
+        past the wrappers in _SCOPE_WRAPPERS, the block of an `extern "C"
+        { ... }` and the expression statement the grammar makes of a TS
+        `namespace N { ... }`."""
+        parent = node.parent
+        while (
+            parent is not None
+            and parent.parent is not None
+            and (
+                parent.type in _SCOPE_WRAPPERS
+                or (parent.type == "declaration_list" and parent.parent.type == "linkage_specification")
+                or (parent.type == "expression_statement" and node.type in NAMESPACES)
+            )
+        ):
+            parent = parent.parent
+        return parent
+
+    @staticmethod
+    def _c_local(node: Node) -> bool:
+        """Whether a C/C++ declaration, field, typedef or `using` alias is
+        local to a function: inside a body (`int i;`, `for (int i = 0;
+        ...)`) before any class or namespace (the fields of a struct defined
+        in a function are its own). Macros, functions and types are never
+        local."""
+        if node.type not in ("declaration", "field_declaration", "type_definition", "alias_declaration"):
+            return False
+        parent = node.parent
+        while parent is not None:
+            if parent.type == "compound_statement":
+                return True
+            if parent.type in ("field_declaration_list", "declaration_list", "translation_unit"):
+                return False
+            parent = parent.parent
+        return False
 
     def _find_child_with_name(self, node: Node, name: str, valid_types: list[str]) -> Node | None:
         # Search below `node` only: the container must not match itself, or
         # a Java constructor target such as `LRUCache.LRUCache` would resolve
-        # to the class.
+        # to the class. Of the nodes that declare `name` in one scope, the
+        # one with the lowest definition_rank is the target: a definition
+        # rather than its forward declaration, prototype or overload
+        # signatures, before or after it, and of those of one rank the first
+        # (a preprocessor conditional or TS `namespace` statement around one
+        # puts it deeper in the tree). The variables and types a C/C++
+        # function declares are its own, no targets (_c_local).
+        c_family = self.ext in C_EXTS + CPP_EXTS
+        best, best_rank = None, None
         queue = list(node.named_children)
         while queue:
             curr = queue.pop(0)
@@ -433,50 +828,20 @@ class TreeSitterParser:
                         if child.type == "function_definition":
                             curr = child
                             break
-
-                name_node = curr.child_by_field_name("name")
-
-                # C/C++ function_definition: name is nested in declarator chain
-                if not name_node and curr.type == "function_definition" and self.ext in C_EXTS + CPP_EXTS:
-                    name_node = self._extract_c_function_name(curr)
-
-                # Check for python assignment
-                if not name_node and curr.type == "expression_statement":
-                    assignment = curr.named_children[0] if curr.named_children else None
-                    if assignment and assignment.type == "assignment":
-                        name_node = assignment.named_children[0]
-
-                # Ruby top-level assignment: first child is constant/identifier
-                if not name_node and curr.type == "assignment" and self.ext in RUBY_EXTS:
-                    if curr.named_children:
-                        first = curr.named_children[0]
-                        if first.type in ("constant", "identifier"):
-                            name_node = first
-
-                # Go const_spec / var_spec: name is via `name` field or first identifier child
-                if not name_node and curr.type in ("const_spec", "var_spec") and self.ext in GO_EXTS:
-                    for c in curr.named_children:
-                        if c.type == "identifier":
-                            name_node = c
-                            break
-
-                # Check for JS/TS variable declarators
-                if not name_node and curr.type in ("variable_declaration", "lexical_declaration"):
-                    for child in curr.named_children:
-                        if child.type == "variable_declarator":
-                            name_node = child.child_by_field_name("name")
-                            if name_node:
-                                if self.node_text(name_node) == name:
-                                    self._refuse_ambiguous_ts(outer_node, name, valid_types)
-                                    return outer_node
-
-                if name_node:
-                    if self.node_text(name_node) == name:
-                        self._refuse_ambiguous_ts(outer_node, name, valid_types)
-                        return outer_node
-
+                declared = self.declared_name(curr, name)
+                if declared is not None and not (c_family and self._c_local(curr)):
+                    rank = self.definition_rank(outer_node, declared)
+                    if best is None or (
+                        (rank, outer_node.start_byte) < (best_rank, best.start_byte)
+                        and self._scope(outer_node) == self._scope(best)
+                    ):
+                        best, best_rank = outer_node, rank
+                    if best_rank == 0:
+                        break
             queue.extend(curr.named_children)
-        return None
+        if best is not None:
+            self._refuse_ambiguous_ts(best, name, valid_types)
+        return best
 
     def _refuse_ambiguous_ts(self, match: Node, name: str, valid_types: list[str]) -> None:
         """
@@ -486,10 +851,12 @@ class TreeSitterParser:
         (`const User = z.object(...)` and `type User = z.infer<typeof User>`,
         or an interface and a function), and the tools would act on
         whichever comes first, perhaps not the one list_symbols showed.
-        Declarations of one kind (merged interfaces) are not compared, and
-        function overload signatures are no targets.
+        Declarations of one kind (merged interfaces, a function's overload
+        signatures and its implementation, see _TS_KINDS) are not compared,
+        nor are namespaces, which merge with the other declarations of their
+        name (merged_containers).
         """
-        if self.ext not in (".ts", ".tsx"):
+        if self.ext not in (".ts", ".tsx") or match.type in NAMESPACES:
             return
         statement = match
         while statement.parent is not None and statement.parent.type in _TS_DECLARATION_WRAPPERS:
@@ -505,7 +872,13 @@ class TreeSitterParser:
                 decl = decl.child_by_field_name("declaration") or next(
                     (c for c in decl.named_children if c.type in valid_types), None
                 )
-            if decl is not None and decl.type in valid_types and decl.type != match.type and self._ts_declares(decl, name):
+            if (
+                decl is not None
+                and decl.type in valid_types
+                and decl.type not in NAMESPACES
+                and _TS_KINDS.get(decl.type, decl.type) != _TS_KINDS.get(match.type, match.type)
+                and self._ts_declares(decl, name)
+            ):
                 found.append((sibling, decl))
         if len(found) < 2:
             return

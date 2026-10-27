@@ -187,6 +187,10 @@ _CHUNK_CLOSE = re.compile(r"^```[ \t]*$")
 # A line knitr reads as a closing fence (its R Markdown chunk.end pattern): three or more backticks
 # alone, after nothing but spaces, tabs or >. Wider than _CHUNK_CLOSE; new chunk text is checked with it.
 _KNITR_CHUNK_END = re.compile(r"^[\t >]*```+\s*$")
+# A line knitr reads as a chunk's opening fence (its R Markdown chunk.begin pattern): three or more
+# backticks after nothing but spaces, tabs or >, then {engine} or {engine options}. It and _CHUNK_OPEN
+# each take lines the other doesn't; new prose is checked with both.
+_KNITR_CHUNK_BEGIN = re.compile(r"^[\t >]*```+\s*\{[a-zA-Z0-9_]+(?: *[ ,].*)?\}\s*$")
 
 # A UTF-8 byte order mark as decoded text; editors on Windows may write one before the --- fence.
 _BOM = "\ufeff"
@@ -261,7 +265,6 @@ def _split_body(body: str) -> list[Cell]:
     while i < n:
         header = _read_chunk_header(plain[i].rstrip("\n"))
         if header:
-            flush_prose(i)
             lang, label, options = header
             # Find the closing fence: a bare ``` on its own line (no braces)
             j = i + 1
@@ -269,9 +272,9 @@ def _split_body(body: str) -> list[Cell]:
                 j += 1
             # j now points at the closing fence line, OR == n (unterminated)
             if j >= n:
-                # Unterminated chunk -- fall back: treat the whole remainder as prose
-                flush_prose(n)
-                return cells
+                # Unterminated chunk -- fall back: the whole remainder is prose, one cell with the prose before it
+                break
+            flush_prose(i)
             cells.append(Cell(
                 cell_type="code",
                 source=_chunk_source("".join(plain[i + 1:j])),
@@ -434,6 +437,54 @@ def _r_trouble(s: str) -> Optional[str]:
     return "`" if quote == "`" else None
 
 
+# A quoted R string, as a whole: its quote, then its text with backslash escapes.
+_R_STRING = re.compile(r"""(["'])((?:\\.|(?!\1)[^\\])*)\1""", re.S)
+# The first of a chunk's "#| " option lines, when knitr reads them as YAML: "key:" then a space or nothing.
+_PIPE_YAML = re.compile(r"#\| [^ :]+:(?:\s|$)")
+
+
+def _r_string_value(text: str) -> Optional[str]:
+    """The text of text read as one quoted R string, such as "a\\"b" or 'a', with its escapes undone; None if it isn't one."""
+    m = _R_STRING.fullmatch(text)
+    if m is None:
+        return None
+    return re.sub(r"\\(.)", lambda e: {"n": "\n", "t": "\t"}.get(e.group(1), e.group(1)), m.group(2), flags=re.S)
+
+
+def _pipe_labels(source: str) -> list[tuple[int, int, str, str]]:
+    """
+    Where a chunk's "#| " option lines give its label, as (start, end, key,
+    label): lines [start, end) of its source hold the key "label" or "id" with
+    its value. The option lines are the "#| " lines its body starts with, read
+    without the "#| " as one YAML document, as knitr and Quarto read them when
+    the first is "#| key:" (otherwise they are R key=value text, not read here).
+    knitr takes label: and else id:, so label: keys come first; one with no
+    value gives no label. A value that isn't a string is given as written.
+    """
+    lines = _lines(source)
+    count = next((i for i, line in enumerate(lines) if not line.startswith("#| ")), len(lines))
+    if not count or not _PIPE_YAML.match(lines[0]):
+        return []
+    meta = [line[len("#| "):] for line in lines[:count]]
+    _, _, keys = _read_header("".join(meta))
+    if keys is None:
+        return []
+    labels: list[tuple[int, int, str, str]] = []
+    for key, start, end in _key_spans(meta, keys):
+        if key.name not in ("label", "id"):
+            continue
+        entry = "".join(meta[start:end])
+        text = entry[len(key.prefix):].strip()
+        try:
+            loaded = load_yaml(entry)
+            value = loaded.get(key.name) if isinstance(loaded, dict) else text
+        except (yaml.YAMLError, ValueError):
+            value = text
+        if value is not None:
+            labels.append((start, end, key.name, value if isinstance(value, str) else text))
+    return sorted(labels, key=lambda label: label[2] != "label")
+
+
 # ──────────────────────────────────────────────
 # Serialization
 # ──────────────────────────────────────────────
@@ -505,6 +556,41 @@ def _render_chunk_header(language: str, label: Optional[str], options: "OrderedD
     return "```{" + language + lead + ", ".join(parts) + "}"
 
 
+def _layout(frontmatter: Frontmatter, cells: list[Cell]) -> tuple[Optional[str], list[tuple[int, tuple]]]:
+    """
+    The document as parse reads back what serialize writes for it: the YAML
+    header's text (None without a header), and the cells as (index, shape) pairs,
+    index being that of the first cell the shape stands for. A chunk's shape is
+    ("code", language, label, options, source). A markdown cell's is ("markdown",
+    text), each text ending in a line break, with adjacent markdown cells (and
+    text kept after the header's closing fence) joined, as nothing marks where
+    one ends, and empty ones left out.
+    """
+    header = frontmatter.text() if frontmatter.present else None
+    entries: list[tuple[int, tuple]] = []
+    if frontmatter.present:
+        after = "".join(_lines(frontmatter._split()[2])[1:])
+        entries.append((0, ("markdown", _with_newline(after, "\n"))))
+    for index, cell in enumerate(cells):
+        if cell.cell_type == "markdown":
+            entries.append((index, ("markdown", cell.source)))
+        else:
+            entries.append((index, ("code", cell.language, cell.label, tuple(cell.options.items()), cell.source)))
+    layout: list[tuple[int, tuple]] = []
+    for index, shape in entries:
+        if shape[0] == "markdown":
+            text = shape[1]
+            if not text:
+                continue
+            text = text if text.endswith("\n") else text + "\n"
+            if layout and layout[-1][1][0] == "markdown":
+                layout[-1] = (layout[-1][0], ("markdown", layout[-1][1][1] + text))
+                continue
+            shape = ("markdown", text)
+        layout.append((index, shape))
+    return header, layout
+
+
 # ──────────────────────────────────────────────
 # Frontmatter YAML: tolerant reading, line-level editing
 # ──────────────────────────────────────────────
@@ -530,8 +616,134 @@ class TaggedScalar(str):
         return f"TaggedScalar({self.tag!r}, {self.value!r})"
 
 
-class _TolerantLoader(yaml.SafeLoader):
-    """SafeLoader that keeps nodes with unknown tags instead of raising ConstructorError."""
+# How deep the YAML read here may nest collections, the header mapping itself being one level. PyYAML
+# builds and writes nested values recursively, so a few hundred levels exhaust Python's stack; real
+# headers nest a few.
+_MAX_YAML_DEPTH = 100
+
+
+class _SafeLoader(yaml.SafeLoader):
+    """
+    SafeLoader that raises YAMLError, with the value's position, for every value
+    it can't build: collections nested more than max_depth levels deep, counting
+    the values aliases stand for (see _too_deep), explicitly tagged scalars
+    PyYAML's constructors fail on with another exception, such as !!bool maybe
+    or !!int "" (see _checked_scalar), and an escape past the last Unicode
+    character, such as "\\U00110000".
+    """
+
+    max_depth = _MAX_YAML_DEPTH
+
+    def __init__(self, stream):
+        super().__init__(stream)
+        self._depth = 0
+
+    def compose_node(self, parent, index):
+        if not self.check_event(yaml.events.CollectionStartEvent):
+            return super().compose_node(parent, index)
+        if self._depth == self.max_depth:
+            raise yaml.composer.ComposerError(
+                None, None, f"values are nested more than {self.max_depth} levels deep, deeper than this tool reads",
+                self.peek_event().start_mark,
+            )
+        self._depth += 1
+        try:
+            return super().compose_node(parent, index)
+        finally:
+            self._depth -= 1
+
+    def construct_document(self, node):
+        # Composed nesting is checked above; aliases can nest a value deeper than its text does.
+        deep = _too_deep(node, self.max_depth)
+        if deep is not None:
+            raise yaml.constructor.ConstructorError(
+                None, None, f"values are nested more than {self.max_depth} levels deep (counting the values aliases "
+                "stand for), deeper than this tool reads", deep.start_mark,
+            )
+        return super().construct_document(node)
+
+    def scan_flow_scalar_non_spaces(self, double, start_mark):
+        try:
+            return super().scan_flow_scalar_non_spaces(double, start_mark)
+        except ValueError:
+            # chr() of a \U escape past U+10FFFF; the mark is at its hex digits.
+            raise yaml.scanner.ScannerError(
+                "while scanning a double-quoted scalar", start_mark,
+                "found an escape past U+10FFFF, the last Unicode character", self.get_mark(),
+            ) from None
+
+
+def _too_deep(root: yaml.Node, limit: int) -> Optional[yaml.Node]:
+    """
+    The first collection more than limit levels deep in root, the deepest way
+    down, or None. An alias is the node it names, so a value an alias stands for
+    nests as deep as the alias is, and a merge key's (<<) mapping is a level:
+    PyYAML merges, builds and writes values recursively, following aliases.
+    Measured without recursion, each node once; a value holding itself
+    (&a [*a]) is not followed back into.
+    """
+    def children(node: yaml.Node):
+        return (n for pair in node.value for n in pair) if isinstance(node, yaml.MappingNode) else iter(node.value)
+
+    if not isinstance(root, yaml.nodes.CollectionNode):
+        return None
+    # How many levels deep each finished collection goes; best is the deepest child so far of those still open.
+    heights: dict = {}
+    best = {root: 0}
+    stack = [(root, children(root))]
+    while stack:
+        node, rest = stack[-1]
+        child = next(rest, None)
+        if child is None:
+            stack.pop()
+            heights[node] = best.pop(node) + 1
+            if stack:
+                best[stack[-1][0]] = max(best[stack[-1][0]], heights[node])
+        elif child in heights:
+            best[node] = max(best[node], heights[child])
+        elif isinstance(child, yaml.nodes.CollectionNode) and child not in best:
+            best[child] = 0
+            stack.append((child, children(child)))
+    if heights[root] <= limit:
+        return None
+    # Down the deepest way to the first level past the limit.
+    node = root
+    for _ in range(limit):
+        node = next(c for c in children(node) if heights.get(c, 0) == heights[node] - 1)
+    return node
+
+
+def _checked_scalar(tag: str):
+    """
+    PyYAML's constructor for the scalar tag !!tag, raising ConstructorError where
+    it raises KeyError, IndexError, AttributeError or OverflowError for a value it
+    can't read: !!bool maybe, !!int "", !!timestamp hello, a 60-based float too
+    big for a float. Its other errors, such as the ValueError of the date
+    2026-13-45, pass through, and an int too long to print (from hex, binary or
+    60-based digits) raises the ValueError int() raises for a decimal one.
+    """
+    construct = yaml.SafeLoader.yaml_constructors[f"tag:yaml.org,2002:{tag}"]
+
+    def construct_checked(loader: yaml.SafeLoader, node: yaml.Node):
+        try:
+            value = construct(loader, node)
+        except (KeyError, IndexError, AttributeError, OverflowError):
+            shown = node.value if len(node.value) <= 40 else node.value[:37] + "..."
+            raise yaml.constructor.ConstructorError(None, None, f"can't read {shown!r} as !!{tag}", node.start_mark) from None
+        if type(value) is int:
+            # Here, not when the header is shown or compared: str() refuses an int of more than 4300 digits.
+            str(value)
+        return value
+
+    return construct_checked
+
+
+for _tag in ("bool", "int", "float", "timestamp"):
+    _SafeLoader.add_constructor(f"tag:yaml.org,2002:{_tag}", _checked_scalar(_tag))
+
+
+class _TolerantLoader(_SafeLoader):
+    """_SafeLoader that keeps nodes with unknown tags instead of raising ConstructorError."""
 
 
 def _construct_unknown_tag(loader: _TolerantLoader, node: yaml.Node):
@@ -544,6 +756,12 @@ def _construct_unknown_tag(loader: _TolerantLoader, node: yaml.Node):
 
 
 _TolerantLoader.add_constructor(None, _construct_unknown_tag)
+
+
+class _ValueLoader(_TolerantLoader):
+    """_TolerantLoader for a value to set under a top-level key: one level less deep, as the header mapping is one."""
+
+    max_depth = _MAX_YAML_DEPTH - 1
 
 
 class _TaggedDumper(yaml.SafeDumper):
@@ -588,7 +806,7 @@ def yaml_string(value: str, *, quote: bool = False) -> str:
     """
     if not quote and value:
         try:
-            if yaml.safe_load(f"k: {value}") == {"k": value}:
+            if yaml.load(f"k: {value}", Loader=_SafeLoader) == {"k": value}:
                 return value
         except (yaml.YAMLError, ValueError):
             pass
@@ -748,8 +966,8 @@ def _guess_keys(lines: list[str]) -> list[_Key]:
         name = m.group(1)
         if name[0] in "\"'":
             try:
-                name = str(yaml.safe_load(name))
-            except yaml.YAMLError:
+                name = str(yaml.load(name, Loader=_SafeLoader))
+            except (yaml.YAMLError, ValueError):
                 pass
         keys.append(_Key(name, i, m.group(0)))
     return keys
@@ -809,9 +1027,12 @@ def _key_spans(lines: list[str], keys: list[_Key]) -> list[tuple[_Key, int, int]
 
 
 def _parse_yaml_value(value: str):
-    """value parsed as YAML when possible, else the string itself."""
+    """
+    value parsed as YAML when possible, else the string itself. It is to go under
+    a top-level key, so it may nest one level less than a header.
+    """
     try:
-        return load_yaml(value)
+        return yaml.load(value, Loader=_ValueLoader)
     except (yaml.YAMLError, ValueError):
         return value
 

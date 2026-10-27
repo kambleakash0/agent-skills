@@ -13,7 +13,8 @@ from typing import Optional
 
 from rmd_editor.parser import (
     Cell, Frontmatter, FrontmatterError, dump_yaml, parse, serialize, yaml_string,
-    _KNITR_CHUNK_END, _chunk_body, _chunk_source, _closed, _lines, _r_trouble, _read_chunk_header, _render_chunk_header, _with_newline,
+    _KNITR_CHUNK_BEGIN, _KNITR_CHUNK_END, _chunk_body, _chunk_source, _closed, _join, _layout, _lines, _pipe_labels,
+    _r_string_value, _r_trouble, _read_chunk_header, _render_chunk_header, _with_newline,
 )
 
 
@@ -109,6 +110,95 @@ def _check_chunk_text(text: str) -> None:
             )
 
 
+def _check_prose_text(text: str) -> None:
+    """
+    Reject new prose with a line this parser or knitr would read as a chunk's
+    opening fence, which would make the prose after it chunk code.
+    """
+    for number, line in enumerate(_lines(text), start=1):
+        line = line.rstrip("\n")
+        if _read_chunk_header(line) or _KNITR_CHUNK_BEGIN.match(line):
+            raise RmdManagerError(
+                f"Line {number} of the new text, {line!r}, opens a code chunk (backticks, then {{engine}} or "
+                "{engine options}), which would make the prose after it chunk code: add a chunk with "
+                "add_cell(cell_type=\"code\"), or put `r ''` before the backticks to show the line as text"
+            )
+
+
+def _describe(shape: tuple) -> str:
+    """A cell as parser._layout gives it, in a few words for an error message."""
+    lines = _lines(shape[-1])
+    size = f"{len(lines)} line" + ("" if len(lines) == 1 else "s")
+    start = f" starting {lines[0].rstrip(chr(10))[:30]!r}" if lines else ""
+    if shape[0] == "markdown":
+        return f"markdown of {size}{start}"
+    return f"a {shape[1]} chunk of {size}{start}" if lines else f"an empty {shape[1]} chunk"
+
+
+def _read_back_problem(frontmatter: Frontmatter, cells: list[Cell], text: str) -> Optional[str]:
+    """
+    Why text, written for the given header and cells, reads back as another
+    document (see parser._layout), or None if it reads back as them.
+    """
+    read_frontmatter, read_cells = parse(text)
+    (header, want), (read_header, got) = _layout(frontmatter, cells), _layout(read_frontmatter, read_cells)
+    if header is None and read_header is not None:
+        return (
+            f"Saving would make lines 1 to {len(_lines(read_frontmatter.raw))} of the file read back as the YAML header "
+            "(a --- line at the top and the next --- line enclose it), so the file was left unchanged: start the first "
+            "cell with something other than a --- line, and set header keys with set_frontmatter_key"
+        )
+    if header != read_header:
+        return "Saving would change how the YAML header reads back, so the file was left unchanged"
+    if [shape for _, shape in want] == [shape for _, shape in got]:
+        return None
+    at = next((p for p, (a, b) in enumerate(zip(want, got)) if a[1] != b[1]), min(len(want), len(got)))
+    index = want[at][0] if at < len(want) else len(cells)
+    expected = _describe(want[at][1]) if at < len(want) else "nothing (the end of the document)"
+    found = _describe(got[at][1]) if at < len(got) else "nothing (the end of the document)"
+    return (
+        f"Saving would change the document's cells, so the file was left unchanged: read back, cell {index} would be "
+        f"{found} instead of {expected}. A line that opens or closes a chunk (such as ```{{r}} or ```) in the prose "
+        "next to the edit does this"
+    )
+
+
+def _label_spellings(cell: Cell) -> list[tuple[str, str, str]]:
+    """
+    Every place a chunk's label is written, as (where, label, text) in the order
+    knitr gives them precedence, so the first is the chunk's label: "pipe" for a
+    label: (else id:) key in the "#| " lines at the top of its body (knitr merges
+    those options over the header's), "option" for a label= option, and "header"
+    for the bare name first in the header (knitr's parse_params makes it the label
+    only when no label= is given). text is how it is written.
+    """
+    spellings = []
+    lines = _lines(cell.source)
+    for start, end, _, label in _pipe_labels(cell.source):
+        spellings.append(("pipe", label, "".join(lines[start:end]).rstrip("\n")))
+    value = cell.options.get("label", "")
+    # Without a value it is a bare name, not a label= option
+    if value:
+        # Not a string: knitr deparses the R expression and drops its spaces
+        label = _r_string_value(value)
+        spellings.append(("option", value.replace(" ", "") if label is None else label, f"label={value}"))
+    if cell.label:
+        # knitr quotes a bare name; one already quoted is an R string
+        label = _r_string_value(cell.label)
+        spellings.append(("header", cell.label if label is None else label, f"the bare label {cell.label}"))
+    return spellings
+
+
+def _options_shown(cell: Cell) -> list[tuple[str, str]]:
+    """A chunk's options as list_cells and get_chunk_options show them: a label= option is its label, not one of them."""
+    return [(key, value) for key, value in cell.options.items() if not (key == "label" and value)]
+
+
+def _one_line(text: str) -> str:
+    """text with its line breaks written as \\n and \\r, so output that gives each item a line keeps it on one."""
+    return text.replace("\r", "\\r").replace("\n", "\\n")
+
+
 class RmdManager:
     """
     Open, edit, and save a .rmd file. Mutations are written to disk on each
@@ -126,16 +216,28 @@ class RmdManager:
         with open(file_path, "r", encoding="utf-8", newline="") as f:
             text = f.read()
         self.frontmatter, self.cells = parse(text)
+        # The file's text as last read or written: a save that is refused goes back to it.
+        self._text = text
 
     # ──────────────────────────────────────────────
     # Internal helpers
     # ──────────────────────────────────────────────
 
     def _save(self) -> str:
+        """
+        Write the document to the file if its text reads back as the same header
+        and cells (adjacent markdown cells as one, see parser._layout). If not,
+        raise, leaving the file as it was and the manager as the file reads.
+        """
         text = serialize(self.frontmatter, self.cells)
+        problem = _read_back_problem(self.frontmatter, self.cells, text)
+        if problem is not None:
+            self.frontmatter, self.cells = parse(self._text)
+            raise RmdManagerError(problem)
         # Written as serialized: edited parts already use the document's line break.
         with open(self.filepath, "w", encoding="utf-8", newline="") as f:
             f.write(text)
+        self._text = text
         return "Saved"
 
     def _validate_index(self, index: int, *, allow_end: bool = False) -> int:
@@ -162,12 +264,15 @@ class RmdManager:
         Give a cell new text, with "\\n" line breaks, made with new_text, the text
         the caller passed. The text it already has leaves the cell's bytes as they
         are. In a chunk, new_text can't hold a line knitr would read as the
-        chunk's closing fence; lines the chunk already had aren't checked again.
+        chunk's closing fence, and in prose, a line that would open a chunk; lines
+        the cell already had aren't checked again.
         """
         if source == cell.source:
             return
         if cell.cell_type == "code":
             _check_chunk_text(new_text)
+        else:
+            _check_prose_text(new_text)
         cell.source = source
         cell.mark_dirty()
 
@@ -191,6 +296,62 @@ class RmdManager:
         cell.label, cell.options = label, options
         cell.mark_header_dirty()
 
+    def _set_label(self, cell: Cell, value: str) -> None:
+        """
+        Set a chunk's label to value, or clear it if value is empty. It is written
+        where knitr reads it from (see _label_spellings): a "#| label:" (or id:)
+        line, a label= option (an R string, in the quotes it had), or else the bare
+        name first in the header; the spellings knitr reads it over go, so one is
+        left. Raises, leaving the chunk as it was, for a label that place can't hold.
+        """
+        spellings = _label_spellings(cell)
+        where = (spellings[0][0] if spellings else "header") if value else None
+        if where == "header":
+            _check_header_text("Chunk label", value)
+        elif "\n" in value or "\r" in value:
+            place = "a #| option line" if where == "pipe" else "a chunk header"
+            raise RmdManagerError(f"Chunk label {value!r} contains a line break, but {place} is a single line")
+        options = OrderedDict(cell.options)
+        if where == "option":
+            quote = options["label"][0] if _r_string_value(options["label"]) is not None else '"'
+            options["label"] = quote + value.replace("\\", "\\\\").replace(quote, "\\" + quote) + quote
+        else:
+            options.pop("label", None)
+        # The first label in the #| lines gets the value as one line, under its own key; the others' lines go
+        pipe = _pipe_labels(cell.source)
+        edits = [(start, end, "") for start, end, _, _ in pipe]
+        if where == "pipe":
+            start, end, key, _ = pipe[0]
+            edits[0] = (start, end, f"#| {key}: {yaml_string(value)}\n")
+        self._set_header(cell, value if where == "header" else None, options,
+                         f"Can't set the chunk label to {value!r}" if value else "Can't remove the chunk label")
+        if edits:
+            self._set_body_lines(cell, edits)
+
+    def _set_body_lines(self, cell: Cell, edits: list[tuple[int, int, str]]) -> None:
+        """
+        In a chunk, replace lines [start, end) of its source with text, whole lines
+        each ending in "\\n" ("" drops them), for each (start, end, text) in edits,
+        which don't overlap. Only those lines are written anew, with the document's
+        line break: the header line, the other lines and the closing fence keep
+        their bytes. Each text is checked as _set_source checks new chunk text.
+        """
+        lines = _lines(_chunk_body(cell.source))
+        raw = _lines(cell.raw)
+        newline = self.frontmatter.newline
+        for start, end, text in sorted(edits, reverse=True):
+            _check_chunk_text(text)
+            lines[start:end] = [text] if text else []
+            # The raw text's line 0 is the header line
+            raw[start + 1:end + 1] = [_with_newline(text, newline)] if text else []
+        source = _chunk_source("".join(lines))
+        if cell.dirty or not cell.raw:
+            self._set_source(cell, source, "".join(text for _, _, text in edits))
+            return
+        # _join keeps a lone "\r" ending a line apart from a "\n" line that dropped lines bring next to it.
+        cell.raw = _join(raw, newline)
+        cell.source = source
+
     # ──────────────────────────────────────────────
     # Cell structure & navigation
     # ──────────────────────────────────────────────
@@ -208,10 +369,13 @@ class RmdManager:
                 preview = preview[:57] + "..."
             if cell.cell_type == "code":
                 meta = f"{cell.language}"
-                if cell.label:
-                    meta += f" label={cell.label}"
-                if cell.options:
-                    meta += f" opts={len(cell.options)}"
+                # The label knitr uses, wherever it is written; a label= option is not counted as an option
+                spellings = _label_spellings(cell)
+                if spellings:
+                    meta += f" label={_one_line(spellings[0][1])}"
+                options = _options_shown(cell)
+                if options:
+                    meta += f" opts={len(options)}"
                 lines.append(f"[{i}] code ({meta}) {line_count}L  {preview}")
             else:
                 lines.append(f"[{i}] markdown {line_count}L  {preview}")
@@ -232,6 +396,8 @@ class RmdManager:
         new_cell = Cell(cell_type=cell_type, source=_with_newline(source, "\n"))
         if cell_type == "code":
             _check_chunk_text(new_cell.source)
+        else:
+            _check_prose_text(new_cell.source)
         new_cell.mark_dirty()
         self.cells.insert(insert_at, new_cell)
         return self._save()
@@ -339,14 +505,22 @@ class RmdManager:
     def get_chunk_options(self, index: int) -> str:
         cell = self._require_code_cell(index)
         lines = [f"language: {cell.language}"]
-        if cell.label:
-            lines.append(f"label: {cell.label}")
-        else:
+        # The label knitr uses; one not written as the bare name first in the header says where it is.
+        # Line breaks are escaped, so the label stays on its line.
+        spellings = _label_spellings(cell)
+        if not spellings:
             lines.append("label: (none)")
-        if not cell.options:
+        elif spellings[0][0] == "header":
+            lines.append(f"label: {_one_line(spellings[0][1])}")
+        else:
+            (_, label, text), others = spellings[0], spellings[1:]
+            over = ", which knitr reads over " + " and ".join(t for _, _, t in others) if others else ""
+            lines.append(_one_line(f"label: {label} (from {text}{over})"))
+        options = _options_shown(cell)
+        if not options:
             lines.append("options: (none)")
         else:
-            for k, v in cell.options.items():
+            for k, v in options:
                 lines.append(f"  {k}={v}" if v != "" else f"  {k}")
         return "\n".join(lines)
 
@@ -357,8 +531,7 @@ class RmdManager:
         if not key:
             raise RmdManagerError("Option key must not be empty")
         if key == "label":
-            _check_header_text("Chunk label", value)
-            self._set_header(cell, value or None, cell.options, f"Can't set the chunk label to {value!r}")
+            self._set_label(cell, value)
             return self._save()
         _check_header_text("Option key", key)
         _check_header_text("Chunk option value", value)
@@ -376,9 +549,9 @@ class RmdManager:
         cell = self._require_code_cell(index)
         key = key.strip()
         if key == "label":
-            if cell.label is None:
+            if not _label_spellings(cell):
                 raise RmdManagerError(f"Cell {index} has no label to remove")
-            self._set_header(cell, None, cell.options, "Can't remove the chunk label")
+            self._set_label(cell, "")
         else:
             if key not in cell.options:
                 raise RmdManagerError(f"Cell {index} has no option {key!r}")
