@@ -42,7 +42,8 @@ When working with `.rmd` R Markdown files, do NOT use the generic `edit` or `wri
 **Format notes:**
 
 - `.rmd` has no cell-boundary markers between adjacent prose blocks (unlike `.ipynb`). Two adjacent `markdown` cells in the model will **auto-merge** on save and re-parse. Prefer inserting prose between code chunks, or append to an existing markdown cell.
-- CRLF and mixed-ending files work like LF ones. Cell text comes back with `\n` line breaks, and you pass text with `\n`: on save, an edited cell (rewritten whole) and an edited header key's lines get the file's own line ending; everything else keeps its bytes.
+- CRLF and mixed-ending files work like LF ones. Cell text comes back with `\n` line breaks, and you pass text with `\n`: on save, an edited cell (rewritten whole) and an edited header key's lines get the file's own line ending; everything else keeps its bytes. A UTF-8 byte order mark at the start of the file is kept on save and never shows up in cell text.
+- Only `\n`, `\r\n` or a lone `\r` ends a line (a form feed or U+2028 doesn't), and every tool counts lines this way: `list_cells` line counts, `split_cell` offsets and `find_in_rmd` line numbers agree.
 - Code chunks default to R (`cell_type="code"` creates an ` ```{r} ` chunk). Polyglot chunks (`{python}`, `{bash}`, `{sql}`) already in the file are preserved on round-trip, but no tool can create a non-R chunk or change a chunk's language yet: `replace_cell_source` keeps the language, and `set_chunk_option(key="language")` only adds a `language=` option to the header.
 
 **Kernel lifecycle notes:**
