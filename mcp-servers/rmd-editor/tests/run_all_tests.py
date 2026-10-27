@@ -315,6 +315,18 @@ def test_no_trailing_newline():
     RmdManager(path).merge_cells(0, 1)
     check_same("no newline: merge before newline-less prose", read_doc(path), "```{r}\na\nb\n```\ntail")
 
+    # Rewriting the last cell's text ends the file with a newline; re-saving the same text or an option edit doesn't
+    path = write_doc("no_newline.rmd", "```{r}\nx\n```\nlast")
+    RmdManager(path).replace_cell_source(1, "last")
+    check_same("no newline: re-saving the last cell's own text keeps it", read_doc(path), "```{r}\nx\n```\nlast")
+    RmdManager(path).replace_cell_source(1, "z")
+    check_same("no newline: new text in the last cell adds a final newline", read_doc(path), "```{r}\nx\n```\nz\n")
+    path = write_doc("no_newline.rmd", "```{r}\nx\n```")
+    RmdManager(path).set_chunk_option(0, "echo", "FALSE")
+    check_same("no newline: an option edit on the last chunk keeps it", read_doc(path), "```{r echo=FALSE}\nx\n```")
+    RmdManager(path).append_to_cell(0, "y")
+    check_same("no newline: appending to the last chunk adds a final newline", read_doc(path), "```{r echo=FALSE}\nx\ny\n```\n")
+
 
 def test_line_breaks():
     print("\n═══ only a newline ends a line ═══")
@@ -482,8 +494,8 @@ def test_mixed_line_endings():
     RmdManager(path)._save()
     check("mixed: untouched file saves back byte for byte", read_raw(path) == text, True)
     RmdManager(path).set_chunk_option(3, "echo", "FALSE")
-    check_same("mixed: an edited chunk uses CRLF, the rest is kept", read_raw(path),
-               text.replace("```{r two}\nb\r\n```\n", "```{r two, echo=FALSE}\r\nb\r\n```\r\n"))
+    check_same("mixed: an option edit writes the header line in CRLF, the rest is kept", read_raw(path),
+               text.replace("```{r two}\nb\r\n```\n", "```{r two, echo=FALSE}\r\nb\r\n```\n"))
     path = write_raw("mixed.rmd", text)
     RmdManager(path).set_frontmatter_key("date", "2026")
     check_same("mixed: a new header key uses CRLF, the other header lines are kept", read_raw(path),
@@ -576,7 +588,7 @@ def test_line_numbers_agree():
     for code in (0x85, 0x2028, 0x2029):
         path = write_raw("line_numbers.rmd", f'---\ntitle: "a{chr(code)}b"\nkey: value\n\tbad: x\n---\n')
         check(f"line numbers: U+{code:04X} in the header leaves YAML error lines as the file's",
-              RmdManager(path).get_frontmatter(), "(line 4 of the file)")
+              RmdManager(path).get_frontmatter(), "(line 4, column 1 of the file)")
 
 
 def test_byte_order_mark():
@@ -934,6 +946,240 @@ def test_chunk_options():
         check("chunk ops: reject markdown", str(e), "markdown cell")
 
 
+def test_chunk_header_values():
+    print("\n═══ chunk options: what a header can hold ═══")
+    from rmd_editor import server
+    text = "```{r}\nx <- 1\n```\n\nText\n"
+
+    def refused(label, call, error, doc=text):
+        """call(path) on a fresh copy of doc returns an error holding error, and leaves the file alone."""
+        path = write_doc("header.rmd", doc)
+        check(f"header {label}: refused", call(path), error)
+        check(f"header {label}: file unchanged", read_doc(path) == doc, True)
+
+    # A chunk header is one line: a line break in a value, label or key would split it
+    refused("line break in a value", lambda p: server.set_chunk_option(p, 0, "fig.cap", '"a\nb"'),
+            "Chunk option value '\"a\\nb\"' contains a line break")
+    refused("CRLF in a value", lambda p: server.set_chunk_option(p, 0, "fig.cap", '"a\r\nb"'), "contains a line break")
+    refused("lone CR in a value", lambda p: server.set_chunk_option(p, 0, "fig.cap", '"a\rb"'), "contains a line break")
+    refused("line break in a label", lambda p: server.set_chunk_option(p, 0, "label", "a b\nc"),
+            "Chunk label 'a b\\nc' contains a line break")
+    refused("line break in a key", lambda p: server.set_chunk_option(p, 0, "fig\ncap", "1"),
+            "Option key 'fig\\ncap' contains a line break")
+    # Text that would read back as other options, or swallow the options after it
+    refused("comma outside a string", lambda p: server.set_chunk_option(p, 0, "fig.cap", "a, b"),
+            "the chunk header ```{r fig.cap=a, b} would read back as label None and options {'fig.cap': 'a', 'b': ''}")
+    refused("comma in a label", lambda p: server.set_chunk_option(p, 0, "label", "a, b"), "would read back as label 'a'")
+    refused("= in a label", lambda p: server.set_chunk_option(p, 0, "label", "a=b"), "would read back as label None")
+    refused("= in a key", lambda p: server.set_chunk_option(p, 0, "a=b", "1"), "would read back as")
+    refused("unmatched quote", lambda p: server.set_chunk_option(p, 0, "fig.cap", '"a'),
+            "Chunk option value '\"a' has an unmatched bracket or quote")
+    refused("unmatched bracket", lambda p: server.set_chunk_option(p, 0, "eval", "c(1, 2"), "has an unmatched bracket or quote")
+    refused("stray closing brace", lambda p: server.set_chunk_option(p, 0, "fig.cap", "x}"), "has an unmatched bracket or quote")
+    refused("closing brace in a label", lambda p: server.set_chunk_option(p, 0, "label", "x}"),
+            "Chunk label 'x}' has an unmatched bracket or quote")
+    # knitr reads keys and values as R code: a backtick-quoted name left open, a # outside a string
+    # (a comment to the end of the line) or a second = would break the whole header
+    refused("backtick left open in a value", lambda p: server.set_chunk_option(p, 0, "fig.cap", "`x"),
+            "Chunk option value '`x' has an unmatched bracket or quote")
+    refused("# outside a string in a value", lambda p: server.set_chunk_option(p, 0, "fig.cap", "TRUE # note"),
+            "Chunk option value 'TRUE # note' has a # outside a quoted string")
+    refused("# in a key", lambda p: server.set_chunk_option(p, 0, "a#b", "1"), "Option key 'a#b' has a # outside a quoted string")
+    refused("second = in a value", lambda p: server.set_chunk_option(p, 0, "fig.cap", "a=1"),
+            "Chunk option value 'a=1' has an = outside a quoted string or brackets")
+    # A bare name in a header is the chunk label to knitr, so an option needs a value
+    refused("empty value", lambda p: server.set_chunk_option(p, 0, "echo", ""), "Option value must not be empty")
+    refused("blank value", lambda p: server.set_chunk_option(p, 0, "echo", "  "), "Option value must not be empty")
+    # An option written after an unmatched quote already in the file would be swallowed by it
+    refused("option after an unmatched quote in the file", lambda p: server.set_chunk_option(p, 0, "echo", "FALSE"),
+            "would read back as", doc='```{r fig.cap="a}\nx\n```\n')
+
+    # Accepted text reads back as written, and an option set after it still reads back too
+    accepted = [
+        ("fig.cap", '"a}b"'), ("fig.cap", '"a```b"'), ("fig.cap", '"A, B = C"'), ("fig.cap", "'it, \"is\"'"),
+        ("fig.cap", '"say \\"hi\\", then go"'), ("fig.cap", '"a' + chr(0x2028) + "b" + chr(0x0C) + 'c"'),
+        ("eval", "c(1, 2)"), ("fig.align", "`center`"), ("label", "my-label"), ("label", "a b"),
+        ("eval", "x == 1"), ("eval", "x != 1 && y <= 2"), ("eval", "a %in% b"), ("fig.cap", '"Figure #1"'),
+        ("fig.cap", "list(a = 1)"), ("fig.cap", "`a#b`"), ("label", "`a"), ("label", "fig#1"),
+    ]
+    for key, value in accepted:
+        path = write_doc("header.rmd", text)
+        mgr = RmdManager(path)
+        mgr.set_chunk_option(0, key, value)
+        mgr.set_chunk_option(0, "echo", "FALSE")
+        cells = RmdManager(path).cells
+        want = (value, {"echo": "FALSE"}) if key == "label" else (None, {key: value, "echo": "FALSE"})
+        check(f"header {key}={value!r}: reads back", (cells[0].label, dict(cells[0].options)), want)
+        check(f"header {key}={value!r}: same cells", [(c.cell_type, c.source) for c in cells], [("code", "x <- 1"), ("markdown", "\nText\n")])
+        written = f"```{{r {value}, echo=FALSE}}" if key == "label" else f"```{{r {key}={value}, echo=FALSE}}"
+        check_same(f"header {key}={value!r}: header line written", read_doc(path).split("\n")[0], written)
+    # Surrounding whitespace is dropped, as reading the header drops it
+    path = write_doc("header.rmd", text)
+    RmdManager(path).set_chunk_option(0, "echo", "  FALSE \n")
+    check_same("header: value stripped", read_doc(path), text.replace("{r}", "{r echo=FALSE}"))
+
+    # A bare option first in the header stays an option, not the label, when the header is rewritten
+    path = write_doc("header.rmd", "```{r, foo}\nx\n```\n")
+    RmdManager(path).set_chunk_option(0, "echo", "FALSE")
+    check_same("bare first option: kept after an edit", read_doc(path), "```{r, foo, echo=FALSE}\nx\n```\n")
+    check("bare first option: still not the label", (RmdManager(path).cells[0].label, dict(RmdManager(path).cells[0].options)),
+          (None, {"foo": "", "echo": "FALSE"}))
+    path = write_doc("header.rmd", "```{r setup, foo}\nx\n```\n")
+    RmdManager(path).remove_chunk_option(0, "label")
+    check_same("bare first option: removing the label before it", read_doc(path), "```{r, foo}\nx\n```\n")
+    # A backslash escapes a quote inside an R string
+    fm, cells = parse('```{r fig.cap="a\\", b", echo=FALSE}\nx\n```\n')
+    check("escaped quote: one option", dict(cells[0].options), {"fig.cap": '"a\\", b"', "echo": "FALSE"})
+    # Tools that rewrite a whole chunk write its header from the parsed label and options: it reads back the same,
+    # and is written as the line given here
+    headers = {
+        "{r}": "{r}", "{r setup}": "{r setup}", "{r, echo=FALSE}": "{r echo=FALSE}",
+        "{r setup, include=FALSE}": "{r setup, include=FALSE}", "{r, foo}": "{r, foo}", "{r a, foo, b=1}": "{r a, foo, b=1}",
+        '{r fig.cap="a, b", eval=(x > 0)}': '{r fig.cap="a, b", eval=(x > 0)}', '{r fig.cap="x}"}': '{r fig.cap="x}"}',
+        '{python name, fig.cap="a\\", b"}': '{python name, fig.cap="a\\", b"}',
+        "{r out.width='50%', fig.align=c('a', 'b')}": "{r out.width='50%', fig.align=c('a', 'b')}",
+        '{r fig.cap="a}': '{r fig.cap="a}', "{r a=(, b=1}": "{r a=(, b=1}", "{r  lbl ,  echo = TRUE }": "{r lbl, echo=TRUE}",
+    }
+    for header, written in headers.items():
+        path = write_doc("header.rmd", f"```{header}\nx\n```\n")
+        before = [shape[2:] for shape in _cell_shape(RmdManager(path).cells)]
+        RmdManager(path).replace_cell_source(0, "y")
+        check(f"rewritten {header}: same language, label and options", [shape[2:] for shape in _cell_shape(RmdManager(path).cells)], before)
+        check_same(f"rewritten {header}: header line written", read_doc(path), f"```{written}\ny\n```\n")
+
+    # A line knitr reads as a closing fence in a chunk's new text would close the chunk early; the
+    # error gives its line in the text passed
+    refused("closing fence in a chunk's new text", lambda p: server.replace_cell_source(p, 0, "a\n```\nb"),
+            "Line 2 of the new text, '```', is a closing fence for knitr")
+    refused("closing fence with trailing spaces", lambda p: server.replace_cell_source(p, 0, "a\n```  "), "Line 2 of the new text")
+    refused("closing fence in a new chunk", lambda p: server.add_cell(p, -1, "```"), "Line 1 of the new text")
+    refused("closing fence appended", lambda p: server.append_to_cell(p, 0, "```\ny"), "Line 1 of the new text")
+    refused("closing fence appended after a line", lambda p: server.append_to_cell(p, 0, "e\n```"), "Line 2 of the new text",
+            doc="```{r}\na\nb\nc\nd\n```\n")
+    refused("closing fence prepended", lambda p: server.prepend_to_cell(p, 0, "```"), "Line 1 of the new text")
+    for fence in ["````", "  ```", "\t```\t", "> ```", " > > ````  "]:
+        refused(f"closing fence {fence!r}", lambda p: server.replace_cell_source(p, 0, f"x\n{fence}\ny"),
+                f"Line 2 of the new text, {fence!r}, is a closing fence for knitr")
+    # Other backtick lines stay in the chunk, and prose may hold a plain code fence
+    path = write_doc("header.rmd", text)
+    check("backtick lines in a chunk: saved", server.replace_cell_source(path, 0, "``` x\n````r\n`a` <- 1"), "Saved")
+    check("backtick lines in a chunk: read back", server.get_cell(path, 0) == "``` x\n````r\n`a` <- 1", True)
+    check("code fence in prose: saved", server.replace_cell_source(path, 1, "```\ncode\n```\n"), "Saved")
+    check("code fence in prose: read back", [(c.cell_type, c.source) for c in RmdManager(path).cells],
+          [("code", "``` x\n````r\n`a` <- 1"), ("markdown", "```\ncode\n```\n")])
+    # A fence line already in a chunk that this tool reads as body: the chunk's own text saves back, and
+    # text added to it is checked on its own
+    doc = "```{r}\na\n  ```\n```\n"
+    path = write_doc("header.rmd", doc)
+    check("fence already in a chunk: own text saves back", server.replace_cell_source(path, 0, server.get_cell(path, 0)), "Saved")
+    check("fence already in a chunk: file unchanged", read_doc(path) == doc, True)
+    check("fence already in a chunk: append works", server.append_to_cell(path, 0, "b"), "Saved")
+    check_same("fence already in a chunk: appended", read_doc(path), "```{r}\na\n  ```\nb\n```\n")
+
+
+def test_chunk_body_lines():
+    print("\n═══ chunk bodies: every line kept ═══")
+    from rmd_editor import server
+    # A chunk's text is its body without the line break before the closing fence, so "x <- 1\n"
+    # ends with a blank line; a body of blank lines only is its line breaks, so "" is an empty chunk
+    bodies = {
+        "empty": ("", ""), "one blank line": ("\n", "\n"), "two blank lines": ("\n\n", "\n\n"),
+        "one line": ("x <- 1\n", "x <- 1"), "trailing blank line": ("x <- 1\n\n", "x <- 1\n"),
+        "leading blank line": ("\nx <- 1\n", "\nx <- 1"), "inner blank line": ("a\n\nb\n", "a\n\nb"),
+    }
+    for name, (body, source) in bodies.items():
+        doc = "```{r}\n" + body + "```\n\nText\n"
+        path = write_doc("body.rmd", doc)
+        check_same(f"body {name}: get_cell", server.get_cell(path, 0), source)
+        # An option or label edit rewrites only the header line
+        server.set_chunk_option(path, 0, "echo", "FALSE")
+        check_same(f"body {name}: set_chunk_option keeps the body", read_doc(path), doc.replace("{r}", "{r echo=FALSE}"))
+        server.set_chunk_option(path, 0, "label", "lbl")
+        server.remove_chunk_option(path, 0, "echo")
+        check_same(f"body {name}: label and remove keep the body", read_doc(path), doc.replace("{r}", "{r lbl}"))
+        # Saving the text get_cell returned leaves the file as it was
+        path = write_doc("body.rmd", doc)
+        server.replace_cell_source(path, 0, server.get_cell(path, 0))
+        check_same(f"body {name}: replace with its own text is a no-op", read_doc(path), doc)
+        # Writing that text anew gives the same body
+        server.replace_cell_source(path, 0, "tmp")
+        server.replace_cell_source(path, 0, source)
+        check_same(f"body {name}: replace_cell_source writes that body", read_doc(path), doc)
+    # So text from an agent that ends with a newline leaves a blank line before the fence
+    path = write_doc("body.rmd", "```{r}\ny\n```\n")
+    server.replace_cell_source(path, 0, "x <- 1\n")
+    check_same("body: text ending in \\n leaves a blank line", read_doc(path), "```{r}\nx <- 1\n\n```\n")
+    server.replace_cell_source(path, 0, "x <- 1")
+    check_same("body: text without a final \\n leaves none", read_doc(path), "```{r}\nx <- 1\n```\n")
+    server.append_to_cell(path, 0, "")
+    check_same("body: appending nothing changes nothing", read_doc(path), "```{r}\nx <- 1\n```\n")
+    # Text added to an empty chunk needs no separator, and a one-blank-line chunk keeps its blank line
+    for name, (op, body, want) in {
+        "prepend to an empty chunk": (server.prepend_to_cell, "", "y\n"),
+        "append to an empty chunk": (server.append_to_cell, "", "y\n"),
+        "prepend to a blank line": (server.prepend_to_cell, "\n", "y\n\n"),
+        "append to a blank line": (server.append_to_cell, "\n", "\ny\n"),
+    }.items():
+        path = write_doc("body.rmd", "```{r}\n" + body + "```\n")
+        op(path, 0, "y")
+        check_same(f"body: {name}", read_doc(path), "```{r}\n" + want + "```\n")
+
+    # split_cell keeps every body line, at every offset
+    body_lines = ["\n", "a\n", "\n", "b\n", "\n"]
+    doc = "```{r}\n" + "".join(body_lines) + "```\n"
+    for offset in range(1, 4):
+        path = write_doc("body.rmd", doc)
+        server.split_cell(path, 0, offset)
+        check_same(f"split at {offset}: every line kept", read_doc(path),
+                   "```{r}\n" + "".join(body_lines[:offset]) + "```\n```{r}\n" + "".join(body_lines[offset:]) + "```\n")
+    # A markdown cell split anywhere saves back as it was (the halves merge again on reparse)
+    doc = "```{r}\nx\n```\n\na\n\n\nb\n\n"
+    for offset in range(1, 6):
+        path = write_doc("body.rmd", doc)
+        server.split_cell(path, 1, offset)
+        check_same(f"split prose at {offset}: every line kept", read_doc(path), doc)
+    # merge_cells joins the bodies as they are: an empty chunk adds no line
+    path = write_doc("body.rmd", "```{r}\na\n\n```\n```{r}\n```\n```{r}\n\nb\n```\n")
+    server.merge_cells(path, 0, 2)
+    check_same("merge: every line kept", read_doc(path), "```{r}\na\n\n\nb\n```\n")
+
+    # CRLF, mixed and BOM documents: an option edit writes the header line in the document's line
+    # break and keeps the body's bytes
+    path = write_raw("body.rmd", "```{r}\r\nx <- 1\r\n\r\n```\r\nT\r\n")
+    server.set_chunk_option(path, 0, "echo", "FALSE")
+    check_same("crlf body: option edit keeps the blank line", read_raw(path), "```{r echo=FALSE}\r\nx <- 1\r\n\r\n```\r\nT\r\n")
+    path = write_raw("body.rmd", "```{r}\r\na\nb\r\n\n```\r\nT\r\n")
+    server.set_chunk_option(path, 0, "echo", "FALSE")
+    check_same("mixed body: option edit keeps every byte of the body", read_raw(path), "```{r echo=FALSE}\r\na\nb\r\n\n```\r\nT\r\n")
+    bom = chr(0xFEFF)
+    path = write_raw("body.rmd", bom + "```{r}\nx\n\n```\n")
+    server.set_chunk_option(path, 0, "echo", "FALSE")
+    check("bom body: option edit keeps the mark and the blank line", read_bytes(path), (bom + "```{r echo=FALSE}\nx\n\n```\n").encode("utf-8"))
+
+    # Re-saving every cell's own text is byte for byte a no-op, whatever the document
+    docs = {
+        "sample": SAMPLE, "crlf": SAMPLE.replace("\n", "\r\n"),
+        "mixed": "---\r\ntitle: x\n---\r\n\r\nIntro\n\n```{r one}\r\nx <- 1\n\n```\r\n\r\n```{r two}\nb\r\n```\nTail\r\n",
+        "cr": "---\rtitle: x\r---\r\rIntro\r```{r}\rx <- 1\r\r```\r",
+        "bom": bom + "---\ntitle: x\n---\n\n```{r}\n\n```\n```{r}\n```\n",
+        "no final newline after prose": "```{r}\nx\n\n```\nlast",
+        "no final newline after a chunk": "# T\n```{r}\ny\n\n```",
+    }
+    for name, doc in docs.items():
+        path = write_raw("noop.rmd", doc)
+        for i in range(len(RmdManager(path).cells)):
+            mgr = RmdManager(path)
+            mgr.replace_cell_source(i, mgr.get_cell(i))
+        check(f"no-op {name}: re-saving every cell's text keeps the file byte for byte", read_bytes(path), doc.encode("utf-8"))
+
+    # Front matter: blank lines before the closing fence stay through key edits
+    path = write_doc("body.rmd", "---\ntitle: x\n\n---\nB\n")
+    server.set_frontmatter_key(path, "title", "y")
+    server.set_frontmatter_key(path, "a", "1")
+    server.remove_frontmatter_key(path, "a")
+    check_same("front matter: blank line before the fence kept", read_doc(path), "---\ntitle: y\n\n---\nB\n")
+
+
 # ──────────────────────────────────────────────
 # Frontmatter
 # ──────────────────────────────────────────────
@@ -1136,7 +1382,7 @@ def test_frontmatter_unreadable():
     path = write_doc("broken.rmd", text)
     shown = server.get_frontmatter(path)
     check("broken: get_frontmatter says why", shown, "(the YAML header could not be parsed: found character '\\t'")
-    check("broken: get_frontmatter gives the line", shown, "(line 4 of the file)")
+    check("broken: get_frontmatter gives the line and column", shown, "(line 4, column 1 of the file)")
     check("broken: get_frontmatter returns the raw text", shown, "title: Report\nparams:\n\tn: 1\noutput: html_document")
     check("broken: set works", server.set_frontmatter_key(path, "title", "New"), "Saved")
     check_same("broken: set changes only that line", read_doc(path), text.replace("title: Report", "title: New"))
@@ -1148,7 +1394,7 @@ def test_frontmatter_unreadable():
     # Well-formed YAML holding an impossible date: no crash, and still editable
     path = write_doc("broken.rmd", "---\ndate: 2026-13-45\ntitle: x\n---\n\n```{r}\n1\n```\n")
     check("bad date: other tools still work", server.list_cells(path), "[1] code (r)")
-    check("bad date: get_frontmatter says why", server.get_frontmatter(path), "month must be in 1..12")
+    check("bad date: get_frontmatter says why and where", server.get_frontmatter(path), "month must be in 1..12 (line 2, column 7 of the file)")
     check("bad date: set works", server.set_frontmatter_key(path, "title", "y"), "Saved")
     check_same("bad date: set changes only that line", read_doc(path), "---\ndate: 2026-13-45\ntitle: y\n---\n\n```{r}\n1\n```\n")
     # A control character such as a form feed: the YAML reader refuses the header before parsing
@@ -1157,9 +1403,29 @@ def test_frontmatter_unreadable():
     check("form feed: other tools still work", server.list_cells(path), "[1] code (r)")
     shown = server.get_frontmatter(path)
     check("form feed: get_frontmatter says why", shown, "(the YAML header could not be parsed: unacceptable character #x000c")
+    check("form feed: get_frontmatter gives the line and column", shown,
+          "special characters are not allowed (line 2, column 10 of the file); its raw text follows")
     check("form feed: get_frontmatter returns the raw text", shown, 'its raw text follows)\ntitle: "a\fb"')
     check("form feed: set works", server.set_frontmatter_key(path, "author", "B"), "Saved")
     check_same("form feed: set adds only that line", read_doc(path), text.replace('"\n---', '"\nauthor: B\n---'))
+    # Line and column count the file's own lines: past a byte order mark, CRLF breaks and a NEL inside a line
+    where = {
+        "control character after a mark, in CRLF": (chr(0xFEFF) + '---\r\ntitle: x\r\nz: "a\x01b"\r\n---\r\n',
+                                                     "unacceptable character #x0001: special characters are not allowed (line 3, column 6 of the file)"),
+        "control character after a NEL": ('---\ntitle: "a\x85b"\nkey: "\x0c"\n---\n', "(line 3, column 7 of the file)"),
+        "tab after a mark, in CRLF": (chr(0xFEFF) + "---\r\ntitle: x\r\n\tbad: 1\r\n---\r\n", "(line 3, column 1 of the file)"),
+        "impossible date in a nested list": ("---\ntitle: x\nparams:\n  d: [1, 2026-02-30]\n---\n",
+                                             "day is out of range for month (line 4, column 10 of the file)"),
+        "the impossible date that was read first": ("---\nparams:\n  d: 2026-02-30\ndate: 2026-13-45\n---\n",
+                                                    "month must be in 1..12 (line 4, column 7 of the file)"),
+        "the one of two dates with one message that was read first": ("---\na: [2026-13-45]\nb: 2026-14-01\n---\n",
+                                                                       "month must be in 1..12 (line 3, column 4 of the file)"),
+    }
+    for label, (text, error) in where.items():
+        check(f"where: {label}", server.get_frontmatter(write_raw("broken.rmd", text)), error)
+    path = write_doc("broken.rmd", "---\n{title: x, date: 2026-13-45}\n---\n")
+    check("where: refused set gives the line too", server.set_frontmatter_key(path, "title", "y"),
+          "Error: Frontmatter can't be edited key by key: month must be in 1..12 (line 2, column 18 of the file)")
     # Not a mapping: shown raw, and edits are refused without touching the file
     text = "---\n- a\n- b\n---\n\nBody\n"
     path = write_doc("broken.rmd", text)
@@ -2024,6 +2290,8 @@ if __name__ == "__main__":
         test_replace_cell_source()
         test_prepend_append_to_cell()
         test_chunk_options()
+        test_chunk_header_values()
+        test_chunk_body_lines()
         test_frontmatter()
         test_frontmatter_line_level()
         test_frontmatter_edge_cases()

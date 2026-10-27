@@ -3471,13 +3471,13 @@ def test_line_endings():
             "py",
             "insert_sibling before",
             lambda a: a.insert_sibling("LRUCache", "SIZE = 1", "before"),
-            "SIZE = 1\n\nclass LRUCache:\n",
+            "SIZE = 1\n\n\nclass LRUCache:\n",
         ),
         (
             "py",
             "insert_sibling after",
             lambda a: a.insert_sibling("LRUCache", "def after():\n    pass", "after"),
-            "        return self.items.get(key)\n\ndef after():\n    pass\n",
+            "        return self.items.get(key)\n\n\ndef after():\n    pass\n",
         ),
         (
             "py",
@@ -5691,10 +5691,10 @@ def test_insert_before_leading_comments():
     cases = [
         ("py function (reported)", "s.py",
          "x = 1\n\n# Doc for f\ndef f():\n    pass\n", "f", "def g():\n    pass",
-         "x = 1\n\ndef g():\n    pass\n\n# Doc for f\ndef f():\n    pass\n"),
+         "x = 1\n\n\ndef g():\n    pass\n\n\n# Doc for f\ndef f():\n    pass\n"),
         ("py decorated function", "s.py",
          "x = 1\n\n\n# Doc\n@dec\ndef f():\n    pass\n", "f", "def g():\n    pass",
-         "x = 1\n\n\ndef g():\n    pass\n\n# Doc\n@dec\ndef f():\n    pass\n"),
+         "x = 1\n\n\ndef g():\n    pass\n\n\n# Doc\n@dec\ndef f():\n    pass\n"),
         ("py method", "s.py",
          "class A:\n    x = 1\n\n    # Doc\n    def f(self):\n        pass\n", "A.f",
          "def g(self):\n    pass",
@@ -5729,19 +5729,19 @@ def test_insert_before_leading_comments():
         # leading comment and stays above the new code.
         ("py detached comment stays above", "s.py",
          "# Section\n\ndef f():\n    pass\n", "f", "X = 1",
-         "# Section\n\nX = 1\n\ndef f():\n    pass\n"),
+         "# Section\n\nX = 1\n\n\ndef f():\n    pass\n"),
         # A `#!` line and encoding or magic comments only work at the top of
         # the file, so they are never taken for the target's comment.
         ("py shebang and coding line stay first", "s.py",
          "#!/usr/bin/env python\n# -*- coding: utf-8 -*-\ndef main():\n    pass\n", "main", "X = 1",
-         "#!/usr/bin/env python\n# -*- coding: utf-8 -*-\nX = 1\n\ndef main():\n    pass\n"),
+         "#!/usr/bin/env python\n# -*- coding: utf-8 -*-\nX = 1\n\n\ndef main():\n    pass\n"),
         ("ruby magic comment stays first", "s.rb",
          "# frozen_string_literal: true\n# Doc\nclass A\nend\n", "A", "X = 1",
          "# frozen_string_literal: true\nX = 1\n\n# Doc\nclass A\nend\n"),
         # Further down, a comment that mentions a coding is just a comment.
         ("py comment naming a coding below the top lines", "s.py",
          "x = 1\n\n# Decoding: from bytes\ndef f():\n    pass\n", "f", "Y = 2",
-         "x = 1\n\nY = 2\n\n# Decoding: from bytes\ndef f():\n    pass\n"),
+         "x = 1\n\nY = 2\n\n\n# Decoding: from bytes\ndef f():\n    pass\n"),
     ]
     for label, name, source, target, content, expected in cases:
         _exact(f"insert_sibling before ({label})",
@@ -5816,7 +5816,7 @@ def test_ts_abstract_classes():
            read(lambda a: a.read_symbol("A", depth="signature")), "abstract class A")
     _exact("read_symbol depth=interface: abstract class",
            read(lambda a: a.read_symbol("A", depth="interface")),
-           "export abstract class A {\n  x = 1\n  /** M. */\n  abstract m(): void\n  n(): void ...\n}")
+           "export abstract class A {\n  x = 1;\n  /** M. */\n  abstract m(): void;\n  n(): void ...\n}")
     _exact("add_method on an abstract class",
            edit(lambda a: a.add_method("B", "g() {}")),
            ts.replace("  f() {}\n}", "  f() {}\n\n  g() {}\n}"))
@@ -5947,9 +5947,9 @@ def test_interface_indentation():
         ("ts decorated member, multi-line signature", "i.ts",
          "export class S {\n  private x: number;\n\n  @Get()\n  find(a: string,\n       b: number): void {\n"
          "    return;\n  }\n}\n", "S",
-         "export class S {\n  private x: number\n  @Get()\n  find(a: string,\n       b: number): void ...\n}"),
+         "export class S {\n  private x: number;\n  @Get()\n  find(a: string,\n       b: number): void ...\n}"),
         ("ts class on one line", "i.ts",
-         "class K { a = 1; b() {} }\n", "K", "class K {\n  a = 1\n  b() ...\n}"),
+         "class K { a = 1; b() {} }\n", "K", "class K {\n  a = 1;\n  b() ...\n}"),
         ("js tab-indented class", "i.js",
          "class K {\n\tconstructor() {\n\t\tthis.a = 1;\n\t}\n\n\tget() {}\n}\n", "K",
          "class K {\n\tconstructor() ...\n\tget() ...\n}"),
@@ -5958,13 +5958,13 @@ def test_interface_indentation():
          "Outer.A", "static class A {\n    int x;\n    /** Doc. */\n    void f() ...\n}"),
         ("cpp access labels keep their colons", "i.cpp",
          "class A {\npublic:\n  void f() {}\nprivate:\n  int x;\n};\n", "A",
-         "class A {\npublic:\n  void f() ...\nprivate:\n  int x;\n}"),
+         "class A {\npublic:\n  void f() ...\nprivate:\n  int x;\n};"),
         ("ruby", "i.rb",
          "class A\n  attr_reader :x\n\n  def f(a)\n    a\n  end\nend\n", "A",
          "class A\n  attr_reader :x\n  def f(a) ...\nend"),
         ("ruby nested class", "i.rb",
          "module M\n  class A\n    def f\n      1\n    end\n  end\nend\n", "M.A", "class A\n  def f ...\nend"),
-        ("c struct", "i.c", "struct S {\n  int a;\n  char b;\n};\n", "S", "struct S {\n  int a;\n  char b;\n}"),
+        ("c struct", "i.c", "struct S {\n  int a;\n  char b;\n};\n", "S", "struct S {\n  int a;\n  char b;\n};"),
     ]
     for label, name, source, target, expected in cases:
         _exact(f"read_symbol depth=interface ({label})",
@@ -6151,7 +6151,7 @@ def test_js_ts_symbol_kinds():
            "type T = number;")
     _exact("ts read_symbol depth=interface: enum",
            _read_result("kinds.ts", tsd, lambda a: a.read_symbol("E", depth="interface")),
-           "enum E {\n  A\n  B\n}")
+           "enum E {\n  A,\n  B,\n}")
     _exact("ts replace_function: type alias",
            _edit_result("kinds.ts", tsd, lambda a: a.replace_function("T", "type T = string;")),
            tsd.replace("type T = number;", "type T = string;"))
@@ -6525,19 +6525,19 @@ def test_indentation_whitespace():
     cases = [
         ("insert_sibling: a form feed before the new def stays", "def f():\n    return 1\n",
          lambda a: a.insert_sibling("f", "\x0cdef g():\n    return 2\n", "after"),
-         "def f():\n    return 1\n\n\x0cdef g():\n    return 2\n"),
+         "def f():\n    return 1\n\n\n\x0cdef g():\n    return 2\n"),
         ("insert_sibling: the target's form feed is not copied", "\x0cdef f():\n    return 1\n",
          lambda a: a.insert_sibling("f", "def g():\n    return 2\n", "after"),
-         "\x0cdef f():\n    return 1\n\ndef g():\n    return 2\n"),
+         "\x0cdef f():\n    return 1\n\n\ndef g():\n    return 2\n"),
         ("replace_function: no form feed added to the body", "x = 1\n\n\n\x0cdef f():\n    return 1\n",
          lambda a: a.replace_function("f", "def f():\n    return 2\n"),
          "x = 1\n\n\ndef f():\n    return 2\n"),
         ("add_method: U+2028 starting a docstring line stays", "class A:\n    def f(self):\n        return 1\n",
          lambda a: a.add_method("A", '        def g(self):\n            """Doc.\n\u2028more"""\n            return 1\n'),
-         'class A:\n    def f(self):\n        return 1\n\n    def g(self):\n        """Doc.\n    \u2028more"""\n        return 1\n'),
+         'class A:\n    def f(self):\n        return 1\n\n    def g(self):\n        """Doc.\n\u2028more"""\n        return 1\n'),
         ("add_method: a form feed starting a string line stays", "class A:\n    def f(self):\n        return 1\n",
          lambda a: a.add_method("A", '        def g(self):\n            s = """\n\x0cpage"""\n            return s\n'),
-         'class A:\n    def f(self):\n        return 1\n\n    def g(self):\n        s = """\n    \x0cpage"""\n        return s\n'),
+         'class A:\n    def f(self):\n        return 1\n\n    def g(self):\n        s = """\n\x0cpage"""\n        return s\n'),
     ]
     for label, content, action, expected in cases:
         _exact(label, _edit_result("w.py", content, action), expected)
@@ -6566,19 +6566,19 @@ def test_leading_comments_in_strings():
         ("insert_sibling before: py `#` line closing a string (reported)", "s.py",
          'X = """abc\n# fake comment"""\ndef f():\n    pass\n',
          lambda a: a.insert_sibling("f", "def g():\n    pass", "before"),
-         'X = """abc\n# fake comment"""\ndef g():\n    pass\n\ndef f():\n    pass\n'),
+         'X = """abc\n# fake comment"""\n\n\ndef g():\n    pass\n\n\ndef f():\n    pass\n'),
         ("insert_sibling before: js `//` line closing a template literal (reported)", "s.js",
          "const s = `\n// not a comment`;\nfunction f() {}\n",
          lambda a: a.insert_sibling("f", "function g() {}", "before"),
-         "const s = `\n// not a comment`;\nfunction g() {}\n\nfunction f() {}\n"),
+         "const s = `\n// not a comment`;\n\nfunction g() {}\n\nfunction f() {}\n"),
         ("insert_sibling before: a real comment under the string still moves up", "s.py",
          'X = """abc\n# fake"""\n# Doc for f\ndef f():\n    pass\n',
          lambda a: a.insert_sibling("f", "def g():\n    pass", "before"),
-         'X = """abc\n# fake"""\ndef g():\n    pass\n\n# Doc for f\ndef f():\n    pass\n'),
+         'X = """abc\n# fake"""\n\n\ndef g():\n    pass\n\n\n# Doc for f\ndef f():\n    pass\n'),
         ("insert_sibling before: `/*` opening a string is no comment start", "s.js",
          "const s = `\n/*`; /* real\ncomment */\nfunction f() {}\n",
          lambda a: a.insert_sibling("f", "function g() {}", "before"),
-         "const s = `\n/*`; /* real\ncomment */\nfunction g() {}\n\nfunction f() {}\n"),
+         "const s = `\n/*`; /* real\ncomment */\n\nfunction g() {}\n\nfunction f() {}\n"),
         ("delete_symbol: the string's last line is not deleted as a comment", "s.py",
          'X = """abc\n# fake comment"""\ndef f():\n    pass\n',
          lambda a: a.delete_symbol("f"),
@@ -6676,7 +6676,8 @@ def test_ts_kind_tool_followups():
            "add_field cannot add to it; rewrite it with replace_function")
     _exact("read_symbol signature on a type alias is refused",
            _read_result("k.ts", "type T = number;\n", lambda a: a.read_symbol("T", "signature")),
-           "REFUSED: 'T' is a type alias, which has no signature; read it with depth='full'")
+           "REFUSED: 'T' is a type alias, which has no signature (depth='signature' is for "
+           "functions and class headers); read it with depth='full'")
 
     abstract = "abstract class A {\n  abstract m(): void;\n}\n"
     for label, sig in [("without", "abstract m(x: number): void"),
@@ -6760,6 +6761,1223 @@ def test_yaml_explicit_keys():
 
 
 # ──────────────────────────────────────────────
+# Symbols that share a line with other code; C++ templates; sibling spacing
+# ──────────────────────────────────────────────
+
+
+def _refused(label: str, result: str, reason: str):
+    """check() that an _edit_result was refused for `reason` and left the
+    file as it was."""
+    check(f"{label}: refused", result, reason)
+    check(f"{label}: file unchanged",
+          "[FILE CHANGED]" if result.endswith("[FILE CHANGED]") else "<unchanged>", "<unchanged>")
+
+
+def test_symbols_sharing_a_line():
+    print("\n═══ whole-symbol edits on a symbol that shares its line ═══")
+
+    # An edit never changes code outside its target. A symbol that shares a
+    # line with other code is cut by bytes, with one space left between its
+    # neighbours; the `;` or `,` that ends it, and a comment after it at the
+    # end of the line, go with it.
+    # (label, file name, source, target, expected file text)
+    deletes = [
+        ("js method (reported)", "k.js", "class A { a() {} b() {} }\n", "A.a", "class A { b() {} }\n"),
+        ("js last method", "k.js", "class A { a() {} b() {} }\n", "A.b", "class A { a() {} }\n"),
+        ("js first of two functions", "k.js", "function a() {} function b() {}\n", "a", "function b() {}\n"),
+        ("js second of two functions", "k.js", "function a() {} function b() {}\n", "b", "function a() {}\n"),
+        ("js indented members", "k.js", "class A {\n  a() {} b() {}\n}\n", "A.a", "class A {\n  b() {}\n}\n"),
+        ("js multi-line function before another", "k.js",
+         "function a() {\n  return 1;\n} function b() {}\n", "a", "function b() {}\n"),
+        ("js function after a multi-line one", "k.js",
+         "function a() {\n  return 1;\n} function b() {}\n", "b", "function a() {\n  return 1;\n}\n"),
+        ("js comment at the end of the line goes too", "k.js",
+         "function a() {} function b() {} // b\n", "b", "function a() {}\n"),
+        ("js comment before the next symbol stays", "k.js",
+         "function a() {} /* x */ function b() {}\n", "a", "/* x */ function b() {}\n"),
+        ("js closure in an object literal, with its key and comma", "k.js",
+         "const app = { handler: () => {}, other: 1 };\n", "app.handler", "const app = { other: 1 };\n"),
+        ("js leading comment goes with the line's first symbol", "k.js",
+         "// A.\nfunction a() {} function b() {}\n", "a", "function b() {}\n"),
+        ("js the comment above is not the second symbol's", "k.js",
+         "// A.\nfunction a() {} function b() {}\n", "b", "// A.\nfunction a() {}\n"),
+        ("ts method", "k.ts", "class A { a(): void {} b(): void {} }\n", "A.b", "class A { a(): void {} }\n"),
+        ("java method", "K.java", "class A { void a() {} void b() {} }\n", "A.a", "class A { void b() {} }\n"),
+        ("cpp method", "k.cpp", "class A { void a() {} void b() {} };\n", "A.b", "class A { void a() {} };\n"),
+        ("cpp class, with its `;`", "k.cpp", "class A {}; class B {};\n", "A", "class B {};\n"),
+        ("cpp second class", "k.cpp", "class A {}; class B {};\n", "B", "class A {};\n"),
+        ("ruby method", "k.rb", "class A; def a; end; def b; end; end\n", "A.a", "class A; def b; end; end\n"),
+        ("ruby last method", "k.rb", "class A; def a; end; def b; end; end\n", "A.b", "class A; def a; end; end\n"),
+        ("go function", "k.go", "package main\n\nfunc a() {}; func b() {}\n", "a", "package main\n\nfunc b() {}\n"),
+        ("go last function takes the `;` before it", "k.go",
+         "package main\n\nfunc a() {}; func b() {}\n", "b", "package main\n\nfunc a() {}\n"),
+        ("go type, with its keyword", "k.go",
+         "package main\n\ntype A struct{}; type B struct{}\n", "A", "package main\n\ntype B struct{}\n"),
+        ("python statement", "k.py", "x = 1; y = 2\n", "x", "y = 2\n"),
+        ("python last statement takes the `;` before it", "k.py", "x = 1; y = 2\n", "y", "x = 1\n"),
+        ("python class attribute", "k.py", "class A: x = 1; y = 2\n", "A.x", "class A: y = 2\n"),
+    ]
+    for label, name, source, target, expected in deletes:
+        _exact(f"delete_symbol sharing a line ({label})",
+               _edit_result(name, source, lambda a: a.delete_symbol(target)), expected)
+    _exact("delete_symbol sharing a line (crlf)",
+           _edit_result("k.js", "class A { a() {} b() {} }\n", lambda a: a.delete_symbol("A.a"), "\r\n"),
+           "class A { b() {} }\r\n")
+    # A symbol on lines of its own is still deleted line by line.
+    _exact("delete_symbol on lines of its own",
+           _edit_result("k.js", "function a() {}\nfunction b() {}\n", lambda a: a.delete_symbol("a")),
+           "function b() {}\n")
+    # The only statement of a Python class body leaves the class without a
+    # body, which the save-time check refuses.
+    _refused("delete_symbol of a class's only statement on its line",
+             _edit_result("k.py", "class A: x = 1\n", lambda a: a.delete_symbol("A.x")),
+             "the result would have a syntax error")
+
+    # replace_function replaces only what read_symbol shows; the content's
+    # lines after the first keep their indentation relative to it.
+    # (label, file name, source, target, content, expected file text)
+    replaces = [
+        ("js second function", "k.js", "function a() {} function b() {}\n", "b",
+         "function b() { return 2; }\n", "function a() {} function b() { return 2; }\n"),
+        ("js first function", "k.js", "function a() {} function b() {}\n", "a",
+         "function a() { return 1; }", "function a() { return 1; } function b() {}\n"),
+        ("js method", "k.js", "class A { a() {} b() {} }\n", "A.a", "a() { return 1; }",
+         "class A { a() { return 1; } b() {} }\n"),
+        ("js multi-line content", "k.js", "class A {\n  a() {} b() {}\n}\n", "A.a",
+         "a() {\n  return 1;\n}", "class A {\n  a() {\n    return 1;\n  } b() {}\n}\n"),
+        ("python statement", "k.py", "x = 1; y = 2\n", "y", "y = 3", "x = 1; y = 3\n"),
+        ("python class attribute", "k.py", "class A: x = 1\n", "A.x", "x = 2", "class A: x = 2\n"),
+        ("ruby method", "k.rb", "class A; def a; end; def b; end; end\n", "A.b", "def b; 2; end",
+         "class A; def a; end; def b; 2; end; end\n"),
+        ("go function", "k.go", "package main\n\nfunc a() {}; func b() {}\n", "b", "func b() { x() }",
+         "package main\n\nfunc a() {}; func b() { x() }\n"),
+        ("java method", "K.java", "class A { void a() {} void b() {} }\n", "A.a", "void a() { f(); }",
+         "class A { void a() { f(); } void b() {} }\n"),
+        ("cpp method", "k.cpp", "class A { void a() {} void b() {} };\n", "A.b", "void b() { f(); }",
+         "class A { void a() {} void b() { f(); } };\n"),
+    ]
+    for label, name, source, target, content, expected in replaces:
+        _exact(f"replace_function sharing a line ({label})",
+               _edit_result(name, source, lambda a: a.replace_function(target, content)), expected)
+
+    # insert_sibling works where the new lines land right beside the
+    # target, and is refused where other code is in between.
+    two = "function a() {} function b() {}\n"
+    _exact("insert_sibling before the line's first symbol",
+           _edit_result("k.js", two, lambda a: a.insert_sibling("a", "function c() {}", "before")),
+           "function c() {}\n\nfunction a() {} function b() {}\n")
+    _exact("insert_sibling after the line's last symbol",
+           _edit_result("k.js", two, lambda a: a.insert_sibling("b", "function c() {}", "after")),
+           "function a() {} function b() {}\n\nfunction c() {}\n")
+    _exact("insert_sibling after the line's last python statement",
+           _edit_result("k.py", "x = 1; y = 2\n", lambda a: a.insert_sibling("y", "z = 3", "after")),
+           "x = 1; y = 2\n\nz = 3\n")
+    # (label, file name, source, target, position, reason)
+    refusals = [
+        ("before the line's second symbol", "k.js", two, "b", "before", "shares its first line with other code"),
+        ("after the line's first symbol", "k.js", two, "a", "after", "shares its last line with other code"),
+        ("before a member after the `{`", "k.js", "class A { a() {} b() {} }\n", "A.a", "before",
+         "shares its first line with other code"),
+        ("after a member before the `}`", "k.js", "class A { a() {} b() {} }\n", "A.b", "after",
+         "shares its last line with other code"),
+        ("after a python class's one-line body", "k.py", "class A: x = 1\n", "A.x", "after",
+         "shares its line with the start of the code it is part of"),
+        ("after a ruby method", "k.rb", "class A; def a; end; def b; end; end\n", "A.a", "after",
+         "shares its last line with other code"),
+    ]
+    for label, name, source, target, position, reason in refusals:
+        _refused(f"insert_sibling {label}",
+                 _edit_result(name, source, lambda a: a.insert_sibling(target, "z = 1", position)), reason)
+
+    # A leading comment is above the symbol that starts the line.
+    _exact("edit_leading_comment add on the line's first symbol",
+           _edit_result("k.js", two, lambda a: a.edit_leading_comment("a", "add", "// A.")),
+           "// A.\nfunction a() {} function b() {}\n")
+    for op, comment in (("add", "// B."), ("replace", "// B."), ("remove", "")):
+        _refused(f"edit_leading_comment {op} on the line's second symbol",
+                 _edit_result("k.js", "// A.\n" + two, lambda a: a.edit_leading_comment("b", op, comment)),
+                 "'b' does not start its line")
+
+    # Signature edits were byte-based already.
+    _exact("replace_signature of the line's second symbol",
+           _edit_result("k.js", two, lambda a: a.replace_signature("b", "function b(x)")),
+           "function a() {} function b(x) {}\n")
+    _exact("replace_signature of a one-line python function",
+           _edit_result("k.py", "def f(): return 1\n", lambda a: a.replace_signature("f", "def f(x):")),
+           "def f(x): return 1\n")
+    # add_method rebuilds a one-line class over several lines, and leaves
+    # the code after it on the line alone.
+    _exact("add_method to a class that shares its line",
+           _edit_result("k.js", "class A { a() {} } class B {}\n", lambda a: a.add_method("A", "c() {}")),
+           "class A {\n  a() {}\n\n  c() {}\n} class B {}\n")
+
+
+def test_bodies_sharing_a_line():
+    print("\n═══ body tools on a body that shares a line with its signature or braces ═══")
+
+    # replace_function_body rebuilds such a body over several lines, rather
+    # than replacing the lines it is on (signature and other code included).
+    # (label, file name, source, target, content, expected file text)
+    cases = [
+        ("js one-line body", "k.js", "function f() { return 1; }\n", "f", "return 2;",
+         "function f() {\n  return 2;\n}\n"),
+        ("js after another function", "k.js", "function a() {} function f() { return 1; }\n", "f",
+         "return 2;", "function a() {} function f() {\n  return 2;\n}\n"),
+        ("js first statement on the `{` line", "k.js", "function f() { x();\n  y(); }\n", "f",
+         "return 2;", "function f() {\n  return 2;\n}\n"),
+        ("js last statement on the `}` line", "k.js", "function f() {\n  x();\n  y(); }\n", "f",
+         "return 2;", "function f() {\n  return 2;\n}\n"),
+        ("js empty one-line body", "k.js", "function f() {}\n", "f", "return 2;",
+         "function f() {\n  return 2;\n}\n"),
+        ("python one-line body", "k.py", "def f(): return 1\n", "f", "return 2",
+         "def f():\n    return 2\n"),
+        ("python method", "k.py", "class A:\n    def f(self): return 1\n", "A.f", "return 2",
+         "class A:\n    def f(self):\n        return 2\n"),
+        ("python multi-line signature", "k.py", "def f(\n    x,\n): return x\n", "f", "return 2",
+         "def f(\n    x,\n):\n    return 2\n"),
+        ("ruby one-line method", "k.rb", "def f; 1; end\n", "f", "2", "def f\n  2\nend\n"),
+        ("ruby method with parameters", "k.rb", "def f(x) x end\n", "f", "2", "def f(x)\n  2\nend\n"),
+        ("go", "k.go", "package main\n\nfunc f() { return }\n", "f", "x()",
+         "package main\n\nfunc f() {\n\tx()\n}\n"),
+        ("java", "K.java", "class A {\n    void a() { return; }\n}\n", "A.a", "x();",
+         "class A {\n    void a() {\n        x();\n    }\n}\n"),
+        ("c", "k.c", "int f(void) { return 1; }\n", "f", "return 2;", "int f(void) {\n  return 2;\n}\n"),
+    ]
+    for label, name, source, target, content, expected in cases:
+        _exact(f"replace_function_body sharing a line ({label})",
+               _edit_result(name, source, lambda a: a.replace_function_body(target, content)), expected)
+    _exact("replace_function_body sharing a line (crlf)",
+           _edit_result("k.js", "function f() { return 1; }\n",
+                        lambda a: a.replace_function_body("f", "return 2;"), "\r\n"),
+           "function f() {\r\n  return 2;\r\n}\r\n")
+    # A body on lines of its own is still replaced line by line, comments
+    # after the `{` on its line kept.
+    _exact("replace_function_body keeps a comment after the `{`",
+           _edit_result("k.js", "function f() { // keep\n  x();\n}\n",
+                        lambda a: a.replace_function_body("f", "return 2;")),
+           "function f() { // keep\n  return 2;\n}\n")
+
+    # A Ruby endless method has an expression, not a body.
+    for label, action in (
+        ("replace_function_body", lambda a: a.replace_function_body("f", "2")),
+        ("insert_in_body", lambda a: a.insert_in_body("f", "x = 1", at="top")),
+    ):
+        _refused(f"{label} on a ruby endless method",
+                 _edit_result("k.rb", "def f = 1\n", action), "'f' is an endless method")
+
+    # The snippet tools search the body only, not code before it on its line.
+    _refused("replace_in_body does not match code before the body on its line",
+             _edit_result("k.rb", "x = 1; def f; y; end\n",
+                          lambda a: a.replace_in_body("f", "x = 1", "x = 2")),
+             "Snippet not found in body of 'f'")
+    _exact("replace_in_body in a one-line python body",
+           _edit_result("k.py", "def f(): return 1\n", lambda a: a.replace_in_body("f", "1", "2")),
+           "def f(): return 2\n")
+    # insert_in_body refuses a body that shares a line, also after a
+    # signature over several lines, and before a Ruby `end`.
+    for label, name, source, at in (
+        ("python body after a multi-line signature", "k.py", "def f(\n    x,\n): return x\n", "top"),
+        ("ruby body before the `end`", "k.rb", "def f\n  x; end\n", "bottom"),
+    ):
+        _refused(f"insert_in_body at={at}: {label}",
+                 _edit_result(name, source, lambda a: a.insert_in_body("f", "y = 1", at=at)),
+                 "shares a line with its signature or braces")
+    # replace_docstring has no line of its own for a new docstring there.
+    _refused("replace_docstring into a one-line python body",
+             _edit_result("k.py", "def f(): return 1\n", lambda a: a.replace_docstring("f", '"""Doc."""')),
+             "shares a line with its signature")
+    _exact("replace_docstring of a one-line python body's docstring",
+           _edit_result("k.py", 'def f(): """Old."""\n', lambda a: a.replace_docstring("f", '"""New."""')),
+           'def f(): """New."""\n')
+
+
+_CPP_TEMPLATES = """// Max of two.
+template <typename T>
+T maxOf(T a, T b) {
+    return a > b ? a : b;
+}
+
+template <typename T>
+class Box {
+public:
+    T get() { return v; }
+    template <typename U>
+    U as() { return U(v); }
+private:
+    T v;
+};
+
+int plain() { return 1; }
+"""
+
+
+def test_cpp_templates():
+    print("\n═══ C++ templates: the `template <...>` header is part of the symbol ═══")
+
+    src = _CPP_TEMPLATES
+    read = lambda action, text=src: _read_result("t.cpp", text, action)
+    listing = ("function maxOf (line 2)\nclass Box (line 7)\n  method Box.get (line 10)\n"
+               "  method Box.as (line 11)\nfunction plain (line 17)")
+    _exact("list_symbols lists template functions, classes and member templates (reported)",
+           read(lambda a: a.list_symbols()), listing)
+    _exact("read_symbol of a template function starts at its header (reported)",
+           read(lambda a: a.read_symbol("maxOf")),
+           "template <typename T>\nT maxOf(T a, T b) {\n    return a > b ? a : b;\n}")
+    _exact("read_symbol of a template class",
+           read(lambda a: a.read_symbol("Box")),
+           src[src.index("template <typename T>\nclass"):src.index("\n\nint plain")])
+    _exact("read_symbol of a member template",
+           read(lambda a: a.read_symbol("Box.as")),
+           "template <typename U>\n    U as() { return U(v); }")
+    _exact("read_symbol signature of a template function",
+           read(lambda a: a.read_symbol("maxOf", "signature")),
+           "template <typename T>\nT maxOf(T a, T b)")
+    _exact("read_symbol interface of a template class",
+           read(lambda a: a.read_symbol("Box", "interface")),
+           "template <typename T>\nclass Box {\npublic:\n    T get() ...\n    template <typename U>\n"
+           "    U as() ...\nprivate:\n    T v;\n};")
+    _exact("find_references in a template function",
+           read(lambda a: a.find_references("maxOf")), "line 3: T maxOf(T a, T b) {")
+
+    after_max = src[src.index("template <typename T>\nclass"):]
+    # (label, edit, expected file text)
+    cases = [
+        ("delete_symbol takes the header and the comment above it (reported)",
+         lambda a: a.delete_symbol("maxOf"), after_max),
+        ("delete_symbol keeps the comment when asked",
+         lambda a: a.delete_symbol("maxOf", include_leading_comments=False), "// Max of two.\n\n" + after_max),
+        ("delete_symbol of a template class takes its `;`",
+         lambda a: a.delete_symbol("Box"),
+         src[: src.index("template <typename T>\nclass")] + "int plain() { return 1; }\n"),
+        ("delete_symbol of a member template",
+         lambda a: a.delete_symbol("Box.as"), src.replace("    template <typename U>\n    U as() { return U(v); }\n", "")),
+        ("insert_sibling before goes above the header and its comment (reported)",
+         lambda a: a.insert_sibling("maxOf", "int z() { return 0; }", "before"),
+         "int z() { return 0; }\n\n" + src),
+        ("insert_sibling after goes after the template class's `;`",
+         lambda a: a.insert_sibling("Box", "int z() { return 0; }", "after"),
+         src.replace("};\n\nint plain", "};\n\nint z() { return 0; }\n\nint plain")),
+        ("insert_sibling before a member template",
+         lambda a: a.insert_sibling("Box.as", "int n() { return 0; }", "before"),
+         src.replace("\n    template <typename U>", "\n\n    int n() { return 0; }\n\n    template <typename U>")),
+        ("edit_leading_comment add goes above the header",
+         lambda a: a.edit_leading_comment("Box", "add", "// A box."),
+         src.replace("template <typename T>\nclass", "// A box.\ntemplate <typename T>\nclass")),
+        ("edit_leading_comment replace: the comment above the header is the symbol's",
+         lambda a: a.edit_leading_comment("maxOf", "replace", "// Larger of two."),
+         src.replace("// Max of two.", "// Larger of two.")),
+        ("edit_leading_comment remove",
+         lambda a: a.edit_leading_comment("maxOf", "remove"), src.replace("// Max of two.\n", "")),
+        ("replace_function replaces the header too",
+         lambda a: a.replace_function("maxOf", "template <class T>\nT maxOf(T a, T b) {\n    return b < a ? a : b;\n}"),
+         src.replace("template <typename T>\nT maxOf(T a, T b) {\n    return a > b ? a : b;\n}",
+                     "template <class T>\nT maxOf(T a, T b) {\n    return b < a ? a : b;\n}")),
+        ("replace_signature keeps the header",
+         lambda a: a.replace_signature("maxOf", "T maxOf(T a, T b, T c)"),
+         src.replace("T maxOf(T a, T b) {", "T maxOf(T a, T b, T c) {")),
+        ("replace_signature starting with `template` replaces it",
+         lambda a: a.replace_signature("maxOf", "template <typename T, typename U>\nT maxOf(T a, U b)"),
+         src.replace("template <typename T>\nT maxOf(T a, T b) {", "template <typename T, typename U>\nT maxOf(T a, U b) {")),
+        ("replace_signature of a member template",
+         lambda a: a.replace_signature("Box.as", "template <typename U>\nU as(int n)"),
+         src.replace("U as() {", "U as(int n) {")),
+    ]
+    for label, action, expected in cases:
+        _exact(f"cpp template: {label}", _edit_result("t.cpp", src, action), expected)
+    _exact("cpp template: delete_symbol (crlf)",
+           _edit_result("t.cpp", src, lambda a: a.delete_symbol("maxOf"), "\r\n"),
+           after_max.replace("\n", "\r\n"))
+    _exact("cpp template: list_symbols (crlf)",
+           _read_result("t.cpp", src.replace("\n", "\r\n"), lambda a: a.list_symbols()), listing)
+
+    # A header on the function's own line.
+    one = "template <typename T> T id(T x) { return x; }\nint q() { return 0; }\n"
+    _exact("cpp template header on the function's line: list_symbols",
+           read(lambda a: a.list_symbols(), one), "function id (line 1)\nfunction q (line 2)")
+    _exact("cpp template header on the function's line: read_symbol",
+           read(lambda a: a.read_symbol("id"), one), "template <typename T> T id(T x) { return x; }")
+    _exact("cpp template header on the function's line: delete_symbol",
+           _edit_result("t.cpp", one, lambda a: a.delete_symbol("id")), "int q() { return 0; }\n")
+    _exact("cpp template header on the function's line: replace_signature",
+           _edit_result("t.cpp", one, lambda a: a.replace_signature("id", "T id(T x, T y)")),
+           one.replace("T id(T x)", "T id(T x, T y)"))
+
+    # An explicit specialization (`template <>`) is listed under the name it
+    # specializes.
+    spec = "template <>\nint id<int>(int x) { return 1; }\n\nint q() { return 0; }\n"
+    _exact("cpp explicit specialization: list_symbols",
+           read(lambda a: a.list_symbols(), spec), "function id (line 1)\nfunction q (line 4)")
+    _exact("cpp explicit specialization: read_symbol",
+           read(lambda a: a.read_symbol("id"), spec), "template <>\nint id<int>(int x) { return 1; }")
+    _exact("cpp explicit specialization: delete_symbol",
+           _edit_result("t.cpp", spec, lambda a: a.delete_symbol("id")), "int q() { return 0; }\n")
+
+    # Out-of-line member definitions are top-level functions under their
+    # own names, with or without a template header.
+    plain_out = "struct A { int f(); };\n\nint A::f() { return 1; }\n"
+    _exact("cpp out-of-line definition: list_symbols",
+           read(lambda a: a.list_symbols(), plain_out), "struct_specifier A (line 1)\nfunction f (line 3)")
+    out = ("template <typename T>\nT Box<T>::get() {\n    return v;\n}\n\n"
+           "template <class T> template <class U> U Box<T>::as() { return U(v); }\n")
+    _exact("cpp out-of-line template definitions: list_symbols",
+           read(lambda a: a.list_symbols(), out), "function get (line 1)\nfunction as (line 6)")
+    _exact("cpp out-of-line template definition: read_symbol",
+           read(lambda a: a.read_symbol("get"), out), "template <typename T>\nT Box<T>::get() {\n    return v;\n}")
+    _exact("cpp nested template headers: read_symbol",
+           read(lambda a: a.read_symbol("as"), out), out.split("\n\n")[1].rstrip("\n"))
+    _exact("cpp out-of-line template definition: delete_symbol",
+           _edit_result("t.cpp", out, lambda a: a.delete_symbol("get")), out.split("\n\n")[1])
+
+    # A template struct is listed as a struct is, with its methods. (The
+    # kind is the grammar's node type, as for any C/C++ struct.)
+    _exact("cpp template struct: list_symbols",
+           read(lambda a: a.list_symbols(), "template <typename T>\nstruct Pair {\n    T a;\n    T first() { return a; }\n};\n"),
+           "struct_specifier Pair (line 1)\n  method Pair.first (line 4)")
+    _exact("cpp template struct: delete_symbol",
+           _edit_result("t.cpp", "int x;\n\ntemplate <typename T>\nstruct Pair {\n    T a;\n};\n",
+                        lambda a: a.delete_symbol("Pair")),
+           "int x;\n")
+
+
+def test_sibling_spacing():
+    print("\n═══ insert_sibling: blank lines around the new code ═══")
+
+    # PEP 8 in Python (two blank lines around a top-level def or class, one
+    # between methods), one blank line elsewhere, on both sides of the new
+    # code; the next symbol's leading comment, decorators and `export` are
+    # part of it. A target that opens or closes its body or file gets no
+    # blank line on that side.
+    g = "def g():\n    pass"
+    # (label, file name, source, target, content, position, expected file text)
+    cases = [
+        ("py after a top-level def (reported)", "s.py", "def f():\n    pass\n\n\ndef h():\n    pass\n", "f", g, "after",
+         "def f():\n    pass\n\n\ndef g():\n    pass\n\n\ndef h():\n    pass\n"),
+        ("py after, the next symbol's comment right below (reported)", "s.py",
+         "def f():\n    pass\n# Doc for h\ndef h():\n    pass\n", "f", g, "after",
+         "def f():\n    pass\n\n\ndef g():\n    pass\n\n\n# Doc for h\ndef h():\n    pass\n"),
+        ("py after, the next symbol's decorator right below", "s.py",
+         "def f():\n    pass\n@dec\ndef h():\n    pass\n", "f", g, "after",
+         "def f():\n    pass\n\n\ndef g():\n    pass\n\n\n@dec\ndef h():\n    pass\n"),
+        ("py after the last symbol of the file", "s.py", "def f():\n    pass\n", "f", g, "after",
+         "def f():\n    pass\n\n\ndef g():\n    pass\n"),
+        ("py after a method", "s.py",
+         "class A:\n    def f(self):\n        pass\n\n    def h(self):\n        pass\n", "A.f",
+         "def g(self):\n    pass", "after",
+         "class A:\n    def f(self):\n        pass\n\n    def g(self):\n        pass\n\n    def h(self):\n        pass\n"),
+        ("py after a class's last method", "s.py",
+         "class A:\n    def f(self):\n        pass\n\n\ndef top():\n    pass\n", "A.f",
+         "def g(self):\n    pass", "after",
+         "class A:\n    def f(self):\n        pass\n\n    def g(self):\n        pass\n\n\ndef top():\n    pass\n"),
+        ("py a constant after a class", "s.py", "class A:\n    pass\n\n\nclass B:\n    pass\n", "A", "X = 1", "after",
+         "class A:\n    pass\n\n\nX = 1\n\n\nclass B:\n    pass\n"),
+        ("py a constant between constants", "s.py", "X = 1\nY = 2\n", "X", "Z = 3", "after",
+         "X = 1\n\nZ = 3\n\nY = 2\n"),
+        ("py before, below imports", "s.py", "import os\n\n\ndef f():\n    pass\n", "f", g, "before",
+         "import os\n\n\ndef g():\n    pass\n\n\ndef f():\n    pass\n"),
+        ("py before the first symbol of the file", "s.py", "def f():\n    pass\n", "f", "X = 1", "before",
+         "X = 1\n\n\ndef f():\n    pass\n"),
+        ("py before, below a statement with a comment at its end", "s.py",
+         "x = 1  # note\n\ndef f():\n    pass\n", "f", g, "before",
+         "x = 1  # note\n\n\ndef g():\n    pass\n\n\ndef f():\n    pass\n"),
+        ("py before, below a comment of its own: its blank lines stay", "s.py",
+         "# Section\n\ndef f():\n    pass\n", "f", g, "before",
+         "# Section\n\ndef g():\n    pass\n\n\ndef f():\n    pass\n"),
+        ("py before a class's first method", "s.py", "class A:\n    def f(self):\n        pass\n", "A.f",
+         "def g(self):\n    pass", "before",
+         "class A:\n    def g(self):\n        pass\n\n    def f(self):\n        pass\n"),
+        ("js after", "s.js", "function f() {}\nfunction h() {}\n", "f", "function g() {}", "after",
+         "function f() {}\n\nfunction g() {}\n\nfunction h() {}\n"),
+        ("js after, the next symbol's JSDoc right below", "s.js",
+         "function f() {}\n/** H. */\nfunction h() {}\n", "f", "function g() {}", "after",
+         "function f() {}\n\nfunction g() {}\n\n/** H. */\nfunction h() {}\n"),
+        ("js after, the next symbol's `export`", "s.js",
+         "function f() {}\nexport function h() {}\n", "f", "function g() {}", "after",
+         "function f() {}\n\nfunction g() {}\n\nexport function h() {}\n"),
+        ("js before", "s.js", "function a() {}\nfunction f() {}\n", "f", "function g() {}", "before",
+         "function a() {}\n\nfunction g() {}\n\nfunction f() {}\n"),
+        ("js after a class's last member", "s.js", "class A {\n  a() {}\n}\n", "A.a", "c() {}", "after",
+         "class A {\n  a() {}\n\n  c() {}\n}\n"),
+        ("ts after, the next member's decorator right below", "s.ts",
+         "class S {\n  a() {}\n  @Get()\n  b() {}\n}\n", "S.a", "c() {}", "after",
+         "class S {\n  a() {}\n\n  c() {}\n\n  @Get()\n  b() {}\n}\n"),
+        ("go after, the next function's Godoc right below", "s.go",
+         "package main\n\nfunc f() {}\n// H does.\nfunc h() {}\n", "f", "func g() {}", "after",
+         "package main\n\nfunc f() {}\n\nfunc g() {}\n\n// H does.\nfunc h() {}\n"),
+        ("cpp before a method right after an access label", "s.cpp",
+         "class A {\npublic:\n    void f() {}\n};\n", "A.f", "void g() {}", "before",
+         "class A {\npublic:\n    void g() {}\n\n    void f() {}\n};\n"),
+        ("cpp after a method right before an access label", "s.cpp",
+         "class A {\npublic:\n    void f() {}\nprivate:\n    int x;\n};\n", "A.f", "void g() {}", "after",
+         "class A {\npublic:\n    void f() {}\n\n    void g() {}\nprivate:\n    int x;\n};\n"),
+    ]
+    for label, name, source, target, content, position, expected in cases:
+        _exact(f"insert_sibling spacing ({label})",
+               _edit_result(name, source, lambda a: a.insert_sibling(target, content, position)), expected)
+    _exact("insert_sibling spacing (py after, crlf)",
+           _edit_result("s.py", "def f():\n    pass\n\ndef h():\n    pass\n",
+                        lambda a: a.insert_sibling("f", g, "after"), "\r\n"),
+           "def f():\n    pass\n\n\ndef g():\n    pass\n\n\ndef h():\n    pass\n".replace("\n", "\r\n"))
+
+
+# ──────────────────────────────────────────────
+# Re-indented string literals; multi-line array and parameter lists
+# ──────────────────────────────────────────────
+
+
+def test_reindent_string_literals():
+    print("\n═══ Re-indented content keeps the text of its multi-line string literals ═══")
+
+    # The lines that start inside a multi-line string literal of the content
+    # are part of its value and stay as written while the code around them
+    # moves. A Python docstring, a Ruby `<<~` heredoc and a Java text block
+    # strip their common indentation, so their lines move with the code, all
+    # by as many columns, or all stay when one of them cannot move as far.
+    py_cls = "class A:\n    def f(self):\n        return 1\n"
+    py_added = "class A:\n    def f(self):\n        return 1\n\n"
+    js_cls = "class A {\n  f() {\n    return 1;\n  }\n}\n"
+    js_added = "class A {\n  f() {\n    return 1;\n  }\n\n"
+    # (label, file name, source, edit, expected file text)
+    cases = [
+        ("py add_method: a SQL string at column 0 (reported)", "r.py", py_cls,
+         lambda a: a.add_method("A", 'def g(self):\n    q = """\nSELECT *\nFROM t\n"""\n    return q'),
+         py_added + '    def g(self):\n        q = """\nSELECT *\nFROM t\n"""\n        return q\n'),
+        ("py add_method: content at the members' indentation is kept as written", "r.py", py_cls,
+         lambda a: a.add_method("A", '    def g(self):\n        q = """\nSELECT *\n  FROM t\n"""\n        return q'),
+         py_added + '    def g(self):\n        q = """\nSELECT *\n  FROM t\n"""\n        return q\n'),
+        ("py add_method: strings with every prefix", "r.py", py_cls,
+         lambda a: a.add_method("A", 'def g(self):\n    return (r"""\nr\n""", b\'\'\'\nb\n\'\'\', f"""\n{self}\n""",\n'
+                                     '            u"""\nu\n""", Rb"""\nrb\n""")'),
+         py_added + '    def g(self):\n        return (r"""\nr\n""", b\'\'\'\nb\n\'\'\', f"""\n{self}\n""",\n'
+                    '                u"""\nu\n""", Rb"""\nrb\n""")\n'),
+        ("py add_method: a string continued with a backslash", "r.py", py_cls,
+         lambda a: a.add_method("A", 'def g(self):\n    return "a \\\nb"'),
+         py_added + '    def g(self):\n        return "a \\\nb"\n'),
+        ("py add_method: a docstring moves with the code", "r.py", py_cls,
+         lambda a: a.add_method("A", 'def g(self):\n    """Doc.\n\n    More.\n    """\n    return 1'),
+         py_added + '    def g(self):\n        """Doc.\n\n        More.\n        """\n        return 1\n'),
+        ("py add_method: a docstring line indented less than the code moves as far", "r.py",
+         "class A:\n    class B:\n        def f(self):\n            return 1\n",
+         lambda a: a.add_method("A.B", '    def g(self):\n        """Doc.\n\n  Two columns in.\n        """\n        return 1'),
+         "class A:\n    class B:\n        def f(self):\n            return 1\n\n"
+         '        def g(self):\n            """Doc.\n\n      Two columns in.\n            """\n            return 1\n'),
+        ("py add_method: a docstring that cannot move back as far stays", "r.py", py_cls,
+         lambda a: a.add_method("A", '        def g(self):\n            """Doc.\n\n  Two columns in.\n            """\n'
+                                     '            return 1'),
+         py_added + '    def g(self):\n        """Doc.\n\n  Two columns in.\n            """\n        return 1\n'),
+        ("py add_method: a string after the docstring is no docstring", "r.py", py_cls,
+         lambda a: a.add_method("A", 'def g(self):\n    """Doc."""\n    """\nNote.\n"""\n    return 1'),
+         py_added + '    def g(self):\n        """Doc."""\n        """\nNote.\n"""\n        return 1\n'),
+        ("py replace_function_body: a string stays, the docstring moves", "r.py", "def f():\n    return 1\n",
+         lambda a: a.replace_function_body("f", '"""Doc.\n\nMore.\n"""\nq = """\nSELECT\n  x\n"""\nreturn q'),
+         'def f():\n    """Doc.\n\n    More.\n    """\n    q = """\nSELECT\n  x\n"""\n    return q\n'),
+        ("py replace_function_body: content at the body's indentation is kept as written", "r.py",
+         "def f():\n    return 1\n",
+         lambda a: a.replace_function_body("f", '    """Doc.\n\nMore.\n    """\n    return 1'),
+         'def f():\n    """Doc.\n\nMore.\n    """\n    return 1\n'),
+        ("py replace_function_body of a one-line body", "r.py", "def f(): return 1\n",
+         lambda a: a.replace_function_body("f", 'q = """\nSELECT\n"""\nreturn q'),
+         'def f():\n    q = """\nSELECT\n"""\n    return q\n'),
+        ("py replace_function of a method", "r.py", py_cls,
+         lambda a: a.replace_function("A.f", 'def f(self):\n    return """\nx\n  y\n"""'),
+         'class A:\n    def f(self):\n        return """\nx\n  y\n"""\n'),
+        ("py insert_in_body top: an f-string", "r.py", "def f(x):\n    return 1\n",
+         lambda a: a.insert_in_body("f", 'q = f"""\nSELECT {x}\n"""', at="top"),
+         'def f(x):\n    q = f"""\nSELECT {x}\n"""\n    return 1\n'),
+        ("py insert_in_body bottom", "r.py", "def f():\n    x = 1\n",
+         lambda a: a.insert_in_body("f", 'q = """\n  a\n"""', at="bottom"),
+         'def f():\n    x = 1\n    q = """\n  a\n"""\n'),
+        ("py insert_sibling after a method", "r.py", py_cls,
+         lambda a: a.insert_sibling("A.f", 'def g(self):\n    return """\nx\n"""', "after"),
+         py_added + '    def g(self):\n        return """\nx\n"""\n'),
+        ("py add_field", "r.py", py_cls,
+         lambda a: a.add_field("A", 'Q = """\nSELECT\n"""'),
+         'class A:\n    Q = """\nSELECT\n"""\n\n    def f(self):\n        return 1\n'),
+        ("js add_method: a template literal (reported)", "r.js", js_cls,
+         lambda a: a.add_method("A", "g() {\n  return `\nSELECT\n  x\n`;\n}"),
+         js_added + "  g() {\n    return `\nSELECT\n  x\n`;\n  }\n}\n"),
+        ("js add_method into a class indented with tabs: no tabs in the literal", "r.js",
+         "class A {\n\tf() {\n\t\treturn 1;\n\t}\n}\n",
+         lambda a: a.add_method("A", "g() {\n  return `\n  two\n    four\n`;\n}"),
+         "class A {\n\tf() {\n\t\treturn 1;\n\t}\n\n\tg() {\n\t\treturn `\n  two\n    four\n`;\n\t}\n}\n"),
+        ("js replace_function_body: a string continued with a backslash", "r.js", "function f() {\n  return 1;\n}\n",
+         lambda a: a.replace_function_body("f", "return 'a \\\nb';"),
+         "function f() {\n  return 'a \\\nb';\n}\n"),
+        ("js insert_in_body: a template literal with a substitution", "r.js", "function f(x) {\n  return 1;\n}\n",
+         lambda a: a.insert_in_body("f", "const s = `a ${x}\nb`;", at="top"),
+         "function f(x) {\n  const s = `a ${x}\nb`;\n  return 1;\n}\n"),
+        ("js replace_function of a member that shares its line", "r.js", "class A {\n  a() {} b() {}\n}\n",
+         lambda a: a.replace_function("A.b", "b() {\n  return `\nx\n`;\n}"),
+         "class A {\n  a() {} b() {\n    return `\nx\n`;\n  }\n}\n"),
+        ("ts add_method: a private method", "r.ts", "class A {\n  f(): number {\n    return 1;\n  }\n}\n",
+         lambda a: a.add_method("A", "private g(): string {\n  return `\nSELECT\n`;\n}"),
+         "class A {\n  f(): number {\n    return 1;\n  }\n\n  private g(): string {\n    return `\nSELECT\n`;\n  }\n}\n"),
+        ("rb add_method: heredocs, %q and a quoted string; a <<~ heredoc moves", "r.rb",
+         "class A\n  def f\n    1\n  end\nend\n",
+         lambda a: a.add_method("A", 'def g\n  a = <<EOS\nplain\nEOS\n  b = <<-EOS\n  dash\n  EOS\n'
+                                     '  c = <<~EOS\n    squiggly\n      deeper\n  EOS\n  d = %q(\nq\n)\n  e = "p\nq"\n'
+                                     '  [a, b, c, d, e]\nend'),
+         "class A\n  def f\n    1\n  end\n\n"
+         '  def g\n    a = <<EOS\nplain\nEOS\n    b = <<-EOS\n  dash\n  EOS\n'
+         '    c = <<~EOS\n      squiggly\n        deeper\n    EOS\n    d = %q(\nq\n)\n    e = "p\nq"\n'
+         "    [a, b, c, d, e]\n  end\nend\n"),
+        ("rb insert_in_body: a heredoc's terminator stays at column 0", "r.rb", "def f\n  1\nend\n",
+         lambda a: a.insert_in_body("f", "x = <<SQL\nSELECT\nSQL", at="top"),
+         "def f\n  x = <<SQL\nSELECT\nSQL\n  1\nend\n"),
+        ("rb insert_in_body: a <<~ heredoc that cannot move back as far stays", "r.rb", "def f\n  1\nend\n",
+         lambda a: a.insert_in_body("f", "      x = <<~T\n  a\n    b\n      T", at="top"),
+         "def f\n  x = <<~T\n  a\n    b\n      T\n  1\nend\n"),
+        ("go replace_function_body: a raw string", "r.go", 'package main\n\nfunc f() string {\n\treturn ""\n}\n',
+         lambda a: a.replace_function_body("f", "q := `\nSELECT\n\tx\n`\nreturn q"),
+         "package main\n\nfunc f() string {\n\tq := `\nSELECT\n\tx\n`\n\treturn q\n}\n"),
+        ("go insert_in_body bottom: a raw string", "r.go", "package main\n\nfunc f() {\n\tx := 1\n\t_ = x\n}\n",
+         lambda a: a.insert_in_body("f", "s := `\n  a\n`\n_ = s", at="bottom"),
+         "package main\n\nfunc f() {\n\tx := 1\n\t_ = x\n\ts := `\n  a\n`\n\t_ = s\n}\n"),
+        ("java add_method: a text block moves with the code, column for column", "R.java",
+         "class A {\n    class B {\n        int f() {\n            return 1;\n        }\n    }\n}\n",
+         lambda a: a.add_method("A.B", '    String g() {\n        return """\n  x\n    y\n        """;\n    }'),
+         "class A {\n    class B {\n        int f() {\n            return 1;\n        }\n\n"
+         '        String g() {\n            return """\n      x\n        y\n            """;\n        }\n    }\n}\n'),
+        ("cpp add_method: a raw string", "r.cpp", "class A {\npublic:\n    int f() { return 1; }\n};\n",
+         lambda a: a.add_method("A", 'const char* g() {\n    return R"(\nSELECT\n)";\n}'),
+         'class A {\npublic:\n    int f() { return 1; }\n\n    const char* g() {\n        return R"(\nSELECT\n)";\n    }\n};\n'),
+        ("c replace_function_body: a string continued with a backslash", "r.c", "int f(void) {\n    return 0;\n}\n",
+         lambda a: a.replace_function_body("f", 'puts("a \\\nb");\nreturn 0;'),
+         'int f(void) {\n    puts("a \\\nb");\n    return 0;\n}\n'),
+    ]
+    for label, name, source, action, expected in cases:
+        _exact(f"string literal ({label})", _edit_result(name, source, action), expected)
+    _exact("string literal (py add_method, crlf)",
+           _edit_result("r.py", py_cls, lambda a: a.add_method("A", 'def g(self):\r\n    return """\r\nx\r\n"""'), "\r\n"),
+           (py_added + '    def g(self):\n        return """\nx\n"""\n').replace("\n", "\r\n"))
+
+    # A literal with a syntax error in it is re-indented as code.
+    path = _write_temp("r.js", "x = 1;\n")
+    _exact("_reindent: an unterminated template literal is re-indented as code",
+           repr(Applier(path)._reindent(["f(`", "a"], "  ")), repr(["  f(`", "  a"]))
+    os.remove(path)
+
+
+def test_remove_from_array_lines():
+    print("\n═══ remove_from_array: multi-line arrays and their comments ═══")
+
+    # An element on a line of its own goes with that line, a comment at its
+    # end included; comments on other lines stay, and so does the array's
+    # trailing-comma style. Comments are no elements.
+    toml = "a = [\n  1,\n  2, # two\n  3,\n]\n"
+    py = "a = [\n    1,\n    2,  # two\n    3,\n]\n"
+    # (label, file name, source, value to remove, expected file text)
+    cases = [
+        ("toml: the element's comment goes with it (reported)", "r.toml", toml, "2", "a = [\n  1,\n  3,\n]\n"),
+        ("toml: the element after a comment", "r.toml", toml, "3", "a = [\n  1,\n  2, # two\n]\n"),
+        ("toml: a comment on its own line above stays", "r.toml", "a = [\n  1,\n  # about two\n  2,\n  3,\n]\n", "2",
+         "a = [\n  1,\n  # about two\n  3,\n]\n"),
+        ("toml: the first element", "r.toml", toml, "1", "a = [\n  2, # two\n  3,\n]\n"),
+        ("toml: the last element, with no trailing comma", "r.toml", "a = [\n  1, # one\n  2\n]\n", "2",
+         "a = [\n  1 # one\n]\n"),
+        ("toml: the only element", "r.toml", "a = [\n  1,\n]\n", "1", "a = []\n"),
+        ("toml: two elements on a line", "r.toml", "a = [\n  1, 2,\n  3,\n]\n", "2", "a = [\n  1,\n  3,\n]\n"),
+        ("toml: inline, the middle element", "r.toml", "a = [1, 2, 3]\n", "2", "a = [1, 3]\n"),
+        ("toml: inline, the first element", "r.toml", "a = [1, 2, 3]\n", "1", "a = [2, 3]\n"),
+        ("toml: inline, the last element before a comment", "r.toml", "a = [1, 2]  # c\n", "2", "a = [1]  # c\n"),
+        ("json: the last element takes the comma before it", "r.json", '{\n  "a": [\n    1,\n    2,\n    3\n  ]\n}\n', "3",
+         '{\n  "a": [\n    1,\n    2\n  ]\n}\n'),
+        ("json: the middle element", "r.json", '{\n  "a": [\n    1,\n    2,\n    3\n  ]\n}\n', "2",
+         '{\n  "a": [\n    1,\n    3\n  ]\n}\n'),
+        ("yaml flow: the element's comment goes with it", "r.yaml", "a: [\n  1,\n  2, # two\n  3,\n]\n", "2",
+         "a: [\n  1,\n  3,\n]\n"),
+        ("yaml flow: a comment on its own line above stays", "r.yaml", "a: [\n  1,\n  # about two\n  2\n]\n", "2",
+         "a: [\n  1\n  # about two\n]\n"),
+        ("yaml flow: inline", "r.yaml", "a: [1, 2, 3]  # c\n", "1", "a: [2, 3]  # c\n"),
+        ("yaml block: comments on other lines stay", "r.yaml", "a:\n  - 1\n  # about two\n  - 2 # two\n  # after\n  - 3\n",
+         "2", "a:\n  - 1\n  # about two\n  # after\n  - 3\n"),
+        ("py: the element's comment goes with it (reported)", "r.py", py, "2", "a = [\n    1,\n    3,\n]\n"),
+        ("py: the element after a comment", "r.py", py, "3", "a = [\n    1,\n    2,  # two\n]\n"),
+        ("py: a comment on its own line above stays", "r.py", "a = [\n    1,\n    # about two\n    2,\n    3,\n]\n", "2",
+         "a = [\n    1,\n    # about two\n    3,\n]\n"),
+        ("py: the last element, with no trailing comma", "r.py", "a = [\n    1,  # one\n    2\n]\n", "2",
+         "a = [\n    1  # one\n]\n"),
+        ("py: the only element", "r.py", "a = [\n    1,\n]\n", "1", "a = []\n"),
+        ("py: inline", "r.py", "a = [1, 2, 3]\n", "1", "a = [2, 3]\n"),
+    ]
+    for label, name, source, value, expected in cases:
+        _exact(f"remove_from_array ({label})", _edit_result(name, source, lambda a: a.remove_from_array("a", value)), expected)
+    for name, source in (("r.toml", toml), ("r.py", py)):
+        _refused(f"remove_from_array ({name}: a comment is no element)",
+                 _edit_result(name, source, lambda a: a.remove_from_array("a", "# two")), "not found")
+    for name, source, expected in (
+        ("r.toml", toml, "a = [\n  1,\n  3,\n]\n"),
+        ("r.py", py, "a = [\n    1,\n    3,\n]\n"),
+        ("r.yaml", "a:\n  - 1\n  - 2 # two\n  - 3\n", "a:\n  - 1\n  - 3\n"),
+    ):
+        _exact(f"remove_from_array ({name}, crlf)",
+               _edit_result(name, source, lambda a: a.remove_from_array("a", "2"), "\r\n"), expected.replace("\n", "\r\n"))
+    _refused("remove_from_array (js is not supported)",
+             _edit_result("r.js", "const a = [1, 2];\n", lambda a: a.remove_from_array("a", "2")), "not supported for .js")
+
+
+def test_parameter_lines():
+    print("\n═══ add_parameter / remove_parameter: one parameter per line ═══")
+
+    # A list written one parameter per line gets the new parameter on a line
+    # of its own, at the parameters' indentation (aligned ones included),
+    # keeping the trailing-comma style; comments are no parameters and stay
+    # on their lines. Other lists get it inline, as before.
+    py = "def f(\n    a,\n    b,\n):\n    pass\n"
+    # (label, file name, source, target, parameter, position, expected file text)
+    adds = [
+        ("py, a trailing comma (reported)", "p.py", py, "f", "c=1", "end",
+         "def f(\n    a,\n    b,\n    c=1,\n):\n    pass\n"),
+        ("py, no trailing comma", "p.py", "def f(\n    a,\n    b\n):\n    pass\n", "f", "c=1", "end",
+         "def f(\n    a,\n    b,\n    c=1\n):\n    pass\n"),
+        ("py, at the start", "p.py", py, "f", "c", "start",
+         "def f(\n    c,\n    a,\n    b,\n):\n    pass\n"),
+        ("py, aligned with the `)` on the last line", "p.py", "def f(a,\n      b):\n    pass\n", "f", "c=1", "end",
+         "def f(a,\n      b,\n      c=1):\n    pass\n"),
+        ("py, aligned, at the start", "p.py", "def f(a,\n      b):\n    pass\n", "f", "c", "start",
+         "def f(c,\n      a,\n      b):\n    pass\n"),
+        ("py method, aligned", "p.py", "class A:\n    def f(self,\n          a):\n        pass\n", "A.f", "c=1", "end",
+         "class A:\n    def f(self,\n          a,\n          c=1):\n        pass\n"),
+        ("py, comments at the ends of the lines", "p.py", "def f(\n    a,  # first\n    b,  # second\n):\n    pass\n",
+         "f", "c=1", "end", "def f(\n    a,  # first\n    b,  # second\n    c=1,\n):\n    pass\n"),
+        ("py, a comment after the last parameter, no comma", "p.py",
+         "def f(\n    a,  # first\n    b  # second\n):\n    pass\n", "f", "c=1", "end",
+         "def f(\n    a,  # first\n    b,  # second\n    c=1\n):\n    pass\n"),
+        ("py, a comment on its own line before the `)` stays last", "p.py",
+         "def f(\n    a,\n    b,\n    # more later\n):\n    pass\n", "f", "c=1", "end",
+         "def f(\n    a,\n    b,\n    c=1,\n    # more later\n):\n    pass\n"),
+        ("py, at the start: above the first parameter's comment", "p.py",
+         "def f(\n    # the first\n    a,\n    b,\n):\n    pass\n", "f", "c", "start",
+         "def f(\n    c,\n    # the first\n    a,\n    b,\n):\n    pass\n"),
+        ("py, after `*`", "p.py", "def f(\n    a,\n    *,\n    b,\n):\n    pass\n", "f", "c=1", "end",
+         "def f(\n    a,\n    *,\n    b,\n    c=1,\n):\n    pass\n"),
+        ("py, after `/`", "p.py", "def f(\n    a,\n    /,\n):\n    pass\n", "f", "c=1", "end",
+         "def f(\n    a,\n    /,\n    c=1,\n):\n    pass\n"),
+        ("py, after *args", "p.py", "def f(\n    a,\n    *args,\n):\n    pass\n", "f", "b=1", "end",
+         "def f(\n    a,\n    *args,\n    b=1,\n):\n    pass\n"),
+        ("py, after **kwargs: refused as before", "p.py", "def f(\n    a,\n    **kwargs,\n):\n    pass\n", "f", "*args", "end", None),
+        ("py, a parameter over several lines", "p.py", "def f(\n    a,\n    b={\n        'x': 1,\n    },\n):\n    pass\n",
+         "f", "c=1", "end", "def f(\n    a,\n    b={\n        'x': 1,\n    },\n    c=1,\n):\n    pass\n"),
+        ("py, two parameters on the last line: inline", "p.py", "def f(\n    a, b,\n):\n    pass\n", "f", "c=1", "end",
+         "def f(\n    a, b, c=1,\n):\n    pass\n"),
+        ("py, inline before a comment", "p.py", "def f(a, b  # note\n):\n    pass\n", "f", "c=1", "end",
+         "def f(a, b, c=1  # note\n):\n    pass\n"),
+        ("js", "p.js", "function f(\n  a,\n  b\n) {}\n", "f", "c", "end", "function f(\n  a,\n  b,\n  c\n) {}\n"),
+        ("ts (reported)", "p.ts", "function f(\n  a: number,\n  b: string,\n): void {}\n", "f", "c: boolean", "end",
+         "function f(\n  a: number,\n  b: string,\n  c: boolean,\n): void {}\n"),
+        ("ts arrow function", "p.ts", "const f = (\n  a: number,\n  b: number,\n) => a + b;\n", "f", "c: number", "end",
+         "const f = (\n  a: number,\n  b: number,\n  c: number,\n) => a + b;\n"),
+        ("go", "p.go", "package main\n\nfunc f(\n\ta int,\n\tb int,\n) {\n}\n", "f", "c int", "end",
+         "package main\n\nfunc f(\n\ta int,\n\tb int,\n\tc int,\n) {\n}\n"),
+        ("go, aligned with the `)` on the last line", "p.go", "package main\n\nfunc f(a int,\n\tb int) {\n}\n", "f", "c int",
+         "end", "package main\n\nfunc f(a int,\n\tb int,\n\tc int) {\n}\n"),
+        ("java", "P.java", "class A {\n    void f(\n        int a,\n        int b\n    ) {\n    }\n}\n", "A.f", "int c", "end",
+         "class A {\n    void f(\n        int a,\n        int b,\n        int c\n    ) {\n    }\n}\n"),
+        ("java, at the start", "P.java", "class A {\n    void f(\n        int a,\n        int b\n    ) {\n    }\n}\n", "A.f",
+         "int c", "start", "class A {\n    void f(\n        int c,\n        int a,\n        int b\n    ) {\n    }\n}\n"),
+        ("c, block comments", "p.c", "void f(\n    int a, /* a */\n    int b  /* b */\n) {\n}\n", "f", "int c", "end",
+         "void f(\n    int a, /* a */\n    int b,  /* b */\n    int c\n) {\n}\n"),
+        ("cpp, tabs", "p.cpp", "void f(\n\tint a,\n\tint b\n) {\n}\n", "f", "int c", "end",
+         "void f(\n\tint a,\n\tint b,\n\tint c\n) {\n}\n"),
+        ("rb", "p.rb", "def f(\n  a,\n  b\n)\n  1\nend\n", "f", "c", "end", "def f(\n  a,\n  b,\n  c\n)\n  1\nend\n"),
+        ("rb, no parentheses", "p.rb", "def f a,\n      b\n  1\nend\n", "f", "c", "end",
+         "def f a,\n      b,\n      c\n  1\nend\n"),
+    ]
+    for label, name, source, target, parameter, position, expected in adds:
+        result = _edit_result(name, source, lambda a: a.add_parameter(target, parameter, position))
+        if expected is None:
+            # No reordering: what goes after **kwargs is refused as before.
+            _refused(f"add_parameter ({label})", result, "syntax error")
+        else:
+            _exact(f"add_parameter ({label})", result, expected)
+    _exact("add_parameter (py, crlf)", _edit_result("p.py", py, lambda a: a.add_parameter("f", "c=1"), "\r\n"),
+           "def f(\n    a,\n    b,\n    c=1,\n):\n    pass\n".replace("\n", "\r\n"))
+    _exact("add_parameter (go, crlf, at the start)",
+           _edit_result("p.go", "package main\n\nfunc f(\n\ta int,\n\tb int,\n) {\n}\n",
+                        lambda a: a.add_parameter("f", "c int", "start"), "\r\n"),
+           "package main\n\nfunc f(\n\tc int,\n\ta int,\n\tb int,\n) {\n}\n".replace("\n", "\r\n"))
+
+    # (label, file name, source, target, parameter name, expected file text)
+    removes = [
+        ("py, a line of its own", "p.py", "def f(\n    a,\n    b,\n    c,\n):\n    pass\n", "f", "b",
+         "def f(\n    a,\n    c,\n):\n    pass\n"),
+        ("py, its comment goes, the others stay", "p.py", "def f(\n    a,  # first\n    b,  # second\n    c,\n):\n    pass\n",
+         "f", "b", "def f(\n    a,  # first\n    c,\n):\n    pass\n"),
+        ("py, the last one takes the comma before it", "p.py", "def f(\n    a,  # first\n    b  # second\n):\n    pass\n",
+         "f", "b", "def f(\n    a  # first\n):\n    pass\n"),
+        ("py, a comment on its own line above stays", "p.py", "def f(\n    a,\n    # about b\n    b,\n):\n    pass\n",
+         "f", "b", "def f(\n    a,\n    # about b\n):\n    pass\n"),
+        ("py, **kwargs and its comment", "p.py", "def f(\n    a,  # a\n    **kwargs,  # rest\n):\n    pass\n", "f", "kwargs",
+         "def f(\n    a,  # a\n):\n    pass\n"),
+        ("py, aligned, the last one", "p.py", "def f(a,\n      b):\n    pass\n", "f", "b", "def f(a):\n    pass\n"),
+        ("py, aligned, the first one", "p.py", "def f(self,\n      a,\n      b):\n    pass\n", "f", "self",
+         "def f(a,\n      b):\n    pass\n"),
+        ("ts, its comment goes", "p.ts", "function f(\n  a: number, // a\n  b: string, // b\n): void {}\n", "f", "b",
+         "function f(\n  a: number, // a\n): void {}\n"),
+        ("go, the only one", "p.go", "package main\n\nfunc f(\n\ta int,\n) {\n}\n", "f", "a", "package main\n\nfunc f() {\n}\n"),
+        ("java, the last one", "P.java", "class A {\n    void f(\n        int a,\n        int b\n    ) {\n    }\n}\n", "A.f", "b",
+         "class A {\n    void f(\n        int a\n    ) {\n    }\n}\n"),
+        ("c, block comments", "p.c", "void f(\n    int a, /* a */\n    int b  /* b */\n) {\n}\n", "f", "a",
+         "void f(\n    int b  /* b */\n) {\n}\n"),
+        ("rb", "p.rb", "def f(\n  a,\n  b\n)\n  1\nend\n", "f", "b", "def f(\n  a\n)\n  1\nend\n"),
+        ("rb, no parentheses", "p.rb", "def f a, b\n  1\nend\n", "f", "a", "def f b\n  1\nend\n"),
+    ]
+    for label, name, source, target, parameter, expected in removes:
+        _exact(f"remove_parameter ({label})",
+               _edit_result(name, source, lambda a: a.remove_parameter(target, parameter)), expected)
+    _exact("remove_parameter (py, crlf)",
+           _edit_result("p.py", "def f(\n    a,  # a\n    b,  # b\n):\n    pass\n",
+                        lambda a: a.remove_parameter("f", "b"), "\r\n"),
+           "def f(\n    a,  # a\n):\n    pass\n".replace("\n", "\r\n"))
+
+
+def test_interface_as_written():
+    print("\n═══ read_symbol depth=interface: members end as written; C/C++ classes end with `;` ═══")
+
+    # The `;` or `,` that the grammar leaves outside a member (TS and JS
+    # fields, TS interface members, enum members) is shown with it, and a
+    # C/C++ class, struct, union or enum ends with its `};`.
+    # (label, file name, source, target, expected interface)
+    cases = [
+        ("ts class fields keep their `;` (reported)", "i.ts",
+         "class A {\n  name: string;\n  age = 3;\n  get(): string {\n    return this.name;\n  }\n}\n", "A",
+         "class A {\n  name: string;\n  age = 3;\n  get(): string ...\n}"),
+        ("ts field written without `;`", "i.ts",
+         "class A {\n  x = 1\n  y: number;\n}\n", "A", "class A {\n  x = 1\n  y: number;\n}"),
+        ("ts interface members keep their `;` or `,`", "i.ts",
+         "interface I {\n  a: string;\n  b(): void,\n  c?: number\n}\n", "I",
+         "interface I {\n  a: string;\n  b(): void,\n  c?: number\n}"),
+        ("ts index signature, abstract method and overload", "i.ts",
+         "abstract class K {\n  [k: string]: any;\n  abstract m(): void;\n  f(a: string): void;\n"
+         "  f(a: any) {}\n}\n", "K",
+         "abstract class K {\n  [k: string]: any;\n  abstract m(): void;\n  f(a: string): void;\n"
+         "  f(a: any) ...\n}"),
+        ("ts enum members keep their commas", "i.ts",
+         "enum E {\n  A = 1,\n  B,\n}\n", "E", "enum E {\n  A = 1,\n  B,\n}"),
+        ("ts one-line enum", "i.ts", "enum E { A, B }\n", "E", "enum E {\n  A,\n  B\n}"),
+        ("js class fields keep their `;`", "i.js",
+         "class A {\n  name = 'x';\n  #p = 2;\n  static s;\n  get() {\n    return 1;\n  }\n}\n", "A",
+         "class A {\n  name = 'x';\n  #p = 2;\n  static s;\n  get() ...\n}"),
+        ("js `;` after a method is not shown", "i.js",
+         "class A {\n  get() {};\n}\n", "A", "class A {\n  get() ...\n}"),
+        ("java fields", "I.java",
+         'class A {\n    int x;\n    private String s = "a";\n    int get() {\n        return x;\n    }\n}\n', "A",
+         'class A {\n    int x;\n    private String s = "a";\n    int get() ...\n}'),
+        ("java enum constants keep their `,` and `;`", "I.java",
+         "enum E {\n    A,\n    B;\n\n    void m() {}\n}\n", "E", "enum E {\n    A,\n    B;\n    void m() ...\n}"),
+        ("java enum without a `;`", "I.java", "enum F { X, Y }\n", "F", "enum F {\n    X,\n    Y\n}"),
+        ("cpp class ends with `};` (reported)", "i.cpp",
+         "class A {\npublic:\n    int x;\n    int get() { return x; }\n    void set(int v);\n};\n", "A",
+         "class A {\npublic:\n    int x;\n    int get() ...\n    void set(int v);\n};"),
+        ("cpp template class ends with `};`", "i.cpp", _CPP_TEMPLATES, "Box",
+         "template <typename T>\nclass Box {\npublic:\n    T get() ...\n    template <typename U>\n"
+         "    U as() ...\nprivate:\n    T v;\n};"),
+        ("cpp nested class", "i.cpp", "class A {\n    class B {\n        int y;\n    };\n};\n", "A.B",
+         "class B {\n    int y;\n};"),
+        ("cpp enum", "i.cpp", "enum E { X, Y };\n", "E", "enum E {\n  X,\n  Y\n};"),
+        ("c struct", "i.c", "struct S {\n    int a;\n};\n", "S", "struct S {\n    int a;\n};"),
+        ("go struct fields", "i.go",
+         "package main\n\ntype A struct {\n\tx int\n\ty string\n}\n\nfunc (a A) M() int { return a.x }\n", "A",
+         "type A struct {\n\tx int\n\ty string\n}\n\nfunc (a A) M() int ..."),
+        ("python statements after a `;`", "i.py", "class A:\n    x = 1; y = 2\n", "A",
+         "class A:\n    x = 1;\n    y = 2"),
+    ]
+    for label, name, source, target, expected in cases:
+        _exact(f"read_symbol depth=interface ({label})",
+               _read_result(name, source, lambda a: a.read_symbol(target, depth="interface")),
+               expected)
+
+    # read_symbol of a C/C++ class, struct, union or enum ends with its `;`,
+    # as a template class's does.
+    # (label, file name, source, target, expected text)
+    reads = [
+        ("cpp class (reported)", "r.cpp", "class A {\npublic:\n    int x;\n};\n\nint f() { return 1; }\n", "A",
+         "class A {\npublic:\n    int x;\n};"),
+        ("cpp union", "r.cpp", "struct S { int a; };\nunion U { int a; };\n", "U", "union U { int a; };"),
+        ("cpp enum class", "r.cpp", "enum class E { X };\n", "E", "enum class E { X };"),
+        ("cpp forward declaration", "r.cpp", "class C;\n", "C", "class C;"),
+        ("cpp nested class", "r.cpp", "class A {\n    class B {\n        int y;\n    };\n};\n", "A.B",
+         "class B {\n        int y;\n    };"),
+        ("cpp class in a namespace", "r.cpp", "namespace n {\nclass A {};\n}\n", "n.A", "class A {};"),
+        ("cpp class with its `;` on the next line", "r.cpp", "class D {\n}\n;\n", "D", "class D {\n}\n;"),
+        ("c struct", "r.c", "struct S {\n    int a;\n};\n", "S", "struct S {\n    int a;\n};"),
+    ]
+    for label, name, source, target, expected in reads:
+        _exact(f"read_symbol of a {label} ends with its `;`",
+               _read_result(name, source, lambda a: a.read_symbol(target)), expected)
+
+    # The whole-symbol edits take the `;` too, so replace_function's content
+    # ends with `};`, as read_symbol shows it.
+    cls = "class A {\npublic:\n    int x;\n};\n\nint f() { return 1; }\n"
+    pair = "class A {}; class B {};\n"
+    nested = "class A {\n    class B {\n        int y;\n    };\n    int x;\n};\n"
+    split = "int a;\n\nclass D {\n}\n;\n"
+    # (label, file name, source, edit, expected file text)
+    edits = [
+        ("replace_function with read_symbol's text leaves a cpp class as it was", "e.cpp", cls,
+         lambda a: a.replace_function("A", a.read_symbol("A")), cls),
+        ("... a cpp class that shares its line", "e.cpp", pair,
+         lambda a: a.replace_function("A", a.read_symbol("A")), pair),
+        ("replace_function on a nested cpp class takes its `;`", "e.cpp", nested,
+         lambda a: a.replace_function("A.B", "class B {\n    int z;\n};"), nested.replace("int y", "int z")),
+        ("... a cpp template class", "e.cpp", _CPP_TEMPLATES,
+         lambda a: a.replace_function("Box", a.read_symbol("Box")), _CPP_TEMPLATES),
+        ("... a c struct", "e.c", "struct S {\n    int a;\n};\n",
+         lambda a: a.replace_function("S", a.read_symbol("S")), "struct S {\n    int a;\n};\n"),
+        ("replace_function on a cpp class sharing its line takes its `;` (reported)", "e.cpp", pair,
+         lambda a: a.replace_function("A", "class C {};"), "class C {}; class B {};\n"),
+        ("replace_function on the last cpp class of a line", "e.cpp", pair,
+         lambda a: a.replace_function("B", "class C { int x; };"), "class A {}; class C { int x; };\n"),
+        ("delete_symbol of the first cpp class of a line", "e.cpp", pair,
+         lambda a: a.delete_symbol("A"), "class B {};\n"),
+        ("delete_symbol of the last cpp class of a line keeps the `;` before it", "e.cpp", pair,
+         lambda a: a.delete_symbol("B"), "class A {};\n"),
+        ("delete_symbol of a cpp class", "e.cpp", cls, lambda a: a.delete_symbol("A"), "int f() { return 1; }\n"),
+        ("insert_sibling after a cpp class", "e.cpp", cls,
+         lambda a: a.insert_sibling("A", "int g;", "after"),
+         "class A {\npublic:\n    int x;\n};\n\nint g;\n\nint f() { return 1; }\n"),
+        ("insert_sibling before a cpp class", "e.cpp", cls,
+         lambda a: a.insert_sibling("A", "int g;", "before"),
+         "int g;\n\nclass A {\npublic:\n    int x;\n};\n\nint f() { return 1; }\n"),
+        ("replace_function on a cpp class with its `;` on the next line", "e.cpp", split,
+         lambda a: a.replace_function("D", "class D {\n    int x;\n};"), "int a;\n\nclass D {\n    int x;\n};\n"),
+        ("delete_symbol of a cpp class with its `;` on the next line", "e.cpp", split,
+         lambda a: a.delete_symbol("D"), "int a;\n"),
+        ("insert_sibling after a cpp class with its `;` on the next line", "e.cpp", split,
+         lambda a: a.insert_sibling("D", "int g;", "after"), "int a;\n\nclass D {\n}\n;\n\nint g;\n"),
+    ]
+    for label, name, source, edit, expected in edits:
+        _exact(label, _edit_result(name, source, edit), expected)
+    _exact("replace_function on a cpp class sharing its line (crlf)",
+           _edit_result("e.cpp", pair, lambda a: a.replace_function("B", "class C {\n    int x;\n};"), "\r\n"),
+           "class A {}; class C {\r\n    int x;\r\n};\r\n")
+
+
+def test_depth_refusals():
+    print("\n═══ read_symbol depth=signature/interface on symbols that are not functions or classes ═══")
+
+    def refusal(target, kind, depth):
+        if depth == "signature":
+            return (f"REFUSED: '{target}' is {kind}, which has no signature (depth='signature' is "
+                    "for functions and class headers); read it with depth='full'")
+        return (f"REFUSED: '{target}' is {kind}, which has no interface (depth='interface' is "
+                "for classes and functions); read it with depth='full'")
+
+    # (label, file name, source, target, what the message calls it)
+    cases = [
+        ("ts const (reported)", "k.ts", "const X = 1;\n", "X", "a constant"),
+        ("ts let", "k.ts", "let y = 2;\n", "y", "a variable"),
+        ("ts exported const", "k.ts", "export const Z = 3;\n", "Z", "a constant"),
+        ("ts declared const", "k.ts", "declare const d: number;\n", "d", "a constant"),
+        ("ts type alias", "k.ts", "type T = number;\n", "T", "a type alias"),
+        ("js var", "k.js", "var v = 2;\n", "v", "a variable"),
+        ("python module constant", "k.py", "X = 1\n", "X", "a variable"),
+        ("python annotated variable", "k.py", "Y: int = 2\n", "Y", "a variable"),
+        ("python class attribute", "k.py", "class A:\n    z = 3\n", "A.z", "a field"),
+        ("ruby constant", "k.rb", "X = 1\n", "X", "a constant"),
+        ("ruby class constant", "k.rb", "class A\n  Y = 2\nend\n", "A.Y", "a constant"),
+        ("ruby variable", "k.rb", "x = 1\n", "x", "a variable"),
+        ("go var", "k.go", "package main\n\nvar v = 1\n", "v", "a variable"),
+        ("go const", "k.go", "package main\n\nconst C = 2\n", "C", "a constant"),
+        ("go var in a group", "k.go", "package main\n\nvar (\n\tp = 1\n\tq = 2\n)\n", "q", "a variable"),
+        ("c forward declaration", "k.c", "struct S;\n", "S", "a forward declaration"),
+        ("cpp forward declaration", "k.cpp", "class C;\n", "C", "a forward declaration"),
+        ("cpp opaque enum declaration", "k.cpp", "enum class E : int;\n", "E", "a forward declaration"),
+    ]
+    for label, name, source, target, kind in cases:
+        for depth in ("signature", "interface"):
+            _exact(f"read_symbol depth={depth} on a {label}",
+                   _read_result(name, source, lambda a: a.read_symbol(target, depth)),
+                   refusal(target, kind, depth))
+
+    # A Go type without a struct or interface body has no header, but its
+    # interface lists its methods.
+    gotype = "package main\n\ntype N int\n\nfunc (n N) Double() N { return n * 2 }\n"
+    _exact("read_symbol depth=signature on a go type definition",
+           _read_result("k.go", gotype, lambda a: a.read_symbol("N", "signature")),
+           "REFUSED: 'N' is a type definition, which has no signature (depth='signature' is for "
+           "functions and class headers); read it with depth='interface' for its methods, or depth='full'")
+    _exact("read_symbol depth=interface on a go type definition shows its methods",
+           _read_result("k.go", gotype, lambda a: a.read_symbol("N", "interface")),
+           "type N int\n\nfunc (n N) Double() N ...")
+
+    # Classes give their header, also with nothing in their body, and
+    # functions without a body their whole declaration.
+    # (label, file name, source, target, expected signature)
+    headers = [
+        ("go struct", "k.go", "package main\n\ntype A struct {\n\tx int\n}\n", "A", "type A struct"),
+        ("go generic struct", "k.go", "package main\n\ntype A[T any] struct {\n\tx T\n}\n", "A",
+         "type A[T any] struct"),
+        ("go interface", "k.go", "package main\n\ntype I interface {\n\tM() int\n}\n", "I", "type I interface"),
+        ("go struct in a group", "k.go", "package main\n\ntype (\n\tA struct{ x int }\n\tB int\n)\n", "A",
+         "A struct"),
+        ("ruby empty class", "k.rb", "class A < B\nend\n", "A", "class A < B"),
+        ("ruby one-line module", "k.rb", "module M; end\n", "M", "module M"),
+        ("ruby empty method", "k.rb", "def f(a)\nend\n", "f", "def f(a)"),
+        ("ts enum", "k.ts", "enum E { A, B }\n", "E", "enum E"),
+        ("ts interface", "k.ts", "interface I {\n  a: string;\n}\n", "I", "interface I"),
+        ("cpp struct", "k.cpp", "struct S {\n    int a;\n};\n", "S", "struct S"),
+        ("cpp defaulted constructor", "k.cpp", "class A {\n    A() = default;\n};\n", "A.A", "A() = default"),
+        ("go function without a body", "k.go", "package main\n\nfunc f() int\n", "f", "func f() int"),
+    ]
+    for label, name, source, target, expected in headers:
+        _exact(f"read_symbol depth=signature on a {label}",
+               _read_result(name, source, lambda a: a.read_symbol(target, "signature")), expected)
+    _exact("read_symbol depth=interface on an empty ruby class",
+           _read_result("k.rb", "class A < B\nend\n", lambda a: a.read_symbol("A", "interface")),
+           "class A < B\nend")
+    _exact("read_symbol depth=interface on a cpp defaulted constructor",
+           _read_result("k.cpp", "class A {\n    A() = default;\n};\n", lambda a: a.read_symbol("A.A", "interface")),
+           "A() = default")
+
+
+def test_review_followups():
+    print("\n═══ review follow-ups: containers, separators, comments, tabs, headers ═══")
+
+    # A symbol that is the last of a container with no closing token of
+    # its own (a Java enum's body declarations, a C #else branch, a Ruby
+    # else branch) is edited alone: the container is not part of it.
+    enum = ("enum Mode {\n    ON, OFF;\n\n    int a() {\n        return 1;\n    }\n\n"
+            "    // Doc.\n    boolean isOn() {\n        return this == ON;\n    }\n}\n")
+    _exact("java enum's last method: delete_symbol",
+           _edit_result("M.java", enum, lambda a: a.delete_symbol("Mode.isOn")),
+           "enum Mode {\n    ON, OFF;\n\n    int a() {\n        return 1;\n    }\n}\n")
+    _exact("java enum's last method: replace_function",
+           _edit_result("M.java", enum, lambda a: a.replace_function(
+               "Mode.isOn", "boolean isOn() {\n    return false;\n}")),
+           enum.replace("return this == ON;", "return false;"))
+    _exact("java enum's last method: edit_leading_comment",
+           _edit_result("M.java", enum, lambda a: a.edit_leading_comment("Mode.isOn", op="replace", comment="// New.")),
+           enum.replace("// Doc.", "// New."))
+    _exact("java enum's last method: insert_sibling before",
+           _edit_result("M.java", enum, lambda a: a.insert_sibling("Mode.isOn", "void z() {}", "before")),
+           enum.replace("    // Doc.", "    void z() {}\n\n    // Doc."))
+    branches = ("#ifdef X\nint f(void) { return 1; }\n#else\nint g(void)\n{\n    return 2;\n}\n\n"
+                "int h(void)\n{\n    return 3;\n}\n#endif\n")
+    _exact("c #else branch's last function: delete_symbol",
+           _edit_result("b.c", branches, lambda a: a.delete_symbol("h")),
+           "#ifdef X\nint f(void) { return 1; }\n#else\nint g(void)\n{\n    return 2;\n}\n#endif\n")
+    _exact("c #else branch's last function: replace_function",
+           _edit_result("b.c", branches, lambda a: a.replace_function("h", "int h(void)\n{\n    return 4;\n}")),
+           branches.replace("return 3;", "return 4;"))
+    _exact("c #elif branch's last function: delete_symbol",
+           _edit_result("b.c", branches.replace("#ifdef X", "#if A").replace("#else", "#elif B"),
+                        lambda a: a.delete_symbol("h")),
+           "#if A\nint f(void) { return 1; }\n#elif B\nint g(void)\n{\n    return 2;\n}\n#endif\n")
+    _exact("cpp #else branch's last method: delete_symbol",
+           _edit_result("b.cpp", "class W {\npublic:\n#ifdef X\n    void a() {}\n#else\n    void b() {}\n\n"
+                        "    void c() {}\n#endif\n};\n", lambda a: a.delete_symbol("W.c")),
+           "class W {\npublic:\n#ifdef X\n    void a() {}\n#else\n    void b() {}\n#endif\n};\n")
+    ruby_if = "if x\n  def a\n    1\n  end\nelse\n  def b\n    2\n  end\n\n  def c\n    3\n  end\nend\n"
+    _exact("ruby else branch's last method: delete_symbol",
+           _edit_result("b.rb", ruby_if, lambda a: a.delete_symbol("c")),
+           "if x\n  def a\n    1\n  end\nelse\n  def b\n    2\n  end\nend\n")
+    _exact("ruby else branch's last method: replace_function",
+           _edit_result("b.rb", ruby_if, lambda a: a.replace_function("c", "def c\n  4\nend")),
+           ruby_if.replace("    3\n", "    4\n"))
+    _exact("ruby when branch's last method: delete_symbol",
+           _edit_result("b.rb", "case x\nwhen 1\n  def a\n    1\n  end\n\n  def b\n    2\n  end\nend\n",
+                        lambda a: a.delete_symbol("b")),
+           "case x\nwhen 1\n  def a\n    1\n  end\nend\n")
+    _exact("ruby unless branch's last method: delete_symbol",
+           _edit_result("b.rb", "unless defined?(G)\n  def g1\n    7\n  end\n\n  def g2\n    8\n  end\nend\n",
+                        lambda a: a.delete_symbol("g2")),
+           "unless defined?(G)\n  def g1\n    7\n  end\nend\n")
+
+    # The `;` that JS/TS parse as an empty statement after a declaration
+    # is its separator, as an anonymous `;` is.
+    semi = "function f() {\n  return 1;\n};\nfunction g() {\n  return 2;\n}\n"
+    _exact("js declaration followed by `;`: delete_symbol",
+           _edit_result("s.js", semi, lambda a: a.delete_symbol("f")), "function g() {\n  return 2;\n}\n")
+    _exact("js declaration followed by `;`: insert_sibling after",
+           _edit_result("s.js", semi, lambda a: a.insert_sibling("f", "function h() {}", "after")),
+           "function f() {\n  return 1;\n};\n\nfunction h() {}\n\nfunction g() {\n  return 2;\n}\n")
+    legacy = "class Legacy {\n  run() {}\n};\n\nfunction g() {}\n"
+    _exact("js class followed by `;`: replace_function keeps the `;`",
+           _edit_result("s.js", legacy, lambda a: a.replace_function("Legacy", "class Legacy {\n  run() { return 1; }\n}")),
+           legacy.replace("run() {}", "run() { return 1; }"))
+    _exact("js class followed by `;`: replace_function content with the `;`",
+           _edit_result("s.js", legacy, lambda a: a.replace_function("Legacy", "class Legacy {\n  run() { return 1; }\n};")),
+           legacy.replace("run() {}", "run() { return 1; }"))
+    _exact("js closure's trailing comma stays when the content has none",
+           _edit_result("s.js", "const app = {\n  handler: (req) => {\n    return req;\n  },\n  other: 1,\n};\n",
+                        lambda a: a.replace_function("app.handler", "handler: (req) => {\n  return 2;\n}")),
+           "const app = {\n  handler: (req) => {\n    return 2;\n  },\n  other: 1,\n};\n")
+    _exact("ts exported class followed by `;`: delete_symbol",
+           _edit_result("s.ts", "export class A {\n  m(): void {}\n};\n\nexport class B {}\n",
+                        lambda a: a.delete_symbol("A")),
+           "export class B {}\n")
+    inline_semi = [
+        ("first class", "class A {}; class B {};\n", "A", "class B {};\n"),
+        ("second class", "class A {}; class B {};\n", "B", "class A {};\n"),
+        ("first function", "function a() {}; function b() {}\n", "a", "function b() {}\n"),
+    ]
+    for label, source, target, expected in inline_semi:
+        _exact(f"js `;` after a symbol sharing its line goes with it ({label})",
+               _edit_result("s.js", source, lambda a: a.delete_symbol(target)), expected)
+
+    # Deleting a symbol that shares its line leaves the spaces that were
+    # before it; the last entry of a one-line literal takes the comma
+    # before it.
+    spacing = [
+        ("js last entry of an object", "s.js", "const app = { other: 1, handler: () => {} };\n",
+         "app.handler", "const app = { other: 1 };\n"),
+        ("go last entry of a composite literal", "s.go",
+         'package main\n\nvar cmd = Cmd{Use: "x", RunE: func() error { return nil }}\n',
+         "cmd.RunE", 'package main\n\nvar cmd = Cmd{Use: "x"}\n'),
+        ("go first entry of a composite literal", "s.go",
+         'package main\n\nvar cmd = Cmd{RunE: func() error { return nil }, Use: "x"}\n',
+         "cmd.RunE", 'package main\n\nvar cmd = Cmd{Use: "x"}\n'),
+        ("python statements spaced their own way", "s.py", "x = 1  ;  y = 2  ;  z = 3\n", "y", "x = 1  ;  z = 3\n"),
+    ]
+    for label, name, source, target, expected in spacing:
+        _exact(f"delete_symbol sharing a line ({label})",
+               _edit_result(name, source, lambda a: a.delete_symbol(target)), expected)
+
+    # replace_function on a symbol that code follows on its line refuses
+    # content ending with a line comment, which would take that code in.
+    three = "function a() {} function b() {} function c() {}\n"
+    _refused("replace_function sharing a line, content ending with a // comment",
+             _edit_result("s.js", three, lambda a: a.replace_function("b", "function b() { return 2; } // note")),
+             "The content ends with a comment, and the code after 'b' on its line would become part of it")
+    _refused("replace_function sharing a line, content ending with a # comment",
+             _edit_result("s.py", "x = 1; y = 2\n", lambda a: a.replace_function("x", "x = 3  # changed")),
+             "The content ends with a comment")
+    _exact("replace_function sharing a line, content ending with a block comment",
+           _edit_result("s.js", three, lambda a: a.replace_function("b", "function b() { return 2; } /* note */")),
+           "function a() {} function b() { return 2; } /* note */ function c() {}\n")
+    _exact("replace_function sharing a line, a comment where nothing follows",
+           _edit_result("s.py", "x = 1; y = 2\n", lambda a: a.replace_function("y", "y = 3  # changed")),
+           "x = 1; y = 3  # changed\n")
+
+    # A comment on the line of the entry before stays when the last entry
+    # shares its line with the closing bracket; the only entry with a
+    # comment of its own leaves an empty container.
+    entries = [
+        ("python list", "e.py", "a = [\n    1,  # one\n    2]\n",
+         lambda a: a.remove_from_array("a", "2"), "a = [\n    1  # one\n]\n"),
+        ("toml array", "e.toml", "a = [\n  1,  # one\n  2]\n",
+         lambda a: a.remove_from_array("a", "2"), "a = [\n  1  # one\n]\n"),
+        ("json array", "e.json", '{"a": [\n  1, // one\n  2]}\n',
+         lambda a: a.remove_from_array("a", "2"), '{"a": [\n  1 // one\n]}\n'),
+        ("yaml flow sequence", "e.yaml", "a: [1,  # one\n     2]\n",
+         lambda a: a.remove_from_array("a", "2"), "a: [1  # one\n     ]\n"),
+        ("python aligned list", "e.py", "a = [1,  # one\n     2,  # two\n     3]\n",
+         lambda a: a.remove_from_array("a", "3"), "a = [1,  # one\n     2  # two\n]\n"),
+        ("python parameters", "e.py", "def f(\n    a,  # first\n    b):\n    pass\n",
+         lambda a: a.remove_parameter("f", "b"), "def f(\n    a  # first\n):\n    pass\n"),
+        ("ts parameters", "e.ts", "function f(a: string, // first\n           b: number) {}\n",
+         lambda a: a.remove_parameter("f", "b"), "function f(a: string // first\n) {}\n"),
+        ("go parameters keep the comma", "e.go", "package main\n\nfunc f(a int, // first\n\tb int) {}\n",
+         lambda a: a.remove_parameter("f", "b"), "package main\n\nfunc f(a int, // first\n) {}\n"),
+        ("ruby parameters", "e.rb", "def f(a, # a\n      b)\nend\n",
+         lambda a: a.remove_parameter("f", "b"), "def f(a # a\n)\nend\n"),
+        ("js object key", "e.js", "const d = {a: 1, // one\n  b: 2};\n",
+         lambda a: a.delete_key("d.b"), "const d = {a: 1 // one\n};\n"),
+        ("no comment: cut as before", "e.py", "a = [\n    1,\n    2]\n",
+         lambda a: a.remove_from_array("a", "2"), "a = [\n    1]\n"),
+        ("only element with a comment", "e.py", "a = [\n    1,  # one\n]\n",
+         lambda a: a.remove_from_array("a", "1"), "a = []\n"),
+        ("only toml element with a comment", "e.toml", "a = [\n  1,  # one\n]\n",
+         lambda a: a.remove_from_array("a", "1"), "a = []\n"),
+        ("only parameter with a comment", "e.py", "def f(\n    a,  # x\n):\n    pass\n",
+         lambda a: a.remove_parameter("f", "a"), "def f():\n    pass\n"),
+        ("only go parameter with a comment", "e.go", "package main\n\nfunc f(\n\ta int, // x\n) {}\n",
+         lambda a: a.remove_parameter("f", "a"), "package main\n\nfunc f() {}\n"),
+        ("only element, a comment above stays", "e.py", "a = [\n    # above\n    1,  # one\n]\n",
+         lambda a: a.remove_from_array("a", "1"), "a = [\n    # above\n]\n"),
+    ]
+    for label, name, source, action, expected in entries:
+        _exact(f"entry removal keeps other comments ({label})", _edit_result(name, source, action), expected)
+    _exact("entry removal keeps other comments (crlf)",
+           _edit_result("e.py", "a = [\n    1,  # one\n    2]\n", lambda a: a.remove_from_array("a", "2"), "\r\n"),
+           "a = [\r\n    1  # one\r\n]\r\n")
+    _exact("ruby heredoc constant: delete_symbol (crlf)",
+           _edit_result("h.rb", "X = <<~EOS\n  text\nEOS\n\ndef f\n  1\nend\n", lambda a: a.delete_symbol("X"), "\r\n"),
+           "def f\r\n  1\r\nend\r\n")
+
+    # A Java enum's `;` shows in its interface where no constant shows it.
+    enum_semis = [
+        ("after a trailing comma, on its own line", "enum E {\n    A, B,\n    ;\n    void f() {}\n}\n",
+         "enum E {\n    A,\n    B,\n    ;\n    void f() ...\n}"),
+        ("after a trailing comma, on its line", "enum E {\n    A, B,;\n    void f() {}\n}\n",
+         "enum E {\n    A,\n    B,;\n    void f() ...\n}"),
+        ("with no constants", "enum E {\n    ;\n    void f() {}\n}\n", "enum E {\n    ;\n    void f() ...\n}"),
+        ("after a comment, once", "enum E {\n    A, B // c\n    ;\n    void f() {}\n}\n",
+         "enum E {\n    A,\n    B\n    // c\n    ;\n    void f() ...\n}"),
+    ]
+    for label, source, expected in enum_semis:
+        _exact(f"java enum interface shows the `;` ({label})",
+               _read_result("E.java", source, lambda a: a.read_symbol("E", "interface")), expected)
+
+    # In a tab-indented class a docstring moves with the code, tabs and all.
+    tabbed = "class A:\n\tdef a(self):\n\t\tpass\n"
+    _exact("add_method into a tab-indented class: docstring in line with the code",
+           _edit_result("t.py", tabbed, lambda a: a.add_method(
+               "A", 'def g(self):\n    """Doc.\n\n    More.\n    """\n    return 1')),
+           tabbed + '\n\tdef g(self):\n\t\t"""Doc.\n\n\t\tMore.\n\t\t"""\n\t\treturn 1\n')
+    _exact("add_method into a tab-indented class: docstring's own indentation and strings kept",
+           _edit_result("t.py", tabbed, lambda a: a.add_method(
+               "A", 'def g(self):\n    """Doc.\n\n    Example:\n        x = 1\n    """\n'
+                    '    s = """\n  raw\n"""\n    return 1')),
+           tabbed + '\n\tdef g(self):\n\t\t"""Doc.\n\n\t\tExample:\n\t\t    x = 1\n\t\t"""\n'
+                    '\t\ts = """\n  raw\n"""\n\t\treturn 1\n')
+
+    _exact("add_method into a tab-indented class: a tab inside a string does not stop the tabs",
+           _edit_result("t.py", tabbed, lambda a: a.add_method(
+               "A", 'def g(self):\n    s = """\n\tkept\n"""\n    return s')),
+           tabbed + '\n\tdef g(self):\n\t\ts = """\n\tkept\n"""\n\t\treturn s\n')
+
+    # add_parameter goes on a line of its own only in a list written one
+    # parameter per line.
+    _exact("add_parameter end on a list with several parameters on a line",
+           _edit_result("p.py", "import os\n\n\ndef f(a, b, c,\n      d):\n    pass\n",
+                        lambda a: a.add_parameter("f", "e=1", "end")),
+           "import os\n\n\ndef f(a, b, c,\n      d, e=1):\n    pass\n")
+    _exact("add_parameter start on a list with several parameters on a line",
+           _edit_result("p.py", "def f(a, b,\n      c):\n    pass\n",
+                        lambda a: a.add_parameter("f", "z", "start")),
+           "def f(z, a, b,\n      c):\n    pass\n")
+
+    # A Ruby statement that opens a heredoc ends with its body.
+    heredoc = "X = <<~EOS\n  text\nEOS\n\ndef f\n  1\nend\n"
+    _exact("ruby heredoc constant: delete_symbol",
+           _edit_result("h.rb", heredoc, lambda a: a.delete_symbol("X")), "def f\n  1\nend\n")
+    _exact("ruby heredoc constant: replace_function",
+           _edit_result("h.rb", heredoc, lambda a: a.replace_function("X", "X = 2")), "X = 2\n\ndef f\n  1\nend\n")
+    _exact("ruby heredoc constant: read_symbol",
+           _read_result("h.rb", heredoc, lambda a: a.read_symbol("X")), "X = <<~EOS\n  text\nEOS")
+    _exact("ruby heredoc constant: insert_sibling after",
+           _edit_result("h.rb", heredoc, lambda a: a.insert_sibling("X", "Y = 3", "after")),
+           "X = <<~EOS\n  text\nEOS\n\nY = 3\n\ndef f\n  1\nend\n")
+    _exact("ruby two heredocs on a line: delete_symbol",
+           _edit_result("h.rb", "class A\n  X = [<<~A, <<~B]\n    a\n  A\n    b\n  B\n\n  def f\n    1\n  end\nend\n",
+                        lambda a: a.delete_symbol("A.X")),
+           "class A\n  def f\n    1\n  end\nend\n")
+
+    # replace_signature takes the signature read_symbol gives a symbol
+    # with no body.
+    point = "package main\n\ntype Point struct {\n\tX int\n}\n"
+    signatures = [
+        ("go struct", "g.go", point, "Point", "type Point2 struct", point.replace("Point", "Point2")),
+        ("go struct, as read", "g.go", point, "Point", "type Point struct", point),
+        ("go struct in a group", "g.go", "package main\n\ntype (\n\tA struct{ x int }\n\tB int\n)\n", "A",
+         "C struct", "package main\n\ntype (\n\tC struct{ x int }\n\tB int\n)\n"),
+        ("go function without a body", "g.go", "package main\n\nfunc f() int\n", "f", "func f(a int) int",
+         "package main\n\nfunc f(a int) int\n"),
+        ("cpp defaulted constructor", "g.cpp", "class A {\npublic:\n    A() = default;\n};\n", "A.A",
+         "A(int x) = default", "class A {\npublic:\n    A(int x) = default;\n};\n"),
+        ("ruby empty class", "g.rb", "class A < B\nend\n", "A", "class A < C", "class A < C\nend\n"),
+        ("ruby empty method", "g.rb", "def f(a)\nend\n", "f", "def f(a, b)", "def f(a, b)\nend\n"),
+    ]
+    for label, name, source, target, signature, expected in signatures:
+        _exact(f"replace_signature on a {label}",
+               _edit_result(name, source, lambda a: a.replace_signature(target, signature)), expected)
+    _refused("replace_signature on a constant",
+             _edit_result("g.ts", "const X = 1;\n", lambda a: a.replace_signature("X", "const X = 2")),
+             "'X' is a constant, which has no signature to replace")
+
+
+# ──────────────────────────────────────────────
 # Main
 # ──────────────────────────────────────────────
 
@@ -6836,6 +8054,16 @@ if __name__ == "__main__":
     test_ts_ambiguous_names()
     test_ts_kind_tool_followups()
     test_yaml_explicit_keys()
+    test_symbols_sharing_a_line()
+    test_bodies_sharing_a_line()
+    test_cpp_templates()
+    test_sibling_spacing()
+    test_reindent_string_literals()
+    test_remove_from_array_lines()
+    test_parameter_lines()
+    test_interface_as_written()
+    test_depth_refusals()
+    test_review_followups()
 
     # Reset all fixtures to clean state after tests
     for lang in FIXTURES:

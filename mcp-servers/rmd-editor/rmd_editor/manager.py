@@ -11,7 +11,10 @@ import os
 from collections import OrderedDict
 from typing import Optional
 
-from rmd_editor.parser import Cell, Frontmatter, FrontmatterError, dump_yaml, parse, serialize, yaml_string, _lines, _with_newline
+from rmd_editor.parser import (
+    Cell, Frontmatter, FrontmatterError, dump_yaml, parse, serialize, yaml_string,
+    _KNITR_CHUNK_END, _chunk_body, _chunk_source, _closed, _lines, _r_trouble, _read_chunk_header, _render_chunk_header, _with_newline,
+)
 
 
 class RmdManagerError(Exception):
@@ -68,6 +71,44 @@ def _check_timeout(timeout: float) -> None:
         raise RmdManagerError(f"timeout must be a positive number of seconds, got {timeout}")
 
 
+def _check_header_text(what: str, text: str) -> None:
+    """
+    Reject text for a chunk header (what names it, e.g. "Chunk label") that would
+    split the header's line or swallow the options written after it. knitr reads
+    keys and values as R code, so in those a backtick, # or second = counts too;
+    it quotes the label itself.
+    """
+    if "\n" in text or "\r" in text:
+        hint = ": inside an R string, write it as \\n" if what == "Chunk option value" else ""
+        raise RmdManagerError(f"{what} {text!r} contains a line break, but a chunk header is a single line{hint}")
+    trouble = None if what == "Chunk label" else _r_trouble(text)
+    if trouble == "`" or not _closed(text):
+        raise RmdManagerError(
+            f"{what} {text!r} has an unmatched bracket or quote, which would swallow the options after it in the chunk header"
+        )
+    if trouble == "#":
+        raise RmdManagerError(
+            f"{what} {text!r} has a # outside a quoted string, which R reads as a comment running to the end of the chunk header"
+        )
+    # In a key, any = makes the header read back as other options, which _set_header reports.
+    if trouble == "=" and what == "Chunk option value":
+        raise RmdManagerError(
+            f"{what} {text!r} has an = outside a quoted string or brackets, which knitr can't read after key=: "
+            "write text as a quoted R string"
+        )
+
+
+def _check_chunk_text(text: str) -> None:
+    """Reject new chunk text with a line knitr would read as the chunk's closing fence."""
+    for number, line in enumerate(_lines(text), start=1):
+        line = line.rstrip("\n")
+        if _KNITR_CHUNK_END.match(line):
+            raise RmdManagerError(
+                f"Line {number} of the new text, {line!r}, is a closing fence for knitr (backticks alone on a line, "
+                "after nothing but spaces, tabs or >), which would end the chunk there"
+            )
+
+
 class RmdManager:
     """
     Open, edit, and save a .rmd file. Mutations are written to disk on each
@@ -116,6 +157,40 @@ class RmdManager:
             raise RmdManagerError(f"Cell {index} is a markdown cell, not a code chunk")
         return cell
 
+    def _set_source(self, cell: Cell, source: str, new_text: str) -> None:
+        """
+        Give a cell new text, with "\\n" line breaks, made with new_text, the text
+        the caller passed. The text it already has leaves the cell's bytes as they
+        are. In a chunk, new_text can't hold a line knitr would read as the
+        chunk's closing fence; lines the chunk already had aren't checked again.
+        """
+        if source == cell.source:
+            return
+        if cell.cell_type == "code":
+            _check_chunk_text(new_text)
+        cell.source = source
+        cell.mark_dirty()
+
+    def _set_header(self, cell: Cell, label: Optional[str], options: "OrderedDict[str, str]", change: str) -> None:
+        """
+        Give a chunk this label and options, rewriting only its header line, if
+        that line reads back as exactly them; otherwise raise, leaving the chunk
+        as it was. change starts the error message.
+        """
+        if (label, options) == (cell.label, cell.options):
+            return
+        header = _render_chunk_header(cell.language, label, options)
+        read = _read_chunk_header(header)
+        if read != (cell.language, label, options):
+            _, read_label, read_options = read or (None, None, {})
+            raise RmdManagerError(
+                f"{change}: the chunk header {header} would read back as label {read_label!r} and options "
+                f"{dict(read_options)} (a comma, '=', or an unmatched bracket or quote outside a quoted string "
+                "changes how a header reads), so the file was left unchanged"
+            )
+        cell.label, cell.options = label, options
+        cell.mark_header_dirty()
+
     # ──────────────────────────────────────────────
     # Cell structure & navigation
     # ──────────────────────────────────────────────
@@ -155,6 +230,8 @@ class RmdManager:
         else:
             insert_at = self._validate_index(index, allow_end=True)
         new_cell = Cell(cell_type=cell_type, source=_with_newline(source, "\n"))
+        if cell_type == "code":
+            _check_chunk_text(new_cell.source)
         new_cell.mark_dirty()
         self.cells.insert(insert_at, new_cell)
         return self._save()
@@ -185,10 +262,12 @@ class RmdManager:
                 f"line_offset {line_offset} out of range (1..{len(lines)-1}) for cell with {len(lines)} line(s)"
             )
         first_src = "".join(lines[:line_offset])
-        second_src = "".join(lines[line_offset:])
-        # Strip a trailing newline from the first half so the chunk fence sits on its own line
-        if cell.cell_type == "code" and first_src.endswith("\n"):
-            first_src = first_src[:-1]
+        if cell.cell_type == "code":
+            # Split the chunk's body, then take each half's source: every body line keeps its place.
+            second_src = _chunk_source(_chunk_body(cell.source)[len(first_src):])
+            first_src = _chunk_source(first_src)
+        else:
+            second_src = "".join(lines[line_offset:])
         cell.source = first_src
         cell.mark_dirty()
         new_cell = Cell(cell_type=cell.cell_type, source=second_src)
@@ -216,8 +295,11 @@ class RmdManager:
                     f"Cannot merge code chunks with different languages: cell {s} is {base.language}, cell {k} is {c.language}"
                 )
             parts.append(c.source)
-        sep = "\n" if base.cell_type == "code" else ""
-        base.source = sep.join(parts) if base.cell_type == "code" else "".join(parts)
+        if base.cell_type == "code":
+            # The chunks' bodies joined as they are: an empty chunk adds no line.
+            base.source = _chunk_source("".join(_chunk_body(part) for part in parts))
+        else:
+            base.source = "".join(parts)
         base.mark_dirty()
         del self.cells[s + 1:e + 1]
         return self._save()
@@ -228,9 +310,8 @@ class RmdManager:
 
     def replace_cell_source(self, index: int, new_source: str) -> str:
         idx = self._validate_index(index)
-        cell = self.cells[idx]
-        cell.source = _with_newline(new_source, "\n")
-        cell.mark_dirty()
+        new_source = _with_newline(new_source, "\n")
+        self._set_source(self.cells[idx], new_source, new_source)
         return self._save()
 
     def prepend_to_cell(self, index: int, source: str) -> str:
@@ -238,9 +319,8 @@ class RmdManager:
         cell = self.cells[idx]
         # As "\n" text, so the separator check sees "\r\n" and "\r" breaks too.
         source = _with_newline(source, "\n")
-        sep = "" if cell.source.startswith("\n") or not source or source.endswith("\n") else "\n"
-        cell.source = source + sep + cell.source
-        cell.mark_dirty()
+        sep = "" if cell.source.startswith("\n") or not cell.source or not source or source.endswith("\n") else "\n"
+        self._set_source(cell, source + sep + cell.source, source)
         return self._save()
 
     def append_to_cell(self, index: int, source: str) -> str:
@@ -248,9 +328,8 @@ class RmdManager:
         cell = self.cells[idx]
         # As "\n" text, so the separator check sees "\r\n" and "\r" breaks too.
         source = _with_newline(source, "\n")
-        sep = "" if cell.source.endswith("\n") or not cell.source or source.startswith("\n") else "\n"
-        cell.source = cell.source + sep + source
-        cell.mark_dirty()
+        sep = "" if cell.source.endswith("\n") or not cell.source or not source or source.startswith("\n") else "\n"
+        self._set_source(cell, cell.source + sep + source, source)
         return self._save()
 
     # ──────────────────────────────────────────────
@@ -273,14 +352,24 @@ class RmdManager:
 
     def set_chunk_option(self, index: int, key: str, value: str) -> str:
         cell = self._require_code_cell(index)
-        key = key.strip()
+        # Surrounding whitespace goes, as reading the header drops it.
+        key, value = key.strip(), value.strip()
         if not key:
             raise RmdManagerError("Option key must not be empty")
         if key == "label":
-            cell.label = value.strip() or None
-        else:
-            cell.options[key] = value
-        cell.mark_dirty()
+            _check_header_text("Chunk label", value)
+            self._set_header(cell, value or None, cell.options, f"Can't set the chunk label to {value!r}")
+            return self._save()
+        _check_header_text("Option key", key)
+        _check_header_text("Chunk option value", value)
+        if not value:
+            raise RmdManagerError(
+                "Option value must not be empty: knitr reads a bare name in a chunk header as the chunk label, "
+                "so give a value such as TRUE, or remove the option with remove_chunk_option"
+            )
+        options = OrderedDict(cell.options)
+        options[key] = value
+        self._set_header(cell, cell.label, options, f"Can't set chunk option {key!r} to {value!r}")
         return self._save()
 
     def remove_chunk_option(self, index: int, key: str) -> str:
@@ -289,12 +378,13 @@ class RmdManager:
         if key == "label":
             if cell.label is None:
                 raise RmdManagerError(f"Cell {index} has no label to remove")
-            cell.label = None
+            self._set_header(cell, None, cell.options, "Can't remove the chunk label")
         else:
             if key not in cell.options:
                 raise RmdManagerError(f"Cell {index} has no option {key!r}")
-            del cell.options[key]
-        cell.mark_dirty()
+            options = OrderedDict(cell.options)
+            del options[key]
+            self._set_header(cell, cell.label, options, f"Can't remove chunk option {key!r}")
         return self._save()
 
     # ──────────────────────────────────────────────

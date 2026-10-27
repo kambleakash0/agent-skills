@@ -17,7 +17,9 @@ The parser produces:
 
 Round-trip goal: reading a file and serializing without any edits should
 yield byte-identical output. Cells that haven't been edited replay their
-original raw text; modified cells regenerate from structured fields. The
+original raw text; a chunk whose label or options alone changed gets a new
+header line before its raw body; other modified cells regenerate from
+structured fields, a chunk's body from its source (see _chunk_source). The
 frontmatter is always replayed from its raw text: key edits rewrite only the
 lines of that key.
 
@@ -157,7 +159,7 @@ class Frontmatter:
 @dataclass
 class Cell:
     cell_type: str                             # "markdown" or "code"
-    source: str                                # body only (no fences, no frontmatter markers), "\n" line breaks
+    source: str                                # body only (no fences, no frontmatter markers), "\n" line breaks; a chunk's as _chunk_source gives it
     # Code-cell-only fields
     language: str = "r"                        # "r", "python", "bash", "sql", ... for code cells
     label: Optional[str] = None                # chunk label, e.g. "setup" in  ```{r setup, echo=FALSE}
@@ -165,9 +167,13 @@ class Cell:
     # Bookkeeping
     raw: str = ""                              # original full text (with fences and the file's own line breaks)
     dirty: bool = False                        # True after any structural edit
+    header_dirty: bool = False                 # True after a label or option edit: only the header line is written anew
 
     def mark_dirty(self) -> None:
         self.dirty = True
+
+    def mark_header_dirty(self) -> None:
+        self.header_dirty = True
 
 
 # ──────────────────────────────────────────────
@@ -176,7 +182,11 @@ class Cell:
 
 
 _CHUNK_OPEN = re.compile(r"^```\{\s*([A-Za-z][A-Za-z0-9_]*)\s*(.*?)\s*\}\s*$")
-_CODE_FENCE = re.compile(r"^```")
+# A chunk's closing fence: a bare ``` (or ``` followed by spaces and tabs) on its own line.
+_CHUNK_CLOSE = re.compile(r"^```[ \t]*$")
+# A line knitr reads as a closing fence (its R Markdown chunk.end pattern): three or more backticks
+# alone, after nothing but spaces, tabs or >. Wider than _CHUNK_CLOSE; new chunk text is checked with it.
+_KNITR_CHUNK_END = re.compile(r"^[\t >]*```+\s*$")
 
 # A UTF-8 byte order mark as decoded text; editors on Windows may write one before the --- fence.
 _BOM = "\ufeff"
@@ -249,36 +259,22 @@ def _split_body(body: str) -> list[Cell]:
         prose_start = end
 
     while i < n:
-        open_m = _CHUNK_OPEN.match(plain[i].rstrip("\n"))
-        if open_m:
+        header = _read_chunk_header(plain[i].rstrip("\n"))
+        if header:
             flush_prose(i)
-            lang = open_m.group(1)
-            inside = open_m.group(2)
-            label, options = _parse_label_and_options(inside)
-            # Find the closing fence
+            lang, label, options = header
+            # Find the closing fence: a bare ``` on its own line (no braces)
             j = i + 1
-            while j < n:
-                # Closing ``` on its own line (no braces)
-                if _CODE_FENCE.match(plain[j].rstrip("\n")) and not _CHUNK_OPEN.match(plain[j].rstrip("\n")):
-                    # Only accept as a CLOSE if it's a bare ``` (or ``` followed by whitespace)
-                    if re.match(r"^```[ \t]*$", plain[j].rstrip("\n")):
-                        break
+            while j < n and not _CHUNK_CLOSE.match(plain[j].rstrip("\n")):
                 j += 1
             # j now points at the closing fence line, OR == n (unterminated)
             if j >= n:
                 # Unterminated chunk -- fall back: treat the whole remainder as prose
                 flush_prose(n)
                 return cells
-            # Construct the Cell
-            source = "".join(plain[i + 1:j])
-            # Strip exactly one trailing newline from source so the closing fence line stays outside
-            if source.endswith("\n"):
-                source_no_trailing_nl = source[:-1]
-            else:
-                source_no_trailing_nl = source
             cells.append(Cell(
                 cell_type="code",
-                source=source_no_trailing_nl,
+                source=_chunk_source("".join(plain[i + 1:j])),
                 language=lang,
                 label=label,
                 options=options,
@@ -292,9 +288,35 @@ def _split_body(body: str) -> list[Cell]:
     return cells
 
 
+def _chunk_source(body: str) -> str:
+    """
+    A chunk's source from its body, the lines between its fences with "\\n"
+    breaks: the body without the line break that ends its last line, since the
+    closing fence goes on a line of its own anyway. So a source ending in "\\n"
+    has a blank line before the fence. A body of blank lines only is kept whole,
+    so one blank line ("\\n") stays apart from an empty chunk (""). _chunk_body
+    undoes it: every body has exactly one source.
+    """
+    return body[:-1] if body.endswith("\n") and body.strip("\n") else body
+
+
+def _chunk_body(source: str) -> str:
+    """The body a chunk's source stands for (see _chunk_source), each line ending with a line break."""
+    return source + "\n" if source.strip("\n") else source
+
+
 # ──────────────────────────────────────────────
 # Chunk header parsing
 # ──────────────────────────────────────────────
+
+
+def _read_chunk_header(line: str) -> Optional[tuple[str, Optional[str], "OrderedDict[str, str]"]]:
+    """(language, label, options) of a chunk header line, without its line break; None if it isn't one."""
+    m = _CHUNK_OPEN.match(line)
+    if not m:
+        return None
+    label, options = _parse_label_and_options(m.group(2))
+    return m.group(1), label, options
 
 
 def _parse_label_and_options(inside: str) -> tuple[Optional[str], "OrderedDict[str, str]"]:
@@ -323,15 +345,34 @@ def _parse_label_and_options(inside: str) -> tuple[Optional[str], "OrderedDict[s
 
 
 def _split_top_level_commas(s: str) -> list[str]:
-    """Split on commas that aren't nested inside (), [], {}, or quotes."""
+    """
+    Split on commas that aren't nested inside (), [], {}, or quotes. Inside a
+    quoted string a backslash escapes the next character, as in R, so
+    "a\\", b" stays one part.
+    """
+    return _scan_commas(s)[0]
+
+
+def _closed(s: str) -> bool:
+    """Whether s ends outside every bracket and quote, so a comma written after it still splits."""
+    return _scan_commas(s)[1]
+
+
+def _scan_commas(s: str) -> tuple[list[str], bool]:
+    """The parts of s for _split_top_level_commas, and whether s ends outside every bracket and quote."""
     parts: list[str] = []
     buf: list[str] = []
     depth = 0
     quote: Optional[str] = None
+    escaped = False
     for c in s:
         if quote is not None:
             buf.append(c)
-            if c == quote:
+            if escaped:
+                escaped = False
+            elif c == "\\":
+                escaped = True
+            elif c == quote:
                 quote = None
             continue
         if c in ("'", '"'):
@@ -349,7 +390,48 @@ def _split_top_level_commas(s: str) -> list[str]:
             buf.append(c)
     if buf:
         parts.append("".join(buf).strip())
-    return parts
+    return parts, depth == 0 and quote is None
+
+def _r_trouble(s: str) -> Optional[str]:
+    """
+    What in s, read as R code the way knitr reads a chunk's options (as the
+    arguments of alist(...)), would break the rest of the header: "`" for a
+    backtick-quoted name left open, "#" for a comment (it runs to the end of
+    the line), "=" for an = outside quotes and brackets that isn't part of ==,
+    !=, <= or >= (a second = in key=value), or None. Quotes and brackets left
+    open are _closed's to find.
+    """
+    quote: Optional[str] = None
+    escaped = False
+    depth = 0
+    i = 0
+    while i < len(s):
+        c = s[i]
+        if quote is not None:
+            if escaped:
+                escaped = False
+            elif c == "\\":
+                escaped = True
+            elif c == quote:
+                quote = None
+        elif c in "'\"`":
+            quote = c
+        elif c == "#":
+            return "#"
+        elif c == "%":
+            # An operator such as %in% or %=%: skip to its closing %
+            i = max(i, s.find("%", i + 1))
+        elif c in "([{":
+            depth += 1
+        elif c in ")]}":
+            depth -= 1
+        elif c == "=":
+            if s.startswith("==", i):
+                i += 1
+            elif depth == 0 and not (i and s[i - 1] in "<>!"):
+                return "="
+        i += 1
+    return "`" if quote == "`" else None
 
 
 # ──────────────────────────────────────────────
@@ -360,18 +442,20 @@ def _split_top_level_commas(s: str) -> list[str]:
 def serialize(frontmatter: Frontmatter, cells: list[Cell]) -> str:
     """
     Reconstruct the .rmd source text from the parsed model.
-    The frontmatter and unmodified cells replay their original raw text. A part
-    without a trailing newline (the file's last line had none) gets one only when
-    another part follows it, so fences never run together and an unedited
-    document still round-trips byte for byte. Edited cells and that newline use
-    frontmatter.newline, the document's line break, whatever breaks the cell
-    source was given with. A byte order mark that parse set aside
-    (frontmatter.bom) goes back at the very start, whichever part comes first.
+    The frontmatter and unmodified cells replay their original raw text; a chunk
+    whose label or options alone changed gets a new header line before its raw
+    body and closing fence. A part without a trailing newline (the file's last
+    line had none) gets one only when another part follows it, so fences never
+    run together and an unedited document still round-trips byte for byte.
+    Edited cells, header lines and that newline use frontmatter.newline, the
+    document's line break, whatever breaks the cell source was given with. A
+    byte order mark that parse set aside (frontmatter.bom) goes back at the very
+    start, whichever part comes first.
     """
     newline = frontmatter.newline
     parts: list[str] = [frontmatter.raw] if frontmatter.present else []
     for cell in cells:
-        parts.append(_with_newline(_render_cell(cell), newline) if cell.dirty or not cell.raw else cell.raw)
+        parts.append(_cell_text(cell, newline))
     out_parts: list[str] = []
     for part in parts:
         if not part:
@@ -383,6 +467,20 @@ def serialize(frontmatter: Frontmatter, cells: list[Cell]) -> str:
     return (_BOM if frontmatter.bom else "") + _join(out_parts, newline)
 
 
+def _cell_text(cell: Cell, newline: str) -> str:
+    """
+    A cell as serialize writes it: its raw text if unedited; after label or option
+    edits only, a new header line ending in newline, then the raw text's other
+    lines; otherwise the cell rendered anew with newline for its line breaks.
+    """
+    if cell.dirty or not cell.raw:
+        return _with_newline(_render_cell(cell), newline)
+    if cell.header_dirty:
+        header = _render_chunk_header(cell.language, cell.label, cell.options) + newline
+        return _join([header, cell.raw[_LINE.match(cell.raw).end():]], newline)
+    return cell.raw
+
+
 def _render_cell(cell: Cell) -> str:
     if cell.cell_type == "markdown":
         # Preserve at least one trailing newline if missing
@@ -390,25 +488,21 @@ def _render_cell(cell: Cell) -> str:
         if src and not src.endswith("\n"):
             src = src + "\n"
         return src
-    # code cell
+    # code cell: the body its source stands for, so a source ending in "\n" keeps its blank line
     header = _render_chunk_header(cell.language, cell.label, cell.options)
-    body = cell.source
-    if body and not body.endswith("\n"):
-        body = body + "\n"
-    elif not body:
-        body = ""
-    return f"{header}\n{body}```\n"
+    return f"{header}\n{_chunk_body(cell.source)}```\n"
 
 
 def _render_chunk_header(language: str, label: Optional[str], options: "OrderedDict[str, str]") -> str:
-    parts: list[str] = []
+    # An option without a value is a bare name; one with neither name nor value (a lone "=") stays "=".
+    parts = [f"{k}={v}" if v or not k else k for k, v in options.items()]
     if label:
-        parts.append(label)
-    for k, v in options.items():
-        parts.append(k if v == "" else f"{k}={v}")
-    if parts:
-        return "```{" + language + " " + ", ".join(parts) + "}"
-    return "```{" + language + "}"
+        parts.insert(0, label)
+    if not parts:
+        return "```{" + language + "}"
+    # A bare option first would read back as the label: a comma before it keeps it an option, as in ```{r, echo}.
+    lead = " " if label or "=" in parts[0] else ", "
+    return "```{" + language + lead + ", ".join(parts) + "}"
 
 
 # ──────────────────────────────────────────────
@@ -590,13 +684,27 @@ def _read_header(body: str) -> tuple[dict, Optional[str], Optional[list[_Key]]]:
         try:
             data = loader.construct_document(root)
         except (yaml.YAMLError, ValueError) as e:
-            # Valid YAML holding a value PyYAML can't build, such as the date 2026-13-45.
-            return {}, _yaml_problem(e, body), keys
+            # Valid YAML holding a value PyYAML can't build, such as the date 2026-13-45. A
+            # ValueError has no mark, so the node it came from gives the position.
+            index = None if isinstance(e, yaml.YAMLError) else _failed_node_index(loader)
+            return {}, _yaml_problem(e, body, index), keys
     finally:
         loader.dispose()
     if not isinstance(data, dict):
         return {}, "it is not a mapping of key: value lines", None
     return data, None, keys
+
+
+def _failed_node_index(loader: _TolerantLoader) -> Optional[int]:
+    """
+    The index into the header text where the node loader failed to build (such
+    as the date 2026-13-45) starts, or None. PyYAML's construct_object records
+    each node it starts building in recursive_objects and drops it once built,
+    so after a failure the last node there is the one that failed, whatever
+    order PyYAML built the others in.
+    """
+    node = next(reversed(loader.recursive_objects), None)
+    return None if node is None else node.start_mark.index
 
 
 def _node_keys(root: yaml.Node, body: str) -> Optional[list[_Key]]:
@@ -647,20 +755,28 @@ def _guess_keys(lines: list[str]) -> list[_Key]:
     return keys
 
 
-def _yaml_problem(e: Exception, body: str) -> str:
+def _yaml_problem(e: Exception, body: str, index: Optional[int] = None) -> str:
     """
-    A one-line description of a YAML error, with its file line number when known.
-    body is the header text the error came from, with "\\n" line breaks.
+    A one-line description of a YAML error, with its file line and column when
+    known: from the error's mark, else the position of a character the reader
+    rejected, else index. body is the header text the error came from, with
+    "\\n" line breaks; positions are indexes into it.
     """
     problem = getattr(e, "problem", None) or str(e).split("\n")[0]
     mark = getattr(e, "problem_mark", None)
-    if mark is None:
+    if mark is not None:
+        index = mark.index
+    elif isinstance(e, yaml.reader.ReaderError):
+        # The reader rejects a control character before parsing starts: it gives a position, not a mark.
+        index = e.position
+    if index is None:
         return problem
-    # Counted from the mark's index, not its line: YAML also takes NEL, U+2028 and
-    # U+2029 for line breaks, which the file's lines don't. Header body line 0 is
-    # file line 2, after the opening fence.
-    line = body.count("\n", 0, mark.index) + 2
-    return f"{problem} (line {line} of the file)"
+    # Counted from the index, not the mark's line and column: YAML also takes NEL,
+    # U+2028 and U+2029 for line breaks, which the file's lines don't. Header body
+    # line 0 is file line 2, after the opening fence (a byte order mark is on line 1).
+    line = body.count("\n", 0, index) + 2
+    column = index - body.rfind("\n", 0, index)
+    return f"{problem} (line {line}, column {column} of the file)"
 
 
 def _editable_keys(body: list[str]) -> list[_Key]:

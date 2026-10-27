@@ -35,6 +35,8 @@ _INSTRUCTIONS = (
     "find_in_rmd, get_chunk_options, and get_frontmatter. To add a few lines use "
     "prepend_to_cell or append_to_cell, not replace_cell_source; to rewrite a cell use "
     "replace_cell_source (it keeps the chunk language, label, and options), not add_cell. "
+    "Chunk text has no final newline: one at the end leaves a blank line before the closing "
+    "fence. "
     "Edit chunk options with set_chunk_option and remove_chunk_option, using key=\"label\" "
     "for the chunk label; these tools reject markdown cells. Edit the YAML header with "
     "set_frontmatter_key and remove_frontmatter_key: values are parsed as YAML, and only "
@@ -158,6 +160,10 @@ def list_cells(file_path: FilePath) -> str:
 def get_cell(file_path: FilePath, index: CellIndex) -> str:
     """Return the source text of one cell (chunk body or prose).
 
+    A chunk's text leaves off the line break before its closing fence, so text
+    ending in \\n means a blank line there. A chunk of blank lines only comes back
+    as those line breaks: "" is an empty chunk, "\\n" one blank line.
+
     Args:
         file_path: Absolute path to a .rmd file.
         index: Zero-based cell index. -1 means the last cell.
@@ -172,7 +178,10 @@ def get_cell(file_path: FilePath, index: CellIndex) -> str:
 def add_cell(
     file_path: FilePath,
     index: Annotated[int, Field(description="Zero-based position the new cell takes; -1 (or the current cell count) appends at the end.")],
-    source: Annotated[str, Field(description="Initial cell body: chunk code for a code cell or prose for a markdown cell; empty by default.")] = "",
+    source: Annotated[
+        str,
+        Field(description="Initial cell body: chunk code for a code cell (without a final newline, which would leave a blank line before the closing fence) or prose for a markdown cell; empty by default."),
+    ] = "",
     cell_type: Annotated[str, Field(description='Either "code" (a new R chunk) or "markdown" (prose).')] = "code",
 ) -> str:
     """Insert a new cell at the given index.
@@ -279,9 +288,19 @@ def merge_cells(
 def replace_cell_source(
     file_path: FilePath,
     index: CellIndex,
-    new_source: Annotated[str, Field(description="Replacement body text for the cell; a code chunk keeps its language, label, and options.")],
+    new_source: Annotated[
+        str,
+        Field(description="Replacement body text for the cell; a code chunk keeps its language, label, and options. For a chunk, leave off the final newline: text ending in a newline leaves a blank line before the closing fence."),
+    ],
 ) -> str:
     """Replace a cell's entire source text. Preserves chunk language, label, and options for code cells.
+
+    The text is read as get_cell returns it: for a chunk, text ending in \\n
+    leaves a blank line before the closing fence, so write "x <- 1", not
+    "x <- 1\\n". Passing the text get_cell returned leaves the file byte for byte
+    as it was. In a chunk's text, a line knitr reads as a closing fence
+    (backticks alone on a line, after nothing but spaces, tabs or >) would close
+    the chunk, so it is refused; the error gives its line in the text passed.
 
     Args:
         file_path: Absolute path to a .rmd file.
@@ -361,10 +380,18 @@ def set_chunk_option(
     ],
     value: Annotated[
         str,
-        Field(description='Option value written verbatim into the chunk header as R code, e.g. FALSE, 7, or a quoted string; for key "label" an empty value clears the label.'),
+        Field(description='Option value written into the chunk header as R code, e.g. FALSE, 7, or a quoted string, without its surrounding whitespace. It must fit on one line, close every bracket, quote and backtick it opens, and read back as this one option, so quote text holding a comma, "#" or "=" as an R string (x == 1 is fine). For key "label" an empty value clears the label; any other key needs a value.'),
     ],
 ) -> str:
     """Set or overwrite one chunk option. Special key "label" sets the chunk label.
+
+    Only the chunk's header line is rewritten: its body and closing fence keep
+    their bytes. The header must read back with exactly the new label and
+    options, and knitr reads keys and values as R code, so the edit is refused,
+    leaving the file unchanged, for a line break, an unmatched bracket or quote,
+    a comma outside a quoted string, an "=" in a key or label, or, in a key or
+    value, a backtick left open or a # or "=" outside quotes and brackets
+    (x == 1 is fine). So is an empty value for any key but "label".
 
     Args:
         file_path: Absolute path to a .rmd file.
@@ -408,7 +435,7 @@ def get_frontmatter(file_path: FilePath) -> str:
 
     R Markdown tags such as !r and !expr are shown as tags. A header that is not
     valid YAML is returned as its raw text, after a note saying why it could not
-    be parsed.
+    be parsed and, when known, at which line and column of the file.
 
     Args:
         file_path: Absolute path to a .rmd file.

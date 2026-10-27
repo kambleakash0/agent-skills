@@ -28,8 +28,8 @@ _INSTRUCTIONS = (
     "rather than replace_function or replace_function_body; "
     "add_parameter/remove_parameter rather than replace_signature for one "
     "parameter; add_key for a new key, replace_value for an existing one; "
-    "add_import_name to extend an existing import. Decorators and a JS/TS "
-    "export belong to their symbol.\n\n"
+    "add_import_name to extend an existing import. Decorators, a JS/TS "
+    "export and a C++ template <...> header belong to their symbol.\n\n"
     "Every edit is parse-checked: one that would add a syntax error is "
     "refused with its line and column, and the file is left unchanged. Fix "
     "the content and retry; if the code is valid but the parser does not "
@@ -142,15 +142,25 @@ def replace_function(
         str,
         Field(
             description="Complete replacement definition including decorators "
-            "(and a JS/TS `export`), signature and body, as read_symbol returns "
-            "it; re-indented to the original's level."
+            "(and a JS/TS `export` or C++ `template <...>` header), signature and "
+            "body, as read_symbol returns it (a C/C++ class, struct, union or enum "
+            "ends with its `};`); re-indented to the original's level."
         ),
     ],
 ) -> str:
     """
     Replace an entire function definition with new content -- signature, body, and decorators.
     The replaced span is what read_symbol returns: decorators (TS method
-    decorators too) and a JS/TS `export` included, so keep them in `content`.
+    decorators too), a JS/TS `export` and a C++ `template <...>` header
+    included, so keep them in `content`, and a C/C++ class, struct, union or
+    enum ends with the `;` after its `}`. A symbol that shares a line with
+    other code (`function a() {} function b() {}`) has only its own text
+    replaced; the code around it on the line stays (content ending with a
+    `#` or `//` comment is refused when code follows). When `content` is
+    re-indented, the lines that start inside one of its multi-line string
+    literals (a triple-quoted string, template literal, heredoc, raw
+    string) keep their text; those of a Python docstring, Ruby `<<~`
+    heredoc or Java text block move with the code.
 
     Use this when: You're rewriting a function top-to-bottom (e.g., renaming it,
     changing parameters AND implementation together).
@@ -190,6 +200,13 @@ def replace_function_body(
 ) -> str:
     """
     Replace only the body of a function, preserving its signature and decorators.
+    A body written on one line with its signature or braces (`function f() {
+    return 1; }`, `def f(): return 1`) is rebuilt over lines of its own. A
+    Ruby endless method (`def f = x`) has no body and is refused. The lines
+    that start inside a multi-line string literal of `content` (a
+    triple-quoted string, template literal, heredoc, raw string) keep their
+    text when the rest is re-indented; those of a Python docstring, Ruby
+    `<<~` heredoc or Java text block move with the code.
 
     Use this when: You're changing the implementation while keeping the interface stable.
     Don't use this when: You're also changing parameters or return type -> use
@@ -350,7 +367,11 @@ def insert_in_body(
         the last statement is a nested block.
     `at` needs the body on its own lines: a one-line body such as
     `def f(): return 1` or `function f() { return 1; }` is refused; rewrite
-    it with `replace_function_body` instead.
+    it with `replace_function_body` instead. With `at`, the lines that start
+    inside a multi-line string literal of new_snippet (a triple-quoted
+    string, template literal, heredoc, raw string) keep their text when the
+    rest is re-indented; those of a Python docstring, Ruby `<<~` heredoc or
+    Java text block move with the code.
       - after=<snippet>:  insert immediately after a byte-identical anchor.
       - before=<snippet>: insert immediately before a byte-identical anchor.
 
@@ -439,7 +460,10 @@ def add_method(
     brace; a braced body on one line (`class K {}`, `class K { a() {} }`) is
     opened up over several lines. A Java enum gets the method after its
     constants, with the `;` they need. A one-line Python or Ruby class is
-    refused.
+    refused. The lines that start inside a multi-line string literal of the
+    content (a triple-quoted string, template literal, heredoc, raw string)
+    keep their text; those of a Python docstring, Ruby `<<~` heredoc or Java
+    text block move with the code.
 
     Use this when: You're adding a method to an existing class.
     Don't use this when: You're adding a field/attribute -> use `add_field`. You're
@@ -484,7 +508,8 @@ def delete_symbol(
 ) -> str:
     """
     Delete an entire function or class definition, including its decorators
-    (TS method decorators too) and a JS/TS `export`.
+    (TS method decorators too), a JS/TS `export` and a C++ `template <...>`
+    header, and the `;` that ends a C/C++ class, struct, union or enum.
     By default, also removes the contiguous leading comment block above the
     symbol and its decorators (Godoc, Javadoc `/** ... */`, `#` or `//`
     comment runs) so the doc doesn't become orphaned floating text. Pass
@@ -494,7 +519,12 @@ def delete_symbol(
     the file's spacing: no blank lines are left at the top of the file or
     of a class body (after the first member is deleted) or before a closing
     brace (after the last), and between two remaining symbols only the
-    wider of the two gaps stays.
+    wider of the two gaps stays. A symbol that shares a line with other code
+    (`class A { a() {} b() {} }`) is cut out of the line instead: the `;` or
+    `,` that ends it (the last entry of a one-line literal takes the one
+    before it: `{ a: 1, b: 2 }` minus b is `{ a: 1 }`) and a comment after
+    it at the end of the line go with it, and the spaces that were before
+    it stay between the code on both sides.
 
     Use this when: You want to remove a function, method, or class entirely from a
     source file -- along with its doc comment by default.
@@ -897,6 +927,14 @@ def remove_from_array(
     ('"a.b".list' for a key containing dots).
     For Python (.py): target is the module-level variable name.
 
+    Comments are not elements. An element on a line of its own goes with
+    that whole line, a comment at its end included; comments on other lines
+    (one above the element, or one after the element before it when the
+    removed one shares its line with the `]`) stay where they are. The
+    array's trailing-comma style is kept: removing the last element when it
+    has no comma after it also removes the comma before it. Removing the
+    only element leaves `[]`.
+
     Use this when: You want to remove a specific item from a list.
     Don't use this when: You want to remove a whole key -> use `delete_key`.
 
@@ -946,8 +984,9 @@ def add_field(
     Add a field/attribute/member at the top of a class body (fields-before-methods
     convention): before the first member, after a Python class docstring or
     a Java enum's constants (adding the `;` they need). Indented like
-    add_method, with a blank line after it when the member below is a
-    method; comments after the `{` on its line stay there.
+    add_method (multi-line string literals keep their text), with a blank
+    line after it when the member below is a method; comments after the `{`
+    on its line stay there.
 
     Use this when: You're adding a class attribute (Python), class field (JS/TS),
     or member variable (C++).
@@ -983,12 +1022,15 @@ def replace_signature(
             "body (e.g. 'def get(self, key, default=None):' or JS 'get(key, d)' "
             "without the '{'); indentation on its first line is ignored, and "
             "following lines (parameters, or the def after a decorator line) "
-            "may be indented relative to it. The existing decorators and Java "
-            "annotations are kept unless it includes its own, which then "
-            "replace them. For a JS/TS function bound to a name, "
+            "may be indented relative to it. The existing decorators, Java "
+            "annotations and C++ `template <...>` header are kept unless it "
+            "includes its own, which then replace them. For a JS/TS function "
+            "bound to a name, "
             "'const f = (a, b) =>' replaces from the const on, '(a, b) =>' only "
             "the function's own part. For a method with no body (a TS abstract "
-            "or Java interface method), the ';' after it stays."
+            "or Java interface method, a C++ `A() = default`), the ';' after it "
+            "stays; a Go struct or interface type takes its header (`type A "
+            "struct`)."
         ),
     ],
 ) -> str:
@@ -997,7 +1039,9 @@ def replace_signature(
 
     Decorators (Python, JS/TS) and Java annotations such as `@Override` are kept
     when new_signature has none, in their original layout. If new_signature
-    includes decorators or annotations, they replace the existing ones.
+    includes decorators or annotations, they replace the existing ones. A C++
+    template's `template <...>` header is kept the same way, unless
+    new_signature starts with `template`.
 
     The signature lands at the definition's own column: indentation on its
     first line is ignored, and the lines after it may be indented relative
@@ -1010,8 +1054,12 @@ def replace_signature(
     (`async (a, b) =>`) replaces only the function's own part.
 
     A method declared without a body (a TS abstract method, a Java interface
-    or abstract method) is all signature but the `;` that ends it, which
-    stays whether or not new_signature ends with one.
+    or abstract method, a C++ `A() = default;`, a Go function without one)
+    is all signature but the `;` that ends it, which stays whether or not
+    new_signature ends with one. A Go struct or interface type and an empty
+    Ruby class, module or method take the header read_symbol(depth=
+    "signature") gives them (`type A struct`, `class A < B`); other symbols
+    (variables, constants) have no signature and are refused.
 
     Use this when: You're changing parameters, return type, or function name
     without modifying the implementation.
@@ -1058,7 +1106,10 @@ def list_symbols(file_path: FilePath) -> str:
     or function expression are listed as `function`, TS abstract classes as
     `class` (abstract methods among their methods, an overloaded one once),
     and enums, type aliases and interfaces as `enum`, `type` and
-    `interface`.
+    `interface`. C++ template functions and classes, and member templates,
+    are listed as what they declare, at the line of their `template <...>`
+    header; a definition outside its class (`int A::f()`, `template
+    <typename T> T Box<T>::get()`) is a function under its own name (`f`).
 
     Use this when: You're about to edit an unfamiliar file and want to see its
     structure and exact symbol names. ALWAYS a good first call before editing --
@@ -1204,6 +1255,15 @@ def add_parameter(
     function's one unparenthesized parameter gets parentheses: `x => ...`
     becomes `(x, y) => ...`.
 
+    A list written one parameter per line gets the new one on a line of its
+    own, indented like the parameters (also when they are aligned under the
+    first one, with the `)` on the last line): at the end after the last
+    parameter's line, with a comma after it when the last one has one (else
+    the last one gets the comma), at the start above the first parameter and
+    the comments on lines of their own right before it. Comments are not
+    parameters and stay on their lines. Other lists, with two parameters on
+    a line (`def f(a, b,\\n      c):`), get the parameter inline (`a, b, c`).
+
     Use this when: You need to add one or two parameters without retyping the whole
     signature.
     Don't use this when: You need to replace the entire signature -> use
@@ -1249,7 +1309,12 @@ def remove_parameter(
     """
     Remove a parameter by name from a function signature. Leaves the body
     untouched. A JS/TS arrow function's one unparenthesized parameter leaves
-    `()` behind: `x => 1` becomes `() => 1`.
+    `()` behind: `x => 1` becomes `() => 1`. A parameter on a line of its
+    own goes with that whole line, a comment at its end included; comments
+    on other lines stay (one after the parameter before it too), and a last
+    parameter with no comma after it takes the comma before it (except in
+    Go, which needs it before a line break). Removing the only parameter
+    leaves `()`.
 
     Use this when: You need to remove one parameter without retyping the whole
     signature.
@@ -1302,7 +1367,8 @@ def replace_docstring(
     """
     Replace or insert a Python docstring on a function or class. Python-only. The
     new_docstring should be a valid Python string literal including its surrounding
-    triple quotes.
+    triple quotes. A new docstring for a body on its signature's line (`def
+    f(): return 1`) is refused: rewrite the body with `replace_function_body`.
 
     Use this when: You want to add or update a Python docstring without touching
     the function body.
@@ -1442,8 +1508,9 @@ def read_symbol(
         Field(
             description="'full' (default) returns the whole source, 'interface' a "
             "class skeleton (members indented as in the class) or function "
-            "signature, 'signature' only the signature or class header (a TS "
-            "type alias has none); config files support only 'full'."
+            "signature, 'signature' only the signature or class header; both "
+            "refuse other symbols (variables, constants, fields, type aliases), "
+            "and config files support only 'full'."
         ),
     ] = "full",
 ) -> str:
@@ -1453,18 +1520,31 @@ def read_symbol(
 
     `depth` controls how much is returned:
 
-      - "full" (default): Entire source of the symbol, decorators and a
-        JS/TS `export` included. Typical savings: 10-20x fewer tokens than
-        reading the whole file.
-      - "interface": For a class -> header + field declarations + method
-        signatures with bodies replaced by ' ...', each member indented
-        as it is relative to the class header (a nested class's own
-        indentation removed). For a function -> just the signature.
+      - "full" (default): Entire source of the symbol, decorators, a JS/TS
+        `export` and a C++ `template <...>` header included; a C/C++ class,
+        struct, union or enum ends with the `;` after its `}`, and a Ruby
+        statement that opens a heredoc (`X = <<~EOS`) with the heredoc's
+        body. Typical savings: 10-20x fewer tokens than reading the whole
+        file.
+      - "interface": For a class (struct, interface, enum, module,
+        namespace) -> header + field declarations + method signatures with
+        bodies replaced by ' ...', each member indented as it is relative
+        to the class header (a nested class's own indentation removed) and
+        ending as written, with its `;` or `,`. For a function -> just the
+        signature. For a Go type -> its declaration and the signatures of
+        its methods.
       - "signature": Signature-only. For a function -> the line(s) before
-        the body (for a JS/TS `const f = (x) => ...`, from its `const`;
-        for a method with no body, such as a TS abstract method, its whole
-        declaration). For a class -> the class header. A TS type alias has
-        no signature and is refused.
+        the body (for a JS/TS `const f = (x) => ...`, from its `const`; for
+        a C++ template function, from its `template <...>` header;
+        for a method with no body, such as a TS abstract method or a C++
+        `A() = default;`, its whole declaration). For a class -> the class
+        header (`type A struct` for a Go struct).
+
+    Both "interface" and "signature" refuse a symbol that is neither a
+    function nor a class (a variable, constant, field, type alias or C/C++
+    forward declaration such as `struct S;`), saying what it is; read it
+    with "full". A Go type without a struct or interface body (`type N
+    int`) has no signature, but its interface lists its methods.
 
     Use this when: You need to read a specific symbol without reading the
     whole file. Pick the narrowest depth that contains what you need.
@@ -1560,8 +1640,11 @@ def edit_leading_comment(
     """
     Edit the contiguous leading-comment block above a named symbol. One tool
     covering three operations on the same comment block. The block sits above
-    the symbol's decorators or annotations (TS method decorators too) and a
-    JS/TS `export`, so a new comment goes above the first of them. A `#!`
+    the symbol's decorators or annotations (TS method decorators too), a
+    JS/TS `export` and a C++ `template <...>` header, so a new comment goes
+    above the first of them. A symbol that other code comes before on its
+    line (`b` in `function a() {} function b() {}`) has no leading comment
+    of its own and is refused. A `#!`
     line and encoding or magic comments at the top of a Python or Ruby file
     are never part of it, nor is a line that starts with `#` or `//` inside
     a multi-line string, template literal or YAML block scalar. In YAML and
@@ -1641,7 +1724,8 @@ def insert_sibling(
         str,
         Field(
             description="Source to insert, re-indented to the target's level and "
-            "separated from it by a blank line."
+            "separated from its neighbours by a blank line (two around a "
+            "top-level Python def or class)."
         ),
     ],
     position: Annotated[
@@ -1655,7 +1739,23 @@ def insert_sibling(
     "before" goes above the symbol's leading comment block (doc comment,
     Javadoc, Godoc), decorators and a JS/TS `export`, so the comment stays
     on the symbol it documents; a `#!` line and encoding or magic comments
-    at the top of a Python or Ruby file stay first.
+    at the top of a Python or Ruby file stay first. A C++ `template <...>`
+    header is part of the symbol, too, and "after" a C/C++ class, struct,
+    union or enum goes after the `;` that ends it.
+
+    The new code is separated from the target and from the symbol on its
+    other side (that symbol's leading comment, decorators and `export`
+    included) by one blank line, or two at the top level of a Python module
+    when either is a def or class (PEP 8). The end of a body or file, a C++
+    access label, and a comment above the new code get no added blank lines.
+    "before" is refused when other code comes before the target on its
+    first line, and "after" when other code follows it on its last line or
+    the line starts with the code the target is part of (`class A: x = 1`).
+    When the content is re-indented to the target's level, the lines that
+    start inside one of its multi-line string literals (a triple-quoted
+    string, template literal, heredoc, raw string) keep their text; those of
+    a Python docstring, Ruby `<<~` heredoc or Java text block move with the
+    code.
 
     Use this when: You need precise placement relative to another top-level
     symbol -- e.g. a helper function immediately before its caller, a

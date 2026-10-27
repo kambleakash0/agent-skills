@@ -393,15 +393,21 @@ class TreeSitterParser:
         """
         For C/C++ function_definition nodes, the name is nested inside the declarator chain:
         function_definition -> declarator (function_declarator) -> declarator (identifier/field_identifier/qualified_identifier)
-        Handles pointer/reference declarators and qualified names (Class::method).
+        Handles pointer/reference declarators, qualified names (Class::method)
+        and C++ explicit specializations (`template <> int id<int>(int)`),
+        which are named for the template they specialize (`id`).
         """
         declarator = func_node.child_by_field_name("declarator")
         while declarator:
             if declarator.type in ("identifier", "field_identifier", "type_identifier"):
                 return declarator
+            if declarator.type == "template_function":
+                return declarator.child_by_field_name("name")
             if declarator.type == "qualified_identifier":
                 # For Class::method, return the inner name
                 inner = declarator.child_by_field_name("name")
+                if inner is not None and inner.type == "template_function":
+                    inner = inner.child_by_field_name("name")
                 return inner if inner else declarator
             declarator = declarator.child_by_field_name("declarator")
         return None

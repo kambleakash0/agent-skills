@@ -4,6 +4,8 @@ import os
 import re
 import warnings
 from ast_editor.parser import (
+    C_EXTS,
+    CPP_EXTS,
     DEFAULT_EXPORT_KINDS,
     ApplierError,
     TreeSitterParser,
@@ -76,6 +78,11 @@ def _json_syntax_error(source: bytes) -> ValueError | None:
 
 
 _JS_EXTS = (".js", ".jsx", ".mjs", ".cjs", ".ts", ".tsx")
+_CONFIG_EXTS = (".json", ".yml", ".yaml", ".toml")
+
+# The tokens that end a statement or an entry where others may follow it
+# on its line (`x = 1; y = 2`, `{ a: 1, b: 2 }`).
+_SEPARATORS = (";", ",")
 
 # Methods and functions declared without a body: TS abstract methods, method
 # signatures (class overloads, interface members) and function overloads,
@@ -86,6 +93,49 @@ _BODILESS_FUNCTIONS = (
     "function_signature",
     "method_declaration",
 )
+
+# The C/C++ class, struct, union and enum nodes, which leave out the `;`
+# after their `}` (see Applier._symbol_span).
+_C_TYPE_SPECIFIERS = ("class_specifier", "struct_specifier", "union_specifier", "enum_specifier")
+
+# The constructs a symbol can end that only add what is written before it,
+# so that an edit to the whole symbol takes them too (see
+# Applier._symbol_unit): a Go `type`, `var` or `const` and a composite
+# literal's key, a TS `declare`, a JS/TS `export` and object key, a C++
+# `extern "C"` and a Ruby `private def`. Other containers hold the code
+# before the symbol as siblings of their own (a Java enum's members after
+# its constants, a C #else branch, a Ruby else branch).
+_UNIT_WRAPPERS = (
+    "type_declaration",
+    "var_declaration",
+    "const_declaration",
+    "keyed_element",
+    "literal_element",
+    "ambient_declaration",
+    "export_statement",
+    "pair",
+    "linkage_specification",
+    "argument_list",
+    "call",
+)
+
+# The string literals that can span lines, by file extension (see
+# Applier._literal_rows): Python strings (any prefix), JS/TS template
+# literals and strings continued with a backslash, Ruby strings (`%q(...)`
+# too), heredocs, backtick commands and regexps, Go raw strings, C/C++
+# strings and C++ raw strings, Java text blocks and TOML multi-line strings.
+# JSON strings stay on one line, and YAML values (block scalars, whose
+# indentation YAML strips, included) move with the code.
+_MULTILINE_STRINGS = {
+    ".py": ("string",),
+    ".rb": ("string", "heredoc_body", "subshell", "regex"),
+    ".go": ("raw_string_literal",),
+    ".java": ("string_literal",),
+    ".toml": ("string",),
+    **{ext: ("template_string", "string") for ext in _JS_EXTS},
+    **{ext: ("string_literal",) for ext in C_EXTS},
+    **{ext: ("string_literal", "raw_string_literal") for ext in CPP_EXTS},
+}
 
 # YAML keys that may stay plain scalars (see Applier._yaml_key_source),
 # and the plain scalars YAML 1.1 (PyYAML) or 1.2 reads as booleans or null.
@@ -200,6 +250,18 @@ class Applier:
         return line[: len(line) - len(line.lstrip(" \t"))]
 
     def _reindent(self, content_lines: list[str], target_indent: str) -> list[str]:
+        """
+        content_lines with the indentation of the first one changed to
+        target_indent, and the same change made to every line that starts
+        with it; a line indented less than the first gets target_indent in
+        place of its own. Blank lines stay as they are, and so do the lines
+        that start inside a multi-line string literal of the content
+        (_literal_rows), which are part of its value. Those of a literal
+        whose language strips their common indentation (a Python docstring,
+        a Ruby `<<~` heredoc, a Java text block) move with the code instead,
+        all by the same number of columns, unless one of them is indented
+        less than the code moves back (_shift_line): then they all stay.
+        """
         if not content_lines:
             return content_lines
         old_indent = self._get_indent(content_lines[0])
@@ -212,7 +274,96 @@ class Applier:
             else:
                 # Only spaces and tabs are indentation (see _get_indent).
                 result.append(target_indent + line.lstrip(" \t"))
+        for rows, shifts in self._literal_rows(content_lines):
+            kept = content_lines[rows.start : rows.stop]
+            moved = [self._shift_line(line, old_indent, target_indent) for line in kept] if shifts else [None]
+            result[rows.start : rows.stop] = kept if None in moved else moved
         return result
+
+    def _literal_rows(self, lines: list[str]) -> list[tuple[range, bool]]:
+        """
+        For each multi-line string literal of the caller content `lines`
+        (see _MULTILINE_STRINGS), the indices of the lines that start inside
+        it (the lines after its first, up to the one it ends on) and whether
+        its language strips their common indentation from its value: a
+        Python docstring (the first statement of the content, a class or a
+        function, when it is a string), a Ruby `<<~` heredoc or a Java text
+        block. The content is parsed with the file's grammar, Python's
+        dedented by its first line's indentation first; a literal with a
+        syntax error in it is left out, so its lines are re-indented as code.
+        """
+        ext = self.parser.ext
+        types = _MULTILINE_STRINGS.get(ext)
+        if not types or len(lines) < 2:
+            return []
+        if ext == ".py":
+            # Python parses only from column 0, and where a string ends does
+            # not depend on how its lines are indented.
+            old = self._get_indent(lines[0])
+            lines = [line[len(old) :] if line.startswith(old) else line for line in lines]
+        root = self.parser.parse("\n".join(lines).encode("utf-8")).root_node
+        literals, openers, stack = [], [], [root]
+        while stack:
+            node = stack.pop()
+            if node.type == "heredoc_beginning":
+                openers.append(node)
+            if node.type in types and node.end_point[0] > node.start_point[0]:
+                if not node.has_error:
+                    literals.append(node)
+                continue
+            stack.extend(reversed(node.children))
+        # Ruby heredoc bodies come in the order of their `<<~EOS` openers.
+        bodies = [node for node in literals if node.type == "heredoc_body"]
+        squiggly = {}
+        if len(bodies) == len(openers):
+            squiggly = {body.start_byte: opener.text.startswith(b"<<~") for body, opener in zip(bodies, openers)}
+        result = []
+        for node in literals:
+            if node.type == "heredoc_body":
+                shifts = squiggly.get(node.start_byte, False)
+            elif ext == ".java":
+                shifts = node.text.startswith(b'"""')
+            elif ext == ".py":
+                shifts = self._is_docstring(node)
+            else:
+                shifts = False
+            result.append((range(node.start_point[0] + 1, node.end_point[0] + 1), shifts))
+        return result
+
+    @classmethod
+    def _is_docstring(cls, string) -> bool:
+        """Whether a Python string node is a docstring: the first statement
+        (comments are none) of the module, a class or a function."""
+        stmt = string.parent
+        if stmt is None or not cls._is_docstring_node(stmt):
+            return False
+        body = stmt.parent
+        if body.type == "block":
+            if body.parent is None or body.parent.type not in ("function_definition", "class_definition"):
+                return False
+        elif body.type != "module":
+            return False
+        return next(c for c in body.named_children if c.type != "comment") == stmt
+
+    def _shift_line(self, line: str, old: str, new: str) -> str | None:
+        """
+        A line of a literal whose language strips the common indentation of
+        its lines (see _reindent), moved by as many columns as a line of code
+        indented `old` moves to `new`: its `old` replaced with `new`, the
+        indentation `new` adds put before it, or the indentation `new` drops
+        taken from it. None when it is indented less than that, or `old` and
+        `new` differ in more than their length. A blank line stays as it is.
+        """
+        if not line.strip():
+            return line
+        if line.startswith(old):
+            return new + line[len(old) :]
+        if new.startswith(old):
+            return new[len(old) :] + line
+        cut = len(old) - len(new)
+        if old.startswith(new) and len(self._get_indent(line)) >= cut:
+            return line[cut:]
+        return None
 
     def _symbol_span(self, node):
         """
@@ -221,7 +372,14 @@ class Applier:
         delete_symbol, insert_sibling, edit_leading_comment). That is the
         node itself, except that a JS/TS exported declaration spans its whole
         `export` statement (with any decorators written before `export`), a
-        decorated Python class its decorated_definition, and a TS class
+        decorated Python class its decorated_definition, a C++ template its
+        `template <...>` header (the outermost template_declaration, when a
+        member template defined outside its class has two; a template
+        class's ends with the `;` after its `}`), a C/C++ class, struct,
+        union or enum ends with the `;` after it, as a template class does
+        (a member one is its field_declaration), a Ruby statement that opens
+        heredocs (`X = <<~EOS`) ends with their bodies, which the grammar
+        places after it, and a TS class
         member starts at the first of the decorators the grammar places
         beside it in the class body, comments between them included.
         Decorated Python functions are found as their decorated_definition,
@@ -231,6 +389,32 @@ class Applier:
         parent = node.parent
         if parent is not None and parent.type in ("export_statement", "decorated_definition"):
             return parent, parent
+        if self.parser.ext in C_EXTS + CPP_EXTS:
+            while node.parent is not None and node.parent.type == "template_declaration":
+                node = node.parent
+            end = node.next_sibling
+            if (
+                node.type in _C_TYPE_SPECIFIERS
+                and end is not None
+                and end.type == ";"
+                and not self.parser.source_bytes[node.end_byte : end.start_byte].strip()
+            ):
+                # A member class is a field_declaration of its own with its `;`.
+                if node.parent.type == "field_declaration" and node.parent.child_count == 2:
+                    return node.parent, node.parent
+                return node, end
+            return node, node
+        if self.parser.ext == ".rb":
+            # The bodies of the heredocs a statement opens (`X = <<~EOS`)
+            # follow it, each from the line where the one before ends.
+            last = node
+            while (
+                last.next_sibling is not None
+                and last.next_sibling.type == "heredoc_body"
+                and last.next_sibling.start_point[0] == last.end_point[0]
+            ):
+                last = last.next_sibling
+            return node, last
         if self.parser.ext not in _JS_EXTS:
             return node, node
         first = node
@@ -240,6 +424,123 @@ class Applier:
                 first = prev
             prev = prev.prev_named_sibling
         return first, node
+
+    @staticmethod
+    def _template_entity(node):
+        """What the C++ template_declaration `node` declares (through the
+        nested headers of a member template defined outside its class), or
+        None."""
+        while node is not None and node.type == "template_declaration":
+            node = next(
+                (c for c in reversed(node.named_children)
+                 if c.type != "template_parameter_list" and "comment" not in c.type),
+                None,
+            )
+        return node
+
+    def _symbol_unit(self, node):
+        """
+        The first and last nodes of the code that an edit to the whole symbol
+        `node` takes in a source file: its span (_symbol_span), widened over
+        the constructs it ends, which only add what is written before it: a
+        Go `type`, `var` or `const` around its one spec, a TS `declare`, a C++
+        `extern "C"`, a Ruby `private def`, the key of a closure in an object
+        or composite literal (`handler: () => {}`), and the C/C++ typedef or
+        declaration whose type a struct, union, enum or class is (`typedef
+        struct Node {...} Node;`), all listed in _UNIT_WRAPPERS. Any other
+        container (a class body, a Java enum's body declarations, a C #else
+        or a Ruby else branch) holds the code before the symbol as siblings,
+        never as part of it.
+        """
+        first, last = self._symbol_span(node)
+        if first != last or self.parser.ext in _CONFIG_EXTS:
+            return first, last
+        while True:
+            parent = last.parent
+            if parent is None or parent.parent is None:
+                break
+            later = [
+                c for c in parent.children
+                if c != last and c.start_byte >= last.end_byte and "comment" not in c.type
+            ]
+            heads = (
+                self.parser.ext in C_EXTS + CPP_EXTS
+                and parent.type in ("type_definition", "declaration", "field_declaration")
+                and parent.child_by_field_name("type") == last
+            )
+            if not heads and (later or parent.type not in _UNIT_WRAPPERS):
+                break
+            if parent.type == "argument_list" and any(
+                c != last and "comment" not in c.type for c in parent.named_children
+            ):
+                # `private def f`, not `foo x, def f`
+                break
+            last = parent
+        return last, last
+
+    def _same_line(self, end: int, start: int) -> bool:
+        """Whether the code that ends at byte `end` and the code that starts
+        at `start` share a line (a node such as a C #include can end with
+        its line break)."""
+        return b"\n" not in self.parser.source_bytes[max(end - 1, 0) : start]
+
+    @staticmethod
+    def _is_separator(node) -> bool:
+        """Whether `node` is a `;` or `,` between statements or entries
+        (_SEPARATORS), including the `;` that JS/TS parse as an
+        empty_statement of its own (`class A {};`)."""
+        return node is not None and (
+            (node.type in _SEPARATORS and not node.is_named) or node.type == "empty_statement"
+        )
+
+    def _line_sharing(self, first, last) -> tuple[bool, object, bool]:
+        """
+        How the symbol first..last (_symbol_unit) shares its lines with other
+        code, as (before, separator, after): whether code comes before it on
+        its first line; the `;` or `,` that ends it on its last line, if it
+        has one (None otherwise); and whether code follows it, and that
+        separator, on its last line. Whitespace and comments are not code. A
+        whole-symbol edit takes the lines of a symbol that shares neither;
+        config files are always edited by lines.
+        """
+        if self.parser.ext in _CONFIG_EXTS:
+            return False, None, False
+
+        def neighbour(node, forward: bool):
+            # The code next to `node` in the file, comments skipped.
+            while node is not None:
+                sibling = node.next_sibling if forward else node.prev_sibling
+                while sibling is not None and "comment" in sibling.type:
+                    sibling = sibling.next_sibling if forward else sibling.prev_sibling
+                if sibling is not None:
+                    return sibling
+                node = node.parent
+            return None
+
+        prev = neighbour(first, False)
+        before = prev is not None and self._same_line(prev.end_byte, first.start_byte)
+        separator = last.next_sibling
+        if not (
+            self._is_separator(separator)
+            and not self.parser.source_bytes[last.end_byte : separator.start_byte].strip()
+        ):
+            separator = None
+        end = last if separator is None else separator
+        nxt = neighbour(end, True)
+        after = nxt is not None and self._same_line(end.end_byte, nxt.start_byte)
+        return before, separator, after
+
+    def _line_starts_with_sibling(self, node) -> bool:
+        """Whether the code that starts the first line of `node` is `node`
+        or a sibling of it, rather than the code `node` is part of (the
+        header of a one-line Python class, a `{`)."""
+        row = node.start_point[0]
+        line = self.lines[row]
+        column = len(line[: len(line) - len(line.lstrip())].encode("utf-8"))
+        start = self.parser.tree.root_node.descendant_for_point_range((row, column), (row, column))
+        while start is not None and start.parent != node.parent:
+            start = start.parent
+        return start is not None and start.is_named and "comment" not in start.type
 
     def _callable(self, node, target: str):
         """
@@ -254,13 +555,25 @@ class Applier:
         return bound if bound is not None else node
 
     def replace_function(self, target: str, content: str) -> str:
+        """
+        Replace the whole symbol `target` (decorators, a JS/TS `export` and a
+        C++ `template <...>` header included, see _symbol_span) with
+        content: the lines it takes up, re-indented to its own (a `;` or `,`
+        after it on its last line kept), or, when it shares a line with
+        other code (`function a() {} function b() {}`), only its own text
+        (_replace_inline).
+        """
         node = self.parser.find_node_by_name(target)
         if not node:
             raise ApplierError(f"Target '{target}' not found in {self.filepath}")
 
-        # line indexing is 0-based; decorators and a JS/TS `export` are part
-        # of the definition (see _symbol_span).
-        first, last = self._symbol_span(node)
+        # line indexing is 0-based; decorators, a JS/TS `export` and a C++
+        # `template <...>` are part of the definition (see _symbol_span and
+        # _symbol_unit).
+        first, last = self._symbol_unit(node)
+        before, separator, after = self._line_sharing(first, last)
+        if before or after:
+            return self._replace_inline(target, first, last, content)
         start_line = first.start_point[0]
         end_line = last.end_point[0] + 1
 
@@ -268,9 +581,63 @@ class Applier:
         content_lines = _content_lines(content)
         if content_lines and self._get_indent(content_lines[0]) != original_indent:
             content_lines = self._reindent(content_lines, original_indent)
+        # The `;` or `,` after the symbol on its last line (JS's `class A {};`)
+        # is not part of it, so it stays unless the content ends with it.
+        code = [i for i, line in enumerate(content_lines) if line.strip()]
+        if separator is not None and code and separator.start_point[0] == last.end_point[0]:
+            mark = self.parser.node_text(separator)
+            if not content_lines[code[-1]].rstrip().endswith(mark):
+                content_lines[code[-1]] = content_lines[code[-1]].rstrip() + mark
 
         self.lines = self.lines[:start_line] + content_lines + self.lines[end_line:]
         return self._save()
+
+    def _replace_inline(self, target: str, first, last, content: str) -> str:
+        """
+        replace_function for a symbol that shares a line with other code:
+        its text, first..last, is replaced, and the code around it on its
+        lines stays. The content goes in where the symbol started, without
+        blank lines around it or a final line break, its first line's
+        indentation dropped and the lines after it re-indented with it to
+        the indentation of the symbol's line. Content that ends with a line
+        comment is refused when code follows the symbol on its line.
+        """
+        lines = _content_lines(content)
+        while lines and not lines[0].strip():
+            lines.pop(0)
+        while lines and not lines[-1].strip():
+            lines.pop()
+        indent = self._get_indent(self.lines[first.start_point[0]])
+        if lines:
+            lines = self._reindent(lines, indent)
+            lines[0] = lines[0][len(indent) :]
+        text = "\n".join(lines).rstrip(" \t").encode("utf-8")
+        src = self.parser.source_bytes
+        new = src[: first.start_byte] + text + src[last.end_byte :]
+        # The code after the symbol on its line, comments skipped, must stay
+        # code: content ending in a `#` or `//` comment would take it in.
+        root, pos = self.parser.tree.root_node, last.end_byte
+        while pos < len(src) and src[pos : pos + 1] != b"\n":
+            if src[pos : pos + 1] in (b" ", b"\t", b"\r"):
+                pos += 1
+                continue
+            node = root.descendant_for_byte_range(pos, pos + 1)
+            if "comment" in node.type:
+                pos = max(node.end_byte, pos + 1)
+            else:
+                moved = pos + len(new) - len(src)
+                node = self.parser.parse(new).root_node.descendant_for_byte_range(moved, moved + 1)
+                while node is not None and "comment" not in node.type:
+                    node = node.parent
+                if node is not None and node.start_byte < moved:
+                    raise ApplierError(
+                        f"The content ends with a comment, and the code after '{target}' on its "
+                        "line would become part of it. Leave the comment out, or make this edit "
+                        "with your normal edit tool."
+                    )
+                break
+        self._write_bytes(new)
+        return "Update successful"
 
     def replace_value(self, target: str, content: str) -> str:
         node = self.parser.find_node_by_name(target)
@@ -353,7 +720,17 @@ class Applier:
         return entry.child_by_field_name("value"), ""
 
     def replace_function_body(self, target: str, content: str) -> str:
+        """
+        Replace the body of a function, keeping its signature: the lines
+        between its `{` and `}` lines, or the lines of a Python or Ruby body,
+        with content re-indented to the body's indentation. A body that
+        shares a line with its signature or braces (`function f() { return
+        1; }`, `def f(): return 1`) is rebuilt over lines of its own
+        (_rebuild_body).
+        """
         func_node, block_node = self._get_function_body_node(target)
+        if self._body_shares_line(func_node, block_node):
+            return self._rebuild_body(func_node, block_node, content)
 
         # Python and Ruby use indented body lines between def/class and end markers.
         if self.parser.ext == ".py" or self.parser.ext in (".rb",):
@@ -363,9 +740,6 @@ class Applier:
             # JS/TS/C/C++/Go/Java: body is `{ ... }` -- skip the opening brace line.
             start_line = block_node.start_point[0] + 1
             end_line = block_node.end_point[0]
-            if start_line > end_line:
-                start_line = block_node.start_point[0]
-                end_line = start_line + 1
 
         target_indent = self._get_indent(self.lines[start_line]) if start_line < len(self.lines) else ""
         if not target_indent and start_line < len(self.lines) and self.lines[start_line].strip() == "":
@@ -377,6 +751,75 @@ class Applier:
 
         self.lines = self.lines[:start_line] + content_lines + self.lines[end_line:]
         return self._save()
+
+    def _body_opening(self, func_node, body) -> int:
+        """The byte where the body of func_node opens: after its `{`, after
+        the `:` of a Python def or class, or after the name and parameters of
+        a Ruby method (not a `;` after them)."""
+        ext = self.parser.ext
+        if ext not in (".py", ".rb"):
+            return body.start_byte + 1
+        head = [
+            c for c in func_node.children
+            if c.end_byte <= body.start_byte and c.type != ";" and "comment" not in c.type
+        ]
+        if ext == ".py":
+            head = [c for c in head if c.type == ":"]
+        return head[-1].end_byte if head else body.start_byte
+
+    def _body_shares_line(self, func_node, body) -> bool:
+        """
+        Whether the body of func_node shares a line with its signature or
+        braces, for replace_function_body: its first statement is on the line
+        where it opens (_body_opening), its last one on the line of its `}`
+        (a Ruby body ends on the line of its `end`), or a braced body is on
+        one line. Comments are no statements.
+        """
+        stmts = [c for c in body.named_children if "comment" not in c.type]
+        if len(stmts) == 1 and stmts[0].type == "statement_list":
+            stmts = [c for c in stmts[0].named_children if "comment" not in c.type]
+        open_row = self.parser.source_bytes.count(b"\n", 0, self._body_opening(func_node, body))
+        if stmts and stmts[0].start_point[0] == open_row:
+            return True
+        ext = self.parser.ext
+        if ext == ".py":
+            return False
+        if ext == ".rb":
+            end = func_node.children[-1]
+            return bool(stmts) and end.type == "end" and body.end_point[0] == end.start_point[0]
+        return body.start_point[0] == body.end_point[0] or bool(stmts and stmts[-1].end_point[0] == body.end_point[0])
+
+    def _rebuild_body(self, func_node, body, content: str) -> str:
+        """
+        replace_function_body for a body that shares a line with its
+        signature or braces: what is between where it opens (_body_opening)
+        and its `}` or Ruby `end` becomes the content, on lines of its own one
+        indentation level deeper than the line the function starts on, and
+        the `}` or `end` goes on a line of its own at that line's indentation.
+        Comments that follow the opening on its line, before any statement,
+        stay there. A Python body ends with its last statement.
+        """
+        ext = self.parser.ext
+        src = self.parser.source_bytes
+        base = self._get_indent(self.lines[func_node.start_point[0]])
+        unit = self._indent_unit({".py": "    ", ".java": "    ", ".go": "\t"}.get(ext, "  "))
+        lines = _content_lines(content)
+        while lines and not lines[0].strip():
+            lines.pop(0)
+        while lines and not lines[-1].strip():
+            lines.pop()
+        text = "\n".join(self._reindent(lines, base + unit)).encode("utf-8")
+        opening = self._body_opening(func_node, body)
+        if ext == ".py":
+            self._write_bytes(src[:opening] + b"\n" + text + src[body.end_byte :])
+            return "Update successful"
+        close = func_node.children[-1].start_byte if ext == ".rb" else body.end_byte - 1
+        line_end = src.find(b"\n", opening)
+        code = next((c for c in body.named_children if "comment" not in c.type), None)
+        if 0 <= line_end < close and (code is None or code.start_byte > line_end):
+            opening = line_end
+        self._write_bytes(src[:opening] + b"\n" + text + b"\n" + base.encode("utf-8") + src[close:])
+        return "Update successful"
 
     def add_method(self, class_target: str, content: str) -> str:
         """
@@ -421,15 +864,20 @@ class Applier:
         comments, or C-style `/* ... */` blocks) directly above the symbol --
         pass `include_leading_comments=False` to keep that comment in place.
         The blank lines that separated the symbol from its neighbours go with
-        it (see _separator_lines).
+        it (see _separator_lines). A symbol that shares a line with other
+        code is cut out of it (_delete_inline).
         """
         node = self.parser.find_node_by_name(target)
         if not node:
             raise ApplierError(f"Target '{target}' not found")
 
-        # Decorators and a JS/TS `export` go with the symbol, and its
-        # leading comment is the one above them (see _symbol_span).
-        first, last = self._symbol_span(node)
+        # Decorators, a JS/TS `export` and a C++ `template <...>` go with the
+        # symbol, and its leading comment is the one above them (see
+        # _symbol_span and _symbol_unit).
+        first, last = self._symbol_unit(node)
+        before, separator, after = self._line_sharing(first, last)
+        if before or after:
+            return self._delete_inline(first, last, separator, before, after, include_leading_comments)
         start_line = first.start_point[0]
         end_line = last.end_point[0] + 1
 
@@ -441,6 +889,70 @@ class Applier:
         start_line, end_line = self._separator_lines(first, last, start_line, end_line)
         self.lines = self.lines[:start_line] + self.lines[end_line:]
         return self._save()
+
+    def _delete_inline(self, first, last, separator, before: bool, after: bool, include_leading_comments: bool) -> str:
+        """
+        delete_symbol for a symbol, first..last, that shares its first line
+        (`before`) or its last line (`after`) with other code: its text is cut
+        out of them, with the `;` or `,` that ends it (`separator`) and the
+        spaces and tabs after it, so that the spaces that were before it are
+        left between the code on both sides of it. A symbol that ends its
+        line takes the rest of it (a comment there, as when deleting whole
+        lines) and, if no separator of its own ends it (a C/C++ class's `;`
+        is part of its span, see _symbol_span), the `;` or `,` before it that
+        separated it from the code before (`x = 1; y = 2` loses `; y = 2`);
+        so does a symbol that the `}` or `)` closing its container follows
+        (`{ a: 1, b: 2 }` minus b is `{ a: 1 }`). A symbol that starts
+        its line keeps the line's indentation for the code after it, and
+        takes its leading comment with it unless include_leading_comments is
+        False.
+        """
+        src = self.parser.source_bytes
+        start = first.start_byte
+        end = last.end_byte if separator is None else separator.end_byte
+        # The `;` or `,` before the symbol goes with it when no separator of
+        # its own parts it from what follows it: the rest of its line, or the
+        # `}` or `)` closing the code it is part of.
+        prev = first.prev_sibling
+        following = last.next_sibling
+        while following is not None and "comment" in following.type:
+            following = following.next_sibling
+        takes_prev = (
+            separator is None
+            and last.type not in _SEPARATORS
+            and prev is not None
+            and prev.type in _SEPARATORS
+            and not prev.is_named
+            and not src[prev.end_byte : start].strip()
+            and (not after or following is None or not following.is_named)
+        )
+        if takes_prev:
+            start = prev.start_byte
+        if not after:
+            line_end = src.find(b"\n", end)
+            end = len(src) if line_end == -1 else line_end
+        line_start = src.rfind(b"\n", 0, start) + 1
+        cut = start
+        if before:
+            while start > line_start and src[start - 1 : start] in (b" ", b"\t"):
+                start -= 1
+        # Between the code on both sides stay the spaces that were before the
+        # symbol, or, when it took the separator before it, those before the
+        # code that closes it (`{ a: 1, b: 2 }` minus b is `{ a: 1 }`).
+        gap = b""
+        if after and not takes_prev:
+            gap = src[start:cut]
+            while src[end : end + 1] in (b" ", b"\t"):
+                end += 1
+        head = src[:start]
+        if not before and include_leading_comments:
+            comment_range = self._find_leading_comment_range(first.start_point[0])
+            if comment_range is not None:
+                # Whole comment lines go; the symbol's indentation stays.
+                comment_start = sum(len(line.encode("utf-8")) + 1 for line in self.lines[: comment_range[0]])
+                head = src[:comment_start] + src[line_start:start]
+        self._write_bytes(head + gap + src[end:])
+        return "Update successful"
 
     def _separator_lines(self, first, last, start_line: int, end_line: int) -> tuple[int, int]:
         """
@@ -477,13 +989,7 @@ class Applier:
             unit = unit.parent
         siblings = unit.parent.named_children if unit.parent is not None else []
 
-        def last_row(node) -> int:
-            # A node that ends with its line break (a C #include) ends at
-            # column 0 of the next line.
-            row, column = node.end_point
-            return row - 1 if column == 0 and row > node.start_point[0] else row
-
-        above = any(last_row(s) < start_line and s.type != "access_specifier" for s in siblings)
+        above = any(self._last_row(s) < start_line and s.type != "access_specifier" for s in siblings)
         below = any(s.start_point[0] >= end_line for s in siblings)
         if not above:
             end_line += after
@@ -495,6 +1001,13 @@ class Applier:
             else:
                 start_line -= before
         return start_line, end_line
+
+    @staticmethod
+    def _last_row(node) -> int:
+        """The line `node` ends on. A node that ends with its line break (a
+        C #include) ends at column 0 of the next line."""
+        row, column = node.end_point
+        return row - 1 if column == 0 and row > node.start_point[0] else row
 
     def _save(self) -> str:
         """
@@ -902,27 +1415,27 @@ class Applier:
 
     def _delete_entry(self, container, entries: list, idx: int) -> None:
         """
-        Delete entries[idx] from a brace-delimited container (JSON object,
-        Python dict, JS/TS object literal) along with one adjacent comma, and
-        write the file. An entry on lines of its own goes with those whole
-        lines, a comment on its last line included; if it was the last entry
-        and had no trailing comma, the comma after the entry before it goes
-        too (JSON rejects a trailing comma). An entry sharing a line with
-        another one is cut up to the next entry when it starts its line (or
-        is the first entry), else from the end of the one before it, so one
-        separating comma goes with it. Deleting the only entry leaves `{}`
-        (when nothing but whitespace and a trailing comma surrounds it)
-        rather than a stray comma, which JS would reject.
+        Delete entries[idx] from a brace-, bracket- or parenthesis-delimited
+        container (JSON object or array, Python dict or list, JS/TS object
+        literal, YAML flow sequence, TOML array, a parameter list) along with
+        one adjacent comma, and write the file. An entry on lines of its own
+        goes with those whole lines, a comment on its last line included; if
+        it was the last entry and had no trailing comma, the comma after the
+        entry before it goes too (JSON rejects a trailing comma). An entry
+        sharing a line with another one is cut up to the next entry when it
+        starts its line (or is the first entry), else from the end of the one
+        before it, so one separating comma goes with it; a comment between
+        the two stays, with the closing bracket moved below it when it ends
+        its line. Deleting the only entry leaves `{}` (when nothing but
+        whitespace, a trailing comma and comments on the entry's line
+        surround it) rather than a stray comma, which JS would reject.
+        Comments are no entries: they are left out of `entries`, and those on
+        lines other than the entry's stay.
         """
         src = self.parser.source_bytes
         entry = entries[idx]
         open_brace, close_brace = container.children[0], container.children[-1]
         inner = container.children[1:-1]
-        others = [
-            c
-            for c in inner
-            if c != entry and not (c.type == "," and c.start_byte >= entry.end_byte)
-        ]
         # The entry's comma, then any comments on the same row.
         after = [c for c in inner if c.start_byte >= entry.end_byte]
         comma = after[0] if after and after[0].type == "," else None
@@ -932,6 +1445,14 @@ class Applier:
             if "comment" not in c.type or c.start_point[0] != row:
                 break
             end = c.end_byte
+        # What stays: the comments on the entry's row after it go with it.
+        others = [
+            c
+            for c in inner
+            if c != entry
+            and not (c.type == "," and c.start_byte >= entry.end_byte)
+            and not (entry.end_byte <= c.start_byte and c.end_byte <= end)
+        ]
         line_start = src.rfind(b"\n", 0, entry.start_byte) + 1
         line_end = src.find(b"\n", end)
         starts_line = not src[line_start : entry.start_byte].strip()
@@ -960,14 +1481,46 @@ class Applier:
                     cuts.append((prev_comma.start_byte, prev_comma.end_byte))
         elif (starts_line or idx == 0) and idx + 1 < len(entries):
             cuts = [(entry.start_byte, entries[idx + 1].start_byte)]
-        elif idx > 0:
+        elif idx > 0 and not any(
+            "comment" in c.type and entries[idx - 1].end_byte <= c.start_byte < entry.start_byte
+            for c in inner
+        ):
             cuts = [(entries[idx - 1].end_byte, entry.end_byte)]
+        elif idx > 0:
+            # A comment after the entry before stays with it. That entry's
+            # comma goes, except in Go, which needs it before a line break,
+            # and the closing bracket takes this entry's place, at the
+            # indentation of the container's first line when the entry
+            # started its line.
+            cuts = []
+            prev_comma = next(
+                (
+                    c
+                    for c in inner
+                    if c.type == "," and entries[idx - 1].end_byte <= c.start_byte < entry.start_byte
+                ),
+                None,
+            )
+            if prev_comma is not None and self.parser.ext != ".go":
+                cuts.append((prev_comma.start_byte, prev_comma.end_byte))
+            if starts_line and self.parser.ext in (".yml", ".yaml"):
+                # YAML wants the lines of a flow sequence indented past its key.
+                cuts.append((entry.start_byte, entry.end_byte))
+            elif starts_line:
+                opener_line = src[src.rfind(b"\n", 0, container.start_byte) + 1 : container.start_byte]
+                indent = opener_line[: len(opener_line) - len(opener_line.lstrip(b" \t"))]
+                cuts.append((line_start, entry.end_byte, indent))
+            else:
+                start = entry.start_byte
+                while src[start - 1 : start] in (b" ", b"\t"):
+                    start -= 1
+                cuts.append((start, entry.end_byte))
         else:
             cuts = [(entry.start_byte, (comma or entry).end_byte)]
 
         new_bytes = src
-        for start, stop in sorted(cuts, reverse=True):
-            new_bytes = new_bytes[:start] + new_bytes[stop:]
+        for start, stop, *text in sorted(cuts, reverse=True):
+            new_bytes = new_bytes[:start] + b"".join(text) + new_bytes[stop:]
         self._write_bytes(new_bytes)
 
     def _find_json_object_at_path(self, dotted_path: str):
@@ -1687,6 +2240,12 @@ class Applier:
         """
         Remove the first element matching value_match (stripped text equality) from
         an array/list in a config file OR a Python module-level list literal.
+        Comments are no elements. A JSON or TOML array or a YAML flow
+        sequence loses the element the way _delete_entry deletes an entry:
+        one on a line of its own goes with that line, a comment at its end
+        included (comments on other lines stay), and a last element with no
+        comma after it takes the comma before it. A YAML block sequence item
+        goes with its lines.
         """
         ext = self.parser.ext
         if ext == ".py":
@@ -1695,7 +2254,8 @@ class Applier:
         root = self.parser.tree.root_node
         stripped_match = value_match.strip()
 
-        def _remove_element_bytes(arr_node, elements):
+        def _remove_element(arr_node):
+            elements = [c for c in arr_node.named_children if "comment" not in c.type]
             if not elements:
                 raise ApplierError(f"Array at '{target}' is empty")
             idx = None
@@ -1708,28 +2268,20 @@ class Applier:
                 raise ApplierError(
                     f"Value '{value_match}' not found in array at '{target}'"
                 )
-            source_bytes = self.parser.source_bytes
-            start = elements[idx].start_byte
-            end = elements[idx].end_byte
-            if idx > 0:
-                start = elements[idx - 1].end_byte
-            elif idx + 1 < len(elements):
-                end = elements[idx + 1].start_byte
-            new_bytes = source_bytes[:start] + source_bytes[end:]
-            self._write_bytes(new_bytes)
+            self._delete_entry(arr_node, elements, idx)
 
         if ext == ".json":
             arr = self.parser._search_json_dotted(root, target)
             if arr is None or arr.type != "array":
                 raise ApplierError(f"JSON array at '{target}' not found")
-            _remove_element_bytes(arr, [c for c in arr.named_children])
+            _remove_element(arr)
             return "Update successful"
 
         if ext == ".toml":
             arr = self.parser._search_toml_dotted(root, target)
             if arr is None or arr.type != "array":
                 raise ApplierError(f"TOML array at '{target}' not found")
-            _remove_element_bytes(arr, [c for c in arr.named_children])
+            _remove_element(arr)
             return "Update successful"
 
         if ext in (".yml", ".yaml"):
@@ -1741,9 +2293,7 @@ class Applier:
             ):
                 raise ApplierError(f"YAML sequence at '{target}' not found")
             if collection.type == "flow_sequence":
-                _remove_element_bytes(
-                    collection, [c for c in collection.named_children]
-                )
+                _remove_element(collection)
                 return "Update successful"
             items = [
                 c for c in collection.named_children if c.type == "block_sequence_item"
@@ -1992,30 +2542,41 @@ class Applier:
         constants = [c for c in body.children if c.type in ("enum_constant", ",")]
         return (constants[-1].end_byte if constants else body.start_byte + 1), b";", []
 
-    @staticmethod
-    def _tab_indent(lines: list[str]) -> list[str]:
+    def _tab_indent(self, lines: list[str]) -> list[str]:
         """
         `lines` with the indentation they have beyond their first line's
         written in tabs: one per indentation step of the content (the
         smallest such indentation it has), any spaces left over kept. Lines
-        indented less than the first, and content that already uses tabs
-        for it, are left as they are.
+        indented less than the first, the lines that start inside a
+        multi-line string literal (_literal_rows), and content that already
+        uses tabs for it, are left as they are; the lines of a literal that
+        moves with the code (a docstring) get tabs only for as far as the
+        line it starts on is indented, so they stay in line with it.
         """
         first = lines[0]
         base = first[: len(first) - len(first.lstrip(" \t"))]
+        literals = self._literal_rows(lines)
+        literal = {i for rows, _ in literals for i in rows}
         extra = []
-        for line in lines:
+        for i, line in enumerate(lines):
             rest = line[len(base) :] if line.strip() and line.startswith(base) else ""
             extra.append(rest[: len(rest) - len(rest.lstrip(" \t"))])
-        widths = [len(ws) for ws in extra if ws]
-        if not widths or any("\t" in ws for ws in extra):
+        # How much of a line's indentation may become tabs: all of a code
+        # line's, as much of a moving literal's lines as its first line has.
+        limit = {i: len(ws) for i, ws in enumerate(extra) if i not in literal}
+        for rows, shifts in literals:
+            for i in rows:
+                if shifts and rows.start - 1 in limit:
+                    limit[i] = min(len(extra[i]), limit[rows.start - 1])
+        widths = [len(ws) for i, ws in enumerate(extra) if ws and i not in literal]
+        if not widths or any("\t" in extra[i] for i in limit):
             return lines
         step = min(widths)
         result = []
-        for line, ws in zip(lines, extra):
-            if ws:
-                tabs, spaces = divmod(len(ws), step)
-                line = base + "\t" * tabs + " " * spaces + line[len(base) + len(ws) :]
+        for i, (line, ws) in enumerate(zip(lines, extra)):
+            if limit.get(i):
+                tabs, spaces = divmod(limit[i], step)
+                line = base + "\t" * tabs + " " * spaces + line[len(base) + limit[i] :]
             result.append(line)
         return result
 
@@ -2087,12 +2648,19 @@ class Applier:
 
         Decorators (Python, JS/TS) and Java annotations are preserved when
         new_signature has none; if it includes its own, those replace them.
+        So is a C++ template's `template <...>` header: a new_signature that
+        starts with `template` replaces it (all of them, when a member
+        template defined outside its class has two).
         For a JS/TS function bound to a name, a new_signature that starts
         with const/let/var (`const f = (x) =>`) replaces the declaration's
         head as well, and one that does not (`(x) =>`) only the function's.
         A method declared without a body (a TS abstract method, a Java
-        interface or abstract method) is all signature but its final `;`,
-        which stays whether or not new_signature ends with one.
+        interface or abstract method, a C++ `A() = default;`, a Go function
+        without one) is all signature but its final `;`, which stays whether
+        or not new_signature ends with one. A Go struct or interface type and
+        an empty Ruby class, module or method have the header
+        read_symbol(depth="signature") gives them (_header_span); any other
+        symbol (a variable, a constant) is refused.
         """
         node = self.parser.find_node_by_name(target)
         if not node:
@@ -2101,17 +2669,39 @@ class Applier:
         func_node = self._callable(node, target)
 
         body = func_node.child_by_field_name("body")
-        if body is None and func_node.type not in _BODILESS_FUNCTIONS:
-            raise ApplierError(f"Could not find body for target '{target}'")
+        header = self._header_span(func_node) if body is None else None
+        if (
+            body is None
+            and header is None
+            and func_node.type not in _BODILESS_FUNCTIONS
+            and func_node.type not in self._interface_func_types()
+        ):
+            raise ApplierError(
+                f"'{target}' is {self._symbol_kind(func_node)}, which has no signature to "
+                "replace (replace_signature is for functions and class headers); rewrite "
+                "it with replace_function"
+            )
 
-        # The signature ends where the body starts; a method declared
-        # without one (`abstract m(): void;`) is all signature but the `;`
-        # that ends it, as _get_signature reads it.
+        # The signature ends where the body starts; a function declared
+        # without one (`abstract m(): void;`, `A() = default;`) is all
+        # signature but the `;` that ends it, and a class the grammar gives
+        # no body (a Go struct, an empty Ruby class) its header, as
+        # _get_signature reads them.
         sig_end = func_node.start_byte
         for child in func_node.children:
-            if child == body or (body is None and child.type == ";"):
+            if child == body:
                 break
             sig_end = child.end_byte
+        if header is not None:
+            sig_end = header[1]
+        elif body is None:
+            # The final `;` can sit in a child (C++ `= default;`).
+            source = self.parser.source_bytes
+            sig_end = func_node.end_byte
+            if source[sig_end - 1 : sig_end] == b";":
+                sig_end -= 1
+            while source[sig_end - 1 : sig_end] in (b" ", b"\t"):
+                sig_end -= 1
 
         # The signature is spliced in at the definition's own column, so drop
         # the caller's indentation from its first line (a copied
@@ -2146,7 +2736,10 @@ class Applier:
         # the span back over them; Java annotations (in `modifiers`) and JS
         # decorators are inside it, so keeping them narrows the span.
         replace_from, kept = func_node.start_byte, ""
-        if func_node is not node and node.type in ("lexical_declaration", "variable_declaration"):
+        if header is not None:
+            # From a Go type's `type`, as _header_without_body reads it.
+            replace_from = header[0]
+        elif func_node is not node and node.type in ("lexical_declaration", "variable_declaration"):
             # A JS/TS function bound to a name: `const f = (x) =>`, as
             # read_symbol(depth="signature") gives it, replaces the
             # declaration's head too; `(x) =>` only the function's own.
@@ -2155,6 +2748,11 @@ class Applier:
         elif node.type == "decorated_definition":
             if new_signature.startswith("@"):
                 replace_from = node.start_byte
+        elif self.parser.ext in CPP_EXTS:
+            # A C++ template's `template <...>` header stays unless the new
+            # signature brings its own.
+            if re.match(r"template\b", new_signature):
+                replace_from = self._symbol_span(func_node)[0].start_byte
         elif self._signature_has_annotations(new_signature):
             prev = func_node.prev_named_sibling
             while prev is not None and prev.type == "decorator":
@@ -2247,7 +2845,10 @@ class Applier:
         function or function expression are functions; TS abstract classes
         are classes (their abstract methods listed with the other methods,
         an overloaded one once), and enums, type aliases and interfaces are
-        `enum`, `type` and `interface`.
+        `enum`, `type` and `interface`. C++ templates (functions, classes and
+        member templates) are listed as what they declare, at the line of
+        their `template <...>` header; a definition outside its class
+        (`int A::f()`) is a function under its own name.
         """
         ext = self.parser.ext
         root = self.parser.tree.root_node
@@ -2307,6 +2908,9 @@ class Applier:
             queue = list(body.named_children)
             while queue:
                 child = queue.pop(0)
+                if child.type == "template_declaration":
+                    # A C++ member template is listed as what it declares.
+                    child = self._template_entity(child) or child
                 if child.type == "decorated_definition":
                     definition = child.child_by_field_name("definition")
                     if definition is not None and definition.type == "class_definition":
@@ -2350,6 +2954,12 @@ class Applier:
                 definition = child.child_by_field_name("definition")
                 if definition is not None and definition.type == "class_definition":
                     child, kind_type = definition, definition.type
+            elif child.type == "template_declaration":
+                # C++: a template is listed as the function or class it
+                # declares, at the line of its `template <...>` header.
+                entity = self._template_entity(child)
+                if entity is not None:
+                    child, kind_type = entity, entity.type
             if kind_type in class_types:
                 name = name or get_name(child)
                 kind_map = {
@@ -2385,10 +2995,14 @@ class Applier:
         """
         Return the signature text of a function (everything before its body),
         with surrounding whitespace stripped. Read-only. A JS/TS function
-        bound to a name starts at its `const`/`let`/`var` (`const f = (x) =>`);
+        bound to a name starts at its `const`/`let`/`var` (`const f = (x) =>`),
+        a C++ template function at its `template <...>` header;
         a method or function with no body (a TS abstract method, a Java
-        interface method) is its whole text, without the final `;`. A TS
-        type alias has no signature and is refused.
+        interface method, a C++ `A() = default;`, a Go function declared
+        without one) is its whole text, without the final `;`. A class's
+        signature is its header, also when the grammar gives it no body
+        (_header_without_body). Any other symbol (a variable, a constant, a
+        type alias) has no signature and is refused (_depth_refusal).
         """
         node = self.parser.find_node_by_name(target)
         if not node:
@@ -2398,14 +3012,12 @@ class Applier:
 
         body = func_node.child_by_field_name("body")
         if body is None:
-            if func_node.type in _BODILESS_FUNCTIONS:
+            header = self._header_without_body(func_node)
+            if header is not None:
+                return header
+            if func_node.type in _BODILESS_FUNCTIONS or func_node.type in self._interface_func_types():
                 return self.parser.node_text(func_node).strip().rstrip(";").rstrip()
-            if func_node.type == "type_alias_declaration":
-                raise ApplierError(
-                    f"'{target}' is a type alias, which has no signature; "
-                    "read it with depth='full'"
-                )
-            raise ApplierError(f"Could not find body for target '{target}'")
+            raise self._depth_refusal(target, func_node, "signature")
 
         sig_end = func_node.start_byte
         for child in func_node.children:
@@ -2414,19 +3026,109 @@ class Applier:
             sig_end = child.end_byte
 
         start = node if node.type in ("lexical_declaration", "variable_declaration") else func_node
+        if self.parser.ext in CPP_EXTS:
+            start = self._symbol_span(func_node)[0]
         signature = self.parser.source_bytes[start.start_byte : sig_end].decode("utf-8")
         return signature.strip()
+
+    def _header_without_body(self, node) -> str | None:
+        """
+        The signature read_symbol(depth="signature") gives a class, method
+        or function `node` that the grammar gives no body: a Go struct or
+        interface type is its header up to the `{` (`type A struct`, from its
+        `type` when that declares only it), and a Ruby class, module or
+        method with nothing in its body is its text before the `end`
+        (`class A < B`). None for any other node. See _header_span.
+        """
+        span = self._header_span(node)
+        if span is None:
+            return None
+        return self.parser.source_bytes[span[0] : span[1]].decode("utf-8")
+
+    def _header_span(self, node) -> tuple[int, int] | None:
+        """The bytes [start, end) of the header _header_without_body gives
+        `node`, which replace_signature replaces, or None."""
+        src = self.parser.source_bytes
+        if node.type == "type_spec":
+            kind = node.child_by_field_name("type")
+            if kind is None or kind.type not in ("struct_type", "interface_type"):
+                return None
+            start = node.parent if node.prev_sibling is not None and node.prev_sibling.type == "type" else node
+            return start.start_byte, kind.children[0].end_byte
+        if self.parser.ext in (".rb",) and node.type in ("class", "module", "method", "singleton_method"):
+            end = node.children[-1]
+            if end.type != "end":
+                return None
+            header = src[node.start_byte : end.start_byte].rstrip().rstrip(b";").rstrip()
+            return node.start_byte, node.start_byte + len(header)
+        return None
+
+    def _symbol_kind(self, node) -> str:
+        """
+        What _depth_refusal calls `node`, a symbol that is neither a function
+        nor a class, with its article: a constant (a JS/TS or Go `const`, a
+        Ruby constant), a variable (a Python assignment outside a class, too),
+        a field (a Python class attribute, a Java field), a type alias, a Go
+        type definition (`type N int`) or a C/C++ forward declaration
+        (`struct S;`).
+        """
+        if node.type in ("lexical_declaration", "variable_declaration"):
+            return "a constant" if node.children[0].type == "const" else "a variable"
+        if node.type == "assignment" and self.parser.ext in (".rb",):
+            left = node.named_children[0] if node.named_children else None
+            return "a constant" if left is not None and left.type == "constant" else "a variable"
+        if node.type == "expression_statement":
+            block = node.parent
+            in_class = block is not None and block.parent is not None and block.parent.type == "class_definition"
+            return "a field" if in_class else "a variable"
+        if node.type in _C_TYPE_SPECIFIERS:
+            return "a forward declaration"
+        kinds = {
+            "const_spec": "a constant",
+            "var_spec": "a variable",
+            "field_declaration": "a field",
+            "type_alias_declaration": "a type alias",
+            "type_spec": "a type definition",
+        }
+        return kinds.get(node.type, "a declaration")
+
+    def _depth_refusal(self, target: str, node, depth: str) -> ApplierError:
+        """
+        The error for read_symbol(depth="signature") or depth="interface" on
+        `node`, found for `target`, a symbol that is neither a function nor a
+        class: what it is (_symbol_kind) and what the depth is for. A Go
+        type's interface lists its methods, so a Go type's signature refusal
+        points there too.
+        """
+        if depth == "signature":
+            reason = "which has no signature (depth='signature' is for functions and class headers)"
+        else:
+            reason = "which has no interface (depth='interface' is for classes and functions)"
+        hint = "depth='full'"
+        if node.type == "type_spec":
+            hint = "depth='interface' for its methods, or depth='full'"
+        return ApplierError(f"'{target}' is {self._symbol_kind(node)}, {reason}; read it with {hint}")
 
     def _get_function_body_node(self, target: str):
         """Resolve target to (function node, body block node): the
         block/statement_block/compound_statement/body_statement/constructor_body
         of the function (see _callable). An arrow function whose body is an
-        expression (`() => x`) has no block, and is refused."""
+        expression (`() => x`) has no block, and is refused, as is a Ruby
+        endless method (`def f = x`)."""
         node = self.parser.find_node_by_name(target)
         if not node:
             raise ApplierError(f"Target '{target}' not found in {self.filepath}")
 
         func_node = self._callable(node, target)
+        if (
+            self.parser.ext == ".rb"
+            and func_node.type in ("method", "singleton_method")
+            and func_node.children[-1].type != "end"
+        ):
+            raise ApplierError(
+                f"'{target}' is an endless method (`def name = expression`), not a body "
+                "of statements; rewrite it with replace_function"
+            )
 
         body = func_node.child_by_field_name("body")
         if body is None:
@@ -2573,14 +3275,17 @@ class Applier:
         """Return (start_byte, end_byte) byte range within which to search for
         a snippet inside a function body. For Python/Ruby, extends the start
         back to the beginning of the first body line so leading indentation is
-        part of the searchable text. For brace-delimited languages, returns
+        part of the searchable text, when only that indentation comes before
+        it there (not the signature of a one-line function, or other code).
+        For brace-delimited languages, returns
         the body node's native byte range (which includes `{` and `}`)."""
         start_byte = body_node.start_byte
         end_byte = body_node.end_byte
         if self.parser.ext in (".py", ".rb"):
             source_bytes = self.parser.source_bytes
-            while start_byte > 0 and source_bytes[start_byte - 1:start_byte] != b"\n":
-                start_byte -= 1
+            line_start = source_bytes.rfind(b"\n", 0, start_byte) + 1
+            if not source_bytes[line_start:start_byte].strip(b" \t"):
+                start_byte = line_start
         return start_byte, end_byte
 
     def _body_insert_point(self, target: str, at: str) -> tuple[int, str]:
@@ -2616,7 +3321,11 @@ class Applier:
                 )
             )
         else:
-            compact = bool(stmts) and stmts[0].start_point[0] == sig_line
+            # Where the body opens: after a signature over several lines, too.
+            open_row = self.parser.source_bytes.count(b"\n", 0, self._body_opening(func_node, body))
+            compact = bool(stmts) and stmts[0].start_point[0] == open_row
+            if ext == ".rb" and func_node.children[-1].type == "end":
+                compact = compact or body.end_point[0] == func_node.children[-1].start_point[0]
         if compact:
             raise ApplierError(
                 f"The body of '{target}' shares a line with its signature or braces, so "
@@ -2670,7 +3379,12 @@ class Applier:
         """
         Insert content as a sibling immediately before a named symbol (function, class,
         method, or top-level assignment): above its leading comment block,
-        decorators and JS/TS `export`, followed by a blank line.
+        decorators, JS/TS `export` and C++ `template <...>`, separated from it
+        and from the sibling above it as _sibling_gap says. Blank lines below
+        a comment above it, or below the `{` or access label that opens its
+        body, are left as they are. A symbol that shares its first line with
+        other code is refused: lines above that line would land before that
+        code.
         """
         node = self.parser.find_node_by_name(target)
         if not node:
@@ -2679,7 +3393,14 @@ class Applier:
         # Above the symbol's decorators and a JS/TS `export` (see
         # _symbol_span), and above its leading comment, which documents the
         # symbol and must stay on top of it.
-        insert_line = self._symbol_span(node)[0].start_point[0]
+        first, last = self._symbol_unit(node)
+        if self._line_sharing(first, last)[0]:
+            raise ApplierError(
+                f"'{target}' shares its first line with other code, so new lines above "
+                "that line would not land right before it. Make this edit with your "
+                "normal edit tool."
+            )
+        insert_line = first.start_point[0]
         comment_range = self._find_leading_comment_range(insert_line)
         if comment_range is not None:
             insert_line = comment_range[0]
@@ -2688,19 +3409,27 @@ class Applier:
             if insert_line < len(self.lines)
             else ""
         )
-        content_lines = self._reindent(_content_lines(content), target_indent)
+        content_lines = self._sibling_content(content, target_indent)
 
-        # Add a blank separator line after the inserted content if the target line is non-blank
-        separator = (
-            [""]
-            if insert_line < len(self.lines) and self.lines[insert_line].strip()
-            else []
-        )
+        # The sibling above, a comment at the end of its line not counted.
+        siblings = first.parent.named_children if first.parent is not None else []
+        above = [
+            s for s in siblings
+            if self._last_row(s) < insert_line
+            and ("comment" not in s.type or self._starts_line(s.start_byte))
+        ]
+        top, gap_above = insert_line, []
+        if above and above[-1].type != "access_specifier" and "comment" not in above[-1].type:
+            while top > 0 and not self.lines[top - 1].strip(" \t"):
+                top -= 1
+            gap_above = [""] * self._sibling_gap(first.parent, above[-1], content_lines)
+        gap_below = [""] * self._sibling_gap(first.parent, content_lines, first)
 
         self.lines = (
-            self.lines[:insert_line]
+            self.lines[:top]
+            + gap_above
             + content_lines
-            + separator
+            + gap_below
             + self.lines[insert_line:]
         )
         return self._save()
@@ -2708,33 +3437,90 @@ class Applier:
     def _insert_after(self, target: str, content: str) -> str:
         """
         Insert content as a sibling immediately after a named symbol (function, class,
-        method, or top-level assignment).
+        method, or top-level assignment), separated from it and from the
+        sibling below it (with that sibling's leading comment, decorators and
+        `export`) as _sibling_gap says. When nothing but the end of its body or
+        file, or a C++ access label, follows the symbol, the blank lines after
+        it stay below the new code. A symbol that shares its last line with
+        other code is refused, as is one on the line where the code it is part
+        of starts (`class A: x = 1`): lines below would land after that code.
         """
         node = self.parser.find_node_by_name(target)
         if not node:
             raise ApplierError(f"Target '{target}' not found in {self.filepath}")
 
-        first, last = self._symbol_span(node)
+        first, last = self._symbol_unit(node)
+        before, _, after = self._line_sharing(first, last)
+        if after:
+            raise ApplierError(
+                f"'{target}' shares its last line with other code, so new lines below "
+                "that line would not land right after it. Make this edit with your "
+                "normal edit tool."
+            )
+        if before and not self._line_starts_with_sibling(first):
+            raise ApplierError(
+                f"'{target}' shares its line with the start of the code it is part of, "
+                "so new lines below it would land outside that code. Make this edit "
+                "with your normal edit tool."
+            )
         insert_line = last.end_point[0] + 1
         target_indent = self._get_indent(self.lines[first.start_point[0]])
-        content_lines = self._reindent(_content_lines(content), target_indent)
+        content_lines = self._sibling_content(content, target_indent)
 
-        # Blank separator before the inserted content if the preceding line is non-blank
-        separator = (
-            [""]
-            if insert_line - 1 >= 0
-            and insert_line - 1 < len(self.lines)
-            and self.lines[insert_line - 1].strip()
-            else []
-        )
+        siblings = last.parent.named_children if last.parent is not None else []
+        below = [s for s in siblings if s.start_point[0] >= insert_line]
+        gap_above = [""] * self._sibling_gap(last.parent, last, content_lines)
+        bottom, gap_below = insert_line, []
+        if below and below[0].type != "access_specifier":
+            # The next symbol's leading comment, decorators or `export` start
+            # it; the blank lines before it are replaced.
+            while bottom < len(self.lines) and not self.lines[bottom].strip(" \t"):
+                bottom += 1
+            following = next((s for s in below if "comment" not in s.type), None)
+            gap_below = [""] * self._sibling_gap(last.parent, content_lines, following)
 
         self.lines = (
             self.lines[:insert_line]
-            + separator
+            + gap_above
             + content_lines
-            + self.lines[insert_line:]
+            + gap_below
+            + self.lines[bottom:]
         )
         return self._save()
+
+    def _sibling_content(self, content: str, indent: str) -> list[str]:
+        """The lines of insert_sibling's content, without blank lines around
+        them, re-indented to `indent`."""
+        lines = _content_lines(content)
+        while lines and not lines[0].strip():
+            lines.pop(0)
+        while lines and not lines[-1].strip():
+            lines.pop()
+        if not lines:
+            raise ApplierError("content is empty: pass the source of the code to insert")
+        return self._reindent(lines, indent)
+
+    def _sibling_gap(self, parent, a, b) -> int:
+        """
+        Blank lines between neighbouring siblings `a` and `b` (nodes, or the
+        lines of new content) of `parent`: two at the top level of a Python
+        module when either is a def or a class, decorated or not (PEP 8),
+        else one.
+        """
+        if self.parser.ext != ".py" or parent is None or parent.parent is not None:
+            return 1
+
+        def definition(item) -> bool:
+            if isinstance(item, list):
+                code = next((line.strip() for line in item if line.strip() and not line.strip().startswith("#")), "")
+                return re.match(r"(@|class\b|def\b|async\s+def\b)", code) is not None
+            return item is not None and item.type in (
+                "function_definition",
+                "class_definition",
+                "decorated_definition",
+            )
+
+        return 2 if definition(a) or definition(b) else 1
 
     def insert_sibling(self, target: str, content: str, position: str) -> str:
         """
@@ -2896,10 +3682,11 @@ class Applier:
     def remove_from_list(self, target: str, value_match: str) -> str:
         """
         Remove the first element matching value_match (stripped text equality) from
-        a Python list literal.
+        a Python list literal, the way _delete_entry deletes an entry (see
+        remove_from_array). Comments are no elements.
         """
         list_node = self._find_python_literal(target, "list")
-        elements = list(list_node.named_children)
+        elements = [c for c in list_node.named_children if c.type != "comment"]
 
         stripped = value_match.strip()
         idx = None
@@ -2910,16 +3697,7 @@ class Applier:
         if idx is None:
             raise ApplierError(f"Value {value_match} not found in list '{target}'")
 
-        source_bytes = self.parser.source_bytes
-        start = elements[idx].start_byte
-        end = elements[idx].end_byte
-        if idx > 0:
-            start = elements[idx - 1].end_byte
-        elif idx + 1 < len(elements):
-            end = elements[idx + 1].start_byte
-
-        new_bytes = source_bytes[:start] + source_bytes[end:]
-        self._write_bytes(new_bytes)
+        self._delete_entry(list_node, elements, idx)
         return "Update successful"
 
     def _find_python_from_import(self, module: str):
@@ -3210,14 +3988,16 @@ class Applier:
         or 'start'; anything else raises ApplierError. parameter should be the
         literal source text of the new parameter (e.g. 'default=None' or
         'const int* buf'). A JS/TS arrow function's one unparenthesized
-        parameter gets parentheses: `x => x` becomes `(x, y) => x`.
+        parameter gets parentheses: `x => x` becomes `(x, y) => x`. A list
+        written one parameter per line gets the new one on a line of its own
+        (_add_parameter_line); comments are no parameters.
         """
         if position not in ("start", "end"):
             raise ApplierError(
                 f"add_parameter: position must be 'start' or 'end', got '{position}'"
             )
         params = self._find_parameter_list(target)
-        existing = [c for c in params.named_children]
+        existing = [c for c in params.named_children if "comment" not in c.type]
 
         source_bytes = self.parser.source_bytes
 
@@ -3232,6 +4012,12 @@ class Applier:
             )
             self._write_bytes(new_bytes)
             return "Update successful"
+
+        if existing:
+            new_bytes = self._add_parameter_line(params, existing, parameter, position)
+            if new_bytes is not None:
+                self._write_bytes(new_bytes)
+                return "Update successful"
 
         if not existing:
             # Empty parameter list: insert between ( and )
@@ -3254,11 +4040,83 @@ class Applier:
         self._write_bytes(new_bytes)
         return "Update successful"
 
+    def _add_parameter_line(self, params, existing: list, parameter: str, position: str) -> bytes | None:
+        """
+        The source with `parameter` added to a parameter list written one
+        parameter per line, on a line of its own at the indentation of the
+        parameter next to it, or None when the list is not written that way
+        (two parameters share a line, or a lone one follows the `(`) and the
+        parameter goes inline instead.
+
+        At the end it goes on the line after the last parameter's (after the
+        comma and a comment there), with a comma of its own when the last
+        one has one; else the last one gets the comma. A `)` on the last
+        parameter's line (`def f(a,\\n      b):`) stays after the new one. At
+        the start it goes where the first parameter is, above the comments
+        on lines of their own right before it, and the first parameter moves
+        to the next line, indented like the parameter after it when it
+        follows the `(` (aligned parameters).
+        """
+        # Every parameter after the first starts its line (the first may
+        # follow the `(`), and a lone one starts its own.
+        if not all(self._starts_line(p.start_byte) for p in existing[1:]) or (
+            len(existing) == 1 and not self._starts_line(existing[0].start_byte)
+        ):
+            return None
+        src = self.parser.source_bytes
+        if position == "start":
+            first = existing[0]
+            if self._starts_line(first.start_byte):
+                indent = self._own_line_indent([first], "")
+            elif len(existing) > 1 and self._starts_line(existing[1].start_byte):
+                indent = self._own_line_indent([existing[1]], "")
+            else:
+                return None
+            at = first
+            for c in reversed([c for c in params.children if c.end_byte <= first.start_byte]):
+                if "comment" not in c.type or not self._starts_line(c.start_byte):
+                    break
+                if c.end_point[0] + 1 < at.start_point[0]:
+                    break
+                at = c
+            text = f"{parameter},\n{indent}".encode("utf-8")
+            return src[: at.start_byte] + text + src[at.start_byte :]
+
+        last = existing[-1]
+        if not self._starts_line(last.start_byte):
+            return None
+        indent = self._own_line_indent([last], "")
+        after = [c for c in params.children if c.start_byte >= last.end_byte]
+        comma = after[0] if after and after[0].type == "," else None
+        end = (comma or last).end_byte
+        row = (comma or last).end_point[0]
+        for c in after[1 if comma else 0 :]:
+            if "comment" not in c.type or c.start_point[0] != row:
+                break
+            end = c.end_byte
+        close = params.children[-1]
+        if close.type == ")" and close.start_point[0] == row:
+            at = (comma or last).end_byte
+            text = f"\n{indent}{parameter}," if comma else f",\n{indent}{parameter}"
+            return src[:at] + text.encode("utf-8") + src[at:]
+        line_end = src.find(b"\n", end)
+        if line_end == -1:
+            line_end = len(src)
+        text = f"\n{indent}{parameter}" + ("," if comma else "")
+        new_bytes = src[:line_end] + text.encode("utf-8") + src[line_end:]
+        if comma is None:
+            new_bytes = new_bytes[: last.end_byte] + b"," + new_bytes[last.end_byte :]
+        return new_bytes
+
     def remove_parameter(self, target: str, parameter_name: str) -> str:
         """
         Remove a parameter by name from a function signature. A JS/TS arrow
         function left without its one unparenthesized parameter (`x => 1`)
-        becomes `() => 1`.
+        becomes `() => 1`. A parenthesized list loses the parameter the way
+        _delete_entry deletes an entry: one on a line of its own goes with
+        that line, a comment at its end included (comments on other lines
+        stay), and a last parameter with no comma after it takes the comma
+        before it. Comments are no parameters.
         """
         params = self._find_parameter_list(target)
         if self._is_bare_arrow_parameter(params):
@@ -3268,7 +4126,7 @@ class Applier:
             source_bytes = self.parser.source_bytes
             self._write_bytes(source_bytes[: params.start_byte] + b"()" + source_bytes[params.end_byte :])
             return "Update successful"
-        existing = [c for c in params.named_children]
+        existing = [c for c in params.named_children if "comment" not in c.type]
 
         idx = None
         for i, p in enumerate(existing):
@@ -3278,6 +4136,11 @@ class Applier:
         if idx is None:
             raise ApplierError(f"Parameter '{parameter_name}' not found in '{target}'")
 
+        if params.children[0].type == "(" and params.children[-1].type == ")":
+            self._delete_entry(params, existing, idx)
+            return "Update successful"
+
+        # A Ruby parameter list without parentheses (`def f a, b`).
         source_bytes = self.parser.source_bytes
         start = existing[idx].start_byte
         end = existing[idx].end_byte
@@ -3438,7 +4301,8 @@ class Applier:
         """
         Replace or insert a Python docstring on a function or class. The new_docstring
         should be a valid Python string literal including its surrounding triple
-        quotes. Python-specific.
+        quotes. Python-specific. A new docstring for a body that shares the
+        line of its signature (`def f(): return 1`) is refused.
         """
         if self.parser.ext != ".py":
             raise ApplierError(
@@ -3480,6 +4344,13 @@ class Applier:
             return "Update successful (docstring replaced)"
 
         # No existing docstring -- insert at the start of the body
+        open_row = source_bytes.count(b"\n", 0, self._body_opening(func_node, body))
+        if first_stmt is not None and first_stmt.start_point[0] == open_row:
+            raise ApplierError(
+                f"The body of '{target}' shares a line with its signature, so a new "
+                "docstring has no line of its own to go on. Use replace_function_body "
+                "to rewrite the body over several lines, docstring first."
+            )
         insert_byte = body.start_byte
         indent = (
             self._get_indent(self.lines[body.start_point[0]])
@@ -3537,6 +4408,8 @@ class Applier:
           - "signature": signature-only. For a function -> the line(s)
             before the body. For a class -> the class header. Equivalent to
             the old `get_signature`.
+        "interface" and "signature" refuse a symbol that is neither a
+        function nor a class, saying what it is (_depth_refusal).
 
         For config files (JSON/YAML/TOML), "full" returns the value node's
         source ('' for a YAML key with no value) and the other depths raise.
@@ -3584,8 +4457,12 @@ class Applier:
         """
         Return a stub view of a class: its header, field declarations, and method
         signatures (with bodies replaced by ' ...'), each member at its
-        indentation relative to the class's header (see _interface_line). For a
-        function target, returns just its signature. Read-only.
+        indentation relative to the class's header (see _interface_line) and
+        ending as written (_member_text), and its closing (a C/C++ class's
+        `};`). For a function target, returns just its signature, and for a
+        Go type its declaration with its methods' signatures. Any other
+        symbol (a variable, a constant, a type alias) is refused
+        (_depth_refusal). Read-only.
         """
         node = self.parser.find_node_by_name(target)
         if not node:
@@ -3620,6 +4497,9 @@ class Applier:
 
         body = inner.child_by_field_name("body")
         if body is None:
+            # A Ruby class or module with nothing in it is its whole text.
+            if self._header_without_body(inner) is None:
+                raise self._depth_refusal(target, inner, "interface")
             return self.parser.node_text(node)
 
         source = self.parser.source_bytes
@@ -3649,8 +4529,9 @@ class Applier:
                 tail_start = node.end_byte - len(tail.encode("utf-8"))
                 parts.append(self._interface_line(tail_start, tail, base, base))
         elif ext not in (".py",):
-            # Brace-delimited: closing } (or }; for C++)
-            closing = source[body.end_byte - 1:node.end_byte].decode("utf-8").rstrip()
+            # Brace-delimited: closing } (or }; for C/C++, see _symbol_span)
+            end = self._symbol_span(node)[1].end_byte
+            closing = source[body.end_byte - 1:end].decode("utf-8").rstrip()
             parts.append(self._interface_line(body.end_byte - 1, closing, base, base))
 
         return "\n".join(parts)
@@ -3680,6 +4561,9 @@ class Applier:
                 if cc.type == "function_definition":
                     c_inner = cc
                     break
+        elif child.type == "template_declaration":
+            # A C++ member template: its signature starts at its header.
+            c_inner = self._template_entity(child) or child
 
         if c_inner.type not in func_types:
             return None
@@ -3715,13 +4599,45 @@ class Applier:
             if sig is not None:
                 parts.append(self._interface_line(child.start_byte, sig, base, indent))
             elif child.type in ("enum_body_declarations", "class_body", "interface_body"):
+                semi, prev = child.child(0), child.prev_sibling
+                if child.type == "enum_body_declarations" and semi.type == ";" and not prev.is_named:
+                    # A Java enum's `;` that no constant or comment before it
+                    # shows (_member_text): after a trailing comma, or with
+                    # no constants before it.
+                    if prev.type == "," and self._same_line(prev.end_byte, semi.start_byte) and parts:
+                        parts[-1] += ";"
+                    else:
+                        parts.append(self._interface_line(semi.start_byte, ";", base, indent))
                 self._collect_interface_members(child, func_types, parts, base, indent)
             else:
-                text = self.parser.node_text(child)
+                text = self._member_text(child)
                 if child.type == "access_specifier":
                     # The grammar leaves the `:` of a C++ `public:` outside.
                     text += ":"
                 parts.append(self._interface_line(child.start_byte, text, base, indent))
+
+    def _member_text(self, member) -> str:
+        """
+        The source of a class member other than a method, as
+        read_symbol(depth="interface") shows it: with the `;` or `,` that
+        ends it where the grammar leaves that outside the member (TS and JS
+        fields, TS interface members, enum members, a Python or Ruby
+        statement before a `;`), and for a Java enum's last constant the `;`
+        that ends the constants.
+        """
+        src = self.parser.source_bytes
+        after = member.next_sibling
+        if after is not None and after.type == "enum_body_declarations":
+            after = after.child(0)
+        end = member.end_byte
+        if (
+            after is not None
+            and after.type in _SEPARATORS
+            and not after.is_named
+            and not src[end : after.start_byte].strip()
+        ):
+            end = after.end_byte
+        return src[member.start_byte : end].decode("utf-8")
 
     def _interface_line(self, start_byte: int, text: str, base: str, indent: str) -> str:
         """
@@ -3989,8 +4905,9 @@ class Applier:
         start its line (inside a flow mapping or inline table) is refused,
         as the comment line above belongs to the key the line starts with.
         In source files it is the first node of the symbol find_node_by_name
-        finds (_symbol_span), so the comment goes above its decorators and a
-        JS/TS `export`.
+        finds (_symbol_unit), so the comment goes above its decorators, a
+        JS/TS `export` and a C++ `template <...>`; a symbol that does not
+        start its line is refused the same way.
         """
         if self.parser.ext in (".yml", ".yaml", ".toml"):
             node = self._find_config_pair_by_path(target)
@@ -4006,7 +4923,15 @@ class Applier:
         node = self.parser.find_node_by_name(target)
         if node is None:
             return None
-        return self._symbol_span(node)[0]
+        first, last = self._symbol_unit(node)
+        if self._line_sharing(first, last)[0]:
+            raise ApplierError(
+                f"'{target}' does not start its line (other code comes before it there), "
+                "so it has no leading comment of its own; a comment line above it would "
+                "belong to the code the line starts with. Edit the comment with your "
+                "normal edit tool."
+            )
+        return first
 
     def _is_ruby_require_call(self, call_node) -> bool:
         """Return True if a Ruby `call` node is a require/require_relative/load statement."""
