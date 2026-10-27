@@ -2,10 +2,18 @@
 Test suite for notebook-editor MCP server.
 
 Uses nbformat to generate a fixture .ipynb file programmatically before each test,
-so tests are idempotent and don't depend on a static file on disk.
+so tests are idempotent and don't depend on a static file on disk. Every notebook
+the tests write lives in a temporary directory that __main__ creates and always
+removes, so a crash can't leave files behind in tests/.
 """
+import asyncio
+import importlib.metadata
+import json
+import logging
 import os
+import shutil
 import sys
+import tempfile
 
 sys.path.insert(0, os.path.abspath(os.path.join(os.path.dirname(__file__), '..')))
 
@@ -14,8 +22,9 @@ from nbformat.v4 import new_notebook, new_code_cell, new_markdown_cell
 
 from notebook_editor.manager import NotebookManager, NotebookManagerError, create_notebook
 
-TESTS_DIR = os.path.dirname(__file__)
-FIXTURE_PATH = os.path.join(TESTS_DIR, "test_fixture.ipynb")
+# Scratch directory for every notebook the tests write; set in __main__ via tempfile.mkdtemp()
+WORK_DIR = None
+FIXTURE_PATH = None
 
 PASS = 0
 FAIL = 0
@@ -294,7 +303,7 @@ def test_execute_cell():
         new_code_cell("x / 0"),  # will error
         new_markdown_cell("## End"),
     ]
-    path = os.path.join(TESTS_DIR, "test_exec.ipynb")
+    path = os.path.join(WORK_DIR, "test_exec.ipynb")
     nbformat.write(nb, path)
 
     mgr = NotebookManager(path)
@@ -345,7 +354,7 @@ def test_execute_all_cells():
         new_markdown_cell("## Midpoint"),
         new_code_cell("print(b)"),
     ]
-    path = os.path.join(TESTS_DIR, "test_exec_all.ipynb")
+    path = os.path.join(WORK_DIR, "test_exec_all.ipynb")
     nbformat.write(nb, path)
 
     try:
@@ -375,7 +384,7 @@ def test_execute_all_cells_stop_on_error():
         new_code_cell("raise ValueError('bad')"),
         new_code_cell("y = 2"),  # should not execute
     ]
-    path = os.path.join(TESTS_DIR, "test_exec_err.ipynb")
+    path = os.path.join(WORK_DIR, "test_exec_err.ipynb")
     nbformat.write(nb, path)
 
     try:
@@ -398,7 +407,7 @@ def test_kernel_lifecycle():
     from notebook_editor import kernel as _kernel
     nb = new_notebook()
     nb.cells = [new_code_cell("z = 100")]
-    path = os.path.join(TESTS_DIR, "test_lifecycle.ipynb")
+    path = os.path.join(WORK_DIR, "test_lifecycle.ipynb")
     nbformat.write(nb, path)
 
     try:
@@ -418,6 +427,164 @@ def test_kernel_lifecycle():
         if os.path.exists(path):
             os.remove(path)
 
+
+def test_kernel_cwd():
+    print("\n═══ kernel working directory ═══")
+    from notebook_editor import kernel as _kernel
+    nb_dir = os.path.join(WORK_DIR, "cwd_check")
+    os.makedirs(nb_dir)
+    with open(os.path.join(nb_dir, "data.txt"), "w") as f:
+        f.write("relative-ok")
+    nb = new_notebook()
+    nb.cells = [
+        new_code_cell("import os\nprint(os.getcwd())"),
+        new_code_cell("print(open('data.txt').read())"),
+    ]
+    path = os.path.join(nb_dir, "test_cwd.ipynb")
+    nbformat.write(nb, path)
+
+    def run(index: int) -> str:
+        NotebookManager(path).execute_cell(index)
+        outputs = read_notebook(path).cells[index].outputs
+        return "".join(o.get("text", "") for o in outputs if o.get("output_type") == "stream").strip()
+
+    try:
+        # realpath on both sides: macOS temp dirs live behind the /var -> /private/var symlink
+        expected = os.path.realpath(nb_dir)
+        check("kernel cwd: starts in the notebook's folder", os.path.realpath(run(0)), expected)
+        check("kernel cwd: relative path resolves next to the notebook", run(1), "relative-ok")
+        _kernel.restart_kernel(path)
+        check("kernel cwd: kept after restart_kernel", os.path.realpath(run(0)), expected)
+    finally:
+        _kernel.shutdown_kernel(path)
+
+
+def test_kernel_start_failures():
+    print("\n═══ kernel start failures ═══")
+    from notebook_editor import kernel as _kernel
+    from notebook_editor import server
+
+    # Missing kernelspec
+    path = os.path.join(WORK_DIR, "test_missing_kernel.ipynb")
+    create_notebook(path, kernel_name="nosuchkernel-xyz")
+    NotebookManager(path).add_cell(0, "x = 1")
+    try:
+        try:
+            _kernel.get_or_start_kernel(path)
+            check("missing kernelspec: KernelError raised", "FAIL", "PASS")
+        except _kernel.KernelError as e:
+            check("missing kernelspec: message starts with 'No such kernel named'",
+                  str(e).startswith("No such kernel named nosuchkernel-xyz"), True)
+        check("missing kernelspec: no session left registered", _kernel.kernel_state(path), "not started")
+
+        try:
+            NotebookManager(path).execute_cell(0)
+            check("missing kernelspec: execute_cell raises NotebookManagerError", "FAIL", "PASS")
+        except NotebookManagerError as e:
+            check("missing kernelspec: execute_cell raises NotebookManagerError", str(e), "No such kernel named")
+        try:
+            NotebookManager(path).execute_all_cells()
+            check("missing kernelspec: execute_all_cells raises NotebookManagerError", "FAIL", "PASS")
+        except NotebookManagerError as e:
+            check("missing kernelspec: execute_all_cells raises NotebookManagerError", str(e), "No such kernel named")
+
+        # The tools return their normal error strings, not "Internal error ..."
+        check("missing kernelspec: execute_cell tool error string",
+              server.execute_cell(path, 0), "Cannot execute cell: No such kernel named nosuchkernel-xyz")
+        check("missing kernelspec: execute_all_cells tool error string",
+              server.execute_all_cells(path), "Cannot execute all cells: No such kernel named nosuchkernel-xyz")
+        check("missing kernelspec: get_kernel_state reports 'not started'",
+              server.get_kernel_state(path), "not started")
+    finally:
+        _kernel.shutdown_kernel(path)
+
+    # Broken kernelspec: it exists, but its executable doesn't
+    jupyter_dir = os.path.join(WORK_DIR, "jupyter")
+    spec_dir = os.path.join(jupyter_dir, "kernels", "broken-xyz")
+    os.makedirs(spec_dir)
+    with open(os.path.join(spec_dir, "kernel.json"), "w") as f:
+        json.dump({
+            "argv": [os.path.join(WORK_DIR, "no-such-kernel-binary"), "-f", "{connection_file}"],
+            "display_name": "Broken",
+            "language": "python",
+        }, f)
+    broken_path = os.path.join(WORK_DIR, "test_broken_kernel.ipynb")
+    create_notebook(broken_path, kernel_name="broken-xyz")
+    NotebookManager(broken_path).add_cell(0, "x = 1")
+    old_jupyter_path = os.environ.get("JUPYTER_PATH")
+    os.environ["JUPYTER_PATH"] = jupyter_dir
+    try:
+        check("broken kernelspec: execute_cell tool reports the start failure",
+              server.execute_cell(broken_path, 0), "Cannot execute cell: Kernel failed to start")
+        check("broken kernelspec: no session left registered", _kernel.kernel_state(broken_path), "not started")
+    finally:
+        if old_jupyter_path is None:
+            os.environ.pop("JUPYTER_PATH", None)
+        else:
+            os.environ["JUPYTER_PATH"] = old_jupyter_path
+        _kernel.shutdown_kernel(broken_path)
+
+
+def test_ansi_stripped_from_returned_text():
+    print("\n═══ ANSI codes stripped from returned text ═══")
+    from notebook_editor import kernel as _kernel
+    from notebook_editor import server
+
+    # Colored outputs already in the file: returned text is clean, the file is unchanged
+    nb = new_notebook()
+    nb.cells = [new_code_cell("print('x')")]
+    nb.cells[0].outputs = [
+        nbformat.v4.new_output(output_type="stream", name="stdout", text="\x1b[31mred text\x1b[0m\n"),
+        nbformat.v4.new_output(output_type="error", ename="ValueError", evalue="bad",
+                               traceback=["\x1b[0;31mValueError\x1b[0m: bad"]),
+    ]
+    path = os.path.join(WORK_DIR, "test_ansi.ipynb")
+    nbformat.write(nb, path)
+    out = NotebookManager(path).get_outputs(0)
+    check("ansi: get_outputs text has no escape codes", "\x1b[" in out, False)
+    check("ansi: stream text kept", out, "red text")
+    check("ansi: traceback text kept", out, "ValueError: bad")
+    stored = read_notebook(path).cells[0].outputs
+    check("ansi: stored stream output unchanged", stored[0]["text"], "\x1b[31mred text\x1b[0m")
+    check("ansi: stored traceback unchanged", stored[1]["traceback"][0], "\x1b[0;31mValueError\x1b[0m")
+
+    # A real kernel traceback returned through the execute_cell tool
+    exec_path = os.path.join(WORK_DIR, "test_ansi_exec.ipynb")
+    nb = new_notebook()
+    nb.cells = [new_code_cell("1 / 0")]
+    nbformat.write(nb, exec_path)
+    try:
+        out = server.execute_cell(exec_path, 0)
+        check("ansi: execute_cell tool returned the error", out, "ZeroDivisionError")
+        check("ansi: execute_cell tool text has no escape codes", "\x1b[" in out, False)
+        check("ansi: get_outputs after a real traceback has no escape codes",
+              "\x1b[" in NotebookManager(exec_path).get_outputs(0), False)
+    finally:
+        _kernel.shutdown_kernel(exec_path)
+
+
+def test_kernel_dies_during_execution():
+    print("\n═══ kernel dies during execution ═══")
+    import time
+    from notebook_editor import kernel as _kernel
+
+    nb = new_notebook()
+    nb.cells = [new_code_cell("import os; os._exit(1)"), new_code_cell("print('back')")]
+    path = os.path.join(WORK_DIR, "test_kernel_dies.ipynb")
+    nbformat.write(nb, path)
+    try:
+        started = time.time()
+        try:
+            NotebookManager(path).execute_cell(0, timeout=30)
+            check("dies: kernel death reported as an error", "no error", "Kernel died during execution")
+        except NotebookManagerError as e:
+            check("dies: kernel death reported as an error", str(e), "Kernel died during execution")
+        check("dies: reported well before the timeout", time.time() - started < 15, True)
+        # The next execute starts a fresh kernel instead of reusing the dead one
+        NotebookManager(path).execute_cell(1)
+        check("dies: next execute runs on a fresh kernel", NotebookManager(path).get_outputs(1), "back")
+    finally:
+        _kernel.shutdown_kernel(path)
 
 
 def test_list_notebook_symbols():
@@ -457,7 +624,7 @@ def test_find_in_notebook():
 
 def test_create_notebook():
     print("\n═══ create_notebook ═══")
-    new_path = os.path.join(TESTS_DIR, "test_created.ipynb")
+    new_path = os.path.join(WORK_DIR, "test_created.ipynb")
     if os.path.exists(new_path):
         os.remove(new_path)
 
@@ -518,7 +685,7 @@ def test_create_notebook():
 
 def test_non_python_kernel():
     print("\n═══ non-Python kernel (R) support ═══")
-    r_path = os.path.join(TESTS_DIR, "test_r_notebook.ipynb")
+    r_path = os.path.join(WORK_DIR, "test_r_notebook.ipynb")
     if os.path.exists(r_path):
         os.remove(r_path)
 
@@ -557,7 +724,7 @@ def test_non_python_kernel():
     check("non-python: _notebook_language returns 'r'", mgr2._notebook_language(), "r")
 
     # Missing kernelspec -- falls back to python behavior for backward compat
-    blank_path = os.path.join(TESTS_DIR, "test_blank_kernel.ipynb")
+    blank_path = os.path.join(WORK_DIR, "test_blank_kernel.ipynb")
     nb_blank = new_notebook()
     nb_blank.metadata = {}
     nb_blank.cells = [new_code_cell("x = 1")]
@@ -571,35 +738,95 @@ def test_non_python_kernel():
 
 
 # ──────────────────────────────────────────────
+# Server schema (tool annotations, parameter descriptions, instructions, version)
+# ──────────────────────────────────────────────
+
+def test_server_schema():
+    print("\n═══ server schema ═══")
+    from notebook_editor import server
+    tools = asyncio.run(server.mcp.list_tools())
+    check("schema: tool count", len(tools), 23)
+    check("schema: every tool has annotations", [t.name for t in tools if t.annotations is None], [])
+    undescribed = [
+        f"{t.name}.{name}"
+        for t in tools
+        for name, prop in t.input_schema.get("properties", {}).items()
+        if not prop.get("description")
+    ]
+    check("schema: every parameter has a description", undescribed, [])
+
+    # (read_only_hint, destructive_hint, open_world_hint) -> tools expected to carry it
+    expected_hints = {
+        (True, False, False): ["find_in_notebook", "get_cell", "get_kernel_state", "get_outputs",
+                               "list_cells", "list_notebook_symbols"],
+        (False, False, False): ["add_cell", "interrupt_kernel", "move_cell"],
+        (False, True, False): ["append_to_cell", "clear_execution_counts", "clear_outputs",
+                               "create_notebook", "delete_cell", "merge_cells", "prepend_to_cell",
+                               "replace_cell_source", "restart_kernel", "set_cell_metadata",
+                               "shutdown_kernel", "split_cell"],
+        (False, True, True): ["execute_all_cells", "execute_cell"],
+    }
+    actual_hints = {
+        t.name: (t.annotations.read_only_hint, t.annotations.destructive_hint, t.annotations.open_world_hint)
+        for t in tools
+        if t.annotations is not None
+    }
+    for hints, names in expected_hints.items():
+        actual = sorted(n for n, h in actual_hints.items() if h == hints)
+        check(f"schema: tools annotated {hints}", actual, names)
+
+    instructions = server.mcp.instructions or ""
+    check("schema: server instructions are non-empty", bool(instructions.strip()), True)
+    check("schema: server version matches the installed package",
+          server.mcp.version, importlib.metadata.version("notebook-editor-mcp"))
+
+
+# ──────────────────────────────────────────────
 # Main
 # ──────────────────────────────────────────────
 
 if __name__ == "__main__":
-    test_list_cells()
-    test_get_cell()
-    test_add_cell()
-    test_delete_cell()
-    test_move_cell()
-    test_split_cell()
-    test_merge_cells()
-    test_replace_cell_source()
-    test_prepend_to_cell()
-    test_append_to_cell()
-    test_clear_outputs()
-    test_clear_execution_counts()
-    test_get_outputs()
-    test_set_cell_metadata()
-    test_list_notebook_symbols()
-    test_find_in_notebook()
-    test_execute_cell()
-    test_execute_all_cells()
-    test_execute_all_cells_stop_on_error()
-    test_kernel_lifecycle()
-    test_create_notebook()
-    test_non_python_kernel()
+    # Keep the server's info/warning logs for expected errors out of the output; crashes still show
+    logging.getLogger("notebook-editor").setLevel(logging.ERROR)
+    # jupyter_client logs a traceback for each deliberately failed kernel start
+    logging.getLogger("traitlets").setLevel(logging.CRITICAL)
 
-    if os.path.exists(FIXTURE_PATH):
-        os.remove(FIXTURE_PATH)
+    WORK_DIR = tempfile.mkdtemp(prefix="notebook-editor-tests-")
+    FIXTURE_PATH = os.path.join(WORK_DIR, "test_fixture.ipynb")
+    try:
+        test_list_cells()
+        test_get_cell()
+        test_add_cell()
+        test_delete_cell()
+        test_move_cell()
+        test_split_cell()
+        test_merge_cells()
+        test_replace_cell_source()
+        test_prepend_to_cell()
+        test_append_to_cell()
+        test_clear_outputs()
+        test_clear_execution_counts()
+        test_get_outputs()
+        test_set_cell_metadata()
+        test_list_notebook_symbols()
+        test_find_in_notebook()
+        test_execute_cell()
+        test_execute_all_cells()
+        test_execute_all_cells_stop_on_error()
+        test_kernel_lifecycle()
+        test_kernel_cwd()
+        test_kernel_start_failures()
+        test_ansi_stripped_from_returned_text()
+        test_kernel_dies_during_execution()
+        test_create_notebook()
+        test_non_python_kernel()
+        test_server_schema()
+    finally:
+        # Runs even if a test crashed: stop any kernel still registered, then drop every file
+        from notebook_editor import kernel as _kernel
+        for kernel_path in list(_kernel._kernels):
+            _kernel.shutdown_kernel(kernel_path)
+        shutil.rmtree(WORK_DIR, ignore_errors=True)
 
     print(f"\n{'═' * 40}")
     print(f"Results: {PASS} passed, {FAIL} failed")

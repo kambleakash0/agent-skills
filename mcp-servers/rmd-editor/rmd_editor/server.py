@@ -5,8 +5,12 @@ from __future__ import annotations
 
 import logging
 import sys
+from importlib.metadata import PackageNotFoundError, version as _pkg_version
+from typing import Annotated
 
 from mcp.server import MCPServer
+from mcp.types import ToolAnnotations
+from pydantic import Field
 
 from rmd_editor import kernel as _kernel
 from rmd_editor.manager import (
@@ -22,7 +26,57 @@ logging.basicConfig(
 )
 logger = logging.getLogger("rmd-editor")
 
-mcp = MCPServer("rmd-editor")
+# Condensed RMD-EDITOR.md, sent to clients as MCP server instructions.
+_INSTRUCTIONS = (
+    "rmd-editor edits and runs R Markdown (.rmd) documents at the chunk and prose level. "
+    "Use it instead of generic text edit/write tools for .rmd files, and use create_rmd "
+    "to create one. Every file_path must be absolute. Call list_cells first: cell indices "
+    "are zero-based and shift when cells are added or deleted. Inspect with get_cell, "
+    "find_in_rmd, get_chunk_options, and get_frontmatter. To add a few lines use "
+    "prepend_to_cell or append_to_cell, not replace_cell_source; to rewrite a cell use "
+    "replace_cell_source (it keeps the chunk language, label, and options), not add_cell. "
+    "Edit chunk options with set_chunk_option and remove_chunk_option, using key=\"label\" "
+    "for the chunk label; these tools reject markdown cells. Edit the YAML header with "
+    "set_frontmatter_key and remove_frontmatter_key (values are parsed as YAML). Adjacent "
+    "markdown cells merge on save, so put new prose between chunks or append to an "
+    "existing markdown cell. execute_cell and execute_all_cells lazily start one Jupyter "
+    "kernel per file, chosen from the language of the first chunk run (r uses ir, python "
+    "uses python3, julia uses julia-1); that kernel must be installed. The kernel runs "
+    "in the .rmd file's folder, so relative paths in chunks resolve there. State "
+    "persists across calls: use interrupt_kernel to stop a runaway chunk, restart_kernel "
+    "for a clean namespace, and shutdown_kernel to free resources. Outputs are returned "
+    "inline and never written to the .rmd file."
+)
+
+
+def _server_version() -> str:
+    try:
+        return _pkg_version("rmd-editor-mcp")
+    except PackageNotFoundError:
+        return "0.0.0"
+
+
+mcp = MCPServer("rmd-editor", instructions=_INSTRUCTIONS, version=_server_version())
+
+
+# Tool behavior hints. The .rmd file is the tool's environment; execution tools
+# also run arbitrary chunk code in a local kernel.
+_READ_ONLY = ToolAnnotations(read_only_hint=True, destructive_hint=False, open_world_hint=False)
+_ADDITIVE = ToolAnnotations(read_only_hint=False, destructive_hint=False, open_world_hint=False)
+_DESTRUCTIVE = ToolAnnotations(read_only_hint=False, destructive_hint=True, open_world_hint=False)
+_RUNS_CODE = ToolAnnotations(read_only_hint=False, destructive_hint=True, open_world_hint=True)
+
+# Shared parameter types. The Field descriptions end up in each tool's inputSchema.
+FilePath = Annotated[str, Field(description="Absolute path to an existing .rmd file.")]
+KernelFilePath = Annotated[
+    str,
+    Field(description="Absolute path of the .rmd file whose kernel to use; must be the same path string passed to execute_cell."),
+]
+CellIndex = Annotated[int, Field(description="Zero-based cell index as shown by list_cells; -1 means the last cell.")]
+ChunkIndex = Annotated[
+    int,
+    Field(description="Zero-based index of a code chunk as shown by list_cells; -1 means the last cell; markdown cells are rejected."),
+]
 
 
 def _err(e: Exception) -> str:
@@ -34,13 +88,16 @@ def _err(e: Exception) -> str:
 # ──────────────────────────────────────────────
 
 
-@mcp.tool()
+@mcp.tool(annotations=_DESTRUCTIVE)
 def create_rmd(
-    file_path: str,
-    title: str = "",
-    author: str = "",
-    output_format: str = "html_document",
-    overwrite: bool = False,
+    file_path: Annotated[str, Field(description="Absolute path for the new .rmd file; its parent directory must already exist.")],
+    title: Annotated[str, Field(description="Document title for the YAML frontmatter; an empty string omits the title key.")] = "",
+    author: Annotated[str, Field(description="Author for the YAML frontmatter; an empty string omits the author key.")] = "",
+    output_format: Annotated[
+        str,
+        Field(description="rmarkdown output format for the output key, e.g. html_document, pdf_document, word_document, or github_document."),
+    ] = "html_document",
+    overwrite: Annotated[bool, Field(description="Replace an existing file at file_path; when false, an existing file is an error.")] = False,
 ) -> str:
     """Create a new empty .rmd file with a minimal YAML frontmatter.
 
@@ -67,8 +124,8 @@ def create_rmd(
 # ──────────────────────────────────────────────
 
 
-@mcp.tool()
-def list_cells(file_path: str) -> str:
+@mcp.tool(annotations=_READ_ONLY)
+def list_cells(file_path: FilePath) -> str:
     """List all cells in the .rmd with index, type (code/markdown), language/label/option-count for code chunks, line count, and a one-line preview.
 
     Args:
@@ -80,8 +137,8 @@ def list_cells(file_path: str) -> str:
         return _err(e)
 
 
-@mcp.tool()
-def get_cell(file_path: str, index: int) -> str:
+@mcp.tool(annotations=_READ_ONLY)
+def get_cell(file_path: FilePath, index: CellIndex) -> str:
     """Return the source text of one cell (chunk body or prose).
 
     Args:
@@ -94,8 +151,13 @@ def get_cell(file_path: str, index: int) -> str:
         return _err(e)
 
 
-@mcp.tool()
-def add_cell(file_path: str, index: int, source: str = "", cell_type: str = "code") -> str:
+@mcp.tool(annotations=_ADDITIVE)
+def add_cell(
+    file_path: FilePath,
+    index: Annotated[int, Field(description="Zero-based position the new cell takes; -1 (or the current cell count) appends at the end.")],
+    source: Annotated[str, Field(description="Initial cell body: chunk code for a code cell or prose for a markdown cell; empty by default.")] = "",
+    cell_type: Annotated[str, Field(description='Either "code" (a new R chunk) or "markdown" (prose).')] = "code",
+) -> str:
     """Insert a new cell at the given index.
 
     Args:
@@ -111,8 +173,8 @@ def add_cell(file_path: str, index: int, source: str = "", cell_type: str = "cod
         return _err(e)
 
 
-@mcp.tool()
-def delete_cell(file_path: str, index: int) -> str:
+@mcp.tool(annotations=_DESTRUCTIVE)
+def delete_cell(file_path: FilePath, index: CellIndex) -> str:
     """Delete the cell at the given index.
 
     Args:
@@ -125,8 +187,12 @@ def delete_cell(file_path: str, index: int) -> str:
         return _err(e)
 
 
-@mcp.tool()
-def move_cell(file_path: str, from_index: int, to_index: int) -> str:
+@mcp.tool(annotations=_ADDITIVE)
+def move_cell(
+    file_path: FilePath,
+    from_index: Annotated[int, Field(description="Zero-based index of the cell to move; -1 means the last cell.")],
+    to_index: Annotated[int, Field(description="Zero-based index the cell ends up at after the move; -1 means the last position.")],
+) -> str:
     """Move a cell from one index to another.
 
     Args:
@@ -140,8 +206,15 @@ def move_cell(file_path: str, from_index: int, to_index: int) -> str:
         return _err(e)
 
 
-@mcp.tool()
-def split_cell(file_path: str, index: int, line_offset: int) -> str:
+@mcp.tool(annotations=_ADDITIVE)
+def split_cell(
+    file_path: FilePath,
+    index: CellIndex,
+    line_offset: Annotated[
+        int,
+        Field(description="Number of lines that stay in the original cell, from 1 to its line count minus 1; the rest move to a new cell inserted right after it, which keeps a chunk's language but not its label or options."),
+    ],
+) -> str:
     """Split a cell into two at the given line offset (1-indexed, exclusive upper).
 
     Args:
@@ -157,8 +230,15 @@ def split_cell(file_path: str, index: int, line_offset: int) -> str:
         return _err(e)
 
 
-@mcp.tool()
-def merge_cells(file_path: str, start_index: int, end_index: int) -> str:
+@mcp.tool(annotations=_DESTRUCTIVE)
+def merge_cells(
+    file_path: FilePath,
+    start_index: Annotated[int, Field(description="Zero-based index of the first cell to merge; its chunk header is the one kept.")],
+    end_index: Annotated[
+        int,
+        Field(description="Zero-based index of the last cell to merge (inclusive); must be greater than start_index; -1 means the last cell."),
+    ],
+) -> str:
     """Merge consecutive cells [start_index..end_index] inclusive. All cells must share the same cell_type (and language for code chunks).
 
     Args:
@@ -177,8 +257,12 @@ def merge_cells(file_path: str, start_index: int, end_index: int) -> str:
 # ──────────────────────────────────────────────
 
 
-@mcp.tool()
-def replace_cell_source(file_path: str, index: int, new_source: str) -> str:
+@mcp.tool(annotations=_DESTRUCTIVE)
+def replace_cell_source(
+    file_path: FilePath,
+    index: CellIndex,
+    new_source: Annotated[str, Field(description="Replacement body text for the cell; a code chunk keeps its language, label, and options.")],
+) -> str:
     """Replace a cell's entire source text. Preserves chunk language, label, and options for code cells.
 
     Args:
@@ -192,8 +276,12 @@ def replace_cell_source(file_path: str, index: int, new_source: str) -> str:
         return _err(e)
 
 
-@mcp.tool()
-def prepend_to_cell(file_path: str, index: int, source: str) -> str:
+@mcp.tool(annotations=_ADDITIVE)
+def prepend_to_cell(
+    file_path: FilePath,
+    index: CellIndex,
+    source: Annotated[str, Field(description="Text to insert at the top of the cell body; a newline separator is added when needed.")],
+) -> str:
     """Prepend text to an existing cell's source.
 
     Args:
@@ -207,8 +295,12 @@ def prepend_to_cell(file_path: str, index: int, source: str) -> str:
         return _err(e)
 
 
-@mcp.tool()
-def append_to_cell(file_path: str, index: int, source: str) -> str:
+@mcp.tool(annotations=_ADDITIVE)
+def append_to_cell(
+    file_path: FilePath,
+    index: CellIndex,
+    source: Annotated[str, Field(description="Text to add at the bottom of the cell body; a newline separator is added when needed.")],
+) -> str:
     """Append text to an existing cell's source.
 
     Args:
@@ -227,8 +319,8 @@ def append_to_cell(file_path: str, index: int, source: str) -> str:
 # ──────────────────────────────────────────────
 
 
-@mcp.tool()
-def get_chunk_options(file_path: str, index: int) -> str:
+@mcp.tool(annotations=_READ_ONLY)
+def get_chunk_options(file_path: FilePath, index: ChunkIndex) -> str:
     """Return the chunk's language, label, and all key=value options.
 
     Args:
@@ -241,8 +333,19 @@ def get_chunk_options(file_path: str, index: int) -> str:
         return _err(e)
 
 
-@mcp.tool()
-def set_chunk_option(file_path: str, index: int, key: str, value: str) -> str:
+@mcp.tool(annotations=_DESTRUCTIVE)
+def set_chunk_option(
+    file_path: FilePath,
+    index: ChunkIndex,
+    key: Annotated[
+        str,
+        Field(description='Chunk option name such as echo, warning, or fig.width; the special key "label" sets the chunk label.'),
+    ],
+    value: Annotated[
+        str,
+        Field(description='Option value written verbatim into the chunk header as R code, e.g. FALSE, 7, or a quoted string; for key "label" an empty value clears the label.'),
+    ],
+) -> str:
     """Set or overwrite one chunk option. Special key "label" sets the chunk label.
 
     Args:
@@ -257,8 +360,12 @@ def set_chunk_option(file_path: str, index: int, key: str, value: str) -> str:
         return _err(e)
 
 
-@mcp.tool()
-def remove_chunk_option(file_path: str, index: int, key: str) -> str:
+@mcp.tool(annotations=_DESTRUCTIVE)
+def remove_chunk_option(
+    file_path: FilePath,
+    index: ChunkIndex,
+    key: Annotated[str, Field(description='Name of the option to remove; the special key "label" clears the chunk label.')],
+) -> str:
     """Remove one chunk option. Use key="label" to clear the chunk label.
 
     Args:
@@ -277,8 +384,8 @@ def remove_chunk_option(file_path: str, index: int, key: str) -> str:
 # ──────────────────────────────────────────────
 
 
-@mcp.tool()
-def get_frontmatter(file_path: str) -> str:
+@mcp.tool(annotations=_READ_ONLY)
+def get_frontmatter(file_path: FilePath) -> str:
     """Return the YAML frontmatter as a formatted YAML string.
 
     Args:
@@ -290,8 +397,15 @@ def get_frontmatter(file_path: str) -> str:
         return _err(e)
 
 
-@mcp.tool()
-def set_frontmatter_key(file_path: str, key: str, value: str) -> str:
+@mcp.tool(annotations=_DESTRUCTIVE)
+def set_frontmatter_key(
+    file_path: FilePath,
+    key: Annotated[str, Field(description="Top-level YAML frontmatter key such as title, author, date, or output.")],
+    value: Annotated[
+        str,
+        Field(description='Value parsed as YAML when possible ("true" becomes a bool, "42" an int); quote it to keep it a string.'),
+    ],
+) -> str:
     """Set or overwrite one top-level YAML frontmatter key. Value is parsed as YAML when possible.
 
     Args:
@@ -307,8 +421,11 @@ def set_frontmatter_key(file_path: str, key: str, value: str) -> str:
         return _err(e)
 
 
-@mcp.tool()
-def remove_frontmatter_key(file_path: str, key: str) -> str:
+@mcp.tool(annotations=_DESTRUCTIVE)
+def remove_frontmatter_key(
+    file_path: FilePath,
+    key: Annotated[str, Field(description="Top-level YAML frontmatter key to remove; it must exist.")],
+) -> str:
     """Remove one top-level YAML frontmatter key.
 
     Args:
@@ -326,8 +443,11 @@ def remove_frontmatter_key(file_path: str, key: str) -> str:
 # ──────────────────────────────────────────────
 
 
-@mcp.tool()
-def find_in_rmd(file_path: str, pattern: str) -> str:
+@mcp.tool(annotations=_READ_ONLY)
+def find_in_rmd(
+    file_path: FilePath,
+    pattern: Annotated[str, Field(description="Case-sensitive literal substring (not a regex) to look for in every cell's source.")],
+) -> str:
     """Case-sensitive substring search across all cell sources.
 
     Args:
@@ -345,8 +465,15 @@ def find_in_rmd(file_path: str, pattern: str) -> str:
 # ──────────────────────────────────────────────
 
 
-@mcp.tool()
-def execute_cell(file_path: str, index: int, timeout: float = 60.0) -> str:
+@mcp.tool(annotations=_RUNS_CODE)
+def execute_cell(
+    file_path: FilePath,
+    index: ChunkIndex,
+    timeout: Annotated[
+        float,
+        Field(description="Seconds to wait for the chunk to finish before returning a timeout error; the chunk keeps running (use interrupt_kernel to stop it)."),
+    ] = 60.0,
+) -> str:
     """Execute one code chunk via a Jupyter kernel and return the captured outputs INLINE. Outputs are NOT written to the .rmd file.
 
     Args:
@@ -360,8 +487,15 @@ def execute_cell(file_path: str, index: int, timeout: float = 60.0) -> str:
         return _err(e)
 
 
-@mcp.tool()
-def execute_all_cells(file_path: str, timeout: float = 60.0, stop_on_error: bool = True) -> str:
+@mcp.tool(annotations=_RUNS_CODE)
+def execute_all_cells(
+    file_path: FilePath,
+    timeout: Annotated[float, Field(description="Seconds to wait for each chunk; a timeout aborts the run with an error.")] = 60.0,
+    stop_on_error: Annotated[
+        bool,
+        Field(description="Stop after the first chunk that produces an error output; when false, every chunk runs."),
+    ] = True,
+) -> str:
     """Execute all code chunks in order and return a transcript of captured outputs. Outputs are NOT written to the .rmd file.
 
     Args:
@@ -375,8 +509,8 @@ def execute_all_cells(file_path: str, timeout: float = 60.0, stop_on_error: bool
         return _err(e)
 
 
-@mcp.tool()
-def get_kernel_state(file_path: str) -> str:
+@mcp.tool(annotations=_READ_ONLY)
+def get_kernel_state(file_path: KernelFilePath) -> str:
     """Return whether the kernel for this .rmd is 'not started', 'alive', or 'dead'.
 
     Args:
@@ -385,8 +519,8 @@ def get_kernel_state(file_path: str) -> str:
     return _kernel.kernel_state(file_path)
 
 
-@mcp.tool()
-def restart_kernel(file_path: str) -> str:
+@mcp.tool(annotations=_DESTRUCTIVE)
+def restart_kernel(file_path: KernelFilePath) -> str:
     """Restart the kernel; in-memory state is lost.
 
     Args:
@@ -399,8 +533,8 @@ def restart_kernel(file_path: str) -> str:
         return _err(e)
 
 
-@mcp.tool()
-def interrupt_kernel(file_path: str) -> str:
+@mcp.tool(annotations=_ADDITIVE)
+def interrupt_kernel(file_path: KernelFilePath) -> str:
     """Send an interrupt signal to stop a long-running cell.
 
     Args:
@@ -413,8 +547,8 @@ def interrupt_kernel(file_path: str) -> str:
         return _err(e)
 
 
-@mcp.tool()
-def shutdown_kernel(file_path: str) -> str:
+@mcp.tool(annotations=_DESTRUCTIVE)
+def shutdown_kernel(file_path: KernelFilePath) -> str:
     """Shut down the kernel and release its resources.
 
     Args:

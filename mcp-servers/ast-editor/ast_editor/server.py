@@ -1,7 +1,12 @@
 import logging
 import os
+from importlib.metadata import PackageNotFoundError, version as _pkg_version
+from typing import Annotated
 
 from mcp.server import MCPServer
+from mcp.types import ToolAnnotations
+from pydantic import Field
+
 from ast_editor.applier import Applier, ApplierError
 
 logging.basicConfig(
@@ -9,7 +14,106 @@ logging.basicConfig(
 )
 logger = logging.getLogger("ast-editor")
 
-mcp = MCPServer("AST-Code-Editor")
+# Condensed form of AST-EDITOR.md, sent to clients as MCP server instructions.
+_INSTRUCTIONS = (
+    "Structural, AST-targeted edits for source and config files (.py, .js, .ts, "
+    ".c, .cpp, .rb, .go, .java, .json, .yaml, .toml): you name a target such as "
+    "LRUCache.get and the server locates it, so prefer these tools over generic "
+    "text edits for those files. Every file_path must be an absolute path.\n\n"
+    "For source files, start with list_symbols to get exact, case-sensitive "
+    "target names (dotted for nesting, e.g. Class.method); for config files, "
+    "address keys by dotted path (e.g. project.version) in read_symbol, "
+    "replace_value and add_key. Read only what you need with read_symbol "
+    "(depth \"full\", \"interface\" or \"signature\") and read_imports, and call "
+    "find_references before renaming anything.\n\n"
+    "Pick the narrowest tool. To change a few lines inside a function, use "
+    "replace_in_body, insert_in_body (at=\"top\"/\"bottom\", or after=/before= an "
+    "anchor) or delete_in_body rather than replace_function or "
+    "replace_function_body; snippets and anchors must match byte for byte and "
+    "occur once in the target's body. Use add_parameter/remove_parameter rather "
+    "than replace_signature for one parameter, add_key rather than replace_value "
+    "for a new key, and add_import_name rather than add_import to extend an "
+    "existing named import. delete_symbol also removes the symbol's leading doc "
+    "comment unless include_leading_comments=False.\n\n"
+    "For arbitrary sub-expression surgery or whole-file rewrites, fall back to "
+    "the client's normal edit or write tools."
+)
+
+
+def _server_version() -> str:
+    try:
+        return _pkg_version("ast-editor-mcp")
+    except PackageNotFoundError:
+        return "0.0.0"
+
+
+mcp = MCPServer(
+    "AST-Code-Editor", instructions=_INSTRUCTIONS, version=_server_version()
+)
+
+# Tool annotation presets. Every tool works on one local file, so none is
+# open-world; additive tools only insert code (line-based edits still rewrite
+# the file with LF line endings), destructive ones can also overwrite or
+# delete existing text.
+_READ_ONLY = ToolAnnotations(read_only_hint=True, destructive_hint=False, open_world_hint=False)
+_ADDITIVE = ToolAnnotations(read_only_hint=False, destructive_hint=False, open_world_hint=False)
+_DESTRUCTIVE = ToolAnnotations(read_only_hint=False, destructive_hint=True, open_world_hint=False)
+
+# Parameter types shared by several tools; the descriptions become part of
+# each tool's inputSchema.
+FilePath = Annotated[
+    str,
+    Field(
+        description="Absolute path to an existing source or config file; its "
+        "extension selects the language."
+    ),
+]
+FunctionTarget = Annotated[
+    str,
+    Field(
+        description="Case-sensitive function or method name, dotted for nested "
+        "symbols (e.g. 'LRUCache.get'); call list_symbols for exact names."
+    ),
+]
+ClassTarget = Annotated[
+    str,
+    Field(
+        description="Case-sensitive name of the class (or TS interface, C++ "
+        "struct, Go struct type) to add to."
+    ),
+]
+BodySnippet = Annotated[
+    str,
+    Field(
+        description="Exact text to match, byte-identical including indentation "
+        "and newlines; it must occur exactly once in the target's body."
+    ),
+]
+LiteralValue = Annotated[
+    str,
+    Field(
+        description="Value as literal source text in the file's own syntax "
+        "(e.g. '\"2.0.0\"' or '42'); quote strings where the format requires it."
+    ),
+]
+ArrayTarget = Annotated[
+    str,
+    Field(
+        description="Dotted path to the array in a JSON/YAML/TOML file (e.g. "
+        "'project.dependencies'), or the name of a Python module-level list."
+    ),
+]
+ImportModule = Annotated[
+    str,
+    Field(
+        description="Module of the existing named import as written, without "
+        "quotes (e.g. 'typing' or './utils')."
+    ),
+]
+ImportName = Annotated[
+    str,
+    Field(description="A single imported name, e.g. 'Optional' or 'baz'."),
+]
 
 
 def _validate_file(file_path: str) -> str | None:
@@ -21,8 +125,18 @@ def _validate_file(file_path: str) -> str | None:
     return None
 
 
-@mcp.tool()
-def replace_function(file_path: str, target: str, content: str) -> str:
+@mcp.tool(annotations=_DESTRUCTIVE)
+def replace_function(
+    file_path: FilePath,
+    target: FunctionTarget,
+    content: Annotated[
+        str,
+        Field(
+            description="Complete replacement definition including decorators, "
+            "signature and body; re-indented to the original's level."
+        ),
+    ],
+) -> str:
     """
     Replace an entire function definition with new content -- signature, body, and decorators.
 
@@ -50,8 +164,18 @@ def replace_function(file_path: str, target: str, content: str) -> str:
         return f"Internal error in replace_function: {type(e).__name__}: {e}"
 
 
-@mcp.tool()
-def replace_function_body(file_path: str, target: str, content: str) -> str:
+@mcp.tool(annotations=_DESTRUCTIVE)
+def replace_function_body(
+    file_path: FilePath,
+    target: FunctionTarget,
+    content: Annotated[
+        str,
+        Field(
+            description="New body statements only, without the signature or "
+            "enclosing braces; re-indented as a block to the body's indentation."
+        ),
+    ],
+) -> str:
     """
     Replace only the body of a function, preserving its signature and decorators.
 
@@ -77,8 +201,19 @@ def replace_function_body(file_path: str, target: str, content: str) -> str:
         logger.exception("replace_function_body crashed")
         return f"Internal error in replace_function_body: {type(e).__name__}: {e}"
 
-@mcp.tool()
-def replace_in_body(file_path: str, target: str, old_snippet: str, new_snippet: str) -> str:
+@mcp.tool(annotations=_DESTRUCTIVE)
+def replace_in_body(
+    file_path: FilePath,
+    target: FunctionTarget,
+    old_snippet: BodySnippet,
+    new_snippet: Annotated[
+        str,
+        Field(
+            description="Replacement text, written exactly as given (include the "
+            "indentation and newlines you need)."
+        ),
+    ],
+) -> str:
     """
     Replace a byte-identical snippet inside a named function/method body,
     without touching the surrounding code. The match is scoped to the target's
@@ -116,8 +251,10 @@ def replace_in_body(file_path: str, target: str, old_snippet: str, new_snippet: 
         return f"Internal error in replace_in_body: {type(e).__name__}: {e}"
 
 
-@mcp.tool()
-def delete_in_body(file_path: str, target: str, snippet: str) -> str:
+@mcp.tool(annotations=_DESTRUCTIVE)
+def delete_in_body(
+    file_path: FilePath, target: FunctionTarget, snippet: BodySnippet
+) -> str:
     """
     Delete a byte-identical snippet inside a named function/method body. Scoped
     to the target's body so global file matches don't apply.
@@ -155,13 +292,39 @@ def delete_in_body(file_path: str, target: str, snippet: str) -> str:
         return f"Internal error in delete_in_body: {type(e).__name__}: {e}"
 
 
-@mcp.tool()
+@mcp.tool(annotations=_ADDITIVE)
 def insert_in_body(
-    file_path: str,
-    target: str,
-    new_snippet: str,
-    after: str = "",
-    before: str = "", at: str = "",
+    file_path: FilePath,
+    target: FunctionTarget,
+    new_snippet: Annotated[
+        str,
+        Field(
+            description="Text to insert: placed byte for byte with after/before "
+            "(include your own newlines and indentation), or re-indented as a "
+            "block (relative indentation kept) to the body's indentation with at."
+        ),
+    ],
+    after: Annotated[
+        str,
+        Field(
+            description="Unique, byte-identical anchor in the target's body to "
+            "insert after; '' (default) leaves this mode unused."
+        ),
+    ] = "",
+    before: Annotated[
+        str,
+        Field(
+            description="Unique, byte-identical anchor in the target's body to "
+            "insert before; '' (default) leaves this mode unused."
+        ),
+    ] = "",
+    at: Annotated[
+        str,
+        Field(
+            description="'top' or 'bottom' of the body; '' (default) leaves this "
+            "mode unused, and exactly one of at, after or before must be set."
+        ),
+    ] = "",
 ) -> str:
     """
     Insert new_snippet inside a named function/method body. Pass EXACTLY ONE
@@ -232,8 +395,18 @@ def insert_in_body(
         return f"Internal error in insert_in_body: {type(e).__name__}: {e}"
 
 
-@mcp.tool()
-def add_method(file_path: str, class_target: str, content: str) -> str:
+@mcp.tool(annotations=_ADDITIVE)
+def add_method(
+    file_path: FilePath,
+    class_target: ClassTarget,
+    content: Annotated[
+        str,
+        Field(
+            description="Complete method source, re-indented and appended to the "
+            "class body (Go: a receiver func placed after the type declaration)."
+        ),
+    ],
+) -> str:
     """
     Add a new method at the end of a class body.
 
@@ -260,8 +433,24 @@ def add_method(file_path: str, class_target: str, content: str) -> str:
         return f"Internal error in add_method: {type(e).__name__}: {e}"
 
 
-@mcp.tool()
-def delete_symbol(file_path: str, target: str, include_leading_comments: bool = True) -> str:
+@mcp.tool(annotations=_DESTRUCTIVE)
+def delete_symbol(
+    file_path: FilePath,
+    target: Annotated[
+        str,
+        Field(
+            description="Case-sensitive name of the function, method, or class to "
+            "delete, dotted for nested symbols (e.g. 'LRUCache.old_method')."
+        ),
+    ],
+    include_leading_comments: Annotated[
+        bool,
+        Field(
+            description="If true (default), also delete the contiguous comment "
+            "block directly above the symbol; false keeps it."
+        ),
+    ] = True,
+) -> str:
     """
     Delete an entire function or class definition, including its decorators.
     By default, also removes the contiguous leading comment block above the
@@ -296,8 +485,18 @@ def delete_symbol(file_path: str, target: str, include_leading_comments: bool = 
         return f"Internal error in delete_symbol: {type(e).__name__}: {e}"
 
 
-@mcp.tool()
-def replace_value(file_path: str, target: str, content: str) -> str:
+@mcp.tool(annotations=_DESTRUCTIVE)
+def replace_value(
+    file_path: FilePath,
+    target: Annotated[
+        str,
+        Field(
+            description="Dotted path to an existing key in a JSON, YAML, or TOML "
+            "file (e.g. 'project.version')."
+        ),
+    ],
+    content: LiteralValue,
+) -> str:
     """
     Replace the value of an existing key in a JSON, YAML, or TOML file.
 
@@ -324,8 +523,19 @@ def replace_value(file_path: str, target: str, content: str) -> str:
         return f"Internal error in replace_value: {type(e).__name__}: {e}"
 
 
-@mcp.tool()
-def add_import(file_path: str, import_text: str) -> str:
+@mcp.tool(annotations=_ADDITIVE)
+def add_import(
+    file_path: FilePath,
+    import_text: Annotated[
+        str,
+        Field(
+            description="Complete import line in the file's language (e.g. 'from "
+            "typing import Optional' or '#include <stdlib.h>'); in Go a bare spec "
+            "like '\"fmt\"' works only when a parenthesized import ( ... ) block "
+            "already exists; skipped if an identical line exists."
+        ),
+    ],
+) -> str:
     """
     Add an import statement to a source file. Skips exact duplicates. Places new
     imports after existing ones, or at the top of the file if none exist.
@@ -354,8 +564,17 @@ def add_import(file_path: str, import_text: str) -> str:
         return f"Internal error in add_import: {type(e).__name__}: {e}"
 
 
-@mcp.tool()
-def remove_import(file_path: str, import_text: str) -> str:
+@mcp.tool(annotations=_DESTRUCTIVE)
+def remove_import(
+    file_path: FilePath,
+    import_text: Annotated[
+        str,
+        Field(
+            description="Exact import line to remove, compared after stripping "
+            "surrounding whitespace (e.g. 'import os')."
+        ),
+    ],
+) -> str:
     """
     Remove a matching import statement from a source file. Matching is by stripped
     text equality -- pass the exact import line you want to remove.
@@ -382,8 +601,27 @@ def remove_import(file_path: str, import_text: str) -> str:
         return f"Internal error in remove_import: {type(e).__name__}: {e}"
 
 
-@mcp.tool()
-def add_key(file_path: str, parent_target: str, key: str, value: str) -> str:
+@mcp.tool(annotations=_ADDITIVE)
+def add_key(
+    file_path: FilePath,
+    parent_target: Annotated[
+        str,
+        Field(
+            description="Parent container: dotted path to a JSON object or YAML "
+            "mapping, a TOML table name as in its [header], '' for a config "
+            "file's root, or the name of a Python module-level dict."
+        ),
+    ],
+    key: Annotated[
+        str,
+        Field(
+            description="Key to add: a bare name for JSON (quoted for you), YAML "
+            "and TOML; for Python a key expression, so quote string keys (e.g. "
+            "'\"timeout\"')."
+        ),
+    ],
+    value: LiteralValue,
+) -> str:
     """
     Add a new key-value pair inside a dict-like container. Works for JSON objects,
     YAML mappings, TOML tables, AND Python module-level dict literals.
@@ -423,8 +661,19 @@ def add_key(file_path: str, parent_target: str, key: str, value: str) -> str:
         return f"Internal error in add_key: {type(e).__name__}: {e}"
 
 
-@mcp.tool()
-def delete_key(file_path: str, target: str) -> str:
+@mcp.tool(annotations=_DESTRUCTIVE)
+def delete_key(
+    file_path: FilePath,
+    target: Annotated[
+        str,
+        Field(
+            description="Key to delete: dotted path for JSON/YAML/TOML (e.g. "
+            "'dependencies.tree-sitter'), 'DictName.keyExpr' for a Python "
+            "module-level dict (e.g. 'CONFIG.\"timeout\"'), or 'VarName.key' for "
+            "a JS/TS module-level object literal."
+        ),
+    ],
+) -> str:
     """
     Delete a key-value pair from a dict-like container.
       - JSON / YAML / TOML: dotted path to the key.
@@ -467,8 +716,10 @@ def delete_key(file_path: str, target: str) -> str:
         return f"Internal error in delete_key: {type(e).__name__}: {e}"
 
 
-@mcp.tool()
-def append_to_array(file_path: str, target: str, value: str) -> str:
+@mcp.tool(annotations=_ADDITIVE)
+def append_to_array(
+    file_path: FilePath, target: ArrayTarget, value: LiteralValue
+) -> str:
     """
     Append a literal value to an array/list. Works for JSON arrays, YAML sequences,
     TOML arrays, AND Python module-level list literals.
@@ -502,8 +753,19 @@ def append_to_array(file_path: str, target: str, value: str) -> str:
         return f"Internal error in append_to_array: {type(e).__name__}: {e}"
 
 
-@mcp.tool()
-def remove_from_array(file_path: str, target: str, value_match: str) -> str:
+@mcp.tool(annotations=_DESTRUCTIVE)
+def remove_from_array(
+    file_path: FilePath,
+    target: ArrayTarget,
+    value_match: Annotated[
+        str,
+        Field(
+            description="Element to remove, compared with each element's source "
+            "text after stripping whitespace (e.g. '\"old-package\"'); only the "
+            "first match is removed."
+        ),
+    ],
+) -> str:
     """
     Remove the first element matching value_match (stripped text equality) from an
     array/list. Works for JSON/YAML/TOML config arrays AND Python module-level
@@ -542,8 +804,19 @@ def remove_from_array(file_path: str, target: str, value_match: str) -> str:
         return f"Internal error in remove_from_array: {type(e).__name__}: {e}"
 
 
-@mcp.tool()
-def add_field(file_path: str, class_target: str, content: str) -> str:
+@mcp.tool(annotations=_ADDITIVE)
+def add_field(
+    file_path: FilePath,
+    class_target: ClassTarget,
+    content: Annotated[
+        str,
+        Field(
+            description="Literal field or member declaration (e.g. 'version = "
+            "\"1.0\"' or Go 'version int'), re-indented and inserted at the top "
+            "of the class body with no auto-wrapping."
+        ),
+    ],
+) -> str:
     """
     Add a field/attribute/member at the top of a class body (fields-before-methods
     convention).
@@ -571,8 +844,20 @@ def add_field(file_path: str, class_target: str, content: str) -> str:
         return f"Internal error in add_field: {type(e).__name__}: {e}"
 
 
-@mcp.tool()
-def replace_signature(file_path: str, target: str, new_signature: str) -> str:
+@mcp.tool(annotations=_DESTRUCTIVE)
+def replace_signature(
+    file_path: FilePath,
+    target: FunctionTarget,
+    new_signature: Annotated[
+        str,
+        Field(
+            description="Everything from the start of the definition up to its "
+            "body, without leading indentation (e.g. 'def get(self, key, "
+            "default=None):' or JS 'get(key, d)' without the '{'); Java "
+            "annotations count as part of it."
+        ),
+    ],
+) -> str:
     """
     Replace only the signature of a function, preserving its body and decorators.
 
@@ -583,7 +868,7 @@ def replace_signature(file_path: str, target: str, new_signature: str) -> str:
 
     Example:
         target="LRUCache.get"
-        new_signature="    def get(self, key, default=None):"
+        new_signature="def get(self, key, default=None):"
     """
     if err := _validate_file(file_path):
         return err
@@ -600,8 +885,8 @@ def replace_signature(file_path: str, target: str, new_signature: str) -> str:
         return f"Internal error in replace_signature: {type(e).__name__}: {e}"
 
 
-@mcp.tool()
-def list_symbols(file_path: str) -> str:
+@mcp.tool(annotations=_READ_ONLY)
+def list_symbols(file_path: FilePath) -> str:
     """
     Return a formatted outline of all top-level functions, classes, and methods in
     a source file (Python, JS, TS, C, C++), with line numbers. Read-only.
@@ -638,8 +923,10 @@ def list_symbols(file_path: str) -> str:
 
 
 
-@mcp.tool()
-def add_import_name(file_path: str, module: str, name: str) -> str:
+@mcp.tool(annotations=_ADDITIVE)
+def add_import_name(
+    file_path: FilePath, module: ImportModule, name: ImportName
+) -> str:
     """
     Add a name to an existing named-import statement. Idempotent: skips if
     the name is already present.
@@ -677,8 +964,10 @@ def add_import_name(file_path: str, module: str, name: str) -> str:
         return f"Internal error in add_import_name: {type(e).__name__}: {e}"
 
 
-@mcp.tool()
-def remove_import_name(file_path: str, module: str, name: str) -> str:
+@mcp.tool(annotations=_DESTRUCTIVE)
+def remove_import_name(
+    file_path: FilePath, module: ImportModule, name: ImportName
+) -> str:
     """
     Remove a name from a named-import statement.
 
@@ -721,9 +1010,24 @@ def remove_import_name(file_path: str, module: str, name: str) -> str:
         return f"Internal error in remove_import_name: {type(e).__name__}: {e}"
 
 
-@mcp.tool()
+@mcp.tool(annotations=_ADDITIVE)
 def add_parameter(
-    file_path: str, target: str, parameter: str, position: str = "end"
+    file_path: FilePath,
+    target: FunctionTarget,
+    parameter: Annotated[
+        str,
+        Field(
+            description="Literal source text of one parameter (e.g. 'default=None' "
+            "or 'const int* buf'); the separating comma is added for you."
+        ),
+    ],
+    position: Annotated[
+        str,
+        Field(
+            description="'end' (default) appends after the last parameter; "
+            "'start' inserts before the first."
+        ),
+    ] = "end",
 ) -> str:
     """
     Add a parameter to a function signature at position 'end' (default) or 'start'.
@@ -759,8 +1063,18 @@ def add_parameter(
         return f"Internal error in add_parameter: {type(e).__name__}: {e}"
 
 
-@mcp.tool()
-def remove_parameter(file_path: str, target: str, parameter_name: str) -> str:
+@mcp.tool(annotations=_DESTRUCTIVE)
+def remove_parameter(
+    file_path: FilePath,
+    target: FunctionTarget,
+    parameter_name: Annotated[
+        str,
+        Field(
+            description="Bare name of the parameter to remove (e.g. 'default'), "
+            "without its type or default value."
+        ),
+    ],
+) -> str:
     """
     Remove a parameter by name from a function signature. Leaves the body untouched.
 
@@ -799,8 +1113,25 @@ def remove_parameter(file_path: str, target: str, parameter_name: str) -> str:
 
 
 
-@mcp.tool()
-def replace_docstring(file_path: str, target: str, new_docstring: str) -> str:
+@mcp.tool(annotations=_DESTRUCTIVE)
+def replace_docstring(
+    file_path: FilePath,
+    target: Annotated[
+        str,
+        Field(
+            description="Case-sensitive name of the Python function, method, or "
+            "class, dotted for nested symbols (e.g. 'LRUCache.get')."
+        ),
+    ],
+    new_docstring: Annotated[
+        str,
+        Field(
+            description="Python string literal including its quotes, normally "
+            "triple-quoted; replaces the existing docstring or becomes the first "
+            "body statement."
+        ),
+    ],
+) -> str:
     """
     Replace or insert a Python docstring on a function or class. Python-only. The
     new_docstring should be a valid Python string literal including its surrounding
@@ -830,8 +1161,17 @@ def replace_docstring(file_path: str, target: str, new_docstring: str) -> str:
         return f"Internal error in replace_docstring: {type(e).__name__}: {e}"
 
 
-@mcp.tool()
-def find_references(file_path: str, target: str) -> str:
+@mcp.tool(annotations=_READ_ONLY)
+def find_references(
+    file_path: FilePath,
+    target: Annotated[
+        str,
+        Field(
+            description="Exact identifier to find, matched per identifier rather "
+            "than as a dotted path (e.g. 'LRUCache')."
+        ),
+    ],
+) -> str:
     """
     Return all occurrences of an identifier named `target` in a source file, as
     'line N: <source line>'. Read-only, syntactic only (no scope awareness), so
@@ -859,8 +1199,26 @@ def find_references(file_path: str, target: str) -> str:
         return f"Internal error in find_references: {type(e).__name__}: {e}"
 
 
-@mcp.tool()
-def add_top_level(file_path: str, content: str, position: str = "bottom") -> str:
+@mcp.tool(annotations=_ADDITIVE)
+def add_top_level(
+    file_path: FilePath,
+    content: Annotated[
+        str,
+        Field(
+            description="Top-level source inserted as-is (function, class, "
+            "constant, or any statement), separated from existing code by a "
+            "blank line."
+        ),
+    ],
+    position: Annotated[
+        str,
+        Field(
+            description="'bottom' (default) appends at the end of the file; 'top' "
+            "inserts after the preamble (package, imports, includes, leading "
+            "comments, Python module docstring)."
+        ),
+    ] = "bottom",
+) -> str:
     """
     Insert top-level content into the file: a function, class, constant, type
     alias, or any other top-level statement. `position` controls placement:
@@ -898,8 +1256,26 @@ def add_top_level(file_path: str, content: str, position: str = "bottom") -> str
         return f"Internal error in add_top_level: {type(e).__name__}: {e}"
 
 
-@mcp.tool()
-def read_symbol(file_path: str, target: str, depth: str = "full") -> str:
+@mcp.tool(annotations=_READ_ONLY)
+def read_symbol(
+    file_path: FilePath,
+    target: Annotated[
+        str,
+        Field(
+            description="Case-sensitive symbol name, dotted for nesting (e.g. "
+            "'LRUCache.get'), or a dotted key path in a config file (e.g. "
+            "'project.version')."
+        ),
+    ],
+    depth: Annotated[
+        str,
+        Field(
+            description="'full' (default) returns the whole source, 'interface' a "
+            "class skeleton or function signature, 'signature' only the signature "
+            "or class header; config files support only 'full'."
+        ),
+    ] = "full",
+) -> str:
     """
     Return source text for a single named symbol (function, class, method,
     config key) without reading the entire file. Read-only.
@@ -942,8 +1318,8 @@ def read_symbol(file_path: str, target: str, depth: str = "full") -> str:
         return f"Internal error in read_symbol: {type(e).__name__}: {e}"
 
 
-@mcp.tool()
-def read_imports(file_path: str) -> str:
+@mcp.tool(annotations=_READ_ONLY)
+def read_imports(file_path: FilePath) -> str:
     """
     Return all import statements in a source file as a multi-line string. Read-only.
 
@@ -971,12 +1347,32 @@ def read_imports(file_path: str) -> str:
 
 
 
-@mcp.tool()
+@mcp.tool(annotations=_DESTRUCTIVE)
 def edit_leading_comment(
-    file_path: str,
-    target: str,
-    op: str,
-    comment: str = "",
+    file_path: FilePath,
+    target: Annotated[
+        str,
+        Field(
+            description="Case-sensitive name of the symbol or config key whose "
+            "leading comment to edit, dotted for nesting (e.g. 'LRUCache.get'); "
+            "undotted TOML [table] names (e.g. 'project') also work."
+        ),
+    ],
+    op: Annotated[
+        str,
+        Field(
+            description="'add' inserts a new comment, 'replace' swaps the existing "
+            "block (or inserts one if none), 'remove' deletes the block."
+        ),
+    ],
+    comment: Annotated[
+        str,
+        Field(
+            description="Full comment text including its markers (e.g. '# note', "
+            "'// note', '/** ... */'), re-indented to the symbol; required for "
+            "'add' and 'replace', ignored for 'remove'."
+        ),
+    ] = "",
 ) -> str:
     """
     Edit the contiguous leading-comment block above a named symbol. One tool
@@ -1034,8 +1430,29 @@ def edit_leading_comment(
 
 
 
-@mcp.tool()
-def insert_sibling(file_path: str, target: str, content: str, position: str) -> str:
+@mcp.tool(annotations=_ADDITIVE)
+def insert_sibling(
+    file_path: FilePath,
+    target: Annotated[
+        str,
+        Field(
+            description="Case-sensitive name of the function, class, method, or "
+            "top-level assignment to insert next to, dotted for nesting (e.g. "
+            "'LRUCache')."
+        ),
+    ],
+    content: Annotated[
+        str,
+        Field(
+            description="Source to insert, re-indented to the target's level and "
+            "separated from it by a blank line."
+        ),
+    ],
+    position: Annotated[
+        str,
+        Field(description="Where to insert relative to the target: 'before' or 'after'."),
+    ],
+) -> str:
     """
     Insert content as a sibling of a named symbol (function, class, method,
     or top-level assignment). Pass `position="before"` or `position="after"`.

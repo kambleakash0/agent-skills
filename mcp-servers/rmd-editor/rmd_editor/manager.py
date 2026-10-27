@@ -339,7 +339,10 @@ class RmdManager:
         from rmd_editor import kernel as _kernel
         cell = self._require_code_cell(index)
         kernel_name = _language_to_kernel_name(cell.language)
-        sess = _kernel.get_or_start_kernel(self.filepath, kernel_name=kernel_name)
+        try:
+            sess = _kernel.get_or_start_kernel(self.filepath, kernel_name=kernel_name)
+        except _kernel.KernelError as e:
+            raise RmdManagerError(str(e)) from e
         try:
             outputs = sess.execute(cell.source, timeout=timeout)
         except _kernel.KernelError as e:
@@ -362,7 +365,10 @@ class RmdManager:
             if not cell.source.strip():
                 continue
             kernel_name = _language_to_kernel_name(cell.language)
-            sess = _kernel.get_or_start_kernel(self.filepath, kernel_name=kernel_name)
+            try:
+                sess = _kernel.get_or_start_kernel(self.filepath, kernel_name=kernel_name)
+            except _kernel.KernelError as e:
+                raise RmdManagerError(str(e)) from e
             try:
                 outputs = sess.execute(cell.source, timeout=timeout)
             except _kernel.KernelError as e:

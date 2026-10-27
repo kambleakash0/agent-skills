@@ -3052,6 +3052,58 @@ def test_ast_reader():
 
 
 # ──────────────────────────────────────────────
+# MCP schema tests (annotations, parameter descriptions, server metadata)
+# ──────────────────────────────────────────────
+
+
+def test_tool_schemas():
+    print("\n═══ MCP tool schemas & server metadata ═══")
+
+    import asyncio
+    from importlib.metadata import version as _pkg_version
+
+    from ast_editor.server import mcp
+
+    tools = asyncio.run(mcp.list_tools())
+    check(
+        "schema: 28 tools registered",
+        "PASS" if len(tools) == 28 else f"FAIL: {len(tools)} tools",
+        "PASS",
+    )
+
+    unannotated = [t.name for t in tools if t.annotations is None]
+    check(
+        "schema: every tool has annotations",
+        "PASS" if not unannotated else f"FAIL: {unannotated}",
+        "PASS",
+    )
+
+    undescribed = [
+        f"{t.name}.{prop}"
+        for t in tools
+        for prop, spec in t.input_schema.get("properties", {}).items()
+        if not str(spec.get("description", "")).strip()
+    ]
+    check(
+        "schema: every parameter has a description",
+        "PASS" if not undescribed else f"FAIL: {undescribed}",
+        "PASS",
+    )
+
+    check(
+        "schema: server instructions are set",
+        "PASS" if (mcp.instructions or "").strip() else "FAIL",
+        "PASS",
+    )
+    expected_version = _pkg_version("ast-editor-mcp")
+    check(
+        "schema: server version matches package metadata",
+        "PASS" if mcp.version == expected_version else f"FAIL: {mcp.version!r}",
+        "PASS",
+    )
+
+
+# ──────────────────────────────────────────────
 # Main
 # ──────────────────────────────────────────────
 
@@ -3094,6 +3146,7 @@ if __name__ == "__main__":
     test_in_body_family()
     test_merged_apis()
     test_ast_reader()
+    test_tool_schemas()
 
     # Reset all fixtures to clean state after tests
     for lang in FIXTURES:

@@ -21,6 +21,9 @@ dist/
 *.swp
 *.swo
 
+# Jupyter
+.ipynb_checkpoints/
+
 # OS generated files
 .DS_Store
 .DS_Store?

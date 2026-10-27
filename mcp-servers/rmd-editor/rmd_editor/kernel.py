@@ -15,10 +15,13 @@ Design:
 """
 from __future__ import annotations
 
+import os
 import queue
+import re
 import time
 
 from jupyter_client import KernelManager
+from jupyter_client.kernelspec import NoSuchKernel
 
 
 class KernelError(Exception):
@@ -26,21 +29,29 @@ class KernelError(Exception):
 
 
 class _KernelSession:
-    def __init__(self, kernel_name: str = "ir"):
+    def __init__(self, kernel_name: str = "ir", cwd: str | None = None):
         self.kernel_name = kernel_name
+        # Working directory for the kernel process (the .rmd file's folder).
+        self.cwd = cwd
         self.km: KernelManager | None = None
         self.kc = None
 
     def start(self) -> None:
         if self.km is not None and self.km.is_alive():
             return
-        self.km = KernelManager(kernel_name=self.kernel_name)
-        self.km.start_kernel()
-        self.kc = self.km.client()
-        self.kc.start_channels()
+        # Release a dead kernel's channels and connection file before starting a new one.
+        self.shutdown()
         try:
+            self.km = KernelManager(kernel_name=self.kernel_name)
+            # restart_kernel() reuses these launch args, so cwd survives restarts.
+            self.km.start_kernel(cwd=self.cwd)
+            self.kc = self.km.client()
+            self.kc.start_channels()
             self.kc.wait_for_ready(timeout=30)
-        except RuntimeError as e:
+        except NoSuchKernel as e:
+            self.shutdown()
+            raise KernelError(str(e)) from e
+        except Exception as e:
             self.shutdown()
             raise KernelError(f"Kernel failed to start: {e}") from e
 
@@ -50,19 +61,26 @@ class _KernelSession:
     def interrupt(self) -> None:
         if self.km is None:
             raise KernelError("No kernel to interrupt")
-        self.km.interrupt_kernel()
+        try:
+            self.km.interrupt_kernel()
+        except Exception as e:
+            raise KernelError(f"Kernel interrupt failed: {e}") from e
 
     def restart(self) -> None:
         if self.km is None:
             raise KernelError("No kernel to restart")
-        self.km.restart_kernel(now=True)
-        if self.kc is not None:
-            self.kc.stop_channels()
-        self.kc = self.km.client()
-        self.kc.start_channels()
+        try:
+            # Relaunches with the original start_kernel() args, including cwd.
+            self.km.restart_kernel(now=True)
+            if self.kc is not None:
+                self.kc.stop_channels()
+            self.kc = self.km.client()
+            self.kc.start_channels()
+        except Exception as e:
+            raise KernelError(f"Kernel failed to restart: {e}") from e
         try:
             self.kc.wait_for_ready(timeout=30)
-        except RuntimeError as e:
+        except Exception as e:
             raise KernelError(f"Kernel failed to restart cleanly: {e}") from e
 
     def shutdown(self) -> None:
@@ -72,9 +90,14 @@ class _KernelSession:
             except Exception:
                 pass
             self.kc = None
-        if self.km is not None and self.km.is_alive():
+        if self.km is not None:
             try:
-                self.km.shutdown_kernel(now=True)
+                if self.km.is_alive():
+                    self.km.shutdown_kernel(now=True)
+                else:
+                    # A kernel that failed to start (or died) can still own a
+                    # connection file and sockets.
+                    self.km.cleanup_resources()
             except Exception:
                 pass
         self.km = None
@@ -96,6 +119,9 @@ class _KernelSession:
             try:
                 msg = self.kc.get_iopub_msg(timeout=min(remaining, 1.0))
             except queue.Empty:
+                # A dead kernel never sends "idle"; fail now instead of at the timeout.
+                if not self.is_alive():
+                    raise KernelError("Kernel died during execution")
                 continue
             parent = msg.get("parent_header", {})
             if parent.get("msg_id") != msg_id:
@@ -136,10 +162,19 @@ _kernels: dict[str, _KernelSession] = {}
 def get_or_start_kernel(file_path: str, kernel_name: str = "ir") -> _KernelSession:
     sess = _kernels.get(file_path)
     if sess is None:
-        sess = _KernelSession(kernel_name=kernel_name)
+        # Start in the document's folder, like Jupyter, so relative paths in
+        # chunks resolve against it rather than the server's working directory.
+        cwd = os.path.dirname(os.path.abspath(file_path))
+        sess = _KernelSession(kernel_name=kernel_name, cwd=cwd)
         _kernels[file_path] = sess
     if not sess.is_alive():
-        sess.start()
+        try:
+            sess.start()
+        except KernelError:
+            # Drop the half-started session so kernel_state reports "not started".
+            if _kernels.get(file_path) is sess:
+                del _kernels[file_path]
+            raise
     return sess
 
 
@@ -176,8 +211,13 @@ def kernel_state(file_path: str) -> str:
     return "dead"
 
 
+# ANSI CSI escape sequences (colors, cursor moves) that kernels put in
+# tracebacks and stream output; they only cost tokens in returned text.
+_ANSI_CSI = re.compile(r"\x1b\[[0-?]*[ -/]*[@-~]")
+
+
 def format_outputs(outputs: list[dict]) -> str:
-    """Render captured outputs for inline return to the caller."""
+    """Render captured outputs for inline return to the caller, minus ANSI escape codes."""
     if not outputs:
         return "(no output)"
     parts: list[str] = []
@@ -201,4 +241,5 @@ def format_outputs(outputs: list[dict]) -> str:
             parts.append(f"[error] {o.get('ename','Error')}: {o.get('evalue','')}")
         else:
             parts.append(f"[{t}] {o}")
-    return "".join(parts) if all(p.startswith("[stream:") for p in parts) else "\n".join(parts)
+    text = "".join(parts) if all(p.startswith("[stream:") for p in parts) else "\n".join(parts)
+    return _ANSI_CSI.sub("", text)

@@ -7,10 +7,16 @@ lightweight symbol extraction within code cells (no tree-sitter dependency).
 import ast as pyast
 import json as _json
 import os
+import re
 from typing import Any
 
 import nbformat
 from nbformat.v4 import new_code_cell, new_markdown_cell, new_notebook, new_raw_cell
+
+# ANSI CSI escape sequences (colors, cursor moves) that kernels emit in tracebacks
+# and some stream output. Stripped from text returned to the caller only; outputs
+# stored in the notebook keep them so Jupyter can still render the colors.
+_ANSI_CSI = re.compile(r"\x1b\[[0-?]*[ -/]*[@-~]")
 
 
 class NotebookManagerError(Exception):
@@ -275,7 +281,8 @@ class NotebookManager:
     def get_outputs(self, index: int) -> str:
         """
         Return a formatted text representation of a cell's outputs. Handles stream,
-        execute_result, display_data, and error output types.
+        execute_result, display_data, and error output types. ANSI escape codes are
+        stripped from the returned text; the stored outputs are left unchanged.
         """
         self._validate_index(index)
         cell = self.nb.cells[index]
@@ -318,7 +325,7 @@ class NotebookManager:
                 lines.append(f"[error] {ename}: {evalue}\n{tb_text}")
             else:
                 lines.append(f"[{otype}] (unrecognized output type)")
-        return "\n\n".join(lines)
+        return _ANSI_CSI.sub("", "\n\n".join(lines))
 
     def set_cell_metadata(self, index: int, key: str, value: str) -> str:
         """
@@ -438,6 +445,18 @@ class NotebookManager:
             return f"(pattern {pattern!r} not found)"
         return "\n".join(results)
 
+    def _kernel_session(self):
+        """
+        Return this notebook's kernel session, starting it if needed. Startup
+        failures (missing or broken kernelspec, kernel not ready) are raised as
+        NotebookManagerError so callers get the normal error path.
+        """
+        from notebook_editor import kernel as _kernel
+        try:
+            return _kernel.get_or_start_kernel(self.filepath)
+        except _kernel.KernelError as e:
+            raise NotebookManagerError(str(e)) from e
+
     def execute_cell(self, index: int, timeout: float = 60.0) -> str:
         """
         Execute a single code cell using the notebook's Jupyter kernel. The kernel
@@ -454,7 +473,7 @@ class NotebookManager:
                 f"Cell at index {index} is a {cell.cell_type} cell -- cannot execute"
             )
         code = self._cell_source_as_string(cell)
-        sess = _kernel.get_or_start_kernel(self.filepath)
+        sess = self._kernel_session()
         try:
             outputs, exec_count = sess.execute(code, timeout=timeout)
         except _kernel.KernelError as e:
@@ -472,7 +491,7 @@ class NotebookManager:
         raises an error. Returns a summary string.
         """
         from notebook_editor import kernel as _kernel
-        sess = _kernel.get_or_start_kernel(self.filepath)
+        sess = self._kernel_session()
         executed = 0
         errored = 0
         stopped_at: int | None = None
