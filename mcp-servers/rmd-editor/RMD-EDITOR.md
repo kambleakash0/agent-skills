@@ -19,9 +19,9 @@ When working with `.rmd` R Markdown files, do NOT use the generic `edit` or `wri
    - Set/overwrite one option: `set_chunk_option(index, key, value)` — use `key="label"` to set the chunk label (e.g. `setup`, `analysis`).
    - Remove one option: `remove_chunk_option(index, key)` — use `key="label"` to clear the chunk label.
 5. **YAML frontmatter:**
-   - Read: `get_frontmatter`
-   - Set/overwrite one key: `set_frontmatter_key(key, value)` — value is parsed as YAML when possible.
-   - Remove one key: `remove_frontmatter_key(key)`
+   - Read: `get_frontmatter` (shows R tags such as `!r`; a header that isn't valid YAML comes back as raw text with a note)
+   - Set/overwrite one key: `set_frontmatter_key(key, value)` — value is parsed as YAML when possible. Only that key's lines change, so comments, quoting and tags elsewhere in the header are kept. A value that means the same written as given is written that way (`"!r Sys.Date()"` stays an R tag). A new key goes at the end of the header.
+   - Remove one key: `remove_frontmatter_key(key)` (removes its indented lines too)
 6. **Running chunks (R kernel via IRkernel by default):**
    - One chunk: `execute_cell` — captured outputs are returned **INLINE** to the caller and are NOT written to the `.rmd` file (R Markdown regenerates outputs on render).
    - All chunks: `execute_all_cells`
@@ -49,5 +49,6 @@ When working with `.rmd` R Markdown files, do NOT use the generic `edit` or `wri
 - Kernel starts lazily on first `execute_cell` / `execute_all_cells`. One kernel per `.rmd` file path, cached for the server's lifetime.
 - The kernel runs in the `.rmd` file's folder, so relative paths in chunks resolve against that folder, not the server's directory.
 - State accumulates across calls: variables from an earlier `execute_cell` are visible to later ones. Use `restart_kernel` for a clean namespace or `shutdown_kernel` to release resources.
-- The kernel is chosen from the language of the first chunk you run (`r` → `ir`, `python` → `python3`, `julia` → `julia-1`, others passed through lowercased). Later chunks go to that same kernel whatever their language, so in a mixed-language document call `shutdown_kernel` before running chunks in another language (this discards the kernel's state). The matching Jupyter kernel must be installed on the host: install IRkernel for R via `install.packages("IRkernel"); IRkernel::installspec()`.
-- Outputs are **never** written to the `.rmd` file. They're returned inline to the caller only. Render the document with `rmarkdown::render()` if you want persisted HTML/PDF/Word output.
+- A chunk still running at `timeout` (seconds, must be positive) is interrupted and its kernel keeps its state; if the error says the kernel is still busy, call `restart_kernel`. Chunks on one file run one at a time (another call's chunk can run between two chunks of `execute_all_cells`); `restart_kernel` and `shutdown_kernel` kill a running chunk instead of waiting for it.
+- The kernel is chosen from the language of the first chunk you run (`r` → `ir`, `python` → `python3`, `julia` → the installed IJulia kernelspec: `julia`, `julia-1`, or the newest `julia-X.Y`; others passed through lowercased). Later chunks go to that same kernel whatever their language, so in a mixed-language document call `shutdown_kernel` before running chunks in another language (this discards the kernel's state). The matching Jupyter kernel must be installed on the host: install IRkernel for R via `install.packages("IRkernel"); IRkernel::installspec()`.
+- Outputs are **never** written to the `.rmd` file. They're returned inline to the caller only; an error includes the kernel's traceback. Render the document with `rmarkdown::render()` if you want persisted HTML/PDF/Word output.

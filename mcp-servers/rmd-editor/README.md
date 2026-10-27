@@ -21,7 +21,7 @@ All tools require `file_path` to be an **absolute path**. Every tool except `cre
 
 | Tool | Parameters | Description |
 | :--- | :--- | :--- |
-| `create_rmd` | `file_path`, `title` (default `""`), `author` (default `""`), `output_format` (default `"html_document"`), `overwrite` (default `False`) | Create a new empty `.rmd` with a minimal YAML frontmatter. Refuses to overwrite unless `overwrite=True`. |
+| `create_rmd` | `file_path`, `title` (default `""`), `author` (default `""`), `output_format` (default `"html_document"`), `overwrite` (default `False`) | Create a new empty `.rmd` with a minimal YAML frontmatter. Title and author are written as escaped, double-quoted YAML strings, so quotes, backslashes and newlines are safe; an empty `title`, `author` or `output_format` leaves that key out. Refuses to overwrite unless `overwrite=True`. |
 
 ### Cell structure & navigation
 
@@ -55,9 +55,9 @@ All tools require `file_path` to be an **absolute path**. Every tool except `cre
 
 | Tool | Parameters | Description |
 | :--- | :--- | :--- |
-| `get_frontmatter` | `file_path` | Return the YAML frontmatter as a formatted YAML string. |
-| `set_frontmatter_key` | `file_path`, `key`, `value` | Set or overwrite one top-level YAML key. Value is parsed as YAML where possible (so `"true"` → bool, `"42"` → int). |
-| `remove_frontmatter_key` | `file_path`, `key` | Remove one top-level YAML key. |
+| `get_frontmatter` | `file_path` | Return the YAML frontmatter as a formatted YAML string. R Markdown tags such as `!r` and `!expr` are shown as tags. A header that isn't valid YAML comes back as its raw text, after a note saying why it couldn't be parsed. |
+| `set_frontmatter_key` | `file_path`, `key`, `value` | Set or overwrite one top-level YAML key. Value is parsed as YAML where possible (so `"true"` → bool, `"42"` → int). Only that key's lines change; see [Frontmatter edits](#frontmatter-edits). A new key goes at the end of the header, and a document without a header gets one. |
+| `remove_frontmatter_key` | `file_path`, `key` | Remove one top-level YAML key along with its indented lines. The rest of the header is left as it is. |
 
 ### Discovery (read-only)
 
@@ -69,11 +69,11 @@ All tools require `file_path` to be an **absolute path**. Every tool except `cre
 
 | Tool | Parameters | Description |
 | :--- | :--- | :--- |
-| `execute_cell` | `file_path`, `index`, `timeout` (default `60.0`) | Execute one code chunk via a Jupyter kernel. Captured outputs are returned **inline** — never written to the `.rmd` file. |
-| `execute_all_cells` | `file_path`, `timeout` (default `60.0`), `stop_on_error` (default `True`) | Execute all code chunks in order. Returns a cell-by-cell transcript. |
+| `execute_cell` | `file_path`, `index`, `timeout` (default `60.0`) | Execute one code chunk via a Jupyter kernel. Captured outputs are returned **inline** — never written to the `.rmd` file. An error output includes the kernel's traceback. A chunk still running at `timeout` is interrupted and an error is returned. |
+| `execute_all_cells` | `file_path`, `timeout` (default `60.0`), `stop_on_error` (default `True`) | Execute all code chunks in order. Returns a cell-by-cell transcript. A chunk still running at `timeout` is interrupted and the run stops with an error. |
 | `get_kernel_state` | `file_path` | Report whether this document's kernel is `not started`, `alive`, or `dead`. |
 | `restart_kernel` | `file_path` | Restart the kernel. All in-memory state is lost. |
-| `interrupt_kernel` | `file_path` | Send a signal to stop a long-running chunk. |
+| `interrupt_kernel` | `file_path` | Send a signal to stop a long-running chunk. Returns an error saying the kernel is not running if its process has died. |
 | `shutdown_kernel` | `file_path` | Shut down the kernel and release resources. |
 
 ### Kernel lifecycle notes
@@ -81,16 +81,31 @@ All tools require `file_path` to be an **absolute path**. Every tool except `cre
 - The kernel is **started lazily** on the first `execute_cell` / `execute_all_cells` call.
 - **One kernel per `.rmd` file path**, cached in memory for the server's lifetime.
 - **Runs in the document's folder.** As in Jupyter, the kernel's working directory is the folder that contains the `.rmd` file, so relative paths in chunks (for example `read.csv("data/input.csv")`) resolve against that folder, not the server's install directory. `restart_kernel` keeps the same folder.
-- **Kernel chosen by the first chunk run.** The language of the first executed chunk picks the kernelspec: `r` launches IRkernel (`ir`), `python` launches `python3`, `julia` launches `julia-1`, and other languages pass through lowercased as the kernelspec name. Later chunks run in that same kernel whatever their language, so in a mixed-language document call `shutdown_kernel` before running chunks in another language (this discards the kernel's state). The matching Jupyter kernel must be installed on the host.
+- **Kernel chosen by the first chunk run.** The language of the first executed chunk picks the kernelspec: `r` launches IRkernel (`ir`), `python` launches `python3`, and other languages pass through lowercased as the kernelspec name. `julia` launches the installed IJulia kernelspec: `julia` or `julia-1` if one exists, otherwise the highest-versioned `julia-X.Y` (IJulia names its kernelspecs after the Julia version, for example `julia-1.11`). With no Julia kernel installed, the error names `julia-1`. Later chunks run in that same kernel whatever their language, so in a mixed-language document call `shutdown_kernel` before running chunks in another language (this discards the kernel's state). The matching Jupyter kernel must be installed on the host.
 - **Install IRkernel** (R): in R, run `install.packages("IRkernel"); IRkernel::installspec()`.
 - **Outputs are never persisted.** R Markdown regenerates outputs on render (`rmarkdown::render()`), so the server returns outputs inline to the caller only.
 - Kernels survive across tool calls: state accumulates across `execute_cell` invocations. Use `restart_kernel` to reset or `shutdown_kernel` to free resources.
+- **A timeout interrupts the chunk.** When a chunk is still running after `timeout` seconds, the server interrupts it (as `interrupt_kernel` does) and waits up to 5 seconds for the kernel to stop. The error then says the chunk was interrupted; the kernel keeps its state and is ready for the next call. If the chunk ignores the interrupt, the error says the kernel is still busy: call `restart_kernel`. `timeout` must be positive. If the kernel hadn't started the chunk yet when the timeout passed, the chunk is interrupted as soon as it starts.
+- **Calls on one document take turns.** Concurrent `execute_cell` / `execute_all_cells` calls on the same file never run two chunks at once, and each gets its own outputs; another call's chunk can run between two chunks of an `execute_all_cells` run. `interrupt_kernel` acts at once. `restart_kernel` and `shutdown_kernel` don't wait for a running chunk: they kill the kernel, and that execute call fails with "Kernel died during execution". Calls waiting behind it run afterwards on the restarted kernel, or fail with "Kernel was shut down" after `shutdown_kernel`.
 
 ### Format notes
 
 - `.rmd` has no cell-boundary markers between adjacent prose blocks (unlike `.ipynb`). Two adjacent `markdown` cells in the model **auto-merge** on save + re-parse. This is expected; prefer inserting prose between code chunks or appending to an existing markdown cell.
 - Polyglot chunks (`{python}`, `{bash}`, `{sql}`) parse and round-trip correctly. For execution, the matching Jupyter kernel must be installed.
 - Regular markdown code fences (` ```python ` without braces) stay as prose — only ` ```{lang} ` form is treated as a chunk.
+- A document whose last line has no trailing newline keeps it that way, unless a cell is added after it or moved past it. Then a newline goes in between, so chunk fences never end up on the same line as other text.
+- Only a newline ends a line, as in knitr. A form feed or a Unicode line separator (U+2028) stays part of its line, so a chunk fence that follows one on the same line doesn't start a chunk.
+
+### Frontmatter edits
+
+`set_frontmatter_key` and `remove_frontmatter_key` edit the YAML header line by line. They change only the target key's lines (the `key:` line at the start of the line plus the indented lines below it) and leave every other byte of the header as it is: comments, blank lines, quoting, tags such as `!r` and `!expr`, and key order.
+
+- **Values.** The value is parsed as YAML. If it means the same when written as given, it's written that way: on the key's line for a one-line value, or indented below the key for a multi-line one. So `"!r Sys.Date()"` stays an R expression, `'"2026-04-20"'` stays a quoted string, and comments in a multi-line value are kept. Any other value is written as YAML for the parsed value.
+- **New keys** go just before the closing `---`. A document without a header gets a new one at the top.
+- **Repeated keys.** If a key appears more than once, `set_frontmatter_key` replaces the first copy and removes the others, leaving one copy with the new value. `remove_frontmatter_key` removes every copy.
+- **Headers that aren't valid YAML** (for example, a tab used for indentation) can still be edited: lines that start with `key:` at column 0 count as keys. `get_frontmatter` returns such a header as raw text, after a note saying what is wrong.
+- **What can't be edited key by key:** a header that is a YAML list or a single value rather than `key: value` lines, a flow-style header such as `{title: x, author: y}`, and a header whose keys are indented rather than starting at column 0. For these, both tools return an error and the file is left unchanged.
+- **Safety check.** If the header was valid YAML before an edit, it must still be valid afterwards, with the same other keys. Otherwise the tool returns an error and doesn't write the file. This can happen when the edit removes an anchor that another key refers to.
 
 ## Which tool should I use?
 
@@ -176,7 +191,7 @@ For kernel execution, install the matching Jupyter kernel:
 
 - **R:** in R, run `install.packages("IRkernel"); IRkernel::installspec()`. Docs: <https://irkernel.github.io/>
 - **Python:** `pip install ipykernel`, then `python -m ipykernel install --user` with the same Python. The second step registers the kernel in your user Jupyter folder, which the server always searches. Without it, the kernelspec stays under that Python's own prefix (for example a Homebrew, pyenv or conda Python), where the server may not find it.
-- **Julia:** in Julia, `using Pkg; Pkg.add("IJulia")`.
+- **Julia:** in Julia, `using Pkg; Pkg.add("IJulia")`. IJulia names its kernelspec after the Julia version (for example `julia-1.11`); the server finds it under that name.
 
 The server itself depends on `mcp`, `pyyaml`, and `jupyter-client`. `uv` handles all of these automatically on first run.
 
@@ -320,9 +335,12 @@ For interactive testing, use the [MCP Inspector](https://modelcontextprotocol.io
 
 ### Common issues
 
-- **`No such kernel named <name>`** — the Jupyter kernel for the chunk's language isn't installed (`ir` for R chunks, `python3` for Python chunks). To see the kernels the server can find, run `uv --directory /absolute/path/to/rmd-editor run jupyter kernelspec list`. Install the missing one per the Prerequisites section, then run the chunk again; `get_kernel_state` stays `not started` after this error, so the server doesn't need a restart.
-- **"Kernel failed to start"** — the kernelspec exists but the kernel couldn't be launched (for example, its command points to an R installation that has moved), or it started but died or didn't become ready within 30 seconds. The message includes the underlying error. Check that the kernel's own runtime works (for example, that R starts and loads IRkernel), then retry. `restart_kernel` reports the same kinds of problems as **"Kernel failed to restart"**.
-- **"File is not a .rmd document"** — every tool validates the extension. Rename your file to `.rmd` or use [`jupytext`](https://jupytext.readthedocs.io/) to convert `.Rmd` ↔ `.ipynb`.
+- **`No such kernel named <name>`** — the Jupyter kernel for the chunk's language isn't installed (`ir` for R chunks, `python3` for Python chunks, `julia-1` for Julia chunks when no IJulia kernelspec is found). To see the kernels the server can find, run `uv --directory /absolute/path/to/rmd-editor run jupyter kernelspec list`. Install the missing one per the Prerequisites section, then run the chunk again; `get_kernel_state` stays `not started` after this error, so the server doesn't need a restart.
+- **"Kernel failed to start"** — the kernelspec exists but the kernel couldn't be launched (for example, its command points to an R installation that has moved), or it started but died or didn't become ready within 30 seconds. The message includes the underlying error. Check that the kernel's own runtime works (for example, that R starts and loads IRkernel), then retry. `restart_kernel` reports the same kinds of problems as **"Kernel failed to restart"**. After any of these errors nothing is left running (`get_kernel_state` reports `not started`), and the server log gets one warning line, not a traceback.
+- **"Execution timed out after Ns; the cell was interrupted"** — the chunk ran longer than `timeout` and was stopped; the kernel keeps its state. For long-running code, pass a larger `timeout` (in seconds).
+- **"... the kernel was interrupted but is still busy"** — the chunk ignored the interrupt (for example, native code that doesn't check for interrupts). Call `restart_kernel`; in-memory state is lost.
+- **"Kernel is not running (its process has exited)"** from `interrupt_kernel` — the kernel crashed or was killed (`get_kernel_state` reports `dead`). The next `execute_cell` starts a fresh kernel.
+- **"File is not a .rmd document"** — every tool checks that the path ends in `.rmd`. The check ignores case, so `.Rmd` (the usual RStudio extension) and `.RMD` work as they are. Any other extension, such as `.qmd`, `.md` or `.txt`, is rejected; rename the file to `.Rmd`. For a Jupyter notebook, use `notebook-editor`, or convert between `.Rmd` and `.ipynb` with [`jupytext`](https://jupytext.readthedocs.io/).
 - **Outputs aren't appearing in the file** — by design. Outputs are returned inline to the caller. To persist, render with `rmarkdown::render("file.rmd")`.
 - **Adjacent markdown cells merged after a save** — by design. `.rmd` has no cell-boundary markers for prose; the model collapses consecutive markdown cells on re-parse.
 

@@ -63,11 +63,11 @@ All tools require `file_path` to be an **absolute path**. Every tool except `cre
 
 | Tool | Parameters | Description |
 | :--- | :--- | :--- |
-| `execute_cell` | `file_path`, `index`, `timeout` (default `60.0` seconds) | Execute a code cell using the notebook's Jupyter kernel (from `metadata.kernelspec.name`). Captures outputs and writes them back to the file. |
-| `execute_all_cells` | `file_path`, `timeout` (default `60.0` seconds per cell), `stop_on_error` (default `True`) | Execute all code cells in order. Returns a summary of executed/errored/stopped counts. |
+| `execute_cell` | `file_path`, `index`, `timeout` (default `60.0` seconds) | Execute a code cell using the notebook's Jupyter kernel (from `metadata.kernelspec.name`). Captures outputs and writes them back to the file. A cell still running at `timeout` is interrupted and an error is returned. |
+| `execute_all_cells` | `file_path`, `timeout` (default `60.0` seconds per cell), `stop_on_error` (default `True`) | Execute all code cells in order. Returns a summary of executed/errored/stopped counts. A cell still running at `timeout` is interrupted and the run stops with an error. |
 | `get_kernel_state` | `file_path` | Report whether the notebook's kernel is `not started`, `alive`, or `dead`. |
 | `restart_kernel` | `file_path` | Restart the kernel. All in-memory state is lost. |
-| `interrupt_kernel` | `file_path` | Interrupt the running cell (SIGINT or the kernel's interrupt message; a KeyboardInterrupt in Python). Stops a long-running or stuck cell. |
+| `interrupt_kernel` | `file_path` | Interrupt the running cell (SIGINT or the kernel's interrupt message; a KeyboardInterrupt in Python). Stops a long-running or stuck cell. Returns an error saying the kernel is not running if its process has died. |
 | `shutdown_kernel` | `file_path` | Shut down the kernel and release resources. |
 
 ### Kernel lifecycle notes
@@ -76,8 +76,17 @@ All tools require `file_path` to be an **absolute path**. Every tool except `cre
 - **One kernel per notebook file path**, cached in memory for the server's lifetime. Different notebooks get different kernels (isolated namespaces).
 - **The kernel runs in the notebook's folder**, as in Jupyter, so relative paths in cells (for example `pd.read_csv("data.csv")`) resolve against the folder that contains the `.ipynb`, not the directory the server was launched from. `restart_kernel` keeps the same working directory.
 - **Kernel-agnostic.** The kernel language is read from `metadata.kernelspec.name` in the notebook itself — works with any Jupyter kernel installed on the host: `python3`, `ir` (R via [IRkernel](https://irkernel.github.io/)), `julia-1.x` ([IJulia](https://github.com/JuliaLang/IJulia.jl)), etc. Falls back to `python3` if the notebook has no kernelspec. Set the kernel at creation time with `create_notebook(file_path, kernel_name="ir", language="R", ...)`.
+- **The built-in `python3` kernel runs in the server's own environment.** `python3` is the `ipykernel` that ships with the server, in the server's `.venv`. A `python3` notebook can import only what is installed there, so `import pandas` or importing your project's code fails even if your own environment has it. To run notebooks in a project environment:
+  1. Install `ipykernel` in that environment (for example `pip install ipykernel` or `uv add ipykernel`).
+  2. Register it under its own name, using that environment's Python: `python -m ipykernel install --user --name <name>`.
+  3. Create notebooks with `create_notebook(file_path, kernel_name="<name>")`. For an existing notebook, set its `metadata.kernelspec.name` to `<name>` (in JupyterLab, **Kernel → Change Kernel**, then save), then call `shutdown_kernel` so the next run starts the new kernel.
+
+  Registering the environment as `python3` doesn't replace the built-in kernel. The server runs in a virtual environment, so Jupyter looks for kernels in that environment before your user-level ones, and the server's own `python3` is found first.
 - **Symbol discovery is Python-only.** `list_notebook_symbols` uses Python's `ast` module and returns a clear "not supported for <language>" message for non-Python notebooks. Use `find_in_notebook` for text search in any language.
 - Kernels survive across tool calls, so state accumulates: `execute_cell(0)` then `execute_cell(1)` in a later call sees the variables from cell 0.
+- **A timeout interrupts the cell.** When a cell is still running after `timeout` seconds, the server interrupts it (as `interrupt_kernel` does) and waits up to 5 seconds for the kernel to stop. The error then says the cell was interrupted; the kernel keeps its variables and is ready for the next call. If the cell ignores the interrupt, the error says the kernel is still busy: call `restart_kernel`. `timeout` must be positive. If the kernel hadn't started the cell yet when the timeout passed, the cell is interrupted as soon as it starts.
+- **Calls on one notebook take turns.** Concurrent `execute_cell` / `execute_all_cells` calls on the same notebook never run two cells at once, and each gets its own outputs; another call's cell can run between two cells of an `execute_all_cells` run. `interrupt_kernel` acts at once. `restart_kernel` and `shutdown_kernel` don't wait for a running cell: they kill the kernel, and that execute call fails with "Kernel died during execution". Calls waiting behind it run afterwards on the restarted kernel, or fail with "Kernel was shut down" after `shutdown_kernel`.
+- **Outputs go into the file as it is now.** Execution writes outputs into the notebook as it is when the cell finishes, so edits saved while the cell ran (another tool call, or another cell's execution) are kept.
 - Use `shutdown_kernel` to free resources when done with a notebook.
 
 ## Which tool should I use?
@@ -307,11 +316,14 @@ For interactive testing, use the [MCP Inspector](https://modelcontextprotocol.io
 ### Common issues
 
 - **`No such kernel named <name>`** — the kernel named in the notebook's `metadata.kernelspec.name` isn't installed on this machine. `ipykernel` ships with the server, so `python3` notebooks normally work out of the box; for other languages, install the matching Jupyter kernel (for example IRkernel for R).
+- **`ModuleNotFoundError` (for example `No module named 'pandas'`) in a `python3` notebook** — the built-in `python3` kernel runs in the server's own environment, not yours. Register your environment as its own kernel and use it, as described in [Kernel lifecycle notes](#kernel-lifecycle-notes). Naming it `python3` doesn't work, because the server's own `python3` is found first.
 - **"Kernel failed to start"** — the kernelspec exists but the kernel couldn't be launched (for example, its `argv` points at a missing executable), or the process died or didn't become ready within 30 seconds. Check that the kernel's own runtime works (for example, that R starts and loads IRkernel), then retry.
-- **Retrying after either startup error** — nothing is left running: `get_kernel_state` reports `not started`, and the next `execute_cell` / `execute_all_cells` call tries to start the kernel again.
+- **Retrying after either startup error** — nothing is left running: `get_kernel_state` reports `not started`, and the next `execute_cell` / `execute_all_cells` call tries to start the kernel again. The same holds after a failed `restart_kernel` (**"Kernel failed to restart"**). The server log gets a short warning for each failed start (no traceback).
 - **"File is not a .ipynb notebook"** — every tool validates the extension. Rename your file to `.ipynb` or use a conversion tool like [`jupytext`](https://jupytext.readthedocs.io/) to convert `.py` ↔ `.ipynb`.
 - **Kernel state carries across calls** — this is intentional. If you need a clean namespace, call `restart_kernel` or `shutdown_kernel`.
-- **`execute_cell` timeouts on long-running code** — pass a larger `timeout` (in seconds) or interrupt with `interrupt_kernel`.
+- **"Execution timed out after Ns; the cell was interrupted"** — the cell ran longer than `timeout` and was stopped; the kernel keeps its state. For long-running code, pass a larger `timeout` (in seconds).
+- **"... the kernel was interrupted but is still busy"** — the cell ignored the interrupt (for example, native code that doesn't check for signals). Call `restart_kernel`; in-memory state is lost.
+- **"Kernel is not running (its process has exited)"** from `interrupt_kernel` — the kernel crashed or was killed (`get_kernel_state` reports `dead`). The next `execute_cell` starts a fresh kernel.
 
 ## Tool count
 

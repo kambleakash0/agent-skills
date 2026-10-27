@@ -25,7 +25,7 @@ Per-edit output token savings versus other common edit formats:
 | 1-line tweak | 100 LoC | 3–5x | ~1.5x | ~1.5x |
 | Function body rewrite | 500 LoC | 8–12x | 2–3x | 2–3x |
 | Function body rewrite | 4,000 LoC | **15–20x** | 3–5x | 3–5x |
-| Add 2 lines to a function | any size | **~20x** (via `prepend_to_body` / `append_to_body`) | 5–10x | 3–5x |
+| Add 2 lines to a function | any size | **~20x** (via `insert_in_body(at="top")` / `insert_in_body(at="bottom")`) | 5–10x | 3–5x |
 
 Per-read input token savings versus reading the entire file:
 
@@ -33,42 +33,45 @@ Per-read input token savings versus reading the entire file:
 | :--- | :--- | :--- | :--- |
 | One function's source | 500 LoC | `read_symbol` | **~20x fewer tokens** |
 | One function's source | 2,000 LoC | `read_symbol` | **~50-100x fewer tokens** |
-| Class API (10 methods, no bodies) | 500 LoC | `read_interface` | **~10x fewer tokens** |
+| Class API (10 methods, no bodies) | 500 LoC | `read_symbol(depth="interface")` | **~10x fewer tokens** |
 | Import block only | any size | `read_imports` | **~20-50x fewer tokens** |
 | Structural overview (names + line numbers) | any size | `list_symbols` | **~15-30x fewer tokens** |
-| One function's signature | any size | `get_signature` | **~50-200x fewer tokens** |
+| One function's signature | any size | `read_symbol(depth="signature")` | **~50-200x fewer tokens** |
 
 **For daily agent users, a realistic 40-60% reduction in total tokens per session is achievable, on average** (combining output savings from surgical edits with input savings from targeted reads).
 
 The savings come from four compounding effects:
 
-- **Output tokens:** Using `prepend_to_body` / `append_to_body` for small additions instead of rewriting whole function bodies
-- **Input tokens:** Using `read_symbol` / `read_interface` / `read_imports` to read only what's needed instead of entire files (~10-20x fewer input tokens per read)
-- **Discovery:** `list_symbols` / `get_signature` instead of reading whole files
+- **Output tokens:** Using `insert_in_body` (`at="top"` / `at="bottom"`, or anchored with `after=` / `before=`) for small additions instead of rewriting whole function bodies
+- **Input tokens:** Using `read_symbol` (`depth="full"` / `"interface"`) / `read_imports` to read only what's needed instead of entire files (~10-20x fewer input tokens per read)
+- **Discovery:** `list_symbols` / `read_symbol(depth="signature")` instead of reading whole files
 - **Zero format failures:** AST edits never fail on whitespace drift, eliminating retry loops that plague other formats.
 
 ## Supported Languages & Capabilities
 
 | Language | Extensions | Structural edits | Comments | Docstrings | Notes |
 | :--- | :--- | :--- | :--- | :--- | :--- |
-| **Python** | `.py` | ✅ | ✅ `#` | ✅ function/class | Decorators preserved. Module-level `dict`/`list` literals editable via `add_key` / `append_to_array`. |
-| **JavaScript** | `.js`, `.jsx`, `.mjs`, `.cjs` | ✅ | ✅ `//` + `/* ... */` | — | |
-| **TypeScript** | `.ts`, `.tsx` | ✅ | ✅ `//` + `/* ... */` | — | Interfaces are treated as classes for `add_method` / `add_field`. |
-| **C** | `.c`, `.h` | ✅ | ✅ `//` + `/* ... */` (single + multi-line) | — | `.h` defaults to C — use `.hpp`/`.hxx`/`.hh` for C++ headers. |
+| **Python** | `.py` | ✅ | ✅ `#` | ✅ function/class | Decorators preserved. Module-level `dict`/`list` literals editable via `add_key` / `replace_value` / `delete_key` / `append_to_array` (nested dicts addressed by key path, e.g. `CONFIG."db"`). |
+| **JavaScript** | `.js`, `.jsx`, `.mjs`, `.cjs` | ✅ | ✅ `//` + `/* ... */` | — | Module-level `const`/`let`/`var` object literals (exported or not) editable via `add_key` / `replace_value` / `delete_key`; nested objects addressed by dotted path (`CONFIG.server`). |
+| **TypeScript** | `.ts`, `.tsx` | ✅ | ✅ `//` + `/* ... */` | — | Interfaces are treated as classes for `add_method` / `add_field`. `.tsx` files are parsed with the TSX grammar, so JSX is valid there. Object literals editable as for JavaScript, including `{ ... } as const` and `satisfies T`. |
+| **C** | `.c`, `.h` | ✅ | ✅ `//` + `/* ... */` (single + multi-line) | — | `.h` defaults to C — use `.hpp`/`.hxx`/`.hh` for C++ headers (adding C++-only syntax to a `.h` file that parses as C is refused by the save-time syntax check). |
 | **C++** | `.cpp`, `.cc`, `.cxx`, `.hpp`, `.hxx`, `.hh` | ✅ | ✅ `//` + `/* ... */` (single + multi-line) | — | Supports `class`, `struct`, `union`, `enum`, `namespace`; `Class::method` qualified names resolve correctly. |
 | **Ruby** | `.rb` | ✅ | ✅ `#` | — | Classes, modules, instance methods, `singleton_method` (class methods via `def self.foo`). `require`/`require_relative`/`load`/`autoload` recognized as imports. |
 | **Go** | `.go` | ✅ | ✅ `//` + `/* ... */` | — | `struct`, `interface`, functions, methods. Methods are addressed by receiver: `Cache.Get` resolves to the top-level `func (c *Cache) Get(...)`. Grouped `import (...)` blocks supported. |
-| **Java** | `.java` | ✅ | ✅ `//` + `/* ... */` + Javadoc `/** ... */` | — | `class`, `interface`, `enum`, `record`; methods, constructors, fields. Annotations (`@Override`, `@Deprecated`) travel with their method on edits (wrapped in the `modifiers` node). Enum methods (nested in `enum_body_declarations`) discovered via BFS in `list_symbols`. |
+| **Java** | `.java` | ✅ | ✅ `//` + `/* ... */` + Javadoc `/** ... */` | — | `class`, `interface`, `enum`, `record`; methods, constructors, fields. Annotations (`@Override`, `@Deprecated`) travel with their method on edits (wrapped in the `modifiers` node); `replace_signature` keeps them unless the new signature includes its own. Enum methods (nested in `enum_body_declarations`) discovered via BFS in `list_symbols`. |
 | **JSON** | `.json` | ✅ (keys, values, arrays) | — (no comment syntax) | — | |
 | **YAML** | `.yml`, `.yaml` | ✅ (keys, values, sequences) | ✅ `#` | — | Block and flow sequences supported. |
 | **TOML** | `.toml` | ✅ (keys, values, arrays, tables) | ✅ `#` | — | `[table]` headers addressable by name for comment tools. |
 
 **Cross-cutting features:**
 
-- **Decorated functions** (Python `@decorator`): decorators are preserved on body/signature edits and included on delete.
+- **Decorated functions** (Python and JS/TS `@decorator`, Java annotations): decorators are preserved on body edits and included on delete. `replace_signature` keeps them as written unless the new signature includes its own, which then replace them.
+- **Layout-aware `add_key`**: in JSON objects, Python dicts and JS/TS object literals the new entry follows the container's layout (one key per line at the existing indentation, inline objects stay inline, a trailing comma is kept, and a comment on the last entry's line stays there). A key the container already has is refused with a pointer to `replace_value`, for every format.
 - **Byte-correct slicing**: multi-byte characters (emoji, `═`, `→`) handled safely in source text.
 - **Idempotent imports**: `add_import` skips exact duplicates automatically. For Go specifically, when a parenthesized `import ( ... )` block already exists, new specs are inserted inside the block rather than as a bare top-level line (which would be a syntax error for spec-only input like `"path/filepath"`).
 - **Doc-comment-aware deletion**: `delete_symbol` by default removes the contiguous leading comment block above the symbol (Godoc, Javadoc, `#`/`//` comment runs) so docs don't become orphaned. Opt out with `include_leading_comments=False`.
+- **Syntax-checked saves**: before anything is written, the edited file is re-parsed with its tree-sitter grammar. An edit that would introduce a syntax error into a file that parsed cleanly is refused with the error's line and column (e.g. `Edit refused: the result would have a syntax error at line 11, column 2 (missing '}')`), and the file is left unchanged. Files that already had syntax errors are not guarded, so you can keep working on them. For `.py` files Python's own parser (that of the interpreter running the server) decides: it catches the indentation errors tree-sitter lets through and accepts newer syntax the grammar does not know (PEP 696 type parameter defaults). For `.json` files the `json` module overrules the grammar where it rejects valid JSON (exponents such as `1e+2`); comments in JSONC files stay allowed. Other languages have no second parser, so valid code using syntax the grammar does not support (very new language features, macro-heavy C/C++) can be refused: if you are sure the code is valid, make that edit with your normal edit tool.
+- **Line endings preserved**: CRLF files stay CRLF and LF files stay LF, whichever tool makes the edit, and blank lines at the end of a file are kept as they were (deleting the last symbol does not leave extra ones behind). Write content, snippets and anchors with `\n` line breaks: inserted text is converted to the file's style, and a `\n` in a snippet or anchor matches a CRLF line break. A file with mixed endings is written back in the style most of its lines use.
 
 ### Language-specific design decisions
 
@@ -83,7 +86,7 @@ A few tools have language-specific semantics where multiple reasonable interpret
 **`add_method` (Go) — option (a): top-level sibling insertion**
 
 - `add_method("Cache", "func (c *Cache) Has(key string) bool { ... }")` locates the `type Cache struct { ... }` declaration and inserts the new method **immediately after it, at the top level** (not inside the struct's braces).
-- **Rationale:** Go methods are lexically top-level, not nested inside their receiver type — this matches how Go code is actually written. The alternative option (b) — refusing because "Go methods aren't inside structs" — would be pedantically correct but force callers to use `insert_after("Cache", content)` instead, which loses the semantic signal that this is a method addition.
+- **Rationale:** Go methods are lexically top-level, not nested inside their receiver type — this matches how Go code is actually written. The alternative option (b) — refusing because "Go methods aren't inside structs" — would be pedantically correct but force callers to use `insert_sibling("Cache", content, position="after")` instead, which loses the semantic signal that this is a method addition.
 
 ## Tools Exposed
 
@@ -95,10 +98,10 @@ All tools require `file_path` to be an **absolute path** to an existing file.
 | :--- | :--- | :--- |
 | `replace_function` | `file_path`, `target`, `content` | Replace a full function definition (signature + body + decorators). |
 | `replace_function_body` | `file_path`, `target`, `content` | Replace only the body of a function, preserving signature and decorators. |
-| `replace_signature` | `file_path`, `target`, `new_signature` | Replace only the signature, preserving body and decorators. |
+| `replace_signature` | `file_path`, `target`, `new_signature` | Replace only the signature, preserving the body. Existing decorators (Python, JS/TS) and Java annotations are kept unless `new_signature` includes its own, which replace them. Indentation on the signature's first line is ignored, so `"def get(self):"` and `"    def get(self):"` both work for a method; the lines after it may be indented relative to it (`"@staticmethod\ndef get(key):"`) or written as `read_symbol(depth="signature")` returns them. |
 | `replace_in_body` | `file_path`, `target`, `old_snippet`, `new_snippet` | Replace a byte-identical snippet inside a function body. Scoped to target's body; raises on multiple matches. |
 | `delete_in_body` | `file_path`, `target`, `snippet` | Delete a byte-identical snippet inside a function body. Scoped to target's body; raises on multiple matches. |
-| `insert_in_body` | `file_path`, `target`, `new_snippet`, `at` \| `after` \| `before` | Insert a snippet inside a function body. Pass exactly ONE of: `at="top"` (prepend), `at="bottom"` (append), `after=<snippet>` (anchored), `before=<snippet>` (anchored). |
+| `insert_in_body` | `file_path`, `target`, `new_snippet`, `at` \| `after` \| `before` | Insert a snippet inside a function body. Pass exactly ONE of: `at="top"` (prepend), `at="bottom"` (append), `after=<snippet>` (anchored), `before=<snippet>` (anchored). `at` inserts at the body's own indentation level even when the body ends in a nested block; a Python docstring stays first; a body written on one line with its signature or braces is refused (rewrite it with `replace_function_body`). |
 | `add_top_level` | `file_path`, `content`, `position="bottom"` | Insert top-level content. `position="bottom"` appends at end of file (default); `position="top"` inserts after preamble (package/imports/includes/leading comments, plus Python module docstring) and before the first real declaration. |
 | `add_method` | `file_path`, `class_target`, `content` | Add a method at the end of a class body. |
 | `add_field` | `file_path`, `class_target`, `content` | Add a field/attribute/member at the top of a class body. |
@@ -109,7 +112,7 @@ All tools require `file_path` to be an **absolute path** to an existing file.
 
 | Tool | Parameters | Description |
 | :--- | :--- | :--- |
-| `add_parameter` | `file_path`, `target`, `parameter`, `position` | Add a parameter to a function signature (`position`: `"start"` or `"end"`). |
+| `add_parameter` | `file_path`, `target`, `parameter`, `position="end"` | Add a parameter to a function signature (`position`: `"start"` or `"end"`; any other value is refused). |
 | `remove_parameter` | `file_path`, `target`, `parameter_name` | Remove a parameter by name. |
 
 ### Imports & includes
@@ -125,16 +128,16 @@ All tools require `file_path` to be an **absolute path** to an existing file.
 
 | Tool | Parameters | Description |
 | :--- | :--- | :--- |
-| `edit_leading_comment` | `file_path`, `target`, `op`, `comment=""` | Edit the contiguous leading-comment block above a named symbol. `op="add"` inserts; `op="replace"` replaces (or inserts if none); `op="remove"` deletes. Works for `#` / `//` / `/* ... */` / Javadoc `/** ... */`. |
+| `edit_leading_comment` | `file_path`, `target`, `op`, `comment=""` | Edit the contiguous leading-comment block above a named symbol. `op="add"` inserts (refused if the symbol already has a leading comment; the error quotes it, so a following `op="replace"` can repeat lines worth keeping, such as `// eslint-disable-next-line` or `//go:noinline` directives); `op="replace"` replaces (or inserts if none); `op="remove"` deletes. Works for `#` / `//` / `/* ... */` / Javadoc `/** ... */`; a `/* ... */` that follows code on its line (`int x = 1; /* n */`) is not taken as a leading comment. |
 | `replace_docstring` | `file_path`, `target`, `new_docstring` | Replace or insert a Python function/class docstring. Python-only. |
 
-### Dict/list editing (JSON, YAML, TOML, AND Python module-level dict/list literals)
+### Dict/list editing (JSON, YAML, TOML, Python module-level dict/list literals, AND JS/TS object literals)
 
 | Tool | Parameters | Description |
 | :--- | :--- | :--- |
-| `replace_value` | `file_path`, `target`, `content` | Replace the value of an existing config key. `target` is the dotted key path. |
-| `add_key` | `file_path`, `parent_target`, `key`, `value` | Add a key-value pair to a dict/object/mapping/table. For Python, `parent_target` is the dict variable name; for config, a dotted path (use `""` for root). |
-| `delete_key` | `file_path`, `target` | Delete a key-value pair. Targets: JSON/YAML/TOML dotted path; Python `DictName.keyExpr`; JS/TS `VarName.keyName` on `const`/`let`/`var` or `export const` object literals (handles regular pairs, `{ key }` shorthand, and quoted `"complex-key"`). For JSON and JS/TS, adjacent comma is also removed. |
+| `replace_value` | `file_path`, `target`, `content` | Replace the value of an existing key. Targets as for `delete_key`: JSON/YAML/TOML dotted path; Python `DictName.keyExpr`; JS/TS `VarName.key` (a shorthand `{ key }` becomes `key: <content>`). |
+| `add_key` | `file_path`, `parent_target`, `key`, `value` | Add a key-value pair to a dict/object/mapping/table. For config, `parent_target` is a dotted path (use `""` for root). For Python it is the dict variable name; for JS/TS the name of a module-level `const`/`let`/`var` (or `export const`) object literal, `as const` / `satisfies` included. Both may continue into nested literals (`CONFIG."db"`, `CONFIG.server`). JSON keys are quoted for you, JS/TS keys only when they are not valid identifiers, Python keys are key expressions (`'"timeout"'`). The entry follows the container's layout (one per line, inline, trailing comma), and a key that already exists is refused (use `replace_value`). |
+| `delete_key` | `file_path`, `target` | Delete a key-value pair. Targets: JSON/YAML/TOML dotted path; Python `DictName.keyExpr`; JS/TS `VarName.keyName` on `const`/`let`/`var` or `export const` object literals (handles regular pairs, `{ key }` shorthand, methods, and quoted `"complex-key"`). Python and JS/TS paths may continue into nested literals (`CONFIG.server.port`). For JSON, Python and JS/TS, the adjacent comma is also removed (an entry on its own line goes with that whole line, including its same-line comment), and deleting the only entry leaves `{}`. |
 | `append_to_array` | `file_path`, `target`, `value` | Append a literal value to a list/array/sequence. For Python, `target` is the list variable name; for config, a dotted path. |
 | `remove_from_array` | `file_path`, `target`, `value_match` | Remove the first matching element from a list/array/sequence. |
 
@@ -195,7 +198,7 @@ Dotted targets descend into closures: Go `stdioCmd.RunE` (func_literal in struct
 | Change only the signature, keep the body | `replace_signature` |
 | Change only the leading comment above a symbol | `edit_leading_comment(op="replace")` |
 | Change only the Python docstring | `replace_docstring` |
-| Change the value of an existing config key | `replace_value` |
+| Change the value of an existing key (config, Python dict, JS/TS object) | `replace_value` |
 
 ### Removing content
 
@@ -214,7 +217,7 @@ Dotted targets descend into closures: Go `stdioCmd.RunE` (func_literal in struct
 
 - **Don't use `replace_function` or `replace_function_body` to change a few lines** — use `replace_in_body` (scoped snippet match) or `insert_in_body(at="top" \| "bottom")` for appending/prepending. Rewriting the whole function is wasteful and error-prone.
 - **Don't use `replace_signature` to add or remove one parameter** — use `add_parameter`/`remove_parameter`.
-- **Don't use `replace_value` to add a new key** — use `add_key`. `replace_value` only updates existing keys.
+- **Don't use `replace_value` to add a new key** — use `add_key`. `replace_value` only updates existing keys, and `add_key` refuses a key that already exists.
 - **Don't use `add_import` to add a name to an existing `from X import …` or named import** — use `add_import_name`.
 - **Don't guess at target names.** Call `list_symbols` first. Names are case-sensitive and must match exactly.
 

@@ -14,16 +14,16 @@ When editing `.py`, `.js`, `.ts`, `.c`, `.cpp`, `.rb`, `.go`, `.java`, `.json`, 
    - Relative to an existing top-level symbol: `insert_sibling(position="before"|"after")`
    - Imports: `add_import` (new line) or `add_import_name` (add to existing `from X import ...` or `import { a, b } from "mod"`)
    - Parameters: `add_parameter`
-   - Leading comment: `edit_leading_comment(op="add", comment=...)`
+   - Leading comment: `edit_leading_comment(op="add", comment=...)` (refused if the symbol already has one; the error quotes it, so use `op="replace"` with a block that repeats any lines to keep, such as lint or compiler directives)
    - Python docstring: `replace_docstring`
-   - Any dict/object (config OR Python/JS/TS literal): `add_key`
+   - Any dict/object (config OR Python/JS/TS literal): `add_key` (refused if the key already exists; use `replace_value`). For Python/JS/TS, `parent_target` is the module-level variable name, dotted into nested literals (`CONFIG.server`, `CONFIG."db"`)
    - Any list/array (config OR Python literal): `append_to_array`
 3. **Modifying existing content:**
    - Full function: `replace_function`
    - Body only: `replace_function_body`
    - One statement/block inside a large body: `replace_in_body(target, old_snippet, new_snippet)` — scoped match; the single biggest token-saver for long functions
-   - Signature only: `replace_signature`
-   - Config value: `replace_value`
+   - Signature only: `replace_signature` (existing decorators/annotations such as `@Override` are kept unless you include your own)
+   - Value of an existing key (config, Python dict or JS/TS object): `replace_value`
    - Leading comment: `edit_leading_comment(op="replace", comment=...)`
    - Python docstring: `replace_docstring`
 4. **Removing content:**
@@ -41,6 +41,11 @@ When editing `.py`, `.js`, `.ts`, `.c`, `.cpp`, `.rb`, `.go`, `.java`, `.json`, 
 - Don't use `replace_value` to add a new key — use `add_key`.
 - Don't use `add_import` to add a name to an existing from-import or named import — use `add_import_name`.
 - Don't guess target names — call `list_symbols` first. Names are case-sensitive.
+
+**Safety nets:**
+
+- Every edit is parse-checked before it is saved. An edit that would introduce a syntax error into a file that parsed cleanly is refused (the message gives the error's line and column) and the file is left unchanged: fix the content and retry, or, if the code is valid but uses syntax the parser does not support (very new language features, macro-heavy C/C++), use your normal edit tool. Files that already had syntax errors are not guarded.
+- Line endings are preserved (CRLF files stay CRLF). Always write content, snippets and anchors with `\n` line breaks.
 
 **Escape hatches — when to step outside ast-editor:**
 
