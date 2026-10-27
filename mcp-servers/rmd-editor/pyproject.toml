@@ -1,12 +1,13 @@
 [project]
 name = "rmd-editor-mcp"
-version = "1.0.2"
+version = "1.0.3"
 description = "MCP Server for editing R Markdown (.rmd) documents with chunk-level operations and R kernel execution"
 requires-python = ">=3.10"
 dependencies = [
     "mcp>=2.0.0,<3.0.0",
     "pyyaml>=6.0",
     "jupyter-client>=8.6.0",
+    "pydantic>=2.12.0",
 ]
 authors = [{ name = "Akash Kamble", email = "kambleakash0@gmail.com" }]
 license = { text = "MIT" }

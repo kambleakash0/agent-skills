@@ -4,7 +4,7 @@ requires-python = ">=3.10"
 resolution-markers = [
     "python_full_version >= '3.14'",
     "python_full_version >= '3.12' and python_full_version < '3.14' and sys_platform == 'emscripten'",
-    "(python_full_version < '3.14' and sys_platform != 'emscripten') or (python_full_version < '3.12' and sys_platform == 'emscripten')",
+    "python_full_version < '3.12' or (python_full_version >= '3.12' and python_full_version < '3.14' and sys_platform != 'emscripten')",
 ]
 
 [options]
@@ -36,10 +36,11 @@ wheels = [
 
 [[package]]
 name = "ast-editor-mcp"
-version = "2.0.3"
+version = "2.0.4"
 source = { editable = "." }
 dependencies = [
     { name = "mcp" },
+    { name = "pydantic" },
     { name = "tree-sitter" },
     { name = "tree-sitter-c" },
     { name = "tree-sitter-cpp" },
@@ -57,6 +58,7 @@ dependencies = [
 [package.metadata]
 requires-dist = [
     { name = "mcp", specifier = ">=2.0.0,<3.0.0" },
+    { name = "pydantic", specifier = ">=2.12.0" },
     { name = "tree-sitter", specifier = ">=0.25.0" },
     { name = "tree-sitter-c", specifier = ">=0.24.0" },
     { name = "tree-sitter-cpp", specifier = ">=0.23.0" },

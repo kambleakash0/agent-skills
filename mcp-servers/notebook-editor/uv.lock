@@ -616,13 +616,14 @@ wheels = [
 
 [[package]]
 name = "notebook-editor-mcp"
-version = "1.2.2"
+version = "1.2.3"
 source = { editable = "." }
 dependencies = [
     { name = "ipykernel" },
     { name = "jupyter-client" },
     { name = "mcp" },
     { name = "nbformat" },
+    { name = "pydantic" },
 ]
 
 [package.metadata]
@@ -631,6 +632,7 @@ requires-dist = [
     { name = "jupyter-client", specifier = ">=8.6.0" },
     { name = "mcp", specifier = ">=2.0.0,<3.0.0" },
     { name = "nbformat", specifier = ">=5.10.0" },
+    { name = "pydantic", specifier = ">=2.12.0" },
 ]
 
 [[package]]
