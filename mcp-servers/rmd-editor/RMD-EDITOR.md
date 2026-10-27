@@ -18,8 +18,9 @@ When working with `.rmd` R Markdown files, do NOT use the generic `edit` or `wri
    - Read all options: `get_chunk_options`
    - Set/overwrite one option: `set_chunk_option(index, key, value)` — use `key="label"` to set the chunk label (e.g. `setup`, `analysis`).
    - Remove one option: `remove_chunk_option(index, key)` — use `key="label"` to clear the chunk label.
+   - Values go into the one-line chunk header as R code and must read back as written, or the edit is refused and the file left unchanged: no line breaks (inside an R string write `\n`), every bracket, quote and backtick closed, a comma or second `=` only inside brackets or a quoted string, and a `#` only inside a quoted string (pass `'"a, b"'`, not `'a, b'`; `c(6, 4)`, `x == 1` and `list(a = 1)` are fine). Every key but `label` needs a non-empty value. Only the header line changes.
 5. **YAML frontmatter:**
-   - Read: `get_frontmatter` (shows R tags such as `!r`; a header that isn't valid YAML comes back as raw text with a note)
+   - Read: `get_frontmatter` (shows R tags such as `!r`; a header that isn't valid YAML comes back as raw text with a note saying what is wrong and, when known, at which line and column of the file)
    - Set/overwrite one key: `set_frontmatter_key(key, value)` — value is parsed as YAML when possible. Only that key's lines change, so comments, quoting and tags elsewhere in the header are kept. A value that means the same written as given is written that way (`"!r Sys.Date()"` stays an R tag). A new key goes at the end of the header.
    - Remove one key: `remove_frontmatter_key(key)` (removes its indented lines too)
 6. **Running chunks (R kernel via IRkernel by default):**
@@ -42,8 +43,10 @@ When working with `.rmd` R Markdown files, do NOT use the generic `edit` or `wri
 **Format notes:**
 
 - `.rmd` has no cell-boundary markers between adjacent prose blocks (unlike `.ipynb`). Two adjacent `markdown` cells in the model will **auto-merge** on save and re-parse. Prefer inserting prose between code chunks, or append to an existing markdown cell.
-- CRLF and mixed-ending files work like LF ones. Cell text comes back with `\n` line breaks, and you pass text with `\n`: on save, an edited cell (rewritten whole) and an edited header key's lines get the file's own line ending; everything else keeps its bytes. A UTF-8 byte order mark at the start of the file is kept on save and never shows up in cell text.
+- CRLF and mixed-ending files work like LF ones. Cell text comes back with `\n` line breaks, and you pass text with `\n`: on save, an edited cell (rewritten whole, or only its header line for an option edit) and an edited header key's lines get the file's own line ending; everything else keeps its bytes. A UTF-8 byte order mark at the start of the file is kept on save and never shows up in cell text.
 - Only `\n`, `\r\n` or a lone `\r` ends a line (a form feed or U+2028 doesn't), and every tool counts lines this way: `list_cells` line counts, `split_cell` offsets and `find_in_rmd` line numbers agree.
+- A chunk's text, as `get_cell` returns it and `replace_cell_source`, `add_cell`, `prepend_to_cell` and `append_to_cell` take it, leaves off the line break before the closing fence: write `"x <- 1"`, not `"x <- 1\n"`, which leaves a blank line before the fence. A chunk of blank lines only comes back as its line breaks (`""` is an empty chunk, `"\n"` one blank line). Passing a cell's own text back changes nothing in the file, and `split_cell`, `merge_cells` and option edits keep every line. New chunk text with a line knitr reads as a closing fence (backticks alone, after nothing but spaces, tabs or `>`) is refused, since it would close the chunk; the error gives the line number in the text you passed.
+- A file without a final newline keeps it that way until the last cell's text changes or a cell goes after it (an option edit or re-saving the same text doesn't count); then the file ends with a newline.
 - Code chunks default to R (`cell_type="code"` creates an ` ```{r} ` chunk). Polyglot chunks (`{python}`, `{bash}`, `{sql}`) already in the file are preserved on round-trip, but no tool can create a non-R chunk or change a chunk's language yet: `replace_cell_source` keeps the language, and `set_chunk_option(key="language")` only adds a `language=` option to the header.
 
 **Kernel lifecycle notes:**

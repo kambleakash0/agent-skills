@@ -28,18 +28,18 @@ All tools require `file_path` to be an **absolute path**. Every tool except `cre
 | Tool | Parameters | Description |
 | :--- | :--- | :--- |
 | `list_cells` | `file_path` | Outline of all cells with index, type (code/markdown), language/label/option-count for chunks, line count, and a one-line preview. |
-| `get_cell` | `file_path`, `index` | Return the source text of a specific cell. |
+| `get_cell` | `file_path`, `index` | Return the source text of a specific cell. A chunk's text leaves off the line break before its closing fence; see [Chunk text](#chunk-text). |
 | `add_cell` | `file_path`, `index`, `source` (default `""`), `cell_type` (`"code"` or `"markdown"`, default `"code"`) | Insert a new cell at the given index. Pass `index=-1` to append. |
 | `delete_cell` | `file_path`, `index` | Remove a cell by index. |
 | `move_cell` | `file_path`, `from_index`, `to_index` | Reorder: move a cell from one position to another. |
-| `split_cell` | `file_path`, `index`, `line_offset` | Split one cell into two at a line boundary. |
-| `merge_cells` | `file_path`, `start_index`, `end_index` | Merge consecutive cells of the same type into one. Code chunks must share a language. |
+| `split_cell` | `file_path`, `index`, `line_offset` | Split one cell into two at a line boundary. Every line, blank lines included, ends up in one of the two. |
+| `merge_cells` | `file_path`, `start_index`, `end_index` | Merge consecutive cells of the same type into one. Code chunks must share a language; their bodies are joined line for line, so an empty chunk adds no line. |
 
 ### Cell content editing
 
 | Tool | Parameters | Description |
 | :--- | :--- | :--- |
-| `replace_cell_source` | `file_path`, `index`, `new_source` | Replace a cell's entire body. For code chunks, language/label/options are preserved. |
+| `replace_cell_source` | `file_path`, `index`, `new_source` | Replace a cell's entire body. For code chunks, language/label/options are preserved. For a chunk, text ending in `\n` leaves a blank line before the closing fence, and a line knitr would read as the closing fence is refused; see [Chunk text](#chunk-text). The text `get_cell` returned leaves the file byte for byte as it was. |
 | `prepend_to_cell` | `file_path`, `index`, `source` | Add lines to the top of a cell. |
 | `append_to_cell` | `file_path`, `index`, `source` | Add lines to the bottom of a cell. |
 
@@ -48,14 +48,14 @@ All tools require `file_path` to be an **absolute path**. Every tool except `cre
 | Tool | Parameters | Description |
 | :--- | :--- | :--- |
 | `get_chunk_options` | `file_path`, `index` | Return the chunk's language, label, and all options formatted as text. Raises on markdown cells. |
-| `set_chunk_option` | `file_path`, `index`, `key`, `value` | Set or overwrite one option. Use `key="label"` to set the chunk label (e.g. `setup`). |
+| `set_chunk_option` | `file_path`, `index`, `key`, `value` | Set or overwrite one option. Use `key="label"` to set the chunk label (e.g. `setup`). Only the header line is rewritten. A value or label the header can't hold as written is refused; see [Chunk headers](#chunk-headers). |
 | `remove_chunk_option` | `file_path`, `index`, `key` | Remove one option. Use `key="label"` to clear the chunk label. |
 
 ### YAML frontmatter
 
 | Tool | Parameters | Description |
 | :--- | :--- | :--- |
-| `get_frontmatter` | `file_path` | Return the YAML frontmatter as a formatted YAML string. R Markdown tags such as `!r` and `!expr` are shown as tags. A header that isn't valid YAML comes back as its raw text, after a note saying why it couldn't be parsed. |
+| `get_frontmatter` | `file_path` | Return the YAML frontmatter as a formatted YAML string. R Markdown tags such as `!r` and `!expr` are shown as tags. A header that isn't valid YAML comes back as its raw text, after a note saying why it couldn't be parsed and, when known, where (line and column of the file). |
 | `set_frontmatter_key` | `file_path`, `key`, `value` | Set or overwrite one top-level YAML key. Value is parsed as YAML where possible (so `"true"` → bool, `"42"` → int). Only that key's lines change; see [Frontmatter edits](#frontmatter-edits). A new key goes at the end of the header, and a document without a header gets one. |
 | `remove_frontmatter_key` | `file_path`, `key` | Remove one top-level YAML key along with its indented lines. The rest of the header is left as it is. |
 
@@ -93,10 +93,27 @@ All tools require `file_path` to be an **absolute path**. Every tool except `cre
 - `.rmd` has no cell-boundary markers between adjacent prose blocks (unlike `.ipynb`). Two adjacent `markdown` cells in the model **auto-merge** on save + re-parse. This is expected; prefer inserting prose between code chunks or appending to an existing markdown cell.
 - Polyglot chunks (`{python}`, `{bash}`, `{sql}`) parse and round-trip correctly. For execution, the matching Jupyter kernel must be installed.
 - Regular markdown code fences (` ```python ` without braces) stay as prose — only ` ```{lang} ` form is treated as a chunk.
-- A document whose last line has no trailing newline keeps it that way, unless a cell is added after it or moved past it. Then a newline goes in between, so chunk fences never end up on the same line as other text.
-- Only a line break ends a line, as in knitr: `\n`, `\r\n`, or a lone `\r`. A form feed or a Unicode line separator (U+2028) stays part of its line, so a chunk fence that follows one on the same line doesn't start a chunk. Every tool counts lines this way: the line count in `list_cells`, the `line_offset` of `split_cell`, and the line numbers `find_in_rmd` and `get_frontmatter`'s YAML errors give.
-- **Line endings are kept.** A CRLF document, or one that mixes line endings, parses like an LF one: the YAML header, chunk fences and chunk headers are found the same way, and `get_cell`, `get_frontmatter` and `find_in_rmd` return text with `\n` line breaks. On save, cells you don't edit and header lines outside the edited key keep their bytes; an edited cell is rewritten whole, and everything an edit writes (a cell, a chunk header, a frontmatter key's lines, a new header) uses the document's line ending, the one most of its lines end with. The one exception: a lone `\r` that an edit leaves just before a `\n` is rewritten in the document's line ending, so the two don't read back as one `\r\n` line break. Write the text you pass with `\n`; `\r\n` works too, and both are converted. An untouched CRLF file saves back byte for byte. `create_rmd` always writes LF.
+- A document whose last line has no trailing newline keeps it that way while its last cell's text is left alone: re-saving that text, or changing a chunk's label or options, keeps the end of the file as it was. A newline is added when a cell is added after the last one or moved past it, so chunk fences never end up on the same line as other text. Rewriting the last cell's text also ends the file with a newline: new text from `replace_cell_source`, `prepend_to_cell` or `append_to_cell`, or a `split_cell` or `merge_cells` that takes in the last cell. For example, `replace_cell_source(1, "z")` on `` ```{r}\nx\n```\nlast `` writes `` ```{r}\nx\n```\nz\n ``.
+- Only a line break ends a line, as in knitr: `\n`, `\r\n`, or a lone `\r`. A form feed or a Unicode line separator (U+2028) stays part of its line, so a chunk fence that follows one on the same line doesn't start a chunk. Every tool counts lines this way: the line count in `list_cells`, the `line_offset` of `split_cell`, the line numbers `find_in_rmd` gives, and the line and column `get_frontmatter`'s YAML errors give.
+- **Line endings are kept.** A CRLF document, or one that mixes line endings, parses like an LF one: the YAML header, chunk fences and chunk headers are found the same way, and `get_cell`, `get_frontmatter` and `find_in_rmd` return text with `\n` line breaks. On save, cells you don't edit and header lines outside the edited key keep their bytes, and so do the body and closing fence of a chunk whose label or options you change (only its header line is rewritten). Any other edited cell is rewritten whole, and everything an edit writes (a cell, a chunk header line, a frontmatter key's lines, a new header) uses the document's line ending, the one most of its lines end with. The one exception: a lone `\r` that an edit leaves just before a `\n` is rewritten in the document's line ending, so the two don't read back as one `\r\n` line break. Write the text you pass with `\n`; `\r\n` works too, and both are converted. An untouched CRLF file saves back byte for byte. `create_rmd` always writes LF.
 - **A byte order mark is kept.** A file that starts with a UTF-8 byte order mark (as some Windows editors save it) reads as if it had none: the YAML header or a chunk fence on its first line is found, and no cell's text starts with the mark. Every save writes the mark back at the start of the file, so an untouched file still saves back byte for byte. `create_rmd` never writes one.
+
+### Chunk text
+
+- **A chunk's text leaves off the line break before its closing fence.** `get_cell` returns `x <- 1` for a one-line chunk, and `replace_cell_source`, `add_cell`, `prepend_to_cell` and `append_to_cell` take text the same way. The closing fence always starts a new line, so text that ends with `\n` leaves a blank line before it: `replace_cell_source(i, "x <- 1\n")` writes `x <- 1`, then a blank line, then the fence. Pass `"x <- 1"` for no blank line.
+- **Blank lines only.** A chunk that holds nothing but blank lines comes back as one `\n` per blank line, so an empty chunk (`""`, the fence right after the header) and a chunk with one blank line (`"\n"`) stay apart.
+- **Every line is kept.** Saving a cell's own text back (the text `get_cell` returned) or adding empty text leaves the file byte for byte as it was, whatever its line endings. `split_cell` and `merge_cells` keep every line of the chunks they touch, blank lines included, and an option or label edit doesn't touch the body at all. `list_cells` counts the lines of a chunk's text, so for `x <- 1\n` it counts one line: the blank line before the fence isn't counted, and `split_cell` can't split it off.
+- **No closing fence inside.** knitr ends a chunk at a line of three or more backticks with nothing after them but spaces or tabs, and nothing before them but spaces, tabs or `>` (` ``` `, ` ```` `, `  ``` `, `> ``` `). So `add_cell`, `replace_cell_source`, `prepend_to_cell` and `append_to_cell` refuse new chunk text that holds such a line; the error gives its line number in the text you passed. Other lines that start with backticks are fine, and only the text you pass is checked, so a chunk that already holds such a line can still be appended to.
+
+### Chunk headers
+
+`set_chunk_option` and `remove_chunk_option` rewrite only the chunk's header line (` ```{r label, key=value} `); the body and closing fence keep their bytes. The new header must read back with exactly the label and options asked for, and knitr, which reads keys and values as R code, must be able to read it. If not, the tool returns an error saying why (for text that would read back as other options, the header it would write and how that reads back), and the file is left unchanged:
+
+- **One line.** A key, value or label holding a line break (`\n`, `\r\n` or `\r`) is refused. For a line break inside an R string, write the escape `\n`, as in `fig.cap="Line one\nLine two"`.
+- **Quote text.** A comma outside a quoted string would split the header into other options, so `fig.cap=a, b` is refused: pass the value `"a, b"`. In a key or value, a `#` outside a quoted string starts an R comment that runs to the end of the header, and an `=` outside quotes and brackets is a second `=` that knitr can't read (`fig.cap=a=1`), so both are refused; `x == 1`, `x <= 1` and `list(a = 1)` are fine. A key or label can't hold `=` at all.
+- **Close what you open.** A key, value or label must close every bracket and quote it opens, and a key or value every backtick, or it would swallow the options after it: `"a`, `c(1, 2`, `` `x `` and `x}` are refused. Inside a quoted string a backslash escapes the next character, as in R, so `"say \"hi\", then go"` is one value, and `}` or backticks inside a quoted string are fine.
+- **Give a value.** An empty value is refused for any key but `label`, where it clears the label: knitr reads a bare name in a chunk header as the chunk's label. Surrounding whitespace is dropped from keys, values and labels.
+- **Headers written by hand.** If a header in the file already ends in an unmatched quote or bracket, a new option can't go after it: set that option to a balanced value first. A bare name right after the language, as in ` ```{r, foo} `, stays an option, not the label, when the header is rewritten.
 
 ### Frontmatter edits
 
@@ -105,7 +122,7 @@ All tools require `file_path` to be an **absolute path**. Every tool except `cre
 - **Values.** The value is parsed as YAML. If it means the same when written as given, it's written that way: on the key's line for a one-line value, or indented below the key for a multi-line one. So `"!r Sys.Date()"` stays an R expression, `'"2026-04-20"'` stays a quoted string, and comments in a multi-line value are kept. Any other value is written as YAML for the parsed value.
 - **New keys** go just before the closing `---`. A document without a header gets a new one at the top.
 - **Repeated keys.** If a key appears more than once, `set_frontmatter_key` replaces the first copy and removes the others, leaving one copy with the new value. `remove_frontmatter_key` removes every copy.
-- **Headers that aren't valid YAML** (for example, a tab used for indentation) can still be edited: lines that start with `key:` at column 0 count as keys. `get_frontmatter` returns such a header as raw text, after a note saying what is wrong.
+- **Headers that aren't valid YAML** (for example, a tab used for indentation) can still be edited: lines that start with `key:` at column 0 count as keys. `get_frontmatter` returns such a header as raw text, after a note saying what is wrong and where, as a line and column of the file (counted past a byte order mark, and with only a line break ending a line). That holds for syntax errors, for a control character such as a form feed, and for an impossible date such as `2026-13-45` (the one PyYAML rejected, if there are several).
 - **What can't be edited key by key:** a header that is a YAML list or a single value rather than `key: value` lines, a flow-style header such as `{title: x, author: y}`, and a header whose keys are indented rather than starting at column 0. For these, both tools return an error and the file is left unchanged.
 - **Safety check.** If the header was valid YAML before an edit, it must still be valid afterwards, with the same other keys. Otherwise the tool returns an error and doesn't write the file. This can happen when the edit removes an anchor that another key refers to.
 
