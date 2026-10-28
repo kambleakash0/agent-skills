@@ -4048,7 +4048,20 @@ def test_server_schema():
     check("schema: instructions non-empty", bool((server.mcp.instructions or "").strip()), True)
     # Clients show the instructions in addition to RMD-EDITOR.md, which many users include as well, so they stay short
     size = len(server.mcp.instructions or "")
-    check("schema: instructions are at most 1500 characters", "PASS" if size <= 1500 else f"FAIL: {size} characters", "PASS")
+    check("schema: instructions are at most 1000 characters", "PASS" if size <= 1000 else f"FAIL: {size} characters", "PASS")
+    # What a client sends the model for each tool: its name, description and input schema
+    facing = sum(
+        len(json.dumps({"name": t.name, "description": t.description or "", "input_schema": t.input_schema}))
+        for t in tools
+    )
+    check("schema: model-facing tool text is at most 20000 characters",
+          "PASS" if facing <= 20000 else f"FAIL: {facing} characters", "PASS")
+    # RMD-EDITOR.md is the guide users load into the agent's context, so it stays short too
+    md_path = os.path.join(os.path.dirname(os.path.abspath(__file__)), "..", "RMD-EDITOR.md")
+    with open(md_path, encoding="utf-8") as f:
+        md_size = len(f.read())
+    check("schema: RMD-EDITOR.md is at most 5000 characters",
+          "PASS" if md_size <= 5000 else f"FAIL: {md_size} characters", "PASS")
     for phrase in ("create_rmd", "list_cells", "replace_cell_source", "set_chunk_option", "#|", "set_frontmatter_key",
                    "restart_kernel", "absolute"):
         check(f"schema: instructions mention {phrase}", server.mcp.instructions or "", phrase)

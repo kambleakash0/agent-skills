@@ -17,31 +17,22 @@ logger = logging.getLogger("ast-editor")
 # Condensed form of AST-EDITOR.md, sent to clients as MCP server instructions.
 _INSTRUCTIONS = (
     "AST-targeted edits for .py .js .ts .c .cpp .rb .go .java .json .yaml "
-    ".toml files: prefer these over text edits there. file_path must "
-    "be absolute.\n\n"
-    "Source files: call list_symbols first for exact, case-sensitive names "
-    "(Class.method), read_symbol to read one symbol (replace_function takes "
-    "its text back as is), find_references before a rename. Overloads take "
-    "parameter types (A.m(int)); a struct or TS type sharing its name takes "
-    "its keyword (struct stat, type User). Config targets are key paths "
-    "from the top level (project.version); quote a key with dots "
-    "(\"editor.fontSize\").\n\n"
+    ".toml files: prefer these over text edits there. file_path must be "
+    "absolute.\n\n"
+    "Call list_symbols first for exact, case-sensitive targets "
+    "(Class.method, overloads as A.m(int)), read_symbol to read one symbol "
+    "(replace_function takes its text back as is), find_references before "
+    "a rename. Config targets are key paths from the top level "
+    "(project.version); quote a key with dots (\"editor.fontSize\").\n\n"
     "Use the narrowest tool: replace_in_body, insert_in_body or "
-    "delete_in_body for a few lines (a snippet must match once: exact text "
-    "at token boundaries, or whole lines with indentation shifted) "
-    "rather than replace_function or replace_function_body; "
-    "add_parameter/remove_parameter rather than replace_signature for one "
+    "delete_in_body for a few lines, not replace_function or "
+    "replace_function_body; add_parameter or remove_parameter for one "
     "parameter; add_key for a new key, replace_value for an existing one; "
-    "add_import_name to extend an import. Decorators, an export and a C++ "
-    "template header belong to their symbol.\n\n"
+    "add_import_name to extend an import.\n\n"
     "Every edit is parse-checked: one that would add a syntax error is "
-    "refused with its line and column, the file unchanged; fix the content, "
-    "or for valid code the parser does not support, use your normal edit "
-    "tool. Each line's ending, a BOM and a missing final newline are kept; "
-    "write \\n.\n\n"
-    "Escape hatches: delete_symbol once per symbol; your edit tool "
-    "for arbitrary sub-expression changes, your write tool for whole-file "
-    "rewrites."
+    "refused and the file is left unchanged. For valid code the parser "
+    "does not support, or sub-expression edits, use your normal edit tool; "
+    "for whole-file rewrites, your write tool."
 )
 
 
@@ -67,77 +58,54 @@ _DESTRUCTIVE = ToolAnnotations(read_only_hint=False, destructive_hint=True, open
 # Parameter types shared by several tools; the descriptions become part of
 # each tool's inputSchema.
 FilePath = Annotated[
-    str,
-    Field(
-        description="Absolute path to an existing source or config file; its "
-        "extension selects the language."
-    ),
+    str, Field(description="Absolute path to the source or config file.")
 ]
 FunctionTarget = Annotated[
     str,
     Field(
-        description="Case-sensitive function or method name, dotted for nested "
-        "symbols (e.g. 'LRUCache.get'); call list_symbols for exact names. C, "
-        "C++ and Java overloads take their parameter types ('A.m(int, "
-        "String)', 'A.m()', C++ 'A.get(int) const'), a C++ definition outside "
-        "its class its qualified name ('A::f'). A JS/TS const/let/var bound to "
-        "an arrow function or function expression, and a Go var bound to a "
-        "func literal, is a function too; the body tools need a `{ }` body, so "
-        "they refuse an arrow function whose body is an expression. C++ "
-        "destructors and operators go by the names list_symbols gives them "
-        "('A.~A', 'A.operator==')."
+        description="Function or method name as list_symbols lists it, "
+        "dotted for nesting ('LRUCache.get'); overloads take parameter "
+        "types ('A.m(int)')."
     ),
 ]
 ClassTarget = Annotated[
     str,
     Field(
-        description="Case-sensitive name of the class (TS abstract classes "
-        "too, or a TS interface, C/C++ struct or typedef of one, Go struct "
-        "type) to add to, dotted for nested classes ('A.B'); only containers "
-        "count, so 'stat' is `struct stat` beside a function `stat` ('struct "
-        "stat' works too), and a typedef of a struct declared apart is that "
-        "struct. An anonymous JS/TS `export default class` is 'default'. A "
-        "function, TS enum or type alias is refused."
+        description="Class name as list_symbols lists it (a struct, "
+        "interface or Go struct type too), dotted for nesting ('A.B')."
     ),
 ]
 BodySnippet = Annotated[
     str,
     Field(
-        description="Text to match in the target's body (\\n also matches CRLF "
-        "line breaks): its exact text, starting and ending at token boundaries "
-        "(in comments and strings, between words), or else whole lines with "
-        "the same indentation added to or removed from each (the lines of a "
-        "multi-line string as they are in the file); it must match exactly "
-        "one place."
+        description="Text in the target's body, matching one place: its "
+        "exact text at token boundaries, or else whole lines with the same "
+        "indentation added to or removed from each."
     ),
 ]
 LiteralValue = Annotated[
     str,
     Field(
-        description="Value as literal source text in the file's own syntax "
-        "(e.g. '\"2.0.0\"' or '42'); quote strings where the format requires it."
+        description="Value as source text in the file's syntax, strings "
+        "quoted (e.g. '\"2.0.0\"' or '42')."
     ),
 ]
 ArrayTarget = Annotated[
     str,
     Field(
-        description="Full key path from the top level to the array in a "
-        "JSON/YAML/TOML file (e.g. 'project.dependencies'; a key containing "
-        "dots goes in double quotes, '\"a.b\".list'), or the name of a "
-        "Python module-level list."
+        description="Key path from the top level to a JSON, YAML or TOML "
+        "array ('project.dependencies'), or a Python module-level list's "
+        "name."
     ),
 ]
 ImportModule = Annotated[
     str,
     Field(
-        description="Module of the existing named import as written, without "
-        "quotes (e.g. 'typing' or './utils')."
+        description="Module of the import as written, without quotes "
+        "(e.g. 'typing' or './utils')."
     ),
 ]
-ImportName = Annotated[
-    str,
-    Field(description="A single imported name, e.g. 'Optional' or 'baz'."),
-]
+ImportName = Annotated[str, Field(description="One imported name, e.g. 'Optional'.")]
 
 
 def _validate_file(file_path: str) -> str | None:
@@ -156,82 +124,29 @@ def replace_function(
     content: Annotated[
         str,
         Field(
-            description="Complete replacement definition including decorators "
-            "(and a JS/TS `export` or C++ `template <...>` header), signature and "
-            "body, as read_symbol returns it (a C/C++ class, struct, union or enum "
-            "ends with its `};`); read_symbol's text, edited or not, goes in as "
-            "it is, other content is re-indented to the original's level."
+            description="Complete new source of the symbol, decorators "
+            "included, in read_symbol's shape or written from column 0."
         ),
     ],
 ) -> str:
     """
-    Replace an entire function definition with new content -- signature, body, and decorators.
-    The replaced span is what read_symbol returns: decorators (TS method
-    decorators too), a JS/TS `export` and a C++ `template <...>` header
-    included, so keep them in `content`, and a C/C++ class, struct, union or
-    enum ends with the `;` after its `}`. It also takes the code that only
-    wraps the symbol: a Go `type`, `var` or `const` declaring only it, the
-    key of a closure in an object or composite literal (`handler: () =>
-    {...}`), a TS `declare`, the C/C++ typedef or declaration a struct is
-    the type of (`typedef struct N {...} N;`), a Ruby `private def` and the
-    Sorbet `sig` above a method, and a TS function's overload signatures and
-    a Python function's @overload stubs. Refused in JSON, YAML and TOML
-    files, whose keys replace_value edits.
+    Replace a whole symbol (decorators, signature and body) with new content.
+    The replaced span is what read_symbol returns: decorators, a JS/TS
+    `export`, a C++ `template <...>` header and code that only wraps the
+    symbol are part of it, so keep them in content. read_symbol's text,
+    edited or not, goes in as it is, and may become several members;
+    content written from column 0 is re-indented to the symbol's level. A
+    symbol that shares a line with other code has only its own text
+    replaced. For one name of `int a, b;` the content must keep the others.
+    Refused in JSON, YAML and TOML files (use replace_value).
 
-    Content written as read_symbol shows the symbol (its first line without
-    indentation, the later lines at their indentation in the file) goes in
-    as it is, so read_symbol's text can be edited and given back, and given
-    back unchanged it leaves the file byte for byte as it was. It may hold
-    several members (a method replaced by two, a field by two fields): the
-    line that starts each later one sits at the symbol's own indentation,
-    after the one before it ended (its `}`, `end` or `;`, in Python its
-    last statement). Content
-    whose first line is at column 0 and the others indented from it, or
-    with every line at its file indentation, is re-indented to the
-    original's level as before. When no line sits at the symbol's own
-    indentation to tell the first two shapes apart (a Python def, code
-    continued on deeper lines), content whose later lines are all deeper
-    than the symbol's indentation is taken as read_symbol's text and keeps
-    them where they are (a 4-space method body for a 2-space class stays 4
-    spaces in). A decorator or annotation at the symbol's indentation counts
-    only before its first line of code: relative content for a class whose
-    methods are decorated is re-indented. At column 0 the three shapes are
-    one, and content goes in as written. A `;` or `,` after the symbol
-    stays unless the content ends with it (a JS/TS class field's `;` goes
-    when the content is a method), and so does a comment after it
-    on its last line (`int x;  // the x`) unless the content ends with a
-    comment of its own. A name declared together with others (`int a = 1,
-    b = 2;`, `struct S {...} s;`) has that whole declaration replaced, as
-    read_symbol shows it; content that would drop the others is refused.
-
-    A symbol that shares a line with other code (`function a() {} function
-    b() {}`) has only its own text replaced; the code around it on the line
-    stays (content ending with a `#` or `//` comment is refused when code
-    follows), and so does a comment before it on its first line, which is
-    no part of it (`/** @type {X} */ let x;` keeps the comment, and
-    read_symbol starts at `let`); the content's later lines are indented
-    as that line is, or, after a block comment begun on a line above (`
-    */ void f() {`), as the line the comment starts on. When `content` is
-    re-indented, the lines that start inside one of its multi-line string
-    literals (a triple-quoted string, template literal, heredoc, raw
-    string) and Ruby embedded documents (`=begin` ... `=end`, kept at
-    column 0) keep their text; those of a Python docstring, Ruby `<<~`
-    heredoc or Java text block move with the code. Where the file indents
-    with tabs (most of the symbol's indented lines start with one, the
-    text of its strings and the lines that spaces align under a bracket
-    aside, or its class's members do; any Go file), the content's
-    indentation steps written in spaces become tabs; the spaces that align
-    the lines of a block comment, or a line continued inside a `(` or `[`
-    that code follows on its line, stay after the tabs.
-
-    Use this when: You're rewriting a function top-to-bottom (e.g., renaming it,
-    changing parameters AND implementation together).
-    Don't use this when: You only need to change the body -> use `replace_function_body`.
-    You only need to change the signature -> use `replace_signature`.
+    Use this when: rewriting a symbol top to bottom (name, parameters and body).
+    Don't use this when: only the body changes (replace_function_body), only
+    the signature (replace_signature), or a few lines (replace_in_body).
 
     Example:
         target="LRUCache.get"
-        content='    def get(self, key, default=None):\\n        return self.items.get(key, default)'
+        content='def get(self, key, default=None):\\n    return self.items.get(key, default)'
     """
     if err := _validate_file(file_path):
         return err
@@ -255,37 +170,27 @@ def replace_function_body(
     content: Annotated[
         str,
         Field(
-            description="New body statements only, without the signature or "
-            "enclosing braces; re-indented as a block to the body's indentation."
+            description="New body statements without the signature or "
+            "braces, re-indented as a block to the body's indentation."
         ),
     ],
 ) -> str:
     """
-    Replace only the body of a function, preserving its signature and decorators.
-    A body written on one line with its signature or braces (`function f() {
-    return 1; }`, `def f(): return 1`) is rebuilt over lines of its own; a
-    comment after a one-line Python body stays at the end of the def's line
-    (`def b(): pass  # old` becomes `def b():  # old` over the new body).
-    Content for an empty body (`{` and `}` on lines of their own, a Ruby
-    method with nothing but comments between its signature and its `end`,
-    which it replaces) goes one indentation level deeper than the
-    function, and an empty Ruby method on one line (`def h; end`) is
-    opened up over lines of its own. A Ruby endless method
-    (`def f = x`) has no body and is refused. The lines that start inside a
-    multi-line string literal of `content` (a triple-quoted string, template
-    literal, heredoc, raw string) or a Ruby embedded document (`=begin` ...
-    `=end`, kept at column 0) keep their text when the rest is re-indented;
-    those of a Python docstring, Ruby `<<~` heredoc or Java text block move
-    with the code. In a body indented with tabs (any Go function), the
-    content's indentation steps written in spaces become tabs.
+    Replace only the body of a function, keeping its signature and decorators.
+    A body on its signature's line is rebuilt over lines of its own, and an
+    empty body gets content one level deeper than the function. A Ruby
+    method's rescue, else and ensure clauses stay and only the code before
+    them is replaced, unless content has clauses of its own. Refused for a
+    function without a block body: a Ruby endless method, or an arrow
+    function whose body is an expression (use replace_function).
 
-    Use this when: You're changing the implementation while keeping the interface stable.
-    Don't use this when: You're also changing parameters or return type -> use
-    `replace_signature` or `replace_function`.
+    Use this when: changing the implementation but not the interface.
+    Don't use this when: the parameters or return type change too
+    (replace_function), or only a few lines change (replace_in_body).
 
     Example:
         target="LRUCache.get"
-        content='        if key in self.items:\\n            return self.items[key]\\n        return None'
+        content='if key in self.items:\\n    return self.items[key]\\nreturn None'
     """
     if err := _validate_file(file_path):
         return err
@@ -309,76 +214,23 @@ def replace_in_body(
     new_snippet: Annotated[
         str,
         Field(
-            description="Replacement text, with the indentation and newlines you "
-            "need: written as given after an exact match, moved with the "
-            "snippet's lines after one with its indentation shifted, and after "
-            "an exact one-line snippet written without its line's indentation, "
-            "its later lines given that indentation (text already at the file's "
-            "indentation there goes in as written; in Python the reading that "
-            "parses wins); lines inside a string keep their text. '' deletes "
-            "the snippet."
+            description="Replacement text; its lines move with the match's "
+            "indentation, keeping their relative indentation, and text "
+            "already at the file's indentation goes in as written. '' "
+            "deletes the snippet."
         ),
     ],
 ) -> str:
     """
-    Replace a snippet inside a named function/method body, without touching
-    the surrounding code. The match is scoped to the target's body so
-    accidental matches elsewhere in the file cannot happen.
+    Replace a snippet inside a function's body; the match is scoped to that
+    body, so text elsewhere in the file never matches. A snippet found
+    nowhere is refused; one found in several places is refused with their
+    line numbers: add context.
 
-    The snippet matches its exact text where that neither starts nor ends
-    inside an identifier, number, keyword or operator: `x = 1` is not found
-    in `max = 10`, nor `= 1` in `a == 1` or `el` in `$el`. In a comment or
-    string literal (not in an interpolation's code) it may start and end
-    between any two words, and it may end at a Python backslash
-    continuation. An exact match wins. Without one, its lines match whole
-    lines of the body with the same indentation added to or removed from
-    each of them, so a block copied without (some of) its indentation is
-    found: blank lines match blank lines, spaces and tabs at the ends of
-    lines do not count, tabs and spaces differ, and a snippet that starts
-    or ends in the middle of a line must match exactly. The text of a
-    multi-line string is never shifted: a line that starts inside one must
-    be written as it is in the file (but in a Python docstring, Ruby `<<~`
-    heredoc or Java text block, which move with the code). When the exact
-    matches are all inside strings or comments, the shifted matches in
-    other places count too, so a snippet found as written in the text of a
-    string and shifted in code is refused as matching both.
-
-    new_snippet is written like the snippet: after a match with shifted
-    indentation, its lines move the same way, keeping their relative
-    indentation; after an exact one-line snippet that left out (some of)
-    its line's indentation, or that starts in the middle of a line, its
-    later lines get that indentation (the line's own for one in the middle),
-    unless they are all that deep already, as in read_symbol's shape. New
-    text already at the file's indentation there goes in as written, as
-    does new_snippet after an exact snippet of several lines. In Python,
-    when the lines read one way would not parse and read the other way
-    would, the other is taken: `return 2` replaced by `return 2\\n    y = 3`
-    in an `if` block 8 spaces deep ends the block with `y = 3` at 4. The
-    lines that start inside a multi-line string literal, one of new_snippet
-    or one of the file that new_snippet goes into, keep their text; those
-    of a Python docstring, Ruby `<<~` heredoc or Java text block move with
-    the code, and a Ruby `=begin` document stays at column 0. In a body
-    indented with tabs (any Go function), new_snippet's indentation steps
-    written in spaces become tabs. An empty new_snippet deletes the snippet
-    as delete_in_body does.
-
-    Raises if the snippet is not found (saying so when it occurs only inside
-    longer tokens), or if it matches more than one place (naming their
-    lines; include more surrounding context to disambiguate).
-
-    Use this when: You need to change a specific statement or block inside a
-    large function body without rewriting the whole body. The single biggest
-    token-saver for long functions with ~30 similar lines where you only want
-    to change one of them.
-    Don't use this when: You're replacing the entire body -> use
-    `replace_function_body`. You need to change a sub-expression inside a
-    method chain that string matching can't uniquely locate -> use the default
-    `Edit` tool instead.
-
-    Example:
-        target="init"
-        old_snippet="viper.BindPFlag(\\"port\\", cmd.Flags().Lookup(\\"port\\"))"
-        new_snippet="viper.BindPFlag(\\"port\\", cmd.PersistentFlags().Lookup(\\"port\\"))"
+    Use this when: changing one statement or block in a long body.
+    Don't use this when: replacing the whole body (replace_function_body),
+    or editing a sub-expression no unique snippet can locate (your normal
+    edit tool).
 
     Example (a block written without its indentation):
         target="handle"
@@ -405,36 +257,19 @@ def delete_in_body(
     file_path: FilePath, target: FunctionTarget, snippet: BodySnippet
 ) -> str:
     """
-    Delete a snippet inside a named function/method body, matched as
-    replace_in_body matches one: its exact text at token boundaries, else
-    whole lines with their indentation shifted. Scoped to the target's body
-    so global file matches don't apply.
+    Delete a snippet inside a function's body, matched as replace_in_body
+    matches one. A deletion that empties its lines removes them whole; a
+    comment after the snippet on its last line stays. One that would leave
+    a Python body without a statement is refused (replace the snippet with
+    `pass`).
 
-    When the deletion leaves its lines without code (only indentation before
-    the snippet on its first line, only spaces and tabs after it on its last,
-    or it ends with that line's break), the whole lines go, with their
-    indentation and line break; a comment after the snippet on its last line
-    stays, at the line's indentation. A deletion that would leave a Python
-    body without a statement is refused (replace the snippet with `pass`
-    instead).
+    Use this when: removing a statement, block or line in a body, or an
+    entry of an object literal passed as an argument.
+    Don't use this when: deleting a whole function or class (delete_symbol).
 
-    Raises if the snippet is not found, or if it matches more than one place
-    (include more surrounding context to make the match unique).
-
-    Use this when: You want to remove a specific statement, block, or line
-    inside a function body without rewriting the whole body. Also useful for
-    removing a single entry from an inline object-literal passed as a function
-    argument -- target the enclosing function and delete the entry text.
-    Don't use this when: You're deleting the entire function/class -> use
-    `delete_symbol`.
-
-    Example (remove a mount call inside a function):
+    Example:
         target="RegisterRoutes"
         snippet='r.Mount("/kb", kbHandler)'
-
-    Example (remove a key from an inline object arg):
-        target="main"
-        snippet="\\t\\tclassification,\\n"
     """
     if err := _validate_file(file_path):
         return err
@@ -458,121 +293,52 @@ def insert_in_body(
     new_snippet: Annotated[
         str,
         Field(
-            description="Text to insert: with after/before, on lines of its own "
-            "next to an anchor that ends (after) or starts (before) its line, "
-            "indented as the anchor was matched (as written when already at the "
-            "file's indentation there or in read_symbol's shape, at the anchor's "
-            "indentation from column 0, inside the block an after anchor's line "
-            "opens), else byte for byte; with at, re-indented as a block "
-            "(relative indentation kept) to the body's indentation."
+            description="Text to insert. With at, re-indented as a block to "
+            "the body's indentation; with after or before, indented like the "
+            "anchor (as written when already at the file's indentation there)."
         ),
     ],
     after: Annotated[
         str,
         Field(
-            description="Unique anchor in the target's body to insert after, "
-            "matched as replace_in_body matches a snippet; '' (default) leaves "
-            "this mode unused."
+            description="Anchor in the body to insert after; '' (default) "
+            "leaves this mode unused."
         ),
     ] = "",
     before: Annotated[
         str,
         Field(
-            description="Unique anchor in the target's body to insert before, "
-            "matched as replace_in_body matches a snippet; '' (default) leaves "
-            "this mode unused."
+            description="Anchor in the body to insert before; '' (default) "
+            "leaves this mode unused."
         ),
     ] = "",
     at: Annotated[
         str,
         Field(
-            description="'top' or 'bottom' of the body, at the body's own "
-            "indentation level (top goes after a Python docstring); '' (default) "
-            "leaves this mode unused, and exactly one of at, after or before must "
-            "be set. Refused for a body written on one line with its signature or braces."
+            description="'top' or 'bottom' of the body; '' (default) leaves "
+            "this mode unused. Other values are refused."
         ),
     ] = "",
 ) -> str:
     """
-    Insert new_snippet inside a named function/method body. Pass EXACTLY ONE
-    of `at`, `after`, or `before` -- this one tool covers four placement
-    modes that used to be spread across three separate tools.
+    Insert new_snippet inside a function's body. Set exactly one of `at`,
+    `after` or `before`. `at="top"` goes after a Python docstring,
+    `at="bottom"` at body level after the last statement, and in an empty
+    body one level deeper than the function; `at` is refused for a body on
+    its signature's line (use replace_function_body).
 
-      - at="top":    insert at the top of the body (after a Python docstring).
-      - at="bottom": insert at the bottom of the body, at body level even when
-        the last statement is a nested block.
-    `at` needs the body on its own lines: a one-line body such as
-    `def f(): return 1` or `function f() { return 1; }` is refused; rewrite
-    it with `replace_function_body` instead. An empty body (`{` over `}`, a
-    Ruby `def f` over `end`) takes new_snippet one indentation level deeper
-    than the function; `after` and `before` find no anchor there and are
-    refused. With `at`, the lines that start
-    inside a multi-line string literal of new_snippet (a triple-quoted
-    string, template literal, heredoc, raw string) or a Ruby embedded
-    document (`=begin` ... `=end`, kept at column 0) keep their text when
-    the rest is re-indented; those of a Python docstring, Ruby `<<~` heredoc
-    or Java text block move with the code. In a body indented with tabs
-    (any Go function), new_snippet's indentation steps written in spaces
-    become tabs, with `after` and `before` too.
-      - after=<snippet>:  insert after an anchor.
-      - before=<snippet>: insert before an anchor.
+    An anchor is matched as replace_in_body matches a snippet and must be
+    unique. One that ends its line (after) or starts it (before) gets
+    new_snippet on lines of its own; after a line that opens a block (`if
+    x:`, `if (x) {`), new lines go inside the block. A mid-line anchor gets
+    new_snippet byte for byte.
 
-    The anchor (for `after`/`before`) is matched as replace_in_body matches
-    a snippet (its exact text at token boundaries, else whole lines with
-    their indentation shifted), scoped to the target's body, and must be
-    unique -- multiple matches raise an error naming their lines; include
-    more surrounding context. An anchor that ends its line (after: only
-    spaces, tabs or a comment follow it, or it ends with its line break) or
-    starts it (before: only indentation precedes it) gets new_snippet on
-    lines of its own, below or above its lines, indented as the anchor
-    was matched: moved like a shifted anchor's lines, or given the
-    indentation an exact anchor left out of its first line (the line's own
-    for one that starts in the middle of the line, and all of it for
-    new_snippet at column 0 beside an anchor written with its
-    indentation), unless new_snippet is at the file's indentation there
-    already, or in read_symbol's shape beside an exact anchor (its first
-    line without indentation, the others at their file indentation: it
-    goes in as written, the first line at the anchor's indentation). In
-    Python, when new_snippet read one way would not parse and read the
-    other way would, the other is taken. After a line that opens a block
-    (`if (x) {`, `if x:`, `do`; the line below it is indented deeper),
-    new lines that would be at the anchor line's indentation go in at that
-    of the line below, inside the block. Multi-line strings and Ruby
-    `=begin` documents keep their text as with `at`. A line break at the
-    start of new_snippet after an anchor without its own, and spaces after
-    its last line break, are taken for the anchor line's own, and a final
-    line break is added. An anchor in the middle of a line gets new_snippet
-    byte for byte at its end or start, and so does one whose new line
-    would start in the text of a multi-line string or heredoc (after the
-    line that opens a heredoc, too; the lines of a Python docstring, Ruby
-    `<<~` heredoc or Java text block are indented like code and get lines
-    of their own) and one on a body that shares its signature's line;
-    `after` an anchor that ends with the body's closing brace is refused.
+    Use this when: adding lines to a body.
+    Don't use this when: replacing the whole body (replace_function_body),
+    changing existing lines (replace_in_body), or adding a top-level symbol
+    (add_top_level).
 
-    Use this when: You're inserting new lines into a function body. Use
-    `at="top"`/`at="bottom"` for simple prepend/append, or `after`/`before`
-    for anchored insertion.
-    Don't use this when: You're replacing the whole body -> use
-    `replace_function_body`. You're adding a top-level symbol -> use
-    `add_top_level`. You're changing an existing snippet in the body ->
-    use `replace_in_body`.
-
-    Example (prepend):
-        target="handle"
-        new_snippet='    log("start")\\n'
-        at="top"
-
-    Example (append):
-        target="handle"
-        new_snippet='    log("end")\\n'
-        at="bottom"
-
-    Example (after anchor):
-        target="handle"
-        new_snippet='    metrics.incr("calls")\\n'
-        after='    validate(request)\\n'
-
-    Example (before anchor, both written without indentation):
+    Example (both written without indentation):
         target="handle"
         new_snippet='auth_check(request)'
         before='validate(request)'
@@ -610,48 +376,26 @@ def add_method(
     content: Annotated[
         str,
         Field(
-            description="Complete method source, added after the class's last "
-            "member and re-indented like its existing members, keeping its own "
-            "relative indentation (Go: a receiver func placed after the type "
-            "declaration, indented with tabs)."
+            description="Complete method source, re-indented like the "
+            "class's members, keeping its own relative indentation."
         ),
     ],
 ) -> str:
     """
-    Add a new method at the end of a class body.
+    Add a method at the end of a class body, after its last member, spaced
+    like the class's methods. In Go it goes after the type declaration. In
+    a C++ class whose last method is followed by an access label, it goes
+    right after that method, so it gets the same access. A one-line Python
+    or Ruby class is refused, and so is a function target (use
+    insert_in_body).
 
-    The method is indented like the class's existing members (else one indent
-    unit of the file, or the language default, deeper than the class),
-    keeping the content's relative indentation (in tabs when the members are
-    tab-indented), and follows the last member after one blank line, or none
-    if the class's methods have no blank lines between them or the last
-    member is a C++ access label; one-line content (a field) after one-line
-    fields stacked without a blank line between them is stacked too. In Go
-    the method goes after the type declaration, its indentation in tabs,
-    with a blank line on each side. No blank line is added before the closing
-    brace; a braced body on one line (`class K {}`, `class K { a() {} }`) is
-    opened up over several lines. A Java enum gets the method after its
-    constants, with the `;` they need. A one-line Python or Ruby class is
-    refused. The lines that start inside a multi-line string literal of the
-    content (a triple-quoted string, template literal, heredoc, raw string)
-    or a Ruby embedded document (`=begin` ... `=end`, kept at column 0)
-    keep their text; those of a Python docstring, Ruby `<<~` heredoc or Java
-    text block move with the code. A method's read_symbol text copied from
-    another class (its first line without indentation, the later lines at
-    the indentation they had there) is indented as a whole, like content
-    written relative to its first line; a Python def with no decorator only
-    when it was read at the indentation of this class's members. The class
-    is found among the containers of its name only (`struct stat` beside a
-    function `stat`), and a function target is refused (insert_in_body adds
-    to a body). A C++ member template counts as a method for the spacing.
-
-    Use this when: You're adding a method to an existing class.
-    Don't use this when: You're adding a field/attribute -> use `add_field`. You're
-    adding a top-level function (not inside a class) -> use `add_top_level`.
+    Use this when: adding a method to an existing class.
+    Don't use this when: adding a field (add_field) or a top-level function
+    (add_top_level).
 
     Example:
         class_target="LRUCache"
-        content='    def clear(self):\\n        self.items.clear()'
+        content='def clear(self):\\n    self.items.clear()'
     """
     if err := _validate_file(file_path):
         return err
@@ -674,67 +418,33 @@ def delete_symbol(
     target: Annotated[
         str,
         Field(
-            description="Case-sensitive name of the function, method, class or "
-            "other symbol to delete, dotted for nested symbols (e.g. "
-            "'LRUCache.old_method'), as list_symbols lists it ('A.m(int)', "
-            "'struct stat')."
+            description="Symbol name as list_symbols lists it, dotted for "
+            "nesting (e.g. 'LRUCache.old_method', 'A.m(int)')."
         ),
     ],
     include_leading_comments: Annotated[
         bool,
         Field(
-            description="If true (default), also delete the contiguous comment "
-            "block directly above the symbol and its decorators; false keeps it."
+            description="True (default) also deletes the comment block above "
+            "the symbol, or before it on its first line; false keeps it."
         ),
     ] = True,
 ) -> str:
     """
-    Delete an entire function or class definition, including its decorators
-    (TS method decorators too), a JS/TS `export` and a C++ `template <...>`
-    header, and the `;` that ends a C/C++ class, struct, union or enum.
-    By default, also removes the contiguous leading comment block above the
-    symbol and its decorators (Godoc, Javadoc `/** ... */`, `#` or `//`
-    comment runs) so the doc doesn't become orphaned floating text. Pass
-    `include_leading_comments=False` to leave that comment in place. The
-    block ends at a blank line and at a comment line indented deeper than
-    the symbol, which ends the code above it (`    # end of f` under the
-    last line of f's body stays when the def below f is deleted): such
-    comment lines right below the deleted symbol go with it. A Ruby `=begin`
-    ... `=end` document directly above a method is its leading comment, and
-    a Sorbet `sig` is part of the method; a TS function's overload
-    signatures and a Python function's @overload stubs go with it. Refused
-    in JSON, YAML and TOML files (use delete_key).
+    Delete a whole function, method, class or other symbol, with its
+    decorators, a JS/TS `export` and a C++ `template <...>` header. The
+    blank lines that set it apart go too, so the file keeps its spacing. A
+    symbol that shares a line with other code is cut out of the line. One
+    name of a declaration of several (`int a, b;`, `struct S {...} s;`) is
+    refused: give replace_function the declaration without it. Refused in
+    JSON, YAML and TOML files (use delete_key).
 
-    The blank lines that separated the symbol go with it, so the rest keeps
-    the file's spacing: no blank lines are left at the top of the file or
-    of a class body (after the first member is deleted) or before a closing
-    brace (after the last), and between two remaining symbols only the
-    wider of the two gaps stays. A symbol that shares a line with other code
-    (`class A { a() {} b() {} }`) is cut out of the line instead: the `;` or
-    `,` that ends it (the last entry of a one-line literal takes the one
-    before it: `{ a: 1, b: 2 }` minus b is `{ a: 1 }`) and a comment after
-    it at the end of the line go with it, and the spaces that were before
-    it stay between the code on both sides.
-
-    A name declared together with others in one declaration (`int a, *b;`,
-    Java `int x, y;`, JS `const a = 1, b = 2;`, Go `var a, b = 1, 2`, C++
-    `auto [x, y] = p;`, and a C/C++ struct, class, union or enum with the
-    variable or typedef it is defined in, `struct S {...} s;`) is refused,
-    naming the others, since deleting the declaration would delete them
-    too: give replace_function the declaration without that name
-    (read_symbol shows it whole) instead.
-
-    Use this when: You want to remove a function, method, or class entirely from a
-    source file -- along with its doc comment by default.
-    Don't use this when: You want to remove a config key -> use `delete_key`. You
-    want to remove an import -> use `remove_import`. You want to remove lines
-    inside a function -> use `delete_in_body` (or `replace_function_body` to
-    rewrite the whole body without the unwanted lines).
+    Use this when: removing a symbol along with its doc comment.
+    Don't use this when: removing a config key (delete_key), an import
+    (remove_import) or lines inside a body (delete_in_body).
 
     Example:
-        target="LRUCache.old_method"              # deletes a method + its leading comment
-        target="DeprecatedClass"                  # deletes class, all methods, and preceding Javadoc
-        target="Foo", include_leading_comments=False   # keep the comment, delete only the symbol
+        target="LRUCache.old_method"
     """
     if err := _validate_file(file_path):
         return err
@@ -757,69 +467,34 @@ def replace_value(
     target: Annotated[
         str,
         Field(
-            description="Existing key: full key path from the top level in a "
-            "JSON, YAML, or TOML file (e.g. 'project.version'; a deeper "
-            "x.project.version never matches; a key containing dots goes in "
-            "double quotes, as in '\"editor.fontSize\"' or 'a.\"b.c\".d', and "
-            "TOML also takes single quotes; keys inside YAML flow mappings and "
-            "TOML inline tables count, and a YAML key with no value gets one), "
-            "'DictName.keyExpr' for a Python module-level dict (e.g. "
-            "'CONFIG.\"timeout\"'), or 'VarName.key' for a JS/TS module-level "
-            "object literal; Python and JS/TS paths may continue into nested "
-            "literals. In source files also a variable, constant, field or "
-            "macro by its name ('MAX', 'A.x', 'N')."
+            description="Key path from the top level in a config file "
+            "('project.version'; quote a key with dots, "
+            "'\"editor.fontSize\"'; keys in YAML flow mappings and TOML "
+            "inline tables count, 'a.x'), a path into a Python or JS/TS "
+            "module-level dict or object ('CONFIG.\"timeout\"', "
+            "'CONFIG.server.port'), or a variable, constant, field or macro "
+            "name ('MAX', 'A.x')."
         ),
     ],
     content: LiteralValue,
 ) -> str:
     """
-    Replace the value of an existing key in a JSON, YAML, or TOML file, or of an
-    entry in a Python module-level dict literal or JS/TS module-level object
-    literal (same target forms as `delete_key`). A JS/TS shorthand `{ key }`
-    becomes `key: <content>`.
+    Replace the value of an existing config key, dict or object entry, or
+    of a variable, constant, field or macro in a source file (`X = 1`,
+    `const X = 1;`, `int x = 1;`, `#define N 3`). Only the value changes; a
+    declaration without one gets one (`let x;` becomes `let x = 2;`, YAML
+    `a:` becomes `a: 2`). Refused: a function, class or type (use
+    replace_function), a name sharing one value with others (`a = b = 1`)
+    and a declaration that cannot have a value (`extern`, TS `declare`).
+    Array elements are not addressable.
 
-    In a source file, a variable, constant, field or macro has only its
-    value replaced: a Python module variable or class attribute (`X = 1`,
-    `X: int = 1`), a JS/TS `const`/`let`/`var` (each name of `let a = 1, b =
-    2` alone) or class field (`A.x`), a Go `var`/`const`, a C/C++ global,
-    field or static member (`int x(1);` and `int y{1};` keep their
-    delimiters) or a macro's text (`#define N 3`), a Java field and a Ruby
-    constant or local (a heredoc's body too). A declaration without a value
-    gets one (`let x;` becomes `let x = 2;`, `X: int` becomes `X: int = 2`,
-    `int g;` becomes `int g = 2;`). Refused: a function, class or type
-    (rewrite it with replace_function), a name that shares one value with
-    others (`a = b = 1`, Go `var c, d = f()`), and a declaration that cannot
-    have a value of its own (an `extern` one, TS `declare`, an abstract
-    field, a C struct's field, Go `var e, g int`, a Go constant without a
-    value that the constants below it repeat).
-
-    Config targets are key paths from the top level, one key per dot; put a
-    key that contains dots in double quotes ('"editor.fontSize"',
-    'a."b.c".d'; TOML also takes single quotes). Keys inside YAML flow
-    mappings and TOML inline tables are addressable too and stay inline
-    (`a: {x: 1}` is 'a.x', `t = { a = 1 }` is 't.a'). A YAML key with no
-    value (`a:`) gets one: `a: 3`, or for several lines (or a block
-    sequence or mapping) a nested block below the key, one level deeper (a
-    first line such as `|` or `&anchor` stays after the colon); an explicit
-    key with no value (`? a`) gets a `: 3` line below it. Array elements
-    are not addressable.
-
-    Use this when: A key already exists and you want to update its value.
-    Don't use this when: The key doesn't exist yet -> use `add_key`. You're modifying
-    an array -> use `append_to_array` or `remove_from_array`.
+    Use this when: updating a value that exists.
+    Don't use this when: the key is new (add_key), or you edit an array
+    (append_to_array, remove_from_array).
 
     Example:
         target="project.version"
         content='"2.0.0"'
-    Example (JSON key with dots):
-        target='"editor.fontSize"'
-        content="14"
-    Example (Python):
-        target='CONFIG."timeout"'
-        content="60"
-    Example (TS):
-        target="CONFIG.server.port"
-        content="8080"
     """
     if err := _validate_file(file_path):
         return err
@@ -842,32 +517,27 @@ def add_import(
     import_text: Annotated[
         str,
         Field(
-            description="Complete import line in the file's language (e.g. 'from "
-            "typing import Optional' or '#include <stdlib.h>'); in Go a bare spec "
-            "like '\"fmt\"' works only when a parenthesized import ( ... ) block "
-            "already exists; skipped if an identical line exists."
+            description="Complete import line in the file's language (e.g. "
+            "'import os', '#include <stdlib.h>'); in Go a bare spec "
+            "('\"fmt\"') works too."
         ),
     ],
 ) -> str:
     """
-    Add an import statement to a source file. Skips exact duplicates. Places new
-    imports on the line after the last existing one (a C/C++ `#include` right
-    after the last include, a conditional that only includes counting as
-    one; a JS CommonJS `require` counts as an import). A first import goes
-    after the file's preamble: a package clause, a `#!` line and encoding or
-    magic comments, the module docstring, a JS/TS directive ('use strict')
-    or `///` line, `#pragma once`, an include guard's `#define`, and a
-    header comment set off from the code by a blank line; a blank line goes
-    above it and one below it (two before a Python def or class).
+    Add an import line, skipping an exact duplicate. It goes into the group
+    of imports it belongs with (same package, standard library or not,
+    relative or not), at its sorted place when the group is sorted, else
+    after the group's last import. A comment heading the group stays first
+    (a next-line directive stays on its import), and so do Python `from
+    __future__` imports. With no fitting group it goes after the last
+    import, and a first import after the preamble.
 
-    Use this when: You need to import something the file does not already reference.
-    Don't use this when: You're adding a single name to an existing multi-name
-    import statement like `from X import a, b` -> use `add_import_name`.
+    Use this when: importing something the file does not import yet.
+    Don't use this when: adding a name to an existing import
+    (add_import_name).
 
     Example:
-        import_text="from typing import Optional"    # Python
-        import_text="import { readFile } from 'fs';" # JS/TS
-        import_text="#include <stdlib.h>"             # C/C++
+        import_text="from typing import Optional"
     """
     if err := _validate_file(file_path):
         return err
@@ -889,19 +559,16 @@ def remove_import(
     file_path: FilePath,
     import_text: Annotated[
         str,
-        Field(
-            description="Exact import line to remove, compared after stripping "
-            "surrounding whitespace (e.g. 'import os')."
-        ),
+        Field(description="Exact import line to remove (e.g. 'import os')."),
     ],
 ) -> str:
     """
-    Remove a matching import statement from a source file. Matching is by stripped
-    text equality -- pass the exact import line you want to remove.
+    Remove an import line, matched by its text with surrounding whitespace
+    stripped.
 
-    Use this when: You want to remove an unused import.
-    Don't use this when: You want to remove one name from a multi-name import -> use
-    `remove_import_name`.
+    Use this when: removing an unused import.
+    Don't use this when: removing one name from a multi-name import
+    (remove_import_name).
 
     Example:
         import_text="import os"
@@ -927,78 +594,38 @@ def add_key(
     parent_target: Annotated[
         str,
         Field(
-            description="Parent container: full key path from the top level "
-            "to a JSON object or YAML mapping (including `{}`, a flow mapping, "
-            "one nested in a flow mapping, or a YAML key with no value), a TOML "
-            "[table] by its header's names or an inline table by its key path, "
-            "'' for a config file's root (a key containing dots goes in double "
-            "quotes, e.g. 'a.\"b.c\"'; TOML also takes single quotes); in source "
-            "files the name of a Python module-level dict or JS/TS module-level "
-            "object literal, dotted further into nested literals (e.g. "
-            "'CONFIG.\"db\"', 'CONFIG.server')."
+            description="Parent container: its key path from the top level "
+            "in a config file ('' for the root; quote a key with dots, "
+            "'a.\"b.c\"'), or a Python or JS/TS module-level variable's "
+            "name, dotted into nested literals ('CONFIG.server')."
         ),
     ],
     key: Annotated[
         str,
         Field(
-            description="Key to add, refused if the container already has it: "
-            "for JSON and YAML one name, dots included (quoted for you, in YAML "
-            "only when it needs quotes; a name already in quotes is used as "
-            "given); for TOML a dotted key written like a TOML path (quoted for "
-            "you only when it needs quotes, and dots separate its parts, so "
-            "quote a name that contains one yourself, e.g. '\"example.com\"'); "
-            "for JS/TS a name, quoted for you only if it is not a valid "
-            "identifier; for Python a key expression, so quote string keys "
-            "(e.g. '\"timeout\"')."
+            description="Key to add. JSON, YAML and JS/TS: one name, quoted "
+            "for you when needed. TOML: a dotted key, so quote a name with a "
+            "dot yourself ('\"example.com\"'). Python: a key expression, so "
+            "quote string keys ('\"timeout\"')."
         ),
     ],
     value: LiteralValue,
 ) -> str:
     """
-    Add a new key-value pair inside a dict-like container. Works for JSON objects,
-    YAML mappings, TOML tables, Python dict literals, AND JS/TS object literals.
+    Add a key-value pair to a JSON object, YAML mapping, TOML table, Python
+    dict literal or JS/TS object literal. The entry follows the container's
+    layout: one key per line stays so, an inline object stays inline, and a
+    trailing comma is kept. A YAML key with no value gets a nested mapping.
+    A key the container already has is refused, naming the target to give
+    replace_value.
 
-    For JSON/YAML/TOML: parent_target is the full key path from the top level
-    to the parent (use "" for root), into YAML flow mappings and TOML inline
-    tables too; for a TOML [table], its header's names ([a."b.c"] is
-    'a."b.c"'). As in every config target, a key containing dots goes in
-    double quotes ('"a.b"'; TOML also takes single quotes). `key` is one name
-    for JSON and YAML (dots included), and YAML and TOML keys are quoted for
-    you only when they need quotes (`my key` stays plain in YAML; TOML dots
-    separate the parts of a dotted key, so quote a name containing one
-    yourself: '"example.com"').
-    For Python (.py): parent_target is the module-level variable name (e.g. 'CONFIG'),
-    optionally followed by keys into nested dicts (e.g. 'CONFIG."db"').
-    For JS/TS: parent_target names a module-level `const`/`let`/`var` (exported
-    or not; `as const` and `satisfies` are fine) assigned an object literal,
-    optionally followed by keys into nested objects (e.g. 'CONFIG.server').
-    value should be a literal source expression in the target file's syntax (e.g.
-    JSON '"foo"' or '42'; Python '"foo"' or '42').
+    Use this when: the key does not exist yet.
+    Don't use this when: the key exists (replace_value), or you add a list
+    item (append_to_array).
 
-    The new entry follows the container's layout: one key per line stays one
-    per line, an inline object stays inline, and a trailing comma is kept. An
-    empty JS/TS or YAML `{}` becomes `{ key: value }` (an empty TOML inline
-    table `{ key = value }`), and non-empty YAML flow mappings and TOML inline
-    tables (`{a: 1}`, `t = { a = 1 }`) get the entry inline too. A YAML key
-    with no value (`parent:`) gets a nested block mapping (inside a flow
-    mapping, an inline `parent: { key: value }`). A key the container
-    already has is refused, with the target to pass to `replace_value`.
-
-    Use this when: The key does not exist yet and you want to add it.
-    Don't use this when: The key already exists -> use `replace_value`. You're
-    adding an item to a list/array -> use `append_to_array`.
-
-    Example (JSON):
-        parent_target="dependencies"
-        key="mcp"
-        value='"^1.2.0"'
-    Example (Python):
-        parent_target="CONFIG"    # module-level CONFIG = {...}
-        key='"timeout"'            # include quotes if key is a string literal
-        value="30"
-    Example (TS):
-        parent_target="CONFIG.server"   # const CONFIG = { server: { ... } }
-        key="port"                       # quoted for you only when needed
+    Example (TS, const CONFIG = { server: {...} }):
+        parent_target="CONFIG.server"
+        key="port"
         value="8080"
     """
     if err := _validate_file(file_path):
@@ -1024,49 +651,26 @@ def delete_key(
     target: Annotated[
         str,
         Field(
-            description="Key to delete: full key path from the top level for "
-            "JSON/YAML/TOML (e.g. 'dependencies.tree-sitter'; a key containing "
-            "dots goes in double quotes, '\"editor.fontSize\"', and TOML also "
-            "takes single quotes; keys inside YAML flow mappings and TOML "
-            "inline tables count), 'DictName.keyExpr' for a Python module-level "
-            "dict (e.g. 'CONFIG.\"timeout\"'), or 'VarName.key' for a JS/TS "
-            "module-level object literal; Python and JS/TS paths may continue "
-            "into nested literals (e.g. 'CONFIG.server.port')."
+            description="Key path from the top level in a config file "
+            "('dependencies.tree-sitter'; quote a key with dots, "
+            "'\"editor.fontSize\"'), or a path into a Python or JS/TS "
+            "module-level dict or object ('CONFIG.\"timeout\"', "
+            "'CONFIG.server.port')."
         ),
     ],
 ) -> str:
     """
-    Delete a key-value pair from a dict-like container.
-      - JSON / YAML / TOML: key path from the top level ('"a.b"' for a key
-        containing dots), into YAML flow mappings and TOML inline tables too.
-      - Python (.py) module-level dict literals: target is 'DictName.keyExpr'
-        (e.g. 'CONFIG."timeout"'), or a longer path into nested dicts
-        (e.g. 'CONFIG."db"."host"').
-      - JS / TS module-level `const` / `let` / `var` object literals
-        (including `export const ... = { ... }`): target is 'VarName.keyName'
-        or 'VarName."quoted-key"', or a longer path into nested objects
-        (e.g. 'CONFIG.server.port'). Handles regular `{ key: value }` pairs,
-        shorthand `{ key }` properties and methods.
+    Delete a key-value pair from a config file, or from a Python or JS/TS
+    module-level dict or object literal. The adjacent comma goes too where
+    the syntax has one, and deleting the only entry leaves `{}`; YAML and
+    TOML keys otherwise go with their lines.
 
-    For JSON, Python, JS/TS, YAML flow mappings and TOML inline tables, the
-    adjacent comma is also removed to keep the file valid; deleting the only
-    entry leaves `{}`. Other YAML and TOML keys go with their lines.
+    Use this when: removing a whole entry.
+    Don't use this when: removing a list item (remove_from_array), or an
+    entry of an object literal passed as an argument (delete_in_body).
 
-    Use this when: You want to remove an entire entry.
-    Don't use this when: You want to remove an item from a list/array -> use
-    `remove_from_array`. You need to edit an inline object literal passed as a
-    function argument (`foo({ x })`) -- use `delete_in_body` scoped to the
-    enclosing function instead.
-
-    Example (JSON):
-        target="dependencies.tree-sitter"
-    Example (Python):
+    Example:
         target='CONFIG."timeout"'
-    Example (TS):
-        target="CONFIG.port"             # regular pair
-        target="CONFIG.name"              # shorthand `{ name }`
-        target='CONFIG."complex-key"'     # quoted key
-        target="CONFIG.server.port"       # nested object
     """
     if err := _validate_file(file_path):
         return err
@@ -1088,36 +692,18 @@ def append_to_array(
     file_path: FilePath, target: ArrayTarget, value: LiteralValue
 ) -> str:
     """
-    Append a literal value to an array/list. Works for JSON arrays, YAML sequences,
-    TOML arrays, AND Python module-level list literals.
+    Append a value to a JSON, YAML or TOML array or a Python module-level
+    list. The value follows the array's layout: an inline array stays
+    inline (`[1, 2]` becomes `[1, 2, 3]`), one element per line gets a new
+    line, and a trailing comma is kept. Comments are not elements: the
+    comma goes before them.
 
-    For JSON/YAML/TOML: target is the key path to the array from the top level
-    ('"a.b".list' for a key containing dots).
-    For Python (.py): target is the module-level variable name (e.g. 'ITEMS').
+    Use this when: adding a list item.
+    Don't use this when: adding a key-value pair (add_key).
 
-    The value follows the array's layout: an inline array stays inline
-    (`[1, 2]` becomes `[1, 2, 3]`, `[]` becomes `[3]`), an array with one
-    element per line gets a new line at the elements' indentation, and a
-    trailing comma is kept; a YAML block sequence gets a new `- value` item.
-    Comments are not elements: one at the end of the last element's line
-    stays at the end of that line, after the comma the element has or gets
-    (`2,  # two` is followed by a new `3,` line), and a value that ends
-    with a comment gets its comma before it (`3,  # new`). A list aligned
-    under its `[`, the `]` closing its last line, keeps one element per
-    line. A Python list whose brackets are on lines of their own with
-    nothing between them (`[` and `]`) gets the value on a line of its own
-    with a comma.
-
-    Use this when: You want to add an item to a list (dependencies, keywords,
-    include paths, fixtures, etc.).
-    Don't use this when: You're adding a key-value pair -> use `add_key`.
-
-    Example (TOML):
+    Example:
         target="project.dependencies"
         value='"new-package"'
-    Example (Python):
-        target="ITEMS"
-        value='"new-item"'
     """
     if err := _validate_file(file_path):
         return err
@@ -1141,39 +727,24 @@ def remove_from_array(
     value_match: Annotated[
         str,
         Field(
-            description="Element to remove, compared with each element's source "
-            "text after stripping whitespace (e.g. '\"old-package\"'); only the "
-            "first match is removed."
+            description="Element to remove, compared with each element's "
+            "source text, whitespace stripped (e.g. '\"old-package\"')."
         ),
     ],
 ) -> str:
     """
-    Remove the first element matching value_match (stripped text equality) from an
-    array/list. Works for JSON/YAML/TOML config arrays AND Python module-level
-    list literals.
+    Remove the first element matching value_match from a JSON, YAML or
+    TOML array or a Python module-level list. An element on a line of its
+    own goes with that line and its comment; other comments stay. The
+    trailing-comma style is kept, and removing the only element leaves
+    `[]`.
 
-    For JSON/YAML/TOML: target is the key path to the array from the top level
-    ('"a.b".list' for a key containing dots).
-    For Python (.py): target is the module-level variable name.
+    Use this when: removing one list item.
+    Don't use this when: removing a whole key (delete_key).
 
-    Comments are not elements. An element on a line of its own goes with
-    that whole line, a comment at its end included; comments on other lines
-    (one above the element, or one after the element before it when the
-    removed one shares its line with the `]`) stay where they are. The
-    array's trailing-comma style is kept: removing the last element when it
-    has no comma after it also removes the comma before it. Removing the
-    only element leaves `[]`, also in a YAML block sequence (`key: []`,
-    before a comment on the key's line).
-
-    Use this when: You want to remove a specific item from a list.
-    Don't use this when: You want to remove a whole key -> use `delete_key`.
-
-    Example (TOML):
+    Example:
         target="project.dependencies"
         value_match='"old-package"'
-    Example (Python):
-        target="ITEMS"
-        value_match='"old-item"'
     """
     if err := _validate_file(file_path):
         return err
@@ -1202,34 +773,24 @@ def add_field(
     content: Annotated[
         str,
         Field(
-            description="Literal field or member declaration (e.g. 'version = "
-            "\"1.0\"' or Go 'version int'), re-indented like the class's "
-            "existing members and inserted before the first of them (after a "
-            "Python class docstring or a Java enum's constants, below the "
-            "access label a C++ class opens with), with no auto-wrapping."
+            description="Field or member declaration as source text (e.g. "
+            "'version = \"1.0\"' or Go 'version int')."
         ),
     ],
 ) -> str:
     """
-    Add a field/attribute/member at the top of a class body (fields-before-methods
-    convention): before the first member, after a Python class docstring or
-    a Java enum's constants (adding the `;` they need), and below the access
-    label a C++ class or struct opens with (`public:`), so that the field
-    gets that section's access. The class is found as for add_method
-    (containers only; a function is refused). Indented like
-    add_method (multi-line string literals and Ruby embedded documents keep
-    their text, and read_symbol's text from another class is indented as a
-    whole), with a blank line after it when the member below is a method
-    (a C++ member template too); comments after the `{` on its line stay
-    there.
+    Add a field or member at the top of a class body: before the first
+    member, after a Python class docstring or a Java enum's constants
+    (adding the `;` they need), and below the access label a C++ class
+    opens with. It is indented like the class's members, with a blank line
+    after it when a method follows. A function target is refused.
 
-    Use this when: You're adding a class attribute (Python), class field (JS/TS),
-    or member variable (C++).
-    Don't use this when: You're adding a method -> use `add_method`.
+    Use this when: adding a class attribute, field or member variable.
+    Don't use this when: adding a method (add_method).
 
     Example:
         class_target="LRUCache"
-        content='    version = "1.0"'
+        content='version = "1.0"'
     """
     if err := _validate_file(file_path):
         return err
@@ -1253,73 +814,29 @@ def replace_signature(
     new_signature: Annotated[
         str,
         Field(
-            description="Everything from the start of the definition up to its "
-            "body (e.g. 'def get(self, key, default=None):' or JS 'get(key, d)' "
-            "without the '{'); indentation on its first line is ignored, and "
-            "following lines (parameters, or the def after a decorator line) "
-            "may be indented relative to it. The existing decorators, Java "
-            "annotations and C++ `template <...>` header are kept unless it "
-            "includes its own, which then replace them. For a JS/TS function "
-            "bound to a name, "
-            "'const f = (a, b) =>' replaces from the const on, '(a, b) =>' only "
-            "the function's own part. For a method with no body (a TS abstract "
-            "or Java interface method, a C++ `A() = default`), the ';' after it "
-            "stays; a Go struct or interface type takes its header (`type A "
-            "struct`)."
+            description="Everything from the start of the definition up to "
+            "its body, as read_symbol(depth='signature') returns it (e.g. "
+            "'def get(self, key):', JS 'get(key, d)' without the '{'); "
+            "indentation on its first line is ignored."
         ),
     ],
 ) -> str:
     """
-    Replace only the signature of a function, preserving its body and decorators.
+    Replace the signature of a function, or the header of a class, keeping
+    its body. Existing decorators, Java annotations and a C++ `template
+    <...>` header stay unless new_signature has its own. Code that
+    read_symbol's signature starts with (a JS/TS `const f =`, a closure's
+    key, a TS `declare`, a Ruby `private`) is replaced when new_signature
+    starts with it, else kept. A method without a body keeps its `;`.
+    Refused for a symbol with no signature, such as a variable.
 
-    Decorators (Python, JS/TS) and Java annotations such as `@Override` are kept
-    when new_signature has none, in their original layout. If new_signature
-    includes decorators or annotations, they replace the existing ones. A C++
-    template's `template <...>` header is kept the same way, unless
-    new_signature starts with `template`.
-
-    The signature lands at the definition's own column: indentation on its
-    first line is ignored, and the lines after it may be indented relative
-    to that line (as in the decorator example below) or written as
-    read_symbol(depth="signature") returns them.
-
-    For a JS/TS function bound to a name (`const f = (a) => {...}`), a
-    new_signature starting with const/let/var, as read_symbol returns it,
-    replaces the declaration from there (an `export` stays); one without
-    (`async (a, b) =>`) replaces only the function's own part. The other
-    code that read_symbol's signature starts with goes the same way: a
-    new_signature that starts with its own replaces it, and one that does
-    not keeps it. That is a closure's key (`handler: (a) =>`, which may
-    rename it, or `(a) =>`), a Go `type` or `var` (`var y = func()`), a TS
-    `declare`, a C++ `extern "C"`, a C/C++ `typedef` (`typedef struct P`),
-    a Ruby `private` (`protected def m(x)`, or `def m(x, y)`) and a Ruby
-    Sorbet `sig` (one that starts with `sig` replaces it). A TS overload
-    group and a Python @overload group have the implementation's signature
-    replaced, and a Ruby endless method keeps its `= expression`.
-
-    A method declared without a body (a TS abstract method, a Java interface
-    or abstract method, a C++ `A() = default;`, a Go function without one,
-    a C/C++ prototype or a method declared in its class, `int f(int);`)
-    is all signature but the `;` that ends it, which stays whether or not
-    new_signature ends with one. A Go struct or interface type and an empty
-    Ruby class, module or method take the header read_symbol(depth=
-    "signature") gives them (`type A struct`, `class A < B`); other symbols
-    (variables, constants) have no signature and are refused.
-
-    Use this when: You're changing parameters, return type, or function name
-    without modifying the implementation.
-    Don't use this when: You also want to change the body -> use `replace_function`.
-    You're adding/removing one parameter -> use `add_parameter`/`remove_parameter`.
+    Use this when: changing a function's parameters, return type or name.
+    Don't use this when: the body changes too (replace_function), or one
+    parameter is added or removed (add_parameter, remove_parameter).
 
     Example:
         target="LRUCache.get"
         new_signature="def get(self, key, default=None):"
-    Example (Python method; the new decorator replaces any existing ones):
-        target="LRUCache.get"
-        new_signature="@staticmethod\\ndef get(key):"
-    Example (Java; the method's existing @Override line stays):
-        target="LRUCache.toString"
-        new_signature="public synchronized String toString()"
     """
     if err := _validate_file(file_path):
         return err
@@ -1339,78 +856,21 @@ def replace_signature(
 @mcp.tool(annotations=_READ_ONLY)
 def list_symbols(file_path: FilePath) -> str:
     """
-    Return a formatted outline of the symbols in a source file (Python, JS,
-    TS, C, C++, Ruby, Go, Java), with line numbers: its top-level functions,
-    classes and other declarations, and the members of each class, nested
-    classes and their members included (`class A.B`, then `method A.B.m`
-    indented under it), and of namespaces and modules. Read-only. Each line
-    is `<kind> <name> (line N)`, the name being the symbol's target. In C,
-    C++, Java, JS and TS every entry is listed under the target that finds
-    it at the listed line: C++ and Java overloads with their parameter
-    types (`method A.m(int) (line 2)`, `method A.get(int) const (line 8)`),
-    a method beside a field of its name with them too (`method A.size()`),
-    and a C/C++ struct, union, enum or C++ class, or a TS type alias or
-    interface, that shares its name with another symbol after its keyword,
-    which the line then shows twice (`struct struct stat (line 1)`, `type
-    type User (line 2)`); an entry that no target reaches is left out (a TS
-    setter beside its getter, a JS/TS class field or `var` beside a
-    function of its name, which the name targets). In Python and Ruby a
-    name defined again (a redefinition, a @property setter, a reopened Ruby
-    class) is listed again, and the name targets the first. A symbol's line
-    is that of its first decorator, `export` or Ruby Sorbet `sig`, and of
-    its first TS overload signature or Python @overload stub. Data is
-    listed in every language: a Python module variable (`variable`) and
-    class attribute (`field`) at its first assignment, a JS/TS `const`
-    (`constant`), `let` or `var` (`variable`), each name of it, and class
-    field (`field`), a Ruby constant (`constant`) and local (`variable`);
-    names that a pattern binds (`a, b = 1, 2`, `const {a} = o`) are not
-    listed. JS/TS exported declarations are listed under their own names,
-    an anonymous `export default function/class` as `default`. In JS/TS,
-    generator functions and each name of a `const`/`let`/`var` bound to an
-    arrow function or function expression are listed as `function`, TS
-    abstract classes as `class` (abstract methods among their methods),
-    enums, type aliases, interfaces and namespaces (`namespace N {}`, `module N {}`) as `enum`,
-    `type`, `interface` and `namespace`, what `declare` declares like the
-    rest, and a function declared without a body (`declare function f():
-    void;`, an overload signature) as `function`. In C and C++, structs,
-    unions, enums and namespaces are listed as `struct`, `union`, `enum` and
-    `namespace`, typedefs and `using` aliases as `type`, `#define`s as
-    `macro`, data members as `field` and other variables as `variable`, or
-    `constant` when `const` (not a pointer) or `constexpr`; prototypes and
-    methods declared in their class are a `function` and a `method`, and
-    declarations inside `#if`/`#ifdef` blocks and `extern "C"` are listed
-    too. A declaration of several names (`int a, *b;`) lists each. A name
-    that a scope also declares only to announce it (a forward declaration
-    `struct S;`, a prototype, an `extern` variable, a TS overload signature)
-    is listed once, at its definition when the scope has one, which is
-    also what the tools target; of definitions in `#if`/`#ifdef` blocks, one
-    outside them wins (over a copy in `#if 0`), and of alternatives in
-    `#ifdef` and `#else` branches the first; repeated identical
-    declarations are listed once. A C++ or TS namespace opened more than
-    once in a scope is listed once, with the members of all its blocks, and
-    a TS namespace merged with the class, function or enum of its name lists
-    its members under that declaration. C++ template functions and classes, and
-    member templates, are listed as what they declare, at the line of their
-    `template <...>` header; a definition outside its class (`int A::f()`,
-    `template <typename T> T Box<T>::get()`) is a function under its
-    qualified name (`A::f`, `Box::get`, `A::A`), a class or namespace
-    declared with its scope (`struct A::B {...}`, `namespace a::b {}`) is
-    listed under that name, and destructors and operators are named as
-    written, spaces left out (`~A`, `operator==`, `operator()`, `operator
-    bool`; target them as `A.~A`, `A.operator==`). Java fields (interface
-    constants too) are listed as `field`, also one that shares its name
-    with a method (`int size;` and `int size()`), which the name targets
-    (the method is `A.size()`); a nested class whose name a field takes is
-    left out, its members listed (`A.B.m`). Ruby methods include `private
-    def` ones and those in `class << self`. Go lists types (a type alias
-    `type T = int` as `type`) with their methods, then each name a `var` or
-    `const` declares (`variable`, `constant`; a `var` bound to a func
-    literal too), then functions.
+    List the symbols of a source file, one per line as `<kind> <name> (line
+    N)`, class members indented under their class (`method A.B.m`). Each
+    name is the target the other tools take: overloads with their
+    parameter types (`A.m(int)`), a C++ definition outside its class by
+    its qualified name (`A::f`), and a struct or TS type that shares its
+    name with another symbol after its keyword (`struct struct stat`
+    targets `struct stat`). Kinds include function, method, class, struct,
+    enum, interface, namespace, type, macro, field, variable and constant;
+    a Go `var x = func(...) {...}`, listed as a variable, also takes the
+    body, parameter and signature tools. A name with a prototype or
+    forward declaration is listed once, at its definition. Read-only.
 
-    Use this when: You're about to edit an unfamiliar file and want to see its
-    structure and exact symbol names. ALWAYS a good first call before editing --
-    avoids guessing at target names.
-    Don't use this when: You already know the exact target name.
+    Use this when: before editing a file, to get exact target names.
+    Don't use this when: you already know the target (read_symbol reads
+    one symbol).
 
     Example:
         file_path="/abs/path/to/module.py"
@@ -1444,32 +904,20 @@ def add_import_name(
     file_path: FilePath, module: ImportModule, name: ImportName
 ) -> str:
     """
-    Add a name to an existing named-import statement. Idempotent: skips if
-    the name is already present.
+    Add a name to an existing `from <module> import ...` (Python) or
+    `import { ... } from "<module>"` (JS/TS) statement; a name already
+    there is left as is. It goes at its sorted place when the names are
+    sorted (plainly or as isort and ruff sort them), else at the end, in the
+    list's layout: names one per line give it a line of its own, an inline
+    list stays inline. Refused when the file has no such import.
 
-      - Python (.py): `from <module> import a, b`
-      - JS/TS:        `import { a, b } from "<module>"`
+    Use this when: the module is already imported with named imports.
+    Don't use this when: there is no such import yet, or for a default or
+    namespace import (add_import with the full line).
 
-    The name follows the list's layout: names in braces or parentheses
-    written one per line get the new one on a line of its own at their
-    indentation (after the last name's line and a comment at its end),
-    with a comma after it when the last name has one, else the last name
-    gets the comma; names aligned under the `(` or `{` get it aligned too;
-    an inline list stays inline (`a, b` becomes `a, b, c`), and so does a
-    Python list without parentheses.
-
-    Use this when: The module is already imported via a named-import form and
-    you want to add another name to that existing statement.
-    Don't use this when: The import statement doesn't exist yet -> use
-    `add_import`. You want a default or namespace import (`import Foo from ...`
-    or `import * as ns from ...`) -> use `add_import` with the full line.
-
-    Example (Python):
+    Example (`from typing import Any, cast` becomes `Any, Dict, cast`):
         module="typing"
-        name="Optional"
-    Example (TS):
-        module="./utils"
-        name="baz"
+        name="Dict"
     """
     if err := _validate_file(file_path):
         return err
@@ -1493,30 +941,19 @@ def remove_import_name(
     file_path: FilePath, module: ImportModule, name: ImportName
 ) -> str:
     """
-    Remove a name from a named-import statement.
+    Remove one name from a `from <module> import ...` (Python) or `import
+    { ... } from "<module>"` (JS/TS) statement. A name on a line of its own
+    goes with that line and its comment. Removing the only name removes the
+    statement, but is refused when a default import would be left with
+    empty braces (`import D, { a } from "m"`): use remove_import, then
+    add_import.
 
-      - Python (.py): `from <module> import a, b, c`
-      - JS/TS:        `import { a, b, c } from "<module>"`
+    Use this when: dropping one name from a multi-name import.
+    Don't use this when: removing the whole import line (remove_import).
 
-    If the name removed is the only remaining one AND there are no other
-    bindings (default / namespace) in the same statement, the entire import
-    line is removed. Raises an error if removing the last name would leave
-    an invalid `import Default, {} from "mod"` fragment. In braces or
-    parentheses, a name on a line of its own goes with that whole line, a
-    comment at its end included (comments on other lines stay), and a
-    last name with no comma after it takes the comma before it; an inline
-    name goes with one comma next to it.
-
-    Use this when: You want to remove a single name from a multi-name import.
-    Don't use this when: You want to remove the entire import line -> use
-    `remove_import`.
-
-    Example (Python):
+    Example:
         module="typing"
         name="List"
-    Example (TS):
-        module="./utils"
-        name="bar"
     """
     if err := _validate_file(file_path):
         return err
@@ -1545,54 +982,36 @@ def add_parameter(
     parameter: Annotated[
         str,
         Field(
-            description="Literal source text of one parameter (e.g. 'default=None' "
-            "or 'const int* buf'); the separating comma is added for you."
+            description="Source text of one parameter (e.g. 'default=None', "
+            "'const int* buf'); the comma is added for you."
         ),
     ],
     position: Annotated[
         str,
         Field(
-            description="'end' (default) appends after the last parameter; "
-            "'start' inserts before the first. Any other value is refused."
+            description="'end' (default) after the last parameter, before "
+            "any that must stay last; 'start' before the first. Other values "
+            "are refused."
         ),
     ] = "end",
 ) -> str:
     """
-    Add a parameter to a function signature at position 'end' (default) or 'start'
-    (any other position is refused). Leaves the body untouched. A JS/TS arrow
-    function's one unparenthesized parameter gets parentheses: `x => ...`
-    becomes `(x, y) => ...`.
+    Add one parameter to a function's signature, keeping the body. "end"
+    puts it after the last parameter but before those that must come after
+    it (Python `**kwargs`, a JS/TS rest parameter, Go and Java variadics,
+    C/C++ `...`, Ruby `**opts` and `&blk`); "start" before the first, but
+    after a TS `this` or Java receiver parameter. A list written one
+    parameter per line gets it on a line of its own, a C `(void)` takes it
+    in place of `void`, and a bare JS/TS arrow parameter gets parentheses.
+    A name the function already has is refused.
 
-    A list written one parameter per line gets the new one on a line of its
-    own, indented like the parameters (also when they are aligned under the
-    first one, with the `)` on the last line): at the end after the last
-    parameter's line, with a comma after it when the last one has one (else
-    the last one gets the comma), at the start above the first parameter and
-    the comments on lines of their own right before it. Comments are not
-    parameters and stay on their lines. Other lists, with two parameters on
-    a line (`def f(a, b,\\n      c):`), get the parameter inline (`a, b, c`).
-    An empty list whose `)` is on a line below its `(` gets the parameter on
-    a line of its own, one indentation unit deeper than the `(` line, with
-    a trailing comma in Go, none in C, C++, Java and Ruby, and in Python,
-    JS and TS one when most of the file's lists written one per line have
-    one (or it has none). In Python, 'end' is before a `**kwargs`, which
-    must stay last (`def f(a, **kw)` plus `b` is `def f(a, b, **kw)`; after
-    `*args` or a bare `*`, the new parameter is keyword-only). A C or C++
-    `(void)` takes the parameter in place of its `void`: `int f(void)` plus
-    `int c` is `int f(int c)`. A name the function already has is refused
-    (`Parameter 'a' already exists in 'f'`), compared by the names the
-    parameters declare (`*args`, `{a, b}`, Go `a, b int`); several `_` are
-    fine in Go, Java and Ruby.
+    Use this when: adding a parameter without retyping the signature.
+    Don't use this when: rewriting the signature (replace_signature), or
+    changing the body too (replace_function).
 
-    Use this when: You need to add one or two parameters without retyping the whole
-    signature.
-    Don't use this when: You need to replace the entire signature -> use
-    `replace_signature`. You also want to change the body -> use `replace_function`.
-
-    Example:
-        target="LRUCache.get"
-        parameter="default=None"
-        position="end"
+    Example (`def f(a, **kw)` becomes `def f(a, b, **kw)`):
+        target="f"
+        parameter="b"
     """
     if err := _validate_file(file_path):
         return err
@@ -1621,41 +1040,23 @@ def remove_parameter(
     parameter_name: Annotated[
         str,
         Field(
-            description="Bare name of the parameter to remove (e.g. 'default'), "
+            description="Bare name of the parameter (e.g. 'default'), "
             "without its type or default value."
         ),
     ],
 ) -> str:
     """
-    Remove a parameter by name from a function signature. Leaves the body
-    untouched. A JS/TS arrow function's one unparenthesized parameter leaves
-    `()` behind: `x => 1` becomes `() => 1`. A parameter on a line of its
-    own goes with that whole line, a comment at its end included; comments
-    on other lines stay (one after the parameter before it too), and a last
-    parameter with no comma after it takes the comma before it (except in
-    Go, which needs it before a line break). Removing the only parameter
-    leaves `()`, except in C (.c, .h), where `()` declares unspecified
-    parameters before C23: there it leaves `(void)` (C++ keeps `()`). In
-    Python, a bare `*` or a `/` left without the parameter it needs goes
-    too: `def f(a, *, b)` minus b is `def f(a)`, `def f(a, /, b)` minus a
-    is `def f(b)`, `def f(a, *, b, **kw)` minus b is `def f(a, **kw)`. In
-    Go, one name of several that share a type goes alone:
-    removing `a` from `func f(a, b int)` gives `func f(b int)`, removing `b`
-    gives `func f(a int)`; the comments of the other names stay with them,
-    the type moving up to the name before a last one that had a line of its
-    own (a comment after the comma before it stays). A Go parameter written
-    as a type only (`int`) has no name to remove, and the receiver and
-    named results are not parameters. A name that a JS/TS or Ruby
-    destructuring parameter binds goes alone: `function f({a: x, b})` minus
-    x is `function f({b})`; in an array or Ruby pattern, which binds by
-    position, an earlier name leaves a hole or `_` (`[a, b]` minus a is
-    `[, b]`, Ruby `(a, b)` minus a is `(_, b)`), and the parameter goes with
-    its last name. A key (`a` of `{a: x}`) is no name.
+    Remove a parameter by name from a function's signature, keeping the
+    body. A parameter on a line of its own goes with that line and its
+    comment. Removing the only one leaves `()`, or `(void)` in C. In Python
+    a `*` or `/` left invalid goes too, and a `*args` with keyword-only
+    parameters after it leaves a bare `*` (`def f(a, *args, b)` minus args
+    is `def f(a, *, b)`). One Go name of `a, b int`, or one name that a
+    destructuring parameter binds, goes alone. Refused: a name the function
+    lacks, and in C the last named parameter before `...`.
 
-    Use this when: You need to remove one parameter without retyping the whole
-    signature.
-    Don't use this when: You need to replace the whole signature -> use
-    `replace_signature`.
+    Use this when: dropping one parameter without retyping the signature.
+    Don't use this when: rewriting the signature (replace_signature).
 
     Example:
         target="LRUCache.get"
@@ -1687,46 +1088,34 @@ def replace_docstring(
     target: Annotated[
         str,
         Field(
-            description="Case-sensitive name of the Python function, method, or "
-            "class, dotted for nested symbols (e.g. 'LRUCache.get'), or '' for "
-            "the module docstring."
+            description="Python function, method or class name, dotted for "
+            "nesting (e.g. 'LRUCache.get'), or '' for the module."
         ),
     ],
     new_docstring: Annotated[
         str,
         Field(
-            description="Python string literal including its quotes, normally "
-            "triple-quoted; replaces the existing docstring or becomes the first "
-            "body statement (of the module, for target '')."
+            description="One Python string literal with its quotes, usually "
+            "triple-quoted."
         ),
     ],
 ) -> str:
     """
-    Replace or insert a Python docstring on a function, class or module. Python-only. The
-    new_docstring should be a valid Python string literal including its surrounding
-    triple quotes. A new docstring for a body on its signature's line (`def
-    f(): return 1`) is refused: rewrite the body with `replace_function_body`.
+    Replace or add the docstring of a Python function, method or class, or
+    of the module with target "". new_docstring must be one string literal
+    with its quotes; anything else (bare text, an f-string, bytes, an empty
+    value) is refused. A new docstring goes first in the body; the module's
+    goes below a `#!` line and encoding or header comments. A new docstring
+    for a body on its signature's line is refused (use
+    replace_function_body); so is any non-Python file.
 
-    target="" is the module (as add_key's "" is a config file's root): the
-    string the module starts with is replaced (not an f-string or bytes
-    literal, which is no docstring and stays), or a new docstring goes
-    before the first statement (a `from __future__` import stays after
-    it), below a `#!` line and an encoding comment, with no blank line
-    after them, and below a header comment set off by a blank line, which
-    keeps its blank lines; a comment right above the first statement stays
-    with it, below the docstring. One blank line follows the docstring,
-    two before a def or class; in a file with no statement it goes last.
-    A new_docstring for the module that is not a string literal with its
-    quotes (bare text, an f-string) is refused.
-
-    Use this when: You want to add or update a Python docstring without touching
-    the function body.
-    Don't use this when: You're editing a `#` comment above the symbol -> use
-    `edit_leading_comment`. You're in a non-Python file -> no equivalent tool.
+    Use this when: adding or updating a Python docstring.
+    Don't use this when: editing a `#` comment above the symbol
+    (edit_leading_comment).
 
     Example:
         target="LRUCache.get"
-        new_docstring=(triple-quoted string, e.g. with three double-quotes before and after the summary text)
+        new_docstring='\"\"\"Return the cached value, or None.\"\"\"'
     """
     if err := _validate_file(file_path):
         return err
@@ -1749,24 +1138,21 @@ def find_references(
     target: Annotated[
         str,
         Field(
-            description="Exact identifier to find, matched per identifier rather "
-            "than as a dotted path (e.g. 'LRUCache')."
+            description="Identifier to find, a plain name, not a dotted "
+            "path (e.g. 'LRUCache')."
         ),
     ],
 ) -> str:
     """
-    Return all occurrences of an identifier named `target` in a source file, as
-    'line N: <source line>', in file order (by line, then column).
-    Read-only, syntactic only (no scope awareness), so results may include
-    unrelated identifiers that happen to share the same name.
-    C++ destructors and operators are found by the names list_symbols gives
-    them (`~A`, `operator==`, `operator bool`), whatever the spacing in the
-    file.
+    List each occurrence of an identifier in a source file as `line N:
+    <source line>`, in file order. Read-only and syntactic, with no scope
+    analysis, so unrelated identifiers of the same name show up too. C++
+    destructors and operators go by their list_symbols names (`~A`,
+    `operator==`).
 
-    Use this when: You're about to rename or refactor a symbol and need a quick
-    survey of where it appears in the file.
-    Don't use this when: You need cross-file or scope-aware analysis -> use a full
-    language server.
+    Use this when: surveying a name's uses in a file before a rename.
+    Don't use this when: you need references across files or by scope (use
+    a language server).
 
     Example:
         target="LRUCache"
@@ -1791,66 +1177,37 @@ def add_top_level(
     content: Annotated[
         str,
         Field(
-            description="Top-level source inserted as-is (function, class, "
-            "constant, or any statement), separated from existing code by a "
-            "blank line (two in a Python module when it or that code is a def "
-            "or class), or stacked at the bottom after one-line code stacked "
-            "with the code above it when it is one line too (not after imports, "
-            "unless it is one); its indentation steps become tabs in a Go file "
-            "or one indented with tabs; read_symbol's text of a nested symbol "
-            "(recognised by its closing line or a decorator) is moved to column "
-            "0 as a whole."
+            description="Top-level code, inserted as written; read_symbol's "
+            "text of a nested symbol is moved to column 0 as a whole."
         ),
     ],
     position: Annotated[
         str,
         Field(
-            description="'bottom' (default) appends at the end of the file (in a "
-            "header, inside its include guard); 'top' inserts after the "
-            "preamble (package, `#!` and magic comments, directives such as "
-            "'use strict', imports, includes, a header comment, Python module "
-            "docstring)."
+            description="'bottom' (default) at the end of the file; 'top' "
+            "after the preamble (package clause, `#!` and magic comments, "
+            "module docstring, directives such as 'use strict', imports and "
+            "includes). Other values are refused."
         ),
     ] = "bottom",
 ) -> str:
     """
-    Insert top-level content into the file: a function, class, constant, type
-    alias, or any other top-level statement. `position` controls placement:
+    Add top-level code (a function, class, constant or other statement) to
+    a source file. "bottom" appends it at the end, inside a header's include
+    guard; "top" puts it after the preamble, before the first declaration.
+    It is set apart by a blank line, two around a Python def or class, but
+    one-line code added at the bottom under stacked one-line code is
+    stacked too. In Go, or a file indented with tabs, its indentation
+    becomes tabs.
 
-      - "bottom" (default): append to end of file; in a C/C++ header whose
-                code is all inside an include guard, before its `#endif`.
-      - "top": insert after the preamble (a package clause, a `#!` line and
-               encoding or magic comments, the Python module docstring, a
-               JS/TS directive such as 'use strict' or a `///` line,
-               `#pragma once` and an include guard's `#define`, imports,
-               includes and a header comment set off by a blank line) and
-               before the first real declaration; a comment directly above
-               that declaration stays with it.
-
-    The content is separated from the code on each side by one blank line,
-    or two in a Python module when it or that code is a def or class (PEP
-    8); at the top, more blank lines the file had there stay below it. At
-    the bottom, one-line content after one-line code (a constant, a
-    prototype) that is stacked with the one-line code above it, without a
-    blank line, is stacked too, as insert_sibling stacks it; after imports,
-    includes or a package clause it gets the blank line, unless it is an
-    import or include itself. In a Go file,
-    or one indented with tabs, the content's indentation steps written in
-    spaces become tabs (multi-line string text, Ruby embedded documents
-    and the spaces that align a block comment's lines stay).
-
-    Use this when: You're adding any kind of top-level code. Use position="top"
-    when inserting multiple declarations at the top of a file without the
-    reverse-order problem of repeated `insert_sibling(position="before")` calls.
-    Don't use this when: You need placement relative to a specific symbol ->
-    use `insert_sibling`. You're adding to a class body -> use
-    `add_method` / `add_field`. You're adding a line inside an existing
-    function body -> use `insert_in_body` (`at="top"` / `at="bottom"`).
+    Use this when: adding a top-level symbol or statement.
+    Don't use this when: placing it next to a symbol (insert_sibling), in a
+    class (add_method, add_field), in a body (insert_in_body) or in a
+    config file (add_key).
 
     Example:
-        content="def parse_version(text):\\n    return tuple(int(x) for x in text.split('.'))"
-        content="class Logger:\\n    pass", position="top"
-        content="MAX_CONNECTIONS = 10", position="top"
+        content="MAX_CONNECTIONS = 10"
+        position="top"
     """
     if err := _validate_file(file_path):
         return err
@@ -1873,119 +1230,43 @@ def read_symbol(
     target: Annotated[
         str,
         Field(
-            description="Case-sensitive symbol name, dotted for nesting (e.g. "
-            "'LRUCache.get'; an overload with its parameter types, 'A.m(int)', "
-            "a C/C++ tag or TS type that shares its name with another symbol "
-            "after its keyword, 'struct stat', 'type User'), or a config key's "
-            "full key path from the top "
-            "level (e.g. 'project.version'; a key containing dots goes in "
-            "double quotes, '\"editor.fontSize\"', and TOML also takes single "
-            "quotes; keys inside YAML flow mappings and TOML inline tables "
-            "count, and a YAML key with no value reads as '')."
+            description="Symbol name as list_symbols lists it, dotted for "
+            "nesting ('LRUCache.get', 'A.m(int)'), or a config key path from "
+            "the top level ('project.version'; quote a key with dots, "
+            "'\"editor.fontSize\"')."
         ),
     ],
     depth: Annotated[
         str,
         Field(
-            description="'full' (default) returns the whole source, 'interface' a "
-            "class skeleton (members indented as in the class) or function "
-            "signature, 'signature' only the signature or class header; both "
-            "refuse other symbols (variables, constants, fields, type aliases), "
-            "and config files support only 'full'."
+            description="'full' (default) the whole symbol; 'interface' a "
+            "class skeleton or function signature; 'signature' the signature "
+            "or class header. Config files take only 'full'. Other values "
+            "are refused."
         ),
     ] = "full",
 ) -> str:
     """
-    Return source text for a single named symbol (function, class, method,
-    config key) without reading the entire file. Read-only.
+    Return the source of one symbol (function, class, method, variable) or
+    the value of a config key, without reading the whole file. Read-only.
+    "full" is the text replace_function and delete_symbol take: decorators,
+    a JS/TS `export`, a C++ `template <...>` header and code that only
+    wraps the symbol (a Go `type`, a closure's key, a C `typedef`)
+    included, a C/C++ class ending with its `;`. It starts at the symbol's
+    first byte, the later lines at their file indentation. "interface"
+    gives a class's header, fields and method signatures (bodies as
+    ` ...`), indented as in the class, or a function's signature;
+    "signature" the signature or class header alone, after decorators.
+    Both refuse a variable, constant, field, type alias or macro, saying
+    what it is. A name with a prototype or forward declaration reads as
+    its definition.
 
-    `depth` controls how much is returned:
-
-      - "full" (default): Entire source of the symbol, decorators, a JS/TS
-        `export` and a C++ `template <...>` header included; a C/C++ class,
-        struct, union or enum ends with the `;` after its `}`, and a Ruby
-        statement that opens a heredoc (`X = <<~EOS`) with the heredoc's
-        body. It is the code replace_function and delete_symbol take, so it
-        also shows the code that only wraps the symbol: a Go `type`, `var` or
-        `const` declaring only it (a type in a `type (...)` group is its spec
-        alone), the key of a closure in an object or composite literal
-        (`handler: () => {...}`, `RunE: func() error {...}`), a TS `declare`,
-        the C/C++ typedef or declaration a struct is the type of (`typedef
-        struct N {...} N;`), a Ruby `private def` and Sorbet `sig`, a TS
-        function's overload signatures and a Python function's @overload
-        stubs; and the `;` that ends a TS abstract method or JS/TS class
-        field. The text starts at the symbol's first byte, so
-        its later lines keep their indentation in the file; give it back to
-        replace_function, edited or not, as it is. A comment after the
-        symbol on its last line is not part of it (replace_function keeps
-        it). Typical savings: 10-20x
-        fewer tokens than reading the whole file.
-      - "interface": For a class (struct, interface, enum, module,
-        namespace) -> header + field declarations + method signatures with
-        bodies replaced by ' ...', each member indented as it is relative
-        to the class header (a nested class's own indentation removed) and
-        ending as written, with its `;` or `,`, and the closing brace (a TS
-        namespace's too, without a comment after it). For a function (a
-        closure too) -> just the signature. For a Go type -> its
-        declaration as "full" reads it and the signatures of its methods;
-        a Ruby method shows as its signature plus ' ...' (an empty or
-        endless one too).
-      - "signature": Signature-only. For a function -> the line(s) before
-        the body, from where "full" starts but after decorators and a JS/TS
-        `export` (for a JS/TS `const f = (x) => ...`, from its `const`; for
-        a closure, from its key, `handler: () =>`; for a C++ template
-        function, from its `template <...>` header; from a TS `declare`, a
-        C++ `extern "C"` and a Ruby `private`, but after a Sorbet `sig`; for
-        a Ruby endless method, up to its `=`; for a TS or Python overload
-        group, the implementation's;
-        for a method with no body, such as a TS abstract method, a C++
-        `A() = default;`, a C/C++ prototype or a method declared in its
-        class (`int f(int);`), its whole declaration without the `;`). For
-        a class -> the class header (`type A struct` for a Go struct,
-        `typedef struct N` for a C typedef of a struct, `typedef struct`
-        for one without a tag).
-
-    Both "interface" and "signature" refuse a symbol that is neither a
-    function nor a class (a variable, constant, field, type alias, macro or
-    C/C++ forward declaration such as `struct S;`), saying what it is; read
-    it with "full". A Go type without a struct or interface body (`type N
-    int`) has no signature, but its interface lists its methods.
-
-    Where a scope declares a name more than once, the target is its
-    definition: a C/C++ struct, class or function rather than its forward
-    declaration (`struct S;`) or prototype (also when they spell a
-    parameter type differently, `unsigned` and `unsigned int`), a variable
-    rather than its `extern` declaration, and one outside `#if`/`#ifdef`
-    blocks rather than one inside, wherever they are (in another block of
-    a reopened namespace too, and in a TS namespace merged with a class,
-    function or enum, which the name itself targets); a forward declaration,
-    prototype or `declare function` with no definition in the scope is
-    the target itself. C++ and Java overloads take their parameter types
-    (`A.m(int)`, `A.m()`, C++ `A::A(int)`, `A.get(int) const`), as declared
-    without names, defaults or attributes, and the bare name is refused
-    with the targets to use; a name a field, variable or macro shares with
-    functions is that symbol (the function takes its parentheses), and in
-    JS/TS a method or function wins over a class field or `var` of its
-    name. A C/C++ struct, union, enum or C++ class, or a TS type alias or
-    interface, that shares its name with another symbol is targeted with
-    its keyword (`struct stat`, `type User`, also before a dotted path,
-    `type N.User`), the plain name being the other symbol. A declaration of
-    several names (`int a, *b;`, Java `int x, y;`, C++ `auto [x, y] = p;`,
-    or a struct and a variable, `struct S {...} s;`) reads as the whole
-    declaration for each of them.
-
-    Use this when: You need to read a specific symbol without reading the
-    whole file. Pick the narrowest depth that contains what you need.
-    Don't use this when: You need a structural overview of the whole file
-    -> use `list_symbols`. You need to see the file's imports -> use
-    `read_imports`.
+    Use this when: reading one symbol; pick the narrowest depth.
+    Don't use this when: you need the file's outline (list_symbols) or its
+    imports (read_imports).
 
     Example:
-        target="LRUCache.get"                       # full method source
-        target="LRUCache", depth="interface"         # class skeleton
-        target="LRUCache.get", depth="signature"     # just the def line
-        target="project.version"                     # config value
-        target='"editor.fontSize"'                   # config key with dots
+        target="LRUCache", depth="interface"
     """
     if err := _validate_file(file_path):
         return err
@@ -2006,12 +1287,11 @@ def read_symbol(
 @mcp.tool(annotations=_READ_ONLY)
 def read_imports(file_path: FilePath) -> str:
     """
-    Return all import statements in a source file as a multi-line string. Read-only.
+    Return the import statements of a source file (imports, includes, Ruby
+    requires), without reading the rest. Read-only.
 
-    Use this when: You need to see a file's dependencies without reading the entire
-    file (e.g. before adding a new import, or to understand what a module uses).
-    Don't use this when: You want to add/remove imports -> use `add_import` /
-    `remove_import`.
+    Use this when: checking a file's dependencies, as before add_import.
+    Don't use this when: changing imports (add_import, remove_import).
 
     Example:
         file_path="/abs/path/to/module.py"
@@ -2038,89 +1318,44 @@ def edit_leading_comment(
     target: Annotated[
         str,
         Field(
-            description="Case-sensitive name of the symbol whose leading comment "
-            "to edit, dotted for nesting (e.g. 'LRUCache.get'), or a YAML/TOML "
-            "key's full key path from the top level (a key containing dots in "
-            "double quotes, '\"a.b\"'; a YAML key with no value works too, but a "
-            "key that does not start its line, inside a flow mapping or inline "
-            "table, is refused); a TOML [table] by its header's names (e.g. "
-            "'project', 'tool.uv') also works."
+            description="Symbol name as list_symbols lists it, dotted for "
+            "nesting ('LRUCache.get'), or a YAML/TOML key path from the top "
+            "level or TOML [table] name ('tool.uv')."
         ),
     ],
     op: Annotated[
         str,
         Field(
-            description="'add' inserts a new comment (refused if the symbol "
-            "already has one; the error quotes it so that a 'replace' can keep "
-            "lines such as lint or compiler directives), 'replace' swaps the "
-            "existing block (or inserts one if none), 'remove' deletes the block."
+            description="'add' inserts a comment, refused when the symbol has "
+            "one (the error quotes it: use 'replace' with a block that repeats "
+            "lines to keep, such as lint directives); 'replace' replaces the "
+            "block, or adds one; 'remove' deletes it. Other values are refused."
         ),
     ],
     comment: Annotated[
         str,
         Field(
-            description="Full comment text including its markers (e.g. '# note', "
-            "'// note', '/** ... */'), re-indented to the symbol (a Ruby "
-            "`=begin` ... `=end` block stays at column 0); required for "
-            "'add' and 'replace', ignored for 'remove'."
+            description="Comment text with its markers ('# note', '// note', "
+            "'/** ... */'); required for 'add' and 'replace', ignored for "
+            "'remove'."
         ),
     ] = "",
 ) -> str:
     """
-    Edit the contiguous leading-comment block above a named symbol. One tool
-    covering three operations on the same comment block. The block sits above
-    the symbol's decorators or annotations (TS method decorators too), a
-    JS/TS `export`, a C++ `template <...>` header, a Ruby Sorbet `sig` and
-    a TS function's overload signatures, so a new comment goes above the
-    first of them. A Ruby `=begin` ... `=end` document directly above a
-    method counts, alone or with `#` lines beside it. A symbol that other code comes before on its
-    line (`b` in `function a() {} function b() {}`) has no leading comment
-    of its own and is refused. A `#!`
-    line and encoding or magic comments at the top of a Python or Ruby file
-    are never part of it, nor is a line that starts with `#` or `//` inside
-    a multi-line string, template literal or YAML block scalar, nor a
-    comment line indented deeper than the symbol: it ends the code above
-    (a comment under the last line of the function before, or one inside
-    the YAML mapping above a top-level key), and the block stops there, so
-    "add" puts the new comment between the two. In YAML and
-    TOML the target is a key path (as for
-    `replace_value`) or a TOML [table]; a key inside a flow mapping or
-    inline table that does not start its line is refused, since the line
-    above it belongs to the key that line starts with.
+    Add, replace or remove the comment block directly above a symbol, its
+    doc comment. The block sits above the symbol's decorators, annotations,
+    `export` and C++ `template <...>` header, and a new comment goes there,
+    re-indented to the symbol. A comment indented deeper than the symbol
+    ends the code above and is not part of the block. A symbol that other
+    code comes before on its line is refused. In YAML and TOML the target
+    is a key path or a TOML [table]; JSON has no comments and is refused.
 
-    Supported values for `op`:
-      - "add":     Insert a new comment block above the symbol. Requires
-                   `comment`. Refused if the symbol already has a leading
-                   comment, which the new lines would merge into; the error
-                   quotes those lines -> use "replace" with a block that
-                   repeats any you want to keep (lint or compiler
-                   directives such as `// eslint-disable-next-line` or
-                   `//go:noinline`), or "remove" first.
-      - "replace": Replace the existing leading comment block with `comment`;
-                   if no leading comment exists, inserts one. Requires
-                   `comment`.
-      - "remove":  Delete the existing leading comment block. `comment` is
-                   ignored.
-
-    The comment must include the language's comment marker (`#` for
-    Python/Ruby/YAML/TOML, `//` or `/* ... */` for JS/TS/C/C++/Go/Java,
-    `/** ... */` Javadoc for Java). Supports multi-line C-style block
-    comments as a single contiguous run.
-
-    Use this when: You want to document, update, or delete a leading
-    comment on a function/class/method.
-    Don't use this when: You want a Python docstring (which lives inside
-    the function body) -> use `replace_docstring`. You want to edit text
-    inside the function body itself -> use `replace_in_body`.
+    Use this when: adding, rewriting or deleting a symbol's doc comment.
+    Don't use this when: writing a Python docstring (replace_docstring) or
+    a comment inside a body (insert_in_body, replace_in_body).
 
     Example:
-        target="LRUCache.get", op="add",
-        comment="    # Retrieve an item by key, returning None if absent"
-
-        target="LRUCache.get", op="replace",
-        comment="    # Retrieve an item from the cache"
-
-        target="LRUCache.get", op="remove"
+        target="LRUCache.get", op="add", comment="# Return the cached value."
     """
     if err := _validate_file(file_path):
         return err
@@ -2150,92 +1385,48 @@ def insert_sibling(
     target: Annotated[
         str,
         Field(
-            description="Case-sensitive name of the function, class, method, or "
-            "top-level assignment to insert next to, dotted for nesting (e.g. "
-            "'LRUCache')."
+            description="Symbol name as list_symbols lists it, dotted for "
+            "nesting (e.g. 'LRUCache', 'A.m')."
         ),
     ],
     content: Annotated[
         str,
         Field(
-            description="Source to insert, re-indented to the target's level (in "
-            "tabs where the file indents with them) and spaced as the target was "
-            "from its neighbour: one-line code stacked without blank lines stays "
-            "stacked, and a function, class or other code over several lines gets "
-            "at least a blank line (two around a top-level Python def or class)."
+            description="Code to insert, re-indented to the target's level "
+            "(in tabs where the file indents with them); read_symbol's text "
+            "goes in as a whole."
         ),
     ],
     position: Annotated[
         str,
-        Field(description="Where to insert relative to the target: 'before' or 'after'."),
+        Field(
+            description="'before' or 'after' the target; other values are "
+            "refused."
+        ),
     ],
 ) -> str:
     """
-    Insert content as a sibling of a named symbol (function, class, method,
-    or top-level assignment). Pass `position="before"` or `position="after"`.
-    "before" goes above the symbol's leading comment block (doc comment,
-    Javadoc, Godoc, a Ruby `=begin` document), decorators, a JS/TS `export`,
-    a Ruby Sorbet `sig` and TS overload signatures, so the comment stays
-    on the symbol it documents; a `#!` line and encoding or magic comments
-    at the top of a Python or Ruby file stay first. A C++ `template <...>`
-    header is part of the symbol, too, and "after" a C/C++ class, struct,
-    union or enum goes after the `;` that ends it.
+    Insert code next to a named symbol, at its level. "before" goes above
+    the symbol's leading comment, decorators and `export`; "after" below
+    the symbol (after the `;` that ends a C/C++ class). The code is spaced
+    like the gap it goes into: one-line code stacked without blank lines
+    stays stacked, and next to a function or class it gets at least one
+    blank line, two around a top-level Python def or class. A comment
+    indented deeper than the target ends the code above, so "before" goes
+    below it. "before" is refused when other code comes before the target
+    on its line, "after" when code follows it. Refused in JSON, YAML and
+    TOML files (use add_key).
 
-    The new code goes into the gap between the target and the symbol on
-    that side (that symbol's leading comment, decorators and `export`
-    included), and is spaced as that gap was. Next to a block (a function,
-    class or method, also one written on one line, or other code over
-    several lines) the gap is that one, or the usual one when that is
-    wider: one blank line, two at the top level of a Python module around a
-    def or class (PEP 8). Between one-line code (fields, constants,
-    prototypes) the gap toward the symbol on that side stays as it was, and
-    the new code goes against the target with the smallest gap the target
-    had to a one-line neighbour, the one on its other side counted up to
-    the usual gap; so code written without blank lines between stays
-    stacked (`int f(void);` and `int g(void);` with `int h(void);` between
-    them), and after the last field of a class or before its first, the
-    new field is stacked when the fields are. Next to a block target,
-    one-line code goes against the one-line symbol on its other side as
-    that symbol is spaced from its own one-line neighbour (a field before
-    the first method, below stacked fields, is stacked under them). The
-    end of a body or file, a C++ access label, and a comment above the new
-    code get no added blank lines,
-    except a comment indented deeper than the target: it ends the code above
-    it, is not the target's leading comment, and "before" goes below it
-    with the usual blank lines; "after" goes below such comment lines right
-    under the target, and below a block comment after it on its last line
-    that goes on over lines.
-    "before" is refused when other code comes before the target on its
-    first line, and "after" when other code follows it on its last line or
-    the line starts with the code the target is part of (`class A: x = 1`).
-    When the content is re-indented to the target's level, the lines that
-    start inside one of its multi-line string literals (a triple-quoted
-    string, template literal, heredoc, raw string) or a Ruby embedded
-    document (`=begin` ... `=end`, kept at column 0) keep their text; those
-    of a Python docstring, Ruby `<<~` heredoc or Java text block move with
-    the code. A symbol's read_symbol text (its first line without
-    indentation, the later lines at the indentation they had where it was
-    read) is indented as a whole, also when it holds several members (see
-    replace_function). Next to a target indented with tabs, and at the top
-    level of a Go file or one indented with tabs, the content's deeper
-    indentation is written in tabs, as add_method does.
-    Refused in JSON, YAML and TOML files (use add_key).
-
-    Use this when: You need precise placement relative to another top-level
-    symbol -- e.g. a helper function immediately before its caller, a
-    constant immediately above the class that uses it.
-    Don't use this when: You just want to append to the end of the file ->
-    use `add_top_level`. You're inserting inside a function body ->
-    use `insert_in_body` (with `at`, `after`, or `before`).
+    Use this when: placing code relative to a symbol, such as a helper
+    above its caller.
+    Don't use this when: appending at the end of the file (add_top_level),
+    or inserting into a body (insert_in_body) or a class (add_method,
+    add_field).
 
     Example:
         target="LRUCache"
         content="CACHE_SIZE = 100"
         position="before"
-
-        target="LRUCache"
-        content="RELATED_CONSTANT = 42"
-        position="after"
     """
     if err := _validate_file(file_path):
         return err

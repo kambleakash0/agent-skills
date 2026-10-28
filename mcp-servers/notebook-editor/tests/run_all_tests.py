@@ -1253,6 +1253,17 @@ def test_server_schema():
     check("schema: server version matches the installed package",
           server.mcp.version, importlib.metadata.version("notebook-editor-mcp"))
 
+    # Text budgets: what a client sends the model for each tool (name, description, input schema),
+    # the server instructions, and the prompt file users include in their CLAUDE.md (UTF-8 bytes)
+    model_facing = sum(
+        len(json.dumps({"name": t.name, "description": t.description or "", "input_schema": t.input_schema}))
+        for t in tools
+    )
+    check(f"schema: model-facing tool text ({model_facing} chars) is at most 20,000", model_facing <= 20_000, True)
+    check(f"schema: server instructions ({len(instructions)} chars) are at most 1,000", len(instructions) <= 1_000, True)
+    prompt_size = os.path.getsize(os.path.join(os.path.dirname(os.path.abspath(__file__)), "..", "NOTEBOOK-EDITOR.md"))
+    check(f"schema: NOTEBOOK-EDITOR.md ({prompt_size} bytes) is at most 3,200", prompt_size <= 3_200, True)
+
 
 # ──────────────────────────────────────────────
 # Main

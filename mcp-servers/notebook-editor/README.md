@@ -21,7 +21,7 @@ All tools require `file_path` to be an **absolute path**. Every tool except `cre
 
 | Tool | Parameters | Description |
 | :--- | :--- | :--- |
-| `create_notebook` | `file_path`, `kernel_name` (default `"python3"`), `kernel_display_name` (default `""` = same as `kernel_name`), `language` (default `"python"`), `overwrite` (default `False`) | Create a new empty `.ipynb` with a valid nbformat schema and kernelspec. Refuses to overwrite unless `overwrite=True`. |
+| `create_notebook` | `file_path`, `kernel_name` (default `"python3"`), `kernel_display_name` (default `""` = same as `kernel_name`), `language` (default `"python"`), `overwrite` (default `False`) | Create a new empty `.ipynb` with a valid nbformat schema and kernelspec (`language` goes into `kernelspec.language` and `language_info.name`). The parent directory must already exist. Refuses to overwrite unless `overwrite=True`. |
 
 ### Cell structure & navigation
 
@@ -32,7 +32,7 @@ All tools require `file_path` to be an **absolute path**. Every tool except `cre
 | `add_cell` | `file_path`, `index`, `source` (default `""`), `cell_type` (default `"code"`) | Insert a new cell at the given index. `cell_type` is `"code"`, `"markdown"`, or `"raw"`. Pass `index=-1` to append. |
 | `delete_cell` | `file_path`, `index` | Remove a cell by index. |
 | `move_cell` | `file_path`, `from_index`, `to_index` | Reorder: move a cell from one position to another. |
-| `split_cell` | `file_path`, `index`, `line_offset` | Split one cell into two at a line boundary. Outputs cleared on both halves. |
+| `split_cell` | `file_path`, `index`, `line_offset` | Split one cell into two at a line boundary: the cell keeps its first `line_offset` lines (counting from 0) and a new cell of the same type right after it gets the rest. `find_in_notebook` and `list_notebook_symbols` count lines from 1, so their line N is `line_offset=N-1`. Outputs cleared on both halves. |
 | `merge_cells` | `file_path`, `start_index`, `end_index` | Merge consecutive cells of the same type into one. Outputs cleared. |
 
 ### Cell content editing
@@ -47,26 +47,26 @@ All tools require `file_path` to be an **absolute path**. Every tool except `cre
 
 | Tool | Parameters | Description |
 | :--- | :--- | :--- |
-| `clear_outputs` | `file_path`, `index` (default `-1` = all code cells) | Clear outputs and execution_count on one code cell or all code cells. |
+| `clear_outputs` | `file_path`, `index` (default `-1` = all code cells) | Clear outputs and execution_count on one code cell or all code cells. Markdown and raw cells are left alone; naming one by `index` is refused. |
 | `clear_execution_counts` | `file_path` | Reset execution numbering across all code cells. Outputs preserved. |
-| `get_outputs` | `file_path`, `index` | Formatted text view of a code cell's outputs (streams, results, errors, display data). |
-| `set_cell_metadata` | `file_path`, `index`, `key`, `value` | Set a metadata key on a cell. Value parsed as JSON (supports bools, numbers, arrays, objects). |
+| `get_outputs` | `file_path`, `index` | Formatted text view of a code cell's stored outputs (streams, results, errors, display data). ANSI color codes are removed from the text; the file keeps them. A markdown or raw cell gets a note that it has no outputs. |
+| `set_cell_metadata` | `file_path`, `index`, `key`, `value` | Set a metadata key on a cell (for example `tags`, `collapsed`, `scrolled`, papermill parameters). Value parsed as JSON (supports bools, numbers, arrays, objects); a value that isn't JSON is stored as a string. |
 
 ### Discovery (read-only)
 
 | Tool | Parameters | Description |
 | :--- | :--- | :--- |
-| `list_notebook_symbols` | `file_path` | Walk all code cells, list Python symbols (functions, classes, methods, imports, top-level assignments) with cell index and line number. |
-| `find_in_notebook` | `file_path`, `pattern` | Case-sensitive substring search across all cell sources. |
+| `list_notebook_symbols` | `file_path` | Walk all code cells, list Python symbols (functions, classes, methods, imports, top-level assignments) with cell index and line number (counting from 1). |
+| `find_in_notebook` | `file_path`, `pattern` | Case-sensitive substring search across all cell sources. Each match comes back as `cell[i] line N (type): <text>`, N counting from 1. |
 
 ### Kernel execution
 
 | Tool | Parameters | Description |
 | :--- | :--- | :--- |
-| `execute_cell` | `file_path`, `index`, `timeout` (default `60.0` seconds) | Execute a code cell using the notebook's Jupyter kernel (from `metadata.kernelspec.name`). Captures outputs and writes them back to the file. A cell still running at `timeout` is interrupted and an error is returned. |
-| `execute_all_cells` | `file_path`, `timeout` (default `60.0` seconds per cell), `stop_on_error` (default `True`) | Execute all code cells in order. Returns a summary of executed/errored/stopped counts. A cell still running at `timeout` is interrupted and the run stops with an error. |
+| `execute_cell` | `file_path`, `index`, `timeout` (default `60.0` seconds) | Execute a code cell using the notebook's Jupyter kernel (from `metadata.kernelspec.name`); markdown and raw cells are refused. Captures outputs (streams, results, errors, display data), writes them back to the file, and returns them. A cell still running at `timeout` is interrupted and an error is returned. |
+| `execute_all_cells` | `file_path`, `timeout` (default `60.0` seconds per cell), `stop_on_error` (default `True`) | Execute all non-empty code cells in order. Returns a summary of executed/errored/stopped counts. A cell still running at `timeout` is interrupted and the run stops with an error. After a timeout or a kernel death, no outputs from the run are saved to the file, although the cells before it did run (with a timeout, the kernel keeps the state they built). |
 | `get_kernel_state` | `file_path` | Report whether the notebook's kernel is `not started`, `alive`, or `dead`. |
-| `restart_kernel` | `file_path` | Restart the kernel. All in-memory state is lost. |
+| `restart_kernel` | `file_path` | Restart the kernel. All in-memory state is lost; outputs in the file stay until cells are re-run. |
 | `interrupt_kernel` | `file_path` | Interrupt the running cell (SIGINT or the kernel's interrupt message; a KeyboardInterrupt in Python). Stops a long-running or stuck cell. Returns an error saying the kernel is not running if its process has died. |
 | `shutdown_kernel` | `file_path` | Shut down the kernel and release resources. |
 
@@ -114,6 +114,8 @@ All tools require `file_path` to be an **absolute path**. Every tool except `cre
 | Rewrite a cell's whole source | `replace_cell_source` |
 | Add lines to the top of a cell | `prepend_to_cell` |
 | Add lines to the bottom of a cell | `append_to_cell` |
+
+For AST-level Python edits inside cells, convert the notebook to a `.py` file with [`jupytext`](https://jupytext.readthedocs.io/), edit it with ast-editor, and convert it back.
 
 ### Managing outputs and metadata
 

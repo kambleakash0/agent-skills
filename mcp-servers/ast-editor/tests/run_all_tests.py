@@ -3087,6 +3087,7 @@ def test_tool_schemas():
     print("\n═══ MCP tool schemas & server metadata ═══")
 
     import asyncio
+    import json
     from importlib.metadata import version as _pkg_version
 
     from ast_editor.server import mcp
@@ -3126,8 +3127,36 @@ def test_tool_schemas():
     # users include as well, so they stay short.
     size = len(mcp.instructions or "")
     check(
-        "schema: server instructions are at most 1500 characters",
-        "PASS" if size <= 1500 else f"FAIL: {size} characters",
+        "schema: server instructions are at most 1000 characters",
+        "PASS" if size <= 1000 else f"FAIL: {size} characters",
+        "PASS",
+    )
+    # What a client sends the model for each tool: its name, description and
+    # input schema, as JSON. Every character costs tokens on every request.
+    facing = sum(
+        len(
+            json.dumps(
+                {
+                    "name": t.name,
+                    "description": t.description or "",
+                    "input_schema": t.input_schema,
+                }
+            )
+        )
+        for t in tools
+    )
+    check(
+        "schema: model-facing tool text is at most 40000 characters",
+        "PASS" if facing <= 40000 else f"FAIL: {facing} characters",
+        "PASS",
+    )
+    # AST-EDITOR.md is the short guide many users load into every session;
+    # the README is the full reference.
+    with open(os.path.join(TESTS_DIR, "..", "AST-EDITOR.md"), encoding="utf-8") as f:
+        guide_size = len(f.read())
+    check(
+        "schema: AST-EDITOR.md is at most 5000 characters",
+        "PASS" if guide_size <= 5000 else f"FAIL: {guide_size} characters",
         "PASS",
     )
     for phrase in ("list_symbols", "replace_in_body", "parse-checked", "normal edit tool", '"editor.fontSize"'):
