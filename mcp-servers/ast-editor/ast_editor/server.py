@@ -17,27 +17,30 @@ logger = logging.getLogger("ast-editor")
 # Condensed form of AST-EDITOR.md, sent to clients as MCP server instructions.
 _INSTRUCTIONS = (
     "AST-targeted edits for .py .js .ts .c .cpp .rb .go .java .json .yaml "
-    ".toml files: you name a target and the server finds it, so prefer these "
-    "tools over text edits there. file_path must be absolute.\n\n"
+    ".toml files: prefer these tools over text edits there. file_path must "
+    "be absolute.\n\n"
     "Source files: call list_symbols first for exact, case-sensitive names "
     "(Class.method), read_symbol to read one symbol (replace_function takes "
-    "its text back as is), find_references before a rename. Config files: a target is the key path from the top level "
-    "(project.version); quote a key that contains dots (\"editor.fontSize\").\n\n"
+    "its text back as is), find_references before a rename. Overloads take "
+    "parameter types (A.m(int)); a struct or TS type sharing its name takes "
+    "its keyword (struct stat, type User). Config files: a target is the key "
+    "path from the top level (project.version); quote a key that contains "
+    "dots (\"editor.fontSize\").\n\n"
     "Use the narrowest tool: replace_in_body, insert_in_body or "
-    "delete_in_body for a few lines (snippets must match exactly, once) "
-    "rather than replace_function or replace_function_body; "
-    "add_parameter/remove_parameter rather than replace_signature for one "
-    "parameter; add_key for a new key, replace_value for an existing one; "
-    "add_import_name to extend an existing import. Decorators, a JS/TS "
-    "export and a C++ template <...> header belong to their symbol.\n\n"
+    "delete_in_body for a few lines (exact, unique snippets) rather than "
+    "replace_function or replace_function_body; add_parameter/remove_parameter "
+    "rather than replace_signature for one parameter; add_key for a new key, "
+    "replace_value for an existing one; add_import_name to extend an existing "
+    "import. Decorators, an export and a C++ template header belong to their "
+    "symbol.\n\n"
     "Every edit is parse-checked: one that would add a syntax error is "
-    "refused with its line and column, and the file is left unchanged. Fix "
-    "the content and retry; if the code is valid but the parser does not "
-    "support it, make that edit with your normal edit tool. Line endings and "
-    "a UTF-8 byte order mark are kept; write \\n.\n\n"
-    "Escape hatches: to delete several symbols, call delete_symbol once per "
-    "symbol; use your normal edit tool for arbitrary sub-expression changes "
-    "and your write tool for whole-file rewrites."
+    "refused with its line and column, the file unchanged. Fix the content, "
+    "or if the code is valid but the parser does not support it, use your "
+    "normal edit tool. Line endings, a BOM and a missing final newline are "
+    "kept; write \\n.\n\n"
+    "Escape hatches: call delete_symbol once per symbol; use your normal "
+    "edit tool for arbitrary sub-expression changes and your write tool for "
+    "whole-file rewrites."
 )
 
 
@@ -73,12 +76,15 @@ FunctionTarget = Annotated[
     str,
     Field(
         description="Case-sensitive function or method name, dotted for nested "
-        "symbols (e.g. 'LRUCache.get'); call list_symbols for exact names. A "
-        "JS/TS const/let/var bound to an arrow function or function expression "
-        "is a function too; the body tools need a `{ }` body, so they refuse "
-        "an arrow function whose body is an expression. C++ destructors and "
-        "operators go by the names list_symbols gives them ('A.~A', "
-        "'A.operator==')."
+        "symbols (e.g. 'LRUCache.get'); call list_symbols for exact names. C, "
+        "C++ and Java overloads take their parameter types ('A.m(int, "
+        "String)', 'A.m()', C++ 'A.get(int) const'), a C++ definition outside "
+        "its class its qualified name ('A::f'). A JS/TS const/let/var bound to "
+        "an arrow function or function expression, and a Go var bound to a "
+        "func literal, is a function too; the body tools need a `{ }` body, so "
+        "they refuse an arrow function whose body is an expression. C++ "
+        "destructors and operators go by the names list_symbols gives them "
+        "('A.~A', 'A.operator==')."
     ),
 ]
 ClassTarget = Annotated[
@@ -86,9 +92,11 @@ ClassTarget = Annotated[
     Field(
         description="Case-sensitive name of the class (TS abstract classes "
         "too, or a TS interface, C/C++ struct or typedef of one, Go struct "
-        "type) to add to, dotted for nested classes ('A.B'); an "
-        "anonymous JS/TS `export default class` is 'default'. A TS enum or "
-        "type alias is refused."
+        "type) to add to, dotted for nested classes ('A.B'); only containers "
+        "count, so 'stat' is `struct stat` beside a function `stat` ('struct "
+        "stat' works too), and a typedef of a struct declared apart is that "
+        "struct. An anonymous JS/TS `export default class` is 'default'. A "
+        "function, TS enum or type alias is refused."
     ),
 ]
 BodySnippet = Annotated[
@@ -161,7 +169,10 @@ def replace_function(
     wraps the symbol: a Go `type`, `var` or `const` declaring only it, the
     key of a closure in an object or composite literal (`handler: () =>
     {...}`), a TS `declare`, the C/C++ typedef or declaration a struct is
-    the type of (`typedef struct N {...} N;`) and a Ruby `private def`.
+    the type of (`typedef struct N {...} N;`), a Ruby `private def` and the
+    Sorbet `sig` above a method, and a TS function's overload signatures and
+    a Python function's @overload stubs. Refused in JSON, YAML and TOML
+    files, whose keys replace_value edits.
 
     Content written as read_symbol shows the symbol (its first line without
     indentation, the later lines at their indentation in the file) goes in
@@ -178,7 +189,8 @@ def replace_function(
     only before its first line of code: relative content for a class whose
     methods are decorated is re-indented. At column 0 the three shapes are
     one, and content goes in as written. A `;` or `,` after the symbol
-    stays unless the content ends with it, and so does a comment after it
+    stays unless the content ends with it (a JS/TS class field's `;` goes
+    when the content is a method), and so does a comment after it
     on its last line (`int x;  // the x`) unless the content ends with a
     comment of its own. A name declared together with others (`int a = 1,
     b = 2;`, `struct S {...} s;`) has that whole declaration replaced, as
@@ -233,13 +245,15 @@ def replace_function_body(
     """
     Replace only the body of a function, preserving its signature and decorators.
     A body written on one line with its signature or braces (`function f() {
-    return 1; }`, `def f(): return 1`) is rebuilt over lines of its own. A
-    Ruby endless method (`def f = x`) has no body and is refused. The lines
-    that start inside a multi-line string literal of `content` (a
-    triple-quoted string, template literal, heredoc, raw string) or a Ruby
-    embedded document (`=begin` ... `=end`, kept at column 0) keep their
-    text when the rest is re-indented; those of a Python docstring, Ruby
-    `<<~` heredoc or Java text block move with the code.
+    return 1; }`, `def f(): return 1`) is rebuilt over lines of its own,
+    and content for an empty body (`{` and `}` on lines of their own) goes
+    one indentation level deeper than the function. A Ruby endless method
+    (`def f = x`) has no body and is refused. The lines that start inside a
+    multi-line string literal of `content` (a triple-quoted string, template
+    literal, heredoc, raw string) or a Ruby embedded document (`=begin` ...
+    `=end`, kept at column 0) keep their text when the rest is re-indented;
+    those of a Python docstring, Ruby `<<~` heredoc or Java text block move
+    with the code.
 
     Use this when: You're changing the implementation while keeping the interface stable.
     Don't use this when: You're also changing parameters or return type -> use
@@ -502,7 +516,10 @@ def add_method(
     another class (its first line without indentation, the later lines at
     the indentation they had there) is indented as a whole, like content
     written relative to its first line; a Python def with no decorator only
-    when it was read at the indentation of this class's members.
+    when it was read at the indentation of this class's members. The class
+    is found among the containers of its name only (`struct stat` beside a
+    function `stat`), and a function target is refused (insert_in_body adds
+    to a body). A C++ member template counts as a method for the spacing.
 
     Use this when: You're adding a method to an existing class.
     Don't use this when: You're adding a field/attribute -> use `add_field`. You're
@@ -533,8 +550,10 @@ def delete_symbol(
     target: Annotated[
         str,
         Field(
-            description="Case-sensitive name of the function, method, or class to "
-            "delete, dotted for nested symbols (e.g. 'LRUCache.old_method')."
+            description="Case-sensitive name of the function, method, class or "
+            "other symbol to delete, dotted for nested symbols (e.g. "
+            "'LRUCache.old_method'), as list_symbols lists it ('A.m(int)', "
+            "'struct stat')."
         ),
     ],
     include_leading_comments: Annotated[
@@ -555,7 +574,12 @@ def delete_symbol(
     `include_leading_comments=False` to leave that comment in place. The
     block ends at a blank line and at a comment line indented deeper than
     the symbol, which ends the code above it (`    # end of f` under the
-    last line of f's body stays when the def below f is deleted).
+    last line of f's body stays when the def below f is deleted): such
+    comment lines right below the deleted symbol go with it. A Ruby `=begin`
+    ... `=end` document directly above a method is its leading comment, and
+    a Sorbet `sig` is part of the method; a TS function's overload
+    signatures and a Python function's @overload stubs go with it. Refused
+    in JSON, YAML and TOML files (use delete_key).
 
     The blank lines that separated the symbol go with it, so the rest keeps
     the file's spacing: no blank lines are left at the top of the file or
@@ -618,7 +642,8 @@ def replace_value(
             "'DictName.keyExpr' for a Python module-level dict (e.g. "
             "'CONFIG.\"timeout\"'), or 'VarName.key' for a JS/TS module-level "
             "object literal; Python and JS/TS paths may continue into nested "
-            "literals."
+            "literals. In source files also a variable, constant, field or "
+            "macro by its name ('MAX', 'A.x', 'N')."
         ),
     ],
     content: LiteralValue,
@@ -628,6 +653,21 @@ def replace_value(
     entry in a Python module-level dict literal or JS/TS module-level object
     literal (same target forms as `delete_key`). A JS/TS shorthand `{ key }`
     becomes `key: <content>`.
+
+    In a source file, a variable, constant, field or macro has only its
+    value replaced: a Python module variable or class attribute (`X = 1`,
+    `X: int = 1`), a JS/TS `const`/`let`/`var` (each name of `let a = 1, b =
+    2` alone) or class field (`A.x`), a Go `var`/`const`, a C/C++ global,
+    field or static member (`int x(1);` and `int y{1};` keep their
+    delimiters) or a macro's text (`#define N 3`), a Java field and a Ruby
+    constant or local (a heredoc's body too). A declaration without a value
+    gets one (`let x;` becomes `let x = 2;`, `X: int` becomes `X: int = 2`,
+    `int g;` becomes `int g = 2;`). Refused: a function, class or type
+    (rewrite it with replace_function), a name that shares one value with
+    others (`a = b = 1`, Go `var c, d = f()`), and a declaration that cannot
+    have a value of its own (an `extern` one, TS `declare`, an abstract
+    field, a C struct's field, Go `var e, g int`, a Go constant without a
+    value that the constants below it repeat).
 
     Config targets are key paths from the top level, one key per dot; put a
     key that contains dots in double quotes ('"editor.fontSize"',
@@ -687,7 +727,14 @@ def add_import(
 ) -> str:
     """
     Add an import statement to a source file. Skips exact duplicates. Places new
-    imports after existing ones, or at the top of the file if none exist.
+    imports on the line after the last existing one (a C/C++ `#include` right
+    after the last include, a conditional that only includes counting as
+    one; a JS CommonJS `require` counts as an import). A first import goes
+    after the file's preamble: a package clause, a `#!` line and encoding or
+    magic comments, the module docstring, a JS/TS directive ('use strict')
+    or `///` line, `#pragma once`, an include guard's `#define`, and a
+    header comment set off from the code by a blank line; a blank line goes
+    above it and one below it (two before a Python def or class).
 
     Use this when: You need to import something the file does not already reference.
     Don't use this when: You're adding a single name to an existing multi-name
@@ -991,7 +1038,8 @@ def remove_from_array(
     removed one shares its line with the `]`) stay where they are. The
     array's trailing-comma style is kept: removing the last element when it
     has no comma after it also removes the comma before it. Removing the
-    only element leaves `[]`.
+    only element leaves `[]`, also in a YAML block sequence (`key: []`,
+    before a comment on the key's line).
 
     Use this when: You want to remove a specific item from a list.
     Don't use this when: You want to remove a whole key -> use `delete_key`.
@@ -1033,19 +1081,23 @@ def add_field(
             description="Literal field or member declaration (e.g. 'version = "
             "\"1.0\"' or Go 'version int'), re-indented like the class's "
             "existing members and inserted before the first of them (after a "
-            "Python class docstring or a Java enum's constants), with no "
-            "auto-wrapping."
+            "Python class docstring or a Java enum's constants, below the "
+            "access label a C++ class opens with), with no auto-wrapping."
         ),
     ],
 ) -> str:
     """
     Add a field/attribute/member at the top of a class body (fields-before-methods
     convention): before the first member, after a Python class docstring or
-    a Java enum's constants (adding the `;` they need). Indented like
+    a Java enum's constants (adding the `;` they need), and below the access
+    label a C++ class or struct opens with (`public:`), so that the field
+    gets that section's access. The class is found as for add_method
+    (containers only; a function is refused). Indented like
     add_method (multi-line string literals and Ruby embedded documents keep
     their text, and read_symbol's text from another class is indented as a
-    whole), with a blank line after it when the member below is a method;
-    comments after the `{` on its line stay there.
+    whole), with a blank line after it when the member below is a method
+    (a C++ member template too); comments after the `{` on its line stay
+    there.
 
     Use this when: You're adding a class attribute (Python), class field (JS/TS),
     or member variable (C++).
@@ -1110,7 +1162,16 @@ def replace_signature(
     For a JS/TS function bound to a name (`const f = (a) => {...}`), a
     new_signature starting with const/let/var, as read_symbol returns it,
     replaces the declaration from there (an `export` stays); one without
-    (`async (a, b) =>`) replaces only the function's own part.
+    (`async (a, b) =>`) replaces only the function's own part. The other
+    code that read_symbol's signature starts with goes the same way: a
+    new_signature that starts with its own replaces it, and one that does
+    not keeps it. That is a closure's key (`handler: (a) =>`, which may
+    rename it, or `(a) =>`), a Go `type` or `var` (`var y = func()`), a TS
+    `declare`, a C++ `extern "C"`, a C/C++ `typedef` (`typedef struct P`),
+    a Ruby `private` (`protected def m(x)`, or `def m(x, y)`) and a Ruby
+    Sorbet `sig` (one that starts with `sig` replaces it). A TS overload
+    group and a Python @overload group have the implementation's signature
+    replaced, and a Ruby endless method keeps its `= expression`.
 
     A method declared without a body (a TS abstract method, a Java interface
     or abstract method, a C++ `A() = default;`, a Go function without one,
@@ -1159,17 +1220,32 @@ def list_symbols(file_path: FilePath) -> str:
     classes and other declarations, and the members of each class, nested
     classes and their members included (`class A.B`, then `method A.B.m`
     indented under it), and of namespaces and modules. Read-only. Each line
-    is `<kind> <name> (line N)`, the name being the symbol's target, and
-    every listed name is a valid target for the other tools, except a TS
-    name that a type and a value share in one scope (`const User` and `type
-    User`), which they refuse as ambiguous. A symbol's line is that of its
-    first decorator or `export`. JS/TS exported declarations are listed
-    under their own names, an anonymous `export default function/class` as
-    `default`. In JS/TS, generator functions and a `const`/`let`/`var` that
-    declares one name bound to an arrow function or function expression are
-    listed as `function`, TS abstract classes as `class` (abstract methods
-    among their methods, an overloaded one once), enums, type aliases,
-    interfaces and namespaces (`namespace N {}`, `module N {}`) as `enum`,
+    is `<kind> <name> (line N)`, the name being the symbol's target. In C,
+    C++, Java, JS and TS every entry is listed under the target that finds
+    it at the listed line: C++ and Java overloads with their parameter
+    types (`method A.m(int) (line 2)`, `method A.get(int) const (line 8)`),
+    a method beside a field of its name with them too (`method A.size()`),
+    and a C/C++ struct, union, enum or C++ class, or a TS type alias or
+    interface, that shares its name with another symbol after its keyword,
+    which the line then shows twice (`struct struct stat (line 1)`, `type
+    type User (line 2)`); an entry that no target reaches is left out (a TS
+    setter beside its getter, a JS/TS class field or `var` beside a
+    function of its name, which the name targets). In Python and Ruby a
+    name defined again (a redefinition, a @property setter, a reopened Ruby
+    class) is listed again, and the name targets the first. A symbol's line
+    is that of its first decorator, `export` or Ruby Sorbet `sig`, and of
+    its first TS overload signature or Python @overload stub. Data is
+    listed in every language: a Python module variable (`variable`) and
+    class attribute (`field`) at its first assignment, a JS/TS `const`
+    (`constant`), `let` or `var` (`variable`), each name of it, and class
+    field (`field`), a Ruby constant (`constant`) and local (`variable`);
+    names that a pattern binds (`a, b = 1, 2`, `const {a} = o`) are not
+    listed. JS/TS exported declarations are listed under their own names,
+    an anonymous `export default function/class` as `default`. In JS/TS,
+    generator functions and each name of a `const`/`let`/`var` bound to an
+    arrow function or function expression are listed as `function`, TS
+    abstract classes as `class` (abstract methods among their methods),
+    enums, type aliases, interfaces and namespaces (`namespace N {}`, `module N {}`) as `enum`,
     `type`, `interface` and `namespace`, what `declare` declares like the
     rest, and a function declared without a body (`declare function f():
     void;`, an overload signature) as `function`. In C and C++, structs,
@@ -1183,24 +1259,29 @@ def list_symbols(file_path: FilePath) -> str:
     that a scope also declares only to announce it (a forward declaration
     `struct S;`, a prototype, an `extern` variable, a TS overload signature)
     is listed once, at its definition when the scope has one, which is
-    also what the tools target; of alternative definitions in `#ifdef` and
-    `#else` branches, the first is. A C++ or TS namespace opened more than
+    also what the tools target; of definitions in `#if`/`#ifdef` blocks, one
+    outside them wins (over a copy in `#if 0`), and of alternatives in
+    `#ifdef` and `#else` branches the first; repeated identical
+    declarations are listed once. A C++ or TS namespace opened more than
     once in a scope is listed once, with the members of all its blocks, and
     a TS namespace merged with the class, function or enum of its name lists
     its members under that declaration. C++ template functions and classes, and
     member templates, are listed as what they declare, at the line of their
     `template <...>` header; a definition outside its class (`int A::f()`,
-    `template <typename T> T Box<T>::get()`) is a function under its own
-    name (`f`), and destructors and operators are named as written, spaces
-    left out (`~A`, `operator==`, `operator()`, `operator bool`; target them
-    as `A.~A`, `A.operator==`). Java fields (interface constants too) are
-    listed as `field`; a field that shares its name with a method (`int
-    size;` and `int size()`) is left out, as the name targets the method.
-    Ruby methods include `private def` ones and those in `class << self`.
-    Go lists types (a type alias `type T = int` as `type`) with their
-    methods, then each name a `var` or `const` declares (`variable`,
-    `constant`), then functions. Python class attributes, JS/TS
-    `const`/`let`/`var` values and Ruby constants are not listed.
+    `template <typename T> T Box<T>::get()`) is a function under its
+    qualified name (`A::f`, `Box::get`, `A::A`), a class or namespace
+    declared with its scope (`struct A::B {...}`, `namespace a::b {}`) is
+    listed under that name, and destructors and operators are named as
+    written, spaces left out (`~A`, `operator==`, `operator()`, `operator
+    bool`; target them as `A.~A`, `A.operator==`). Java fields (interface
+    constants too) are listed as `field`, also one that shares its name
+    with a method (`int size;` and `int size()`), which the name targets
+    (the method is `A.size()`); a nested class whose name a field takes is
+    left out, its members listed (`A.B.m`). Ruby methods include `private
+    def` ones and those in `class << self`. Go lists types (a type alias
+    `type T = int` as `type`) with their methods, then each name a `var` or
+    `const` declares (`variable`, `constant`; a `var` bound to a func
+    literal too), then functions.
 
     Use this when: You're about to edit an unfamiliar file and want to see its
     structure and exact symbol names. ALWAYS a good first call before editing --
@@ -1354,6 +1435,14 @@ def add_parameter(
     the comments on lines of their own right before it. Comments are not
     parameters and stay on their lines. Other lists, with two parameters on
     a line (`def f(a, b,\\n      c):`), get the parameter inline (`a, b, c`).
+    An empty list whose `)` is on a line below its `(` gets the parameter on
+    a line of its own, one indentation unit deeper than the `(` line, with
+    a trailing comma in Go, none in C, C++, Java and Ruby, and in Python,
+    JS and TS one when most of the file's lists written one per line have
+    one (or it has none). A name the function already has is refused
+    (`Parameter 'a' already exists in 'f'`), compared by the names the
+    parameters declare (`*args`, `{a, b}`, Go `a, b int`); several `_` are
+    fine in Go, Java and Ruby.
 
     Use this when: You need to add one or two parameters without retyping the whole
     signature.
@@ -1409,9 +1498,14 @@ def remove_parameter(
     removing `a` from `func f(a, b int)` gives `func f(b int)`, removing `b`
     gives `func f(a int)`; the comments of the other names stay with them,
     the type moving up to the name before a last one that had a line of its
-    own. A Go parameter written as a type only (`int`)
-    has no name to remove, and the receiver and named results are not
-    parameters.
+    own (a comment after the comma before it stays). A Go parameter written
+    as a type only (`int`) has no name to remove, and the receiver and
+    named results are not parameters. A name that a JS/TS or Ruby
+    destructuring parameter binds goes alone: `function f({a: x, b})` minus
+    x is `function f({b})`; in an array or Ruby pattern, which binds by
+    position, an earlier name leaves a hole or `_` (`[a, b]` minus a is
+    `[, b]`, Ruby `(a, b)` minus a is `(_, b)`), and the parameter goes with
+    its last name. A key (`a` of `{a: x}`) is no name.
 
     Use this when: You need to remove one parameter without retyping the whole
     signature.
@@ -1504,8 +1598,9 @@ def find_references(
 ) -> str:
     """
     Return all occurrences of an identifier named `target` in a source file, as
-    'line N: <source line>'. Read-only, syntactic only (no scope awareness), so
-    results may include unrelated identifiers that happen to share the same name.
+    'line N: <source line>', in file order (by line, then column).
+    Read-only, syntactic only (no scope awareness), so results may include
+    unrelated identifiers that happen to share the same name.
     C++ destructors and operators are found by the names list_symbols gives
     them (`~A`, `operator==`, `operator bool`), whatever the spacing in the
     file.
@@ -1540,16 +1635,19 @@ def add_top_level(
         Field(
             description="Top-level source inserted as-is (function, class, "
             "constant, or any statement), separated from existing code by a "
-            "blank line; read_symbol's text of a nested symbol (recognised by "
+            "blank line (two in a Python module when it or that code is a def "
+            "or class); read_symbol's text of a nested symbol (recognised by "
             "its closing line or a decorator) is moved to column 0 as a whole."
         ),
     ],
     position: Annotated[
         str,
         Field(
-            description="'bottom' (default) appends at the end of the file; 'top' "
-            "inserts after the preamble (package, imports, includes, leading "
-            "comments, Python module docstring)."
+            description="'bottom' (default) appends at the end of the file (in a "
+            "header, inside its include guard); 'top' inserts after the "
+            "preamble (package, `#!` and magic comments, directives such as "
+            "'use strict', imports, includes, a header comment, Python module "
+            "docstring)."
         ),
     ] = "bottom",
 ) -> str:
@@ -1557,10 +1655,19 @@ def add_top_level(
     Insert top-level content into the file: a function, class, constant, type
     alias, or any other top-level statement. `position` controls placement:
 
-      - "bottom" (default): append to end of file.
-      - "top": insert after the preamble (package/imports/includes/leading
-               comments, plus the Python module docstring if present) and
-               before the first real declaration.
+      - "bottom" (default): append to end of file; in a C/C++ header whose
+                code is all inside an include guard, before its `#endif`.
+      - "top": insert after the preamble (a package clause, a `#!` line and
+               encoding or magic comments, the Python module docstring, a
+               JS/TS directive such as 'use strict' or a `///` line,
+               `#pragma once` and an include guard's `#define`, imports,
+               includes and a header comment set off by a blank line) and
+               before the first real declaration; a comment directly above
+               that declaration stays with it.
+
+    The content is separated from the code on each side by one blank line,
+    or two in a Python module when it or that code is a def or class (PEP
+    8); at the top, more blank lines the file had there stay below it.
 
     Use this when: You're adding any kind of top-level code. Use position="top"
     when inserting multiple declarations at the top of a file without the
@@ -1597,7 +1704,10 @@ def read_symbol(
         str,
         Field(
             description="Case-sensitive symbol name, dotted for nesting (e.g. "
-            "'LRUCache.get'), or a config key's full key path from the top "
+            "'LRUCache.get'; an overload with its parameter types, 'A.m(int)', "
+            "a C/C++ tag or TS type that shares its name with another symbol "
+            "after its keyword, 'struct stat', 'type User'), or a config key's "
+            "full key path from the top "
             "level (e.g. 'project.version'; a key containing dots goes in "
             "double quotes, '\"editor.fontSize\"', and TOML also takes single "
             "quotes; keys inside YAML flow mappings and TOML inline tables "
@@ -1631,8 +1741,10 @@ def read_symbol(
         alone), the key of a closure in an object or composite literal
         (`handler: () => {...}`, `RunE: func() error {...}`), a TS `declare`,
         the C/C++ typedef or declaration a struct is the type of (`typedef
-        struct N {...} N;`) and a Ruby `private def`; and the `;` that ends a
-        TS abstract method. The text starts at the symbol's first byte, so
+        struct N {...} N;`), a Ruby `private def` and Sorbet `sig`, a TS
+        function's overload signatures and a Python function's @overload
+        stubs; and the `;` that ends a TS abstract method or JS/TS class
+        field. The text starts at the symbol's first byte, so
         its later lines keep their indentation in the file; give it back to
         replace_function, edited or not, as it is. A comment after the
         symbol on its last line is not part of it (replace_function keeps
@@ -1642,16 +1754,26 @@ def read_symbol(
         namespace) -> header + field declarations + method signatures with
         bodies replaced by ' ...', each member indented as it is relative
         to the class header (a nested class's own indentation removed) and
-        ending as written, with its `;` or `,`. For a function -> just the
-        signature. For a Go type -> its declaration and the signatures of
-        its methods.
+        ending as written, with its `;` or `,`, and the closing brace (a TS
+        namespace's too, without a comment after it). For a function (a
+        closure too) -> just the signature. For a Go type -> its
+        declaration as "full" reads it and the signatures of its methods;
+        a Ruby method shows as its signature plus ' ...' (an empty or
+        endless one too).
       - "signature": Signature-only. For a function -> the line(s) before
-        the body (for a JS/TS `const f = (x) => ...`, from its `const`; for
-        a C++ template function, from its `template <...>` header;
+        the body, from where "full" starts but after decorators and a JS/TS
+        `export` (for a JS/TS `const f = (x) => ...`, from its `const`; for
+        a closure, from its key, `handler: () =>`; for a C++ template
+        function, from its `template <...>` header; from a TS `declare`, a
+        C++ `extern "C"` and a Ruby `private`, but after a Sorbet `sig`; for
+        a Ruby endless method, up to its `=`; for a TS or Python overload
+        group, the implementation's;
         for a method with no body, such as a TS abstract method, a C++
         `A() = default;`, a C/C++ prototype or a method declared in its
         class (`int f(int);`), its whole declaration without the `;`). For
-        a class -> the class header (`type A struct` for a Go struct).
+        a class -> the class header (`type A struct` for a Go struct,
+        `typedef struct N` for a C typedef of a struct, `typedef struct`
+        for one without a tag).
 
     Both "interface" and "signature" refuse a symbol that is neither a
     function nor a class (a variable, constant, field, type alias, macro or
@@ -1661,15 +1783,26 @@ def read_symbol(
 
     Where a scope declares a name more than once, the target is its
     definition: a C/C++ struct, class or function rather than its forward
-    declaration (`struct S;`) or prototype, a variable rather than its
-    `extern` declaration, and a TS function's implementation rather than
-    its overload signatures, wherever they are (in another block of a
-    reopened namespace too, and in a TS namespace merged with a class,
+    declaration (`struct S;`) or prototype (also when they spell a
+    parameter type differently, `unsigned` and `unsigned int`), a variable
+    rather than its `extern` declaration, and one outside `#if`/`#ifdef`
+    blocks rather than one inside, wherever they are (in another block of
+    a reopened namespace too, and in a TS namespace merged with a class,
     function or enum, which the name itself targets); a forward declaration,
     prototype or `declare function` with no definition in the scope is
-    the target itself. A declaration of several names (`int a, *b;`, Java
-    `int x, y;`, C++ `auto [x, y] = p;`, or a struct and a variable, `struct
-    S {...} s;`) reads as the whole declaration for each of them.
+    the target itself. C++ and Java overloads take their parameter types
+    (`A.m(int)`, `A.m()`, C++ `A::A(int)`, `A.get(int) const`), as declared
+    without names, defaults or attributes, and the bare name is refused
+    with the targets to use; a name a field, variable or macro shares with
+    functions is that symbol (the function takes its parentheses), and in
+    JS/TS a method or function wins over a class field or `var` of its
+    name. A C/C++ struct, union, enum or C++ class, or a TS type alias or
+    interface, that shares its name with another symbol is targeted with
+    its keyword (`struct stat`, `type User`, also before a dotted path,
+    `type N.User`), the plain name being the other symbol. A declaration of
+    several names (`int a, *b;`, Java `int x, y;`, C++ `auto [x, y] = p;`,
+    or a struct and a variable, `struct S {...} s;`) reads as the whole
+    declaration for each of them.
 
     Use this when: You need to read a specific symbol without reading the
     whole file. Pick the narrowest depth that contains what you need.
@@ -1767,8 +1900,10 @@ def edit_leading_comment(
     Edit the contiguous leading-comment block above a named symbol. One tool
     covering three operations on the same comment block. The block sits above
     the symbol's decorators or annotations (TS method decorators too), a
-    JS/TS `export` and a C++ `template <...>` header, so a new comment goes
-    above the first of them. A symbol that other code comes before on its
+    JS/TS `export`, a C++ `template <...>` header, a Ruby Sorbet `sig` and
+    a TS function's overload signatures, so a new comment goes above the
+    first of them. A Ruby `=begin` ... `=end` document directly above a
+    method counts, alone or with `#` lines beside it. A symbol that other code comes before on its
     line (`b` in `function a() {} function b() {}`) has no leading comment
     of its own and is refused. A `#!`
     line and encoding or magic comments at the top of a Python or Ruby file
@@ -1867,7 +2002,8 @@ def insert_sibling(
     Insert content as a sibling of a named symbol (function, class, method,
     or top-level assignment). Pass `position="before"` or `position="after"`.
     "before" goes above the symbol's leading comment block (doc comment,
-    Javadoc, Godoc), decorators and a JS/TS `export`, so the comment stays
+    Javadoc, Godoc, a Ruby `=begin` document), decorators, a JS/TS `export`,
+    a Ruby Sorbet `sig` and TS overload signatures, so the comment stays
     on the symbol it documents; a `#!` line and encoding or magic comments
     at the top of a Python or Ruby file stay first. A C++ `template <...>`
     header is part of the symbol, too, and "after" a C/C++ class, struct,
@@ -1880,7 +2016,9 @@ def insert_sibling(
     access label, and a comment above the new code get no added blank lines,
     except a comment indented deeper than the target: it ends the code above
     it, is not the target's leading comment, and "before" goes below it
-    with the usual blank lines.
+    with the usual blank lines; "after" goes below such comment lines right
+    under the target, and below a block comment after it on its last line
+    that goes on over lines.
     "before" is refused when other code comes before the target on its
     first line, and "after" when other code follows it on its last line or
     the line starts with the code the target is part of (`class A: x = 1`).
@@ -1891,7 +2029,9 @@ def insert_sibling(
     of a Python docstring, Ruby `<<~` heredoc or Java text block move with
     the code. A symbol's read_symbol text (its first line without
     indentation, the later lines at the indentation they had where it was
-    read) is indented as a whole.
+    read) is indented as a whole. Next to a target indented with tabs, the
+    content's deeper indentation is written in tabs, as add_method does.
+    Refused in JSON, YAML and TOML files (use add_key).
 
     Use this when: You need precise placement relative to another top-level
     symbol -- e.g. a helper function immediately before its caller, a

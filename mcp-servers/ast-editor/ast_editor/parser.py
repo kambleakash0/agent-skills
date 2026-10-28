@@ -1,6 +1,7 @@
 import json
 import os
 import re
+from typing import NamedTuple
 import tree_sitter_python
 import tree_sitter_javascript
 import tree_sitter_typescript
@@ -33,14 +34,23 @@ DEFAULT_EXPORT_KINDS = {
 # functions; "function" is older grammars' name for function_expression.
 JS_FUNCTION_VALUES = ("arrow_function", "function_expression", "function", "generator_function")
 
-# Statements that wrap one TS declaration (`export ...`, `declare ...`), whose
-# siblings are the declaration's own (see _refuse_ambiguous_ts).
-_TS_DECLARATION_WRAPPERS = ("export_statement", "ambient_declaration")
+# The C/C++ tags and TS type-only declarations, which a target names with
+# their keyword in front (`struct stat`, `type User`) when another
+# declaration of their scope, a function, variable or typedef, or a TS
+# value, shares their name (TreeSitterParser.select).
+_C_TAG_KEYWORDS = {
+    "struct_specifier": "struct",
+    "union_specifier": "union",
+    "enum_specifier": "enum",
+    "class_specifier": "class",
+}
+_TS_TYPE_KEYWORDS = {"type_alias_declaration": "type", "interface_declaration": "interface"}
 
-# TS declarations that declare one kind of symbol under different node
-# types (see _refuse_ambiguous_ts): a function's overload signatures and its
-# implementation.
-_TS_KINDS = {"function_signature": "function_declaration"}
+# The C++ method qualifiers that tell overloads with the same parameter
+# types apart (`int &get(int);`, `int get(int) const;`), which a target may
+# write after its parameter types.
+_CPP_METHOD_QUALIFIERS = ("type_qualifier", "ref_qualifier")
+_QUALIFIERS_AT_END = re.compile(r"\)((?:\s*(?:\bconst\b|\bvolatile\b|&&|&))+)\s*$")
 
 # The C++ and TS namespace nodes: a namespace is one container with the
 # other blocks of its name in its scope and, in TS, with the class, function
@@ -82,6 +92,22 @@ _SCOPE_WRAPPERS = (
     "ambient_declaration",
 )
 
+# The JS/TS functions and methods, which a name they share with data (a
+# class field, a `var`) targets (TreeSitterParser.select).
+_JS_FUNCTIONS = (
+    "function_declaration",
+    "generator_function_declaration",
+    "method_definition",
+    "function_signature",
+    "method_signature",
+    "abstract_method_signature",
+)
+
+# The names of a C++ class or namespace declared with its scope (`struct
+# A::B {...}`, `namespace a::b {}`), which name it by their last part too
+# (TreeSitterParser.declared_name).
+_QUALIFIED_NAMES = ("qualified_identifier", "nested_namespace_specifier")
+
 
 def c_name(text: str) -> str:
     """A C++ destructor or operator name as list_symbols shows it and a
@@ -89,6 +115,188 @@ def c_name(text: str) -> str:
     `~A`, `operator ==` is `operator==`, `operator new []` is `operator
     new[]` and `operator const char *` is `operator const char*`."""
     return re.sub(r" (?=\W)|(?<=\W) ", "", " ".join(text.split()))
+
+
+def parameter_key(text: str) -> str:
+    """A parameter type as an overload is matched by it: one space between
+    words and none around other characters, so that `const A &`, `const
+    A&` and `const A& ` are one type, as are `std::map<int, int>` and
+    `std::map<int,int>`, or `String ...` and `String...`."""
+    return re.sub(r"\s*([^\w\s])\s*", r"\1", " ".join(text.split()))
+
+
+_C_INTEGER_WORDS = {"signed", "unsigned", "short", "long", "int", "char"}
+
+
+def c_parameter_key(text: str) -> str:
+    """
+    A C/C++ parameter type as an overload is matched by it: parameter_key,
+    with the spellings of one type made one, so that a prototype and a
+    definition that write it differently declare one function:
+      - without a `const` or `volatile` on the parameter itself (`const int`
+        and `int`, `char *const` and `char *`), which is no part of its
+        type, and with one on what it points to written first (`char const
+        *` is `const char *`);
+      - an integer type by its shortest name (`unsigned int` is `unsigned`
+        and `long long int` is `long long`, `signed` and `signed int` are
+        `int`; `signed char` stays);
+      - an array as the pointer it is (`int[]` and `int[3]` are `int *`,
+        `char *[]` is `char **`, `int[2][3]` is `int (*)[3]`);
+      - a class, struct, union or enum without its keyword (`struct S *` is
+        `S *`), and a type without `typename`.
+    """
+    key = re.sub(r"\b(?:struct|class|union|enum|typename) (?=[\w:])", "", parameter_key(text))
+    depth, cut = 0, len(key)
+    for i, char in enumerate(key):
+        if char == "<":
+            depth += 1
+        elif char == ">":
+            depth = max(depth - 1, 0)
+        elif depth == 0 and char in "*&([":
+            cut = i
+            break
+    specifiers, declarator = key[:cut].strip(), key[cut:]
+    words = split_top_level(specifiers, " ", "<>")
+    qualifiers = [w for w in ("const", "volatile") if w in words]
+    base = [w for w in words if w not in ("const", "volatile")]
+    if base and set(base) <= _C_INTEGER_WORDS:
+        sign = "unsigned " if "unsigned" in base else ""
+        if "char" in base:
+            base = [("signed " if "signed" in base else sign) + "char"]
+        elif "short" in base:
+            base = [sign + "short"]
+        elif "long" in base:
+            base = [sign + " ".join(["long"] * base.count("long"))]
+        else:
+            base = [sign.strip() or "int"]
+    array = re.fullmatch(r"([*&]*)\[[^\]]*\]((?:\[[^\]]*\])*)", declarator)
+    if array is not None:
+        declarator = array.group(1) + ("(*)" + array.group(2) if array.group(2) else "*")
+    # A qualifier after the last `*` is the parameter's own.
+    declarator = re.sub(r"(?<=\*)(?: ?(?:const|volatile))+$", "", declarator)
+    if not declarator:
+        qualifiers = []
+    return " ".join(qualifiers + base) + declarator
+
+
+def parameter_display(text: str) -> str:
+    """A parameter type as list_symbols and refusals show it: as written
+    without the parameter's name, one space between words, and none
+    inside brackets or before a comma or bracket (`int b[]` is `int[]`,
+    `int (*cb)(int)` is `int (*)(int)`)."""
+    return re.sub(r"\s+(?=[\[\]),>])|(?<=[(<\[])\s+", "", " ".join(text.split()))
+
+
+def split_top_level(text: str, separator: str, brackets: str = "()<>[]") -> list[str]:
+    """`text` split at each `separator` that no pair of `brackets` (opening
+    and closing characters in turn) holds."""
+    opening, closing = brackets[0::2], brackets[1::2]
+    parts, depth, start = [], 0, 0
+    for i, char in enumerate(text):
+        if char in opening:
+            depth += 1
+        elif char in closing:
+            depth = max(depth - 1, 0)
+        elif char == separator and depth == 0:
+            parts.append(text[start:i])
+            start = i + 1
+    parts.append(text[start:])
+    return parts
+
+
+def split_cpp_name(name: str) -> tuple[str, ...]:
+    """The names of a C++ qualified name: ('A', 'B', 'f') for `A::B::f`, a
+    destructor or operator last as c_name writes it (('A', 'operator
+    std::string') for `A::operator std::string`), and template arguments
+    kept whole (('S<std::vector<U>>',) for a partial specialization)."""
+    mark = re.search(r"(?:^|::)\s*(?=operator\b|~)", name)
+    head, tail = (name[: mark.start()], name[mark.end() :]) if mark else (name, "")
+    parts = split_top_level(head.replace("::", "\0"), "\0", "<>")
+    names = [part.replace("\0", "::").strip() for part in parts if part.strip()]
+    if tail.strip():
+        names.append(c_name(tail))
+    return tuple(names) or (name.strip(),)
+
+
+def split_member_path(path: str) -> list[str]:
+    """A JS/TS target's dotted path split into its parts, a dot inside a
+    quoted or computed member name not splitting it: "E.'a.b'" is ['E',
+    "'a.b'"] and 'E.[Symbol.iterator]' is ['E', '[Symbol.iterator]']."""
+    parts, start, quote, depth, i = [], 0, None, 0, 0
+    while i < len(path):
+        char = path[i]
+        if quote is not None:
+            if char == "\\":
+                i += 1
+            elif char == quote:
+                quote = None
+        elif char in "\"'`":
+            quote = char
+        elif char == "[":
+            depth += 1
+        elif char == "]":
+            depth = max(depth - 1, 0)
+        elif char == "." and depth == 0:
+            parts.append(path[start:i])
+            start = i + 1
+        i += 1
+    parts.append(path[start:])
+    return parts
+
+
+class Target(NamedTuple):
+    """
+    A source-file target as TreeSitterParser.parse_target reads it:
+      - text: the target as written, for messages;
+      - keyword: the `struct`, `union`, `enum` or C++ `class`, or TS `type`
+        or `interface`, written before it (`struct stat`), or None;
+      - parts: its dotted path, the last part without its parameter types;
+      - names: the last part's names, split at C++ `::` (('A', 'g') for
+        `A::g`);
+      - params: the parameter types written in parentheses after it, as
+        parameter_key writes them (c_parameter_key in C and C++; () for `f()`
+        and C's `f(void)`), or None;
+      - qualifiers: the C++ method qualifiers written after those (`const`,
+        `&&`), or None.
+    """
+
+    text: str
+    keyword: str | None
+    parts: list[str]
+    names: tuple[str, ...]
+    params: tuple[str, ...] | None
+    qualifiers: str | None
+
+
+class Candidate(NamedTuple):
+    """
+    A declaration of a target's name in its scope, as
+    TreeSitterParser.select weighs it (see TreeSitterParser.candidate):
+      - node: the node find_node_by_name returns for it;
+      - names: its qualified name (('A', 'g') for a C++ `int A::g()`);
+      - keyword: the keyword of a C/C++ tag (`struct`) or of a TS type alias
+        or interface (`type`, `interface`), else None;
+      - unit: the typedef or declaration a C/C++ tag is the type of
+        (`typedef struct N {...} N;`), else None;
+      - function: whether it is a C, C++ or Java function, method or
+        constructor;
+      - params: a function's parameter types as parameter_display shows
+        them, else None;
+      - key: the same as parameter_key writes them (c_parameter_key in C
+        and C++), else None;
+      - qualifiers: a C++ method's qualifiers (`const`), else '';
+      - rank: its TreeSitterParser.definition_rank.
+    """
+
+    node: Node
+    names: tuple[str, ...]
+    keyword: str | None
+    unit: Node | None
+    function: bool
+    params: tuple[str, ...] | None
+    key: tuple[str, ...] | None
+    qualifiers: str
+    rank: int
 
 
 class ApplierError(Exception):
@@ -107,6 +315,37 @@ _OTHER_BOMS = (
     (b"\xff\xfe", "UTF-16"),
     (b"\xfe\xff", "UTF-16"),
 )
+
+
+def _not_utf8_text(raw: bytes) -> str | None:
+    """What a file that is not UTF-8 text is, said after its name ("is
+    UTF-16 text (it starts with a UTF-16 byte order mark)"), when its bytes
+    show it before they are decoded; None otherwise. UTF-8 text has no NUL
+    bytes. UTF-16 and UTF-32 text without a byte order mark does: in each
+    code unit of an ASCII character, at the same positions of the units,
+    so that the bytes decode in one of those encodings. A file with NUL
+    bytes laid out otherwise is not text."""
+    encoding = next((name for mark, name in _OTHER_BOMS if raw.startswith(mark)), None)
+    if encoding:
+        return f"is {encoding} text (it starts with a {encoding} byte order mark)"
+    nul = raw.find(b"\0")
+    if nul == -1:
+        return None
+    candidates = [("UTF-32", "utf-32-le"), ("UTF-32", "utf-32-be")] if len(raw) % 4 == 0 else []
+    # Most code units of source text are ASCII, so at least a quarter of
+    # the UTF-16 units have a NUL, nearly all of them in one byte.
+    odd, even = raw[1::2].count(0), raw[0::2].count(0)
+    if len(raw) % 2 == 0 and max(odd, even) * 8 >= len(raw) and min(odd, even) * 4 <= max(odd, even):
+        candidates.append(("UTF-16", "utf-16-le" if odd > even else "utf-16-be"))
+    for name, codec in candidates:
+        try:
+            text = raw.decode(codec)
+        except UnicodeDecodeError:
+            continue
+        if "\0" not in text:
+            return f"looks like {name} text without a byte order mark"
+    line = raw.count(b"\n", 0, nul) + 1
+    return f"is not text (it has a NUL byte on line {line})"
 
 
 def detect_newline(data: bytes) -> str:
@@ -323,19 +562,24 @@ class TreeSitterParser:
         # its own `newline` style.
         self.newline = detect_newline(raw)
         self.source_bytes = raw.replace(b"\r\n", b"\n")
+        # A last line without a line break is read as if it had one, so that
+        # code added after it starts a line of its own; the Applier leaves
+        # the break off again when it writes the file (`final_newline`). An
+        # empty file has no last line, and gets one from an edit.
+        self.final_newline = not raw or raw.endswith(b"\n")
+        if not self.final_newline:
+            self.source_bytes += b"\n"
+        what = _not_utf8_text(raw)
         try:
-            self.source_code = self.source_bytes.decode("utf-8")
+            if what is None:
+                self.source_code = self.source_bytes.decode("utf-8")
         except UnicodeDecodeError as e:
-            encoding = next((name for mark, name in _OTHER_BOMS if raw.startswith(mark)), None)
-            what = (
-                f"{encoding} text (it starts with a {encoding} byte order mark)"
-                if encoding
-                else f"not UTF-8 text ({e})"
-            )
+            what = f"is not UTF-8 text ({e})"
+        if what is not None:
             raise ValueError(
-                f"{filepath} is {what}; ast-editor reads and writes UTF-8 files only. "
+                f"{filepath} {what}; ast-editor reads and writes UTF-8 files only. "
                 "Convert it to UTF-8, or make this edit with your normal edit tool."
-            ) from e
+            )
         self.tree = self.parse(self.source_bytes)
 
     def parse(self, data: bytes):
@@ -345,6 +589,155 @@ class TreeSitterParser:
         if self.ext == ".json":
             data = mask_json_exponents(data)
         return self.parser.parse(data)
+
+    def target_types(self) -> tuple[list[str], list[str], list[str]]:
+        """The node types that a source-file target finds in this language,
+        as (containers, functions, other symbols): the parts of a dotted
+        target before the last are containers, the last is any of them.
+        Empty lists for config files."""
+        ext = self.ext
+        if ext == ".py":
+            return ["class_definition"], ["function_definition", "decorated_definition"], ["expression_statement"]
+        if ext in (".ts", ".tsx"):
+            return (
+                ["class_declaration", "abstract_class_declaration", "interface_declaration", "internal_module", "module"],
+                [
+                    "function_declaration",
+                    "generator_function_declaration",
+                    "function_signature",
+                    "method_definition",
+                    "abstract_method_signature",
+                    "arrow_function",
+                    "variable_declaration",
+                ],
+                [
+                    "variable_declaration",
+                    "lexical_declaration",
+                    "enum_declaration",
+                    "type_alias_declaration",
+                    "public_field_definition",
+                ],
+            )
+        if ext in JS_EXTS:
+            return (
+                ["class_declaration"],
+                [
+                    "function_declaration",
+                    "generator_function_declaration",
+                    "method_definition",
+                    "arrow_function",
+                    "variable_declaration",
+                    "lexical_declaration",
+                ],
+                ["variable_declaration", "lexical_declaration", "field_definition"],
+            )
+        if ext in C_EXTS:
+            # A typedef of a struct holds its fields (`P.x` of `typedef
+            # struct {...} P;`).
+            return (
+                ["struct_specifier", "union_specifier", "enum_specifier", "type_definition"],
+                ["function_definition"],
+                ["declaration", "field_declaration", "preproc_def", "preproc_function_def"],
+            )
+        if ext in CPP_EXTS:
+            return (
+                [
+                    "class_specifier",
+                    "struct_specifier",
+                    "union_specifier",
+                    "enum_specifier",
+                    "namespace_definition",
+                    "type_definition",
+                ],
+                ["function_definition"],
+                ["declaration", "field_declaration", "alias_declaration", "preproc_def", "preproc_function_def"],
+            )
+        if ext in RUBY_EXTS:
+            return ["class", "module"], ["method", "singleton_method"], ["assignment"]
+        if ext in GO_EXTS:
+            return ["type_spec"], ["function_declaration", "method_declaration"], ["const_spec", "var_spec", "type_alias"]
+        if ext == ".java":
+            return (
+                ["class_declaration", "interface_declaration", "enum_declaration", "record_declaration"],
+                ["method_declaration", "constructor_declaration"],
+                ["field_declaration", "constant_declaration"],
+            )
+        return [], [], []
+
+    def parse_target(self, target: str) -> Target:
+        """
+        A source-file target read into its parts (see Target). It may start
+        with a keyword, which names a tag or type that shares its name with
+        another symbol of its scope: `struct`, `union` or `enum` in C and
+        C++, `class` in C++, `type` or `interface` in TS; with a dotted path
+        the keyword goes in front of it all, and names the last part's kind
+        (`type N.User`, `struct outer.inner`). The path is split at its
+        dots, in C, C++ and Java at those outside parentheses
+        (`A.m(java.util.List)`), in JS and TS at those outside quotes and
+        brackets (`E.'a.b'`, `E.[Symbol.iterator]`, split_member_path). In C, C++ and Java the last part may end
+        with parameter types in parentheses, `m(int, String)` (`m()` for
+        none, which C's `f(void)` also is), and in C++ with the method
+        qualifiers after them (`get(int) const`); the parentheses of
+        `operator()` are part of its name, so `A.operator()(int)` gives it
+        parameter types (c_parameter_key in C and C++). In C and C++ the
+        last part's name may be qualified (`A::B::f`, `A::~A`).
+        """
+        text = target
+        c_family = self.ext in C_EXTS + CPP_EXTS
+        keywords: tuple[str, ...] = ()
+        if c_family:
+            keywords = ("struct", "union", "enum") + (("class",) if self.ext in CPP_EXTS else ())
+        elif self.ext in (".ts", ".tsx"):
+            keywords = ("type", "interface")
+        keyword = None
+        head = target.split(None, 1)
+        if len(head) == 2 and head[0] in keywords:
+            keyword, target = head[0], head[1].strip()
+        typed = c_family or self.ext == ".java"
+        if typed:
+            parts = split_top_level(target, ".", "()")
+        elif self.ext in JS_EXTS:
+            parts = split_member_path(target)
+        else:
+            parts = target.split(".")
+        last, params, qualifiers = parts[-1], None, None
+        if typed:
+            rest, written = last.rstrip(), None
+            mark = _QUALIFIERS_AT_END.search(rest) if self.ext in CPP_EXTS else None
+            if mark is not None:
+                written = " ".join(re.findall(r"const|volatile|&&|&", mark.group(1)))
+                rest = rest[: mark.start() + 1]
+            opening = self._opening_paren(rest)
+            if opening is not None and not (c_family and re.search(r"\boperator\s*$", rest[:opening])):
+                key = c_parameter_key if c_family else parameter_key
+                types = [key(t) for t in split_top_level(rest[opening + 1 : -1], ",")]
+                if types == [""] or (c_family and types == ["void"]):
+                    types = []
+                last, params, qualifiers = rest[:opening].rstrip(), tuple(types), written
+        parts[-1] = last
+        names = split_cpp_name(last) if c_family else (last,)
+        return Target(text, keyword, parts, names, params, qualifiers)
+
+    @staticmethod
+    def _opening_paren(text: str) -> int | None:
+        """The index of the `(` that the `)` ending `text` closes, or None."""
+        if not text.endswith(")"):
+            return None
+        depth = 0
+        for i in range(len(text) - 1, -1, -1):
+            if text[i] == ")":
+                depth += 1
+            elif text[i] == "(":
+                depth -= 1
+                if depth == 0:
+                    return i
+        return None
+
+    def target_leaf(self, target: str) -> str:
+        """The name that a source-file target's last part declares, without
+        its keyword, parameter types and C++ qualification: `m` of
+        `A.m(int)`, `stat` of `struct stat`, `g` of `A::g`."""
+        return self.parse_target(target).names[-1]
 
     def find_node_by_name(self, target_name: str) -> Node | None:
         """
@@ -361,163 +754,135 @@ class TreeSitterParser:
         functions, TS abstract classes and their abstract methods, enums,
         type aliases, namespaces and functions declared without a body
         (`declare function f(): void;`) are found like other declarations,
-        and a `const`/`let`/`var` by the name it declares (the whole
+        a `const`/`let`/`var` by the name it declares (the whole
         declaration is returned; js_bound_function gets the function bound
-        to it). A TS name that two kinds of declaration in one scope declare
-        (a type and a value: `const User` and `type User`) is refused as
-        ambiguous with an ApplierError (_refuse_ambiguous_ts).
+        to it), and a class field by its name (`A.x`, `A.#y`).
         C/C++ variables, fields, typedefs, `using` aliases, macros, function
         prototypes and methods declared in their class are found as well,
         by every name a declaration declares (`b` of `int a, *b;`, the whole
         declaration being returned), destructors as `~A` and operators as
-        c_name writes them (`operator==`, `operator bool`); so are Java
-        fields and Go type aliases and every name of a Go `var`/`const`
-        spec. Where one scope declares a name more than once, a definition
-        is found rather than its forward declaration, prototype, `extern`
-        declaration or TS overload signature (definition_rank).
+        c_name writes them (`operator==`, `operator bool`), and a C++
+        definition outside its class by its qualified name (`A::g`,
+        `A::B::f`) or the end of it (`g`, `B::f`); so are Java fields and Go
+        type aliases and every name of a Go `var`/`const` spec.
+        The last part of a C, C++ or Java target may name a function by its
+        parameter types (`A.m(int, String)`, `A::A()`, C++ `A.get(int)
+        const`), and a C/C++ or TS target may start with a keyword that
+        names a tag or type sharing its name with another symbol (`struct
+        stat`, `type User`), see parse_target. Of the declarations of the
+        name in its scope, select picks the target: a definition rather
+        than its forward declaration, prototype, `extern` declaration, TS
+        overload signature or Python @overload stub, and refuses a name
+        that C++ or Java overloads with an ApplierError naming each
+        overload's target.
         In JSON, YAML and TOML files the target is a key path followed from
         the top level, a segment in double quotes (in TOML also single
         quotes) being one key with any dots in it (split_config_path), and
         the key's value node is returned (see _search_json_dotted,
         find_yaml_pair and toml_pair); a YAML key with no value has none.
         """
-        parts = target_name.split(".")
-
-        if self.ext == ".py":
-            class_types = ["class_definition"]
-            func_types = ["function_definition", "decorated_definition"]
-            var_types = ["expression_statement"]
-        elif self.ext in (".ts", ".tsx"):
-            # JS/TS: try closure-in-object-literal first for dotted paths
-            if len(parts) == 2:
-                closure = self._find_js_closure_by_var(parts[0], parts[1])
-                if closure is not None:
-                    return closure
-            class_types = [
-                "class_declaration",
-                "abstract_class_declaration",
-                "interface_declaration",
-                "internal_module",
-                "module",
-            ]
-            func_types = [
-                "function_declaration",
-                "generator_function_declaration",
-                "function_signature",
-                "method_definition",
-                "abstract_method_signature",
-                "arrow_function",
-                "variable_declaration",
-            ]
-            var_types = ["variable_declaration", "lexical_declaration", "enum_declaration", "type_alias_declaration"]
-        elif self.ext in (".js", ".jsx", ".mjs", ".cjs"):
-            if len(parts) == 2:
-                closure = self._find_js_closure_by_var(parts[0], parts[1])
-                if closure is not None:
-                    return closure
-            class_types = ["class_declaration"]
-            func_types = [
-                "function_declaration",
-                "generator_function_declaration",
-                "method_definition",
-                "arrow_function",
-                "variable_declaration",
-                "lexical_declaration",
-            ]
-            var_types = ["variable_declaration", "lexical_declaration"]
-        elif self.ext in C_EXTS:
-            # A typedef of a struct holds its fields (`P.x` of `typedef
-            # struct {...} P;`).
-            class_types = ["struct_specifier", "union_specifier", "enum_specifier", "type_definition"]
-            func_types = ["function_definition"]
-            var_types = ["declaration", "field_declaration", "preproc_def", "preproc_function_def"]
-        elif self.ext in CPP_EXTS:
-            class_types = [
-                "class_specifier",
-                "struct_specifier",
-                "union_specifier",
-                "enum_specifier",
-                "namespace_definition",
-                "type_definition",
-            ]
-            func_types = ["function_definition"]
-            var_types = ["declaration", "field_declaration", "alias_declaration", "preproc_def", "preproc_function_def"]
-        elif self.ext in RUBY_EXTS:
-            class_types = ["class", "module"]
-            func_types = ["method", "singleton_method"]
-            var_types = ["assignment"]
-        elif self.ext in GO_EXTS:
-            if len(parts) == 2:
-                # Try: receiver-based method (Cache.Get)
-                go_method = self._find_go_method_by_receiver(parts[0], parts[1])
-                if go_method is not None:
-                    return go_method
-                # Try: func_literal stored in a composite-literal field (stdioCmd.RunE)
-                go_closure = self._find_go_closure_in_var(parts[0], parts[1])
-                if go_closure is not None:
-                    return go_closure
-            class_types = ["type_spec"]
-            func_types = ["function_declaration", "method_declaration"]
-            var_types = ["const_spec", "var_spec", "type_alias"]
-        elif self.ext == ".java":
-            class_types = ["class_declaration", "interface_declaration", "enum_declaration", "record_declaration"]
-            func_types = ["method_declaration", "constructor_declaration"]
-            var_types = ["field_declaration", "constant_declaration"]
-        elif self.ext == ".json":
+        if self.ext == ".json":
             return self._search_json_dotted(self.tree.root_node, target_name)
-        elif self.ext in (".yml", ".yaml"):
+        if self.ext in (".yml", ".yaml"):
             return self._search_yaml_dotted(self.tree.root_node, target_name)
-        elif self.ext == ".toml":
+        if self.ext == ".toml":
             return self._search_toml_dotted(self.tree.root_node, target_name)
-        else:
+        class_types, func_types, var_types = self.target_types()
+        if not class_types:
             return None
+        target = self.parse_target(target_name)
+        if target.keyword is None and target.params is None and len(target.parts) == 2:
+            first, second = target.parts
+            if self.ext in JS_EXTS:
+                # A closure in an object literal (`app.handler`).
+                closure = self._find_js_closure_by_var(first, second)
+                if closure is not None:
+                    return closure
+            elif self.ext in GO_EXTS:
+                # A receiver-based method (Cache.Get), or a func_literal
+                # stored in a composite-literal field (stdioCmd.RunE).
+                found = self._find_go_method_by_receiver(first, second)
+                if found is None:
+                    found = self._find_go_closure_in_var(first, second)
+                if found is not None:
+                    return found
+        return self._search_tree_dotted(
+            self.tree.root_node, target, class_types, class_types + func_types + var_types
+        )
 
-        return self._search_tree_dotted(self.tree.root_node, target_name, class_types, func_types, var_types)
+    def find_container(self, target_name: str) -> Node | None:
+        """
+        The class, struct, interface, namespace or module that add_method and
+        add_field add to for `target_name`, or None: the target found among
+        the containers of its scope only (the first of target_types), so
+        that a name a struct shares with a function or variable (`struct
+        stat` and `int stat(...)`, a TS interface and a function of its
+        name) is the struct. A C/C++ typedef of a struct declared apart
+        (`typedef struct Node Node;`) gives that struct (`struct Node`).
+        """
+        class_types = self.target_types()[0]
+        if not class_types:
+            return None
+        root = self.tree.root_node
+        target = self.parse_target(target_name)
+        node = self._search_tree_dotted(root, target, class_types, class_types)
+        spec = node.child_by_field_name("type") if node is not None and node.type == "type_definition" else None
+        tag = spec.child_by_field_name("name") if spec is not None and spec.type in _C_TAG_KEYWORDS else None
+        if tag is not None and spec.child_by_field_name("body") is None:
+            name = self.node_text(tag)
+            keyword = _C_TAG_KEYWORDS[spec.type]
+            tagged = target._replace(keyword=keyword, parts=target.parts[:-1] + [name], names=(name,))
+            node = self._search_tree_dotted(root, tagged, class_types, class_types) or node
+        return node
 
     def _search_tree_dotted(
         self,
         root: Node,
-        target_name: str,
+        target: Target,
         class_types: list[str],
-        func_types: list[str],
-        var_types: list[str],
+        types: list[str],
     ) -> Node | None:
         """
-        The node for the dotted target `target_name` under `root`: each part
-        but the last a container (class_types) found in the ones before it,
-        the last a symbol of any of the types (_find_child_with_name). A C++
-        or TS namespace opened more than once in its scope, and a TS
-        namespace merged with the class, function or enum of its name, are
-        one container that holds the members of all of their blocks
-        (merged_containers): of the nodes that declare a name in them, the
-        target is the first of the lowest definition_rank, so a definition
-        in a later block wins over a forward declaration in an earlier one.
+        The node for the dotted `target` under `root`: each part but the last
+        a container (class_types) found in the ones before it, the last the
+        symbol of any of the `types` that select picks among the declarations
+        of its name in their scope (candidates). A C++ or TS namespace opened
+        more than once in its scope, and a TS namespace merged with the class,
+        function or enum of its name, are one container that holds the members
+        of all of their blocks (merged_containers), a declaration in one of
+        the blocks being found before one nested deeper in another (a
+        member of a class there). Of several containers of
+        one name (a struct and a typedef of its name, a Ruby class reopened),
+        the first of the lowest definition_rank is searched first, then the
+        others, so that the members of each are found.
         """
-        parts = target_name.split(".")
-        containers = [root]
+        return self._search_from([root], target, 0, class_types, types)
 
-        for i, part in enumerate(parts):
-            last = i == len(parts) - 1
-            types = class_types + func_types + var_types if last else class_types
-            found = [self._find_child_with_name(c, part, types) for c in containers]
-            found = [node for node in found if node is not None]
-            if not found:
-                return None
-            best = min(found, key=lambda node: self._rank(node, part))
-            if last:
-                return best
-            containers = self.merged_containers(best, part, class_types)
-
+    def _search_from(
+        self, containers: list[Node], target: Target, i: int, class_types: list[str], types: list[str]
+    ) -> Node | None:
+        """_search_tree_dotted from part i of `target` on, in `containers`."""
+        if i == len(target.parts) - 1:
+            found = [c for container in containers for c in self.candidates(container, target.names[-1], types)]
+            if len(containers) > 1:
+                # The blocks of a namespace opened again: a declaration in
+                # one of them, rather than one nested deeper in another.
+                scopes = containers + [block.child_by_field_name("body") for block in containers]
+                own = [c for c in found if self._scope(c.node) in scopes]
+                found = own or found
+            return self.select(found, target)
+        part = target.parts[i]
+        found = [c for container in containers for c in self.candidates(container, part, class_types)]
+        searched: list[Node] = []
+        for candidate in sorted(found, key=lambda c: (c.rank, c.node.start_byte)):
+            if candidate.node in searched:
+                continue
+            blocks = self.merged_containers(candidate.node, part, class_types)
+            searched.extend(blocks)
+            node = self._search_from(blocks, target, i + 1, class_types, types)
+            if node is not None:
+                return node
         return None
-
-    def _rank(self, node: Node, name: str) -> int:
-        """The definition_rank of `node`, found for `name` (a Python
-        decorated definition by its function's name)."""
-        inner = node
-        if node.type == "decorated_definition":
-            inner = next((c for c in node.named_children if c.type == "function_definition"), node)
-        declared = self.declared_name(inner, name)
-        return self.definition_rank(node, declared) if declared is not None else 0
 
     def merged_containers(self, found: Node, name: str, class_types: list[str]) -> list[Node]:
         """
@@ -685,8 +1050,9 @@ class TreeSitterParser:
     def declared_names(self, node: Node) -> list[Node]:
         """
         The nodes naming what `node`, a node of a type that targets find,
-        declares, in order: its name field; in C/C++ the names
-        c_declared_names finds; a Python or Ruby assignment's left side;
+        declares, in order: its name field (a JS class field's `property`);
+        in C/C++ the names c_declared_names finds; a Python or Ruby
+        assignment's left side;
         every name of a Go `var`/`const` spec (`a, b = 1, 2`); and the
         declarators of a JS/TS `const`/`let`/`var` or a Java field (`int x,
         y;`).
@@ -695,7 +1061,8 @@ class TreeSitterParser:
             return self.c_declared_names(node)
         if node.type in ("const_spec", "var_spec") and self.ext in GO_EXTS:
             return [c for c in node.children_by_field_name("name") if c.type == "identifier"]
-        name = node.child_by_field_name("name")
+        # A JS class field names itself in its `property`, a TS one in `name`.
+        name = node.child_by_field_name("property" if node.type == "field_definition" else "name")
         if name is not None:
             return [name]
         if node.type == "expression_statement":
@@ -718,33 +1085,39 @@ class TreeSitterParser:
     def declared_name(self, node: Node, name: str) -> Node | None:
         """The node of declared_names(node) that names `name` (a C/C++
         destructor or operator name compared as c_name writes it), or
-        None."""
+        None. A C++ class or namespace named with its scope (`struct A::B
+        {...}`, `namespace a::b {}`) names both its whole name and its last
+        one (`A::B` and `B`)."""
         if self.ext in C_EXTS + CPP_EXTS and name.lstrip().startswith(("~", "operator")):
             name = c_name(name)
-        return next((n for n in self.declared_names(node) if self.symbol_name(n) == name), None)
+        for n in self.declared_names(node):
+            text = self.symbol_name(n)
+            if text == name or (n.type in _QUALIFIED_NAMES and split_cpp_name(text)[-1] == name):
+                return n
+        return None
 
     def definition_rank(self, node: Node, name: Node) -> int:
         """
-        How `node`, found for the name node `name`, ranks among the nodes
-        that declare one name in one scope, the lowest being the target
-        (_find_child_with_name): 0 for a definition with a body (a C/C++
-        function, class, struct, union, enum or namespace, a Java method or
-        class) and for any symbol outside C, C++, Java and TS; 1 for another
-        definition (a C/C++ variable, field, typedef, `using` alias or macro,
-        a Java field, which shares its name with an accessor method, `int
-        size;` and `int size()`, a TS namespace, which merges with the class,
-        function or enum of its name); 2 for a declaration that only announces a
-        definition: a C/C++ forward declaration (`struct S;`), a prototype
-        or a method declared in its class, an `extern` variable without a
-        value, and a TS overload signature or function declared without a
-        body (`declare function f(): void;`).
+        How `node`, found for the name node `name`, ranks among the
+        declarations of one symbol in one scope, the lowest being the target
+        (select): 0 for a definition with a body (a C/C++ function, class,
+        struct, union, enum or namespace) and for any symbol outside C, C++,
+        TS and Python; 1 for another definition (a C/C++ variable, field,
+        typedef, `using` alias or macro, which a struct of its name is
+        searched before as a container, and a TS namespace, which merges
+        with the class, function or enum of its name); 2 for a declaration
+        that only announces a definition: a C/C++ forward declaration
+        (`struct S;`), a prototype or a method declared in its class, an
+        `extern` variable without a value, a TS overload signature or
+        function declared without a body (`declare function f(): void;`)
+        and a Python @overload stub (python_overload).
         """
         if self.ext in (".ts", ".tsx"):
             if node.type in NAMESPACES:
                 return 1
             return 2 if node.type == "function_signature" else 0
-        if self.ext == ".java":
-            return 1 if node.type in ("field_declaration", "constant_declaration") else 0
+        if self.ext == ".py":
+            return 2 if self.python_overload(node) else 0
         if self.ext not in C_EXTS + CPP_EXTS:
             return 0
         if node.type in C_TYPE_SPECIFIERS:
@@ -799,120 +1172,339 @@ class TreeSitterParser:
             parent = parent.parent
         return False
 
-    def _find_child_with_name(self, node: Node, name: str, valid_types: list[str]) -> Node | None:
-        # Search below `node` only: the container must not match itself, or
-        # a Java constructor target such as `LRUCache.LRUCache` would resolve
-        # to the class. Of the nodes that declare `name` in one scope, the
-        # one with the lowest definition_rank is the target: a definition
-        # rather than its forward declaration, prototype or overload
-        # signatures, before or after it, and of those of one rank the first
-        # (a preprocessor conditional or TS `namespace` statement around one
-        # puts it deeper in the tree). The variables and types a C/C++
-        # function declares are its own, no targets (_c_local).
-        c_family = self.ext in C_EXTS + CPP_EXTS
-        best, best_rank = None, None
+    def candidates(self, node: Node, name: str, valid_types: list[str]) -> list[Candidate]:
+        """
+        The declarations of `name` of the valid_types below `node`, in one
+        scope: that of the first one found breadth first, its other
+        declarations being found wherever a preprocessor conditional or TS
+        `namespace` statement puts them in it (scope_candidates). Only below
+        `node`: the container must not match itself, or a Java constructor
+        target such as `LRUCache.LRUCache` would find the class. The
+        variables and types a C/C++ function declares are its own, no
+        targets (_c_local). An anonymous `export default function/class` is
+        the one declaration of `default`.
+        """
         queue = list(node.named_children)
         while queue:
             curr = queue.pop(0)
             if name == "default" and curr.type == "export_statement":
                 value = self.anonymous_default_export(curr)
                 if value is not None and DEFAULT_EXPORT_KINDS[value.type] in valid_types:
-                    return value
-            if curr.type in valid_types:
-                # For decorated definitions, preserve the wrapper node so that
-                # replace_function/delete_symbol operate on the full block (decorators
-                # included), but unwrap to the inner function for name matching.
-                outer_node = curr
-                if curr.type == "decorated_definition":
-                    for child in curr.named_children:
-                        if child.type == "function_definition":
-                            curr = child
-                            break
-                declared = self.declared_name(curr, name)
-                if declared is not None and not (c_family and self._c_local(curr)):
-                    rank = self.definition_rank(outer_node, declared)
-                    if best is None or (
-                        (rank, outer_node.start_byte) < (best_rank, best.start_byte)
-                        and self._scope(outer_node) == self._scope(best)
-                    ):
-                        best, best_rank = outer_node, rank
-                    if best_rank == 0:
-                        break
+                    return [Candidate(value, ("default",), None, None, False, None, None, "", 0)]
+            for match in self._declarations_in(curr, valid_types, name):
+                found = self.scope_candidates([self._scope(match[0])], name, valid_types)
+                if not any(c.node == match[0] for c in found):
+                    found.append(self.candidate(*match))
+                return found
+            if curr.type == "decorated_definition":
+                # A decorated Python function is found as its decorated_definition.
+                curr = next((c for c in curr.named_children if c.type == "function_definition"), curr)
             queue.extend(curr.named_children)
-        if best is not None:
-            self._refuse_ambiguous_ts(best, name, valid_types)
-        return best
+        return []
 
-    def _refuse_ambiguous_ts(self, match: Node, name: str, valid_types: list[str]) -> None:
+    def _declarations_in(self, node: Node, valid_types: list[str], name: str | None) -> list[tuple[Node, Node]]:
+        """(node, name node) for each name that `node`, of one of the
+        valid_types, declares (only `name`, when it is given), a decorated
+        Python function by its function's name, so that the edits take its
+        decorators too; [] for any other node and for a C/C++ function's own
+        variables and types (_c_local)."""
+        if node.type not in valid_types:
+            return []
+        inner = node
+        if node.type == "decorated_definition":
+            inner = next((c for c in node.named_children if c.type == "function_definition"), node)
+        if self.ext in C_EXTS + CPP_EXTS and self._c_local(inner):
+            return []
+        if name is None:
+            return [(node, declared) for declared in self.declared_names(inner)]
+        declared = self.declared_name(inner, name)
+        return [(node, declared)] if declared is not None else []
+
+    def scope_candidates(self, scopes: list[Node], name: str, valid_types: list[str]) -> list[Candidate]:
+        """The declarations of `name` of the valid_types that `scopes`
+        declare it in, in document order (scope_declarations), however the
+        name is spaced (`operator ==`)."""
+        groups = self.scope_declarations(scopes, valid_types, name).values()
+        return sorted((c for group in groups for c in group), key=lambda c: c.node.start_byte)
+
+    def scope_declarations(
+        self, scopes: list[Node], valid_types: list[str], name: str | None = None
+    ) -> dict[str, list[Candidate]]:
         """
-        In a TS file, refuse `name` when, beside the declaration `match`
-        found for it, another kind of declaration in the same scope declares
-        it too. TS keeps types apart from values, so one name can be both
-        (`const User = z.object(...)` and `type User = z.infer<typeof User>`,
-        or an interface and a function), and the tools would act on
-        whichever comes first, perhaps not the one list_symbols showed.
-        Declarations of one kind (merged interfaces, a function's overload
-        signatures and its implementation, see _TS_KINDS) are not compared,
-        nor are namespaces, which merge with the other declarations of their
-        name (merged_containers).
+        The declarations of the valid_types that `scopes` declare names in
+        (_scope), by the name they declare (symbol_name), each list in
+        document order; only those of `name` when it is given. They are the
+        scopes' children and what the wrappers among them hold
+        (_SCOPE_WRAPPERS, the block of an `extern "C" { ... }`, a TS
+        `namespace` statement). One pass gives list_symbols the
+        declarations of every name of a container.
         """
-        if self.ext not in (".ts", ".tsx") or match.type in NAMESPACES:
-            return
-        statement = match
-        while statement.parent is not None and statement.parent.type in _TS_DECLARATION_WRAPPERS:
-            statement = statement.parent
-        if statement.parent is None:
-            return
-        found = [(statement, match)]
-        for sibling in statement.parent.named_children:
-            if sibling == statement:
-                continue
-            decl = sibling
-            while decl is not None and decl.type in _TS_DECLARATION_WRAPPERS:
-                decl = decl.child_by_field_name("declaration") or next(
-                    (c for c in decl.named_children if c.type in valid_types), None
-                )
+        found: dict[str, list[Candidate]] = {}
+        for scope in scopes:
+            queue = list(scope.named_children)
+            while queue:
+                curr = queue.pop(0)
+                for node, declared in self._declarations_in(curr, valid_types, name):
+                    if self._scope(node) == scope:
+                        found.setdefault(self.symbol_name(declared), []).append(self.candidate(node, declared))
+                if curr.type in _SCOPE_WRAPPERS + ("expression_statement",) or (
+                    curr.type == "declaration_list" and curr.parent.type == "linkage_specification"
+                ):
+                    queue.extend(curr.named_children)
+        for group in found.values():
+            group.sort(key=lambda c: c.node.start_byte)
+        return found
+
+    def candidate(self, node: Node, name: Node) -> Candidate:
+        """`node`, a declaration found for its name node `name`, as select
+        weighs it (see Candidate)."""
+        c_family = self.ext in C_EXTS + CPP_EXTS
+        keyword = unit = None
+        if c_family:
+            keyword = _C_TAG_KEYWORDS.get(node.type)
+            parent = node.parent
             if (
-                decl is not None
-                and decl.type in valid_types
-                and decl.type not in NAMESPACES
-                and _TS_KINDS.get(decl.type, decl.type) != _TS_KINDS.get(match.type, match.type)
-                and self._ts_declares(decl, name)
+                keyword is not None
+                and parent.type in ("type_definition", "declaration", "field_declaration")
+                and parent.child_by_field_name("type") == node
             ):
-                found.append((sibling, decl))
-        if len(found) < 2:
-            return
-        found.sort(key=lambda f: f[0].start_byte)
-        named = [f"`{self._ts_declaration_label(decl, name)}` (line {stmt.start_point[0] + 1})" for stmt, decl in found]
-        raise ApplierError(
-            f"'{name}' is ambiguous: {', '.join(named[:-1])} and {named[-1]} "
-            f"{'both' if len(named) == 2 else 'all'} declare it, and a target "
-            "cannot say which one it means. Edit these declarations with your "
-            "normal edit tool."
+                unit = parent
+        elif self.ext in (".ts", ".tsx"):
+            keyword = _TS_TYPE_KEYWORDS.get(node.type)
+        function, params, key, qualifiers = False, None, None, ""
+        if c_family and (
+            node.type == "function_definition"
+            or (node.type in ("declaration", "field_declaration") and self.c_declares_function(name))
+        ):
+            function = True
+            params, qualifiers = self._c_parameters(name)
+        elif self.ext == ".java" and node.type in ("method_declaration", "constructor_declaration"):
+            function = True
+            params = self._java_parameters(node.child_by_field_name("parameters"))
+        if params is not None:
+            key = tuple((c_parameter_key if c_family else parameter_key)(text) for text in params)
+        return Candidate(
+            node, self.qualified_name(name), keyword, unit, function, params, key, qualifiers, self.definition_rank(node, name)
         )
 
-    def _ts_declares(self, decl: Node, name: str) -> bool:
-        """Whether the TS declaration `decl` declares `name`: by its name
-        field, or for a `const`/`let`/`var` by one of its declarators."""
-        name_node = decl.child_by_field_name("name")
-        if name_node is not None:
-            return self.node_text(name_node) == name
-        return any(
-            child.type == "variable_declarator"
-            and (declared := child.child_by_field_name("name")) is not None
-            and self.node_text(declared) == name
-            for child in decl.named_children
-        )
+    def qualified_name(self, name: Node) -> tuple[str, ...]:
+        """The name a name node gives its symbol, as a tuple: in C++ after the
+        scopes it is qualified with (('A', 'B', 'f') for `int A::B::f()`, a
+        template's without its arguments, ('Box', 'get') for `Box<T>::get`,
+        and ('A', 'B') for `struct A::B {...}` and `namespace A::B {}`), else
+        (symbol_name(name),)."""
+        if self.ext in CPP_EXTS and name.type in _QUALIFIED_NAMES:
+            return split_cpp_name(self.symbol_name(name))
+        names = [self.symbol_name(name)]
+        if self.ext in CPP_EXTS:
+            child, parent = name, name.parent
+            while parent is not None and parent.type in ("qualified_identifier", "template_function"):
+                scope = parent.child_by_field_name("scope")
+                if parent.type == "qualified_identifier" and scope is not None and scope != child:
+                    if scope.type == "template_type":
+                        scope = scope.child_by_field_name("name") or scope
+                    names.insert(0, self.node_text(scope))
+                child, parent = parent, parent.parent
+        return tuple(names)
 
-    def _ts_declaration_label(self, decl: Node, name: str) -> str:
-        """How _refuse_ambiguous_ts shows a declaration: its keywords and
-        name, `const User`, `type User`, `abstract class A`."""
-        if decl.type in ("lexical_declaration", "variable_declaration"):
-            return f"{self.node_text(decl.children[0])} {name}"
-        name_node = decl.child_by_field_name("name")
-        start = next((c.start_byte for c in decl.children if c.type != "decorator"), decl.start_byte)
-        head = self.source_bytes[start : name_node.start_byte].decode("utf-8")
-        return " ".join(head.split() + [name])
+    def _c_parameters(self, name: Node) -> tuple[tuple[str, ...], str]:
+        """The parameter types of the C/C++ function that the name node `name`
+        names, as parameter_display shows them without names, defaults and
+        attributes (_c_parameter_names; a lone `void` being none, `...`
+        itself), and its method qualifiers (`const`, `&&`) or ''."""
+        declarator = name.parent
+        while declarator is not None and declarator.type in ("qualified_identifier", "template_function"):
+            declarator = declarator.parent
+        if name.type == "operator_cast":
+            # `operator bool() const` holds its own parameters.
+            declarator = next((c for c in name.named_children if c.type == "abstract_function_declarator"), None)
+        params = declarator.child_by_field_name("parameters") if declarator is not None else None
+        if params is None:
+            return (), ""
+        shown = []
+        for child in params.children:
+            if child.type in ("(", ")", ",") or "comment" in child.type:
+                continue
+            if child.type in ("...", "variadic_parameter"):
+                shown.append("...")
+                continue
+            end = child.end_byte
+            if child.type == "optional_parameter_declaration":
+                # Without its default value (`int n = 1`).
+                end = next((c.start_byte for c in child.children if c.type == "="), end)
+            shown.append(parameter_display(self._text_without(child.start_byte, end, self._c_parameter_names(child))))
+        if shown == ["void"]:
+            shown = []
+        qualifiers = " ".join(self.node_text(c) for c in declarator.children if c.type in _CPP_METHOD_QUALIFIERS)
+        return tuple(shown), qualifiers
+
+    def _c_parameter_names(self, param: Node) -> list[Node]:
+        """The nodes that a C/C++ parameter's type is shown without
+        (_c_parameters): its name, its attributes (`[[maybe_unused]]`,
+        `__attribute__((unused))`) and those of the parameters of a function
+        type it has (`x` of `int (*cb)(int x)`)."""
+        found = [self.c_declarator_name(param.child_by_field_name("declarator"))]
+        stack = [param]
+        while stack:
+            node = stack.pop()
+            for child in node.named_children:
+                if child.type in ("attribute_declaration", "attribute_specifier"):
+                    found.append(child)
+                    continue
+                if node.type == "parameter_list" and child.type in (
+                    "parameter_declaration",
+                    "optional_parameter_declaration",
+                ):
+                    found.append(self.c_declarator_name(child.child_by_field_name("declarator")))
+                stack.append(child)
+        return [n for n in found if n is not None]
+
+    def _java_parameters(self, params: Node | None) -> tuple[str, ...]:
+        """The parameter types of a Java method or constructor whose
+        formal_parameters are `params`, as parameter_display shows them:
+        without modifiers and annotations (`final`, `@NonNull`), a varargs
+        one as `String...`, an array as `int[]` either way it is written."""
+        shown = []
+        for child in params.named_children if params is not None else []:
+            if child.type not in ("formal_parameter", "spread_parameter"):
+                continue
+            start = next((c.start_byte for c in child.named_children if c.type != "modifiers"), child.start_byte)
+            own = child.child_by_field_name("name")
+            if child.type == "spread_parameter":
+                declarator = next((c for c in child.named_children if c.type == "variable_declarator"), None)
+                own = declarator.child_by_field_name("name") if declarator is not None else None
+            shown.append(parameter_display(self._text_without(start, child.end_byte, own)))
+        return tuple(shown)
+
+    def _text_without(self, start: int, end: int, nodes) -> str:
+        """The source from byte start to end, with a space for each of
+        `nodes` (a node or a list of them, such as a parameter's name and
+        attributes) that lies inside."""
+        src = self.source_bytes
+        if not isinstance(nodes, list):
+            nodes = [nodes]
+        parts, pos = [], start
+        for node in sorted((n for n in nodes if n is not None), key=lambda n: n.start_byte):
+            if node.start_byte < pos or node.end_byte > end:
+                continue
+            parts.append(src[pos : node.start_byte] + b" ")
+            pos = node.end_byte
+        parts.append(src[pos:end])
+        return b"".join(parts).decode("utf-8")
+
+    def select(self, found: list[Candidate], target: Target) -> Node | None:
+        """
+        The node that the last part of `target` names among `found`, the
+        declarations of its name in one scope (candidates), or None:
+          - Its names: a declaration of that qualified name, or in C++, when
+            there is none, one whose qualified name ends with them (`f` and
+            `B::f` find `int A::B::f()`).
+          - A keyword (`struct stat`, `type User`) names a C/C++ tag or TS type
+            alias or interface written with it. Without one, a tag or TS type
+            that shares its name with another kind of declaration (a function,
+            variable or typedef, a TS value) is not named, unless that is the
+            typedef or declaration it is the type of (`typedef struct N {...}
+            N;` is one symbol).
+          - In C, C++ and Java, parameter types (`m(int)`) name a function with
+            those types, and C++ qualifiers (`get(int) const`) one with those;
+            without qualifiers, of overloads that differ in them only, the one
+            with none. Without parameter types, a name that functions share
+            with a variable, field, macro or type names the latter (Java's
+            `int x;` and `int x()`). A keyword target has no parameter types
+            (`struct A(int)` names nothing).
+          - In JS and TS, a name that a function or method shares with data
+            names the function (`static run = false;` and `run() {}`, `var f`
+            and `function f`).
+        In C++ and Java, functions whose parameter types or qualifiers differ
+        are several symbols, as are symbols of different qualified names (`A::g`
+        and `B::g` for `g`), and a target that names several is refused,
+        naming each by the target that finds it (_refuse_several). Of the
+        declarations of one symbol the target is the first of the lowest
+        definition_rank: a definition rather than its forward declaration,
+        prototype, overload signatures or @overload stubs, then one in fewer
+        C/C++ preprocessor conditionals (_conditional_depth: a definition
+        outside them rather than one in `#if 0`), and of alternatives in
+        `#ifdef` branches the first.
+        """
+        names = target.names
+        match = [c for c in found if c.names == names]
+        if not match and self.ext in CPP_EXTS:
+            match = [c for c in found if len(c.names) > len(names) and c.names[-len(names) :] == names]
+        if target.keyword is not None:
+            match = [c for c in match if c.keyword == target.keyword and target.params is None]
+        else:
+            others = [c for c in match if c.keyword is None]
+            if others:
+                match = [c for c in match if c.keyword is None or any(c.unit == o.node for o in others)]
+            if target.params is not None:
+                match = [c for c in match if c.function and c.key == target.params]
+                if target.qualifiers is not None:
+                    match = [c for c in match if c.qualifiers == target.qualifiers]
+                elif any(not c.qualifiers for c in match):
+                    match = [c for c in match if not c.qualifiers]
+            elif self.ext in C_EXTS + CPP_EXTS + (".java",) and any(not c.function for c in match):
+                match = [c for c in match if not c.function]
+            elif self.ext in JS_EXTS and any(c.node.type in _JS_FUNCTIONS for c in match):
+                match = [c for c in match if c.node.type in _JS_FUNCTIONS]
+        symbols: dict[tuple, list[Candidate]] = {}
+        for c in match:
+            overloads = c.function and self.ext in CPP_EXTS + (".java",)
+            symbols.setdefault((c.names, c.key, c.qualifiers) if overloads else (c.names,), []).append(c)
+        firsts = [
+            min(group, key=lambda c: (c.rank, self._conditional_depth(c.node), c.node.start_byte))
+            for group in symbols.values()
+        ]
+        if len(firsts) > 1:
+            raise self._refuse_several(target, firsts)
+        return firsts[0].node if firsts else None
+
+    @staticmethod
+    def _conditional_depth(node: Node) -> int:
+        """How many C/C++ preprocessor conditionals (`#if`, `#ifdef`, an
+        include guard too) hold `node`; an `#else` or `#elif` branch is part
+        of its `#if`."""
+        depth, parent = 0, node.parent
+        while parent is not None:
+            depth += parent.type in ("preproc_if", "preproc_ifdef")
+            parent = parent.parent
+        return depth
+
+    def _refuse_several(self, target: Target, symbols: list[Candidate]) -> ApplierError:
+        """The refusal of `target`, which names each of `symbols` (the first
+        declaration of each, see select): each by the target that finds it,
+        its qualified name, with its parameter types when another of them has
+        that name and its qualifiers when another has those types too, and
+        by its line."""
+        prefix = "".join(part + "." for part in target.parts[:-1])
+        named = []
+        for c in sorted(symbols, key=lambda c: c.node.start_byte):
+            label = "::".join(c.names)
+            same = [o for o in symbols if o is not c and o.names == c.names]
+            if same:
+                label += f"({', '.join(c.params or ())})"
+                if c.qualifiers and any(o.key == c.key for o in same):
+                    label += " " + c.qualifiers
+            named.append(f"{prefix}{label} (line {self.listed_line(c.node)})")
+        if all(c.names == symbols[0].names for c in symbols):
+            hint = "add the parameter types" if target.params is None else "add the method qualifiers"
+            return ApplierError(f"'{target.text}' is overloaded: {', '.join(named)}; {hint}.")
+        return ApplierError(f"'{target.text}' is ambiguous: {', '.join(named)}; use one of these targets.")
+
+    def listed_line(self, node: Node) -> int:
+        """The line list_symbols gives the symbol `node`: that of its C++
+        `template <...>` header when it has one, else its own."""
+        while self.ext in CPP_EXTS and node.parent is not None and node.parent.type == "template_declaration":
+            node = node.parent
+        return node.start_point[0] + 1
+
+    def python_overload(self, node: Node) -> bool:
+        """Whether `node` is a Python function decorated with typing.overload
+        (`@overload`, `@typing.overload`): a stub that only announces the
+        definition after it."""
+        return self.ext == ".py" and node.type == "decorated_definition" and any(
+            c.type == "decorator" and re.fullmatch(r"@\s*(?:\w+\s*\.\s*)*overload", self.node_text(c).strip())
+            for c in node.children
+        )
 
     def anonymous_default_export(self, node: Node) -> Node | None:
         """For a JS/TS `export default function () {}` or `export default
@@ -1352,4 +1944,18 @@ class TreeSitterParser:
                 continue
             value = decl.child_by_field_name("value")
             return value if value is not None and value.type in JS_FUNCTION_VALUES else None
+        return None
+
+    def go_bound_function(self, node: Node, name: str) -> Node | None:
+        """For a Go `var` spec, the func literal it gives `name` (`var f =
+        func(a int) {...}`, the k-th value for its k-th name), or None if
+        that value is something else, or node is no such spec."""
+        if self.ext not in GO_EXTS or node.type != "var_spec":
+            return None
+        names = [c for c in node.children_by_field_name("name") if c.type == "identifier"]
+        value = node.child_by_field_name("value")
+        values = [c for c in value.named_children if "comment" not in c.type] if value is not None else []
+        for k, name_node in enumerate(names):
+            if self.node_text(name_node) == name and len(values) == len(names):
+                return values[k] if values[k].type == "func_literal" else None
         return None

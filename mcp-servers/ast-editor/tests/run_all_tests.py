@@ -3258,7 +3258,7 @@ def test_syntax_guard():
             "py",
             "add_top_level: unclosed parenthesis",
             lambda a: a.add_top_level("def broken(:\n    pass"),
-            ("at line 9, column 12 (missing ')')",),
+            ("at line 10, column 12 (missing ')')",),
         ),
         (
             "json",
@@ -3391,7 +3391,7 @@ def test_syntax_guard():
         message = _refusal(
             lambda: Applier(path).add_top_level("def g[T = int](x: T) -> T:\n    return x\n\ndef h(:\n    pass")
         )
-        check("py PEP 696 plus a real error: refused at the real error", message, "syntax error at line 10, column ")
+        check("py PEP 696 plus a real error: refused at the real error", message, "syntax error at line 11, column ")
         os.remove(path)
 
     # JSON that tree-sitter-json rejects but RFC 8259 allows (an exponent
@@ -3451,13 +3451,13 @@ def test_line_endings():
             "py",
             "add_top_level bottom",
             lambda a: a.add_top_level("def helper():\n    return 1"),
-            "        return self.items.get(key)\n\ndef helper():\n    return 1\n",
+            "        return self.items.get(key)\n\n\ndef helper():\n    return 1\n",
         ),
         (
             "py",
             "add_top_level top",
             lambda a: a.add_top_level("SIZE = 1", position="top"),
-            "SIZE = 1\n\nclass LRUCache:\n",
+            "SIZE = 1\n\n\nclass LRUCache:\n",
         ),
         (
             "py",
@@ -3702,7 +3702,7 @@ def test_line_endings():
         ("delete the last function, one trailing blank line", "a = 1\n\n\ndef f():\n    pass\n\n",
          lambda a: a.delete_symbol("f"), "a = 1\n\n"),
         ("content ending in blank lines at the end", "a = 1\n",
-         lambda a: a.add_top_level("def g():\n    pass\n\n"), "a = 1\n\ndef g():\n    pass\n"),
+         lambda a: a.add_top_level("def g():\n    pass\n\n"), "a = 1\n\n\ndef g():\n    pass\n"),
     ]:
         _exact(f"trailing blank lines not added ({label})", _edit_result("test_trailing.py", content, action), expected)
 
@@ -4770,7 +4770,7 @@ def test_exported_symbols():
     _exact(
         "ts decorated export: listed at its decorator",
         _read_result("svc.ts", svc, lambda a: a.list_symbols()),
-        "class Svc (line 4)\n  method Svc.run (line 6)",
+        "constant x (line 1)\nclass Svc (line 4)\n  method Svc.run (line 6)",
     )
     _exact(
         "ts decorated export: read_symbol includes the decorator",
@@ -5021,7 +5021,7 @@ def test_decorator_leading_comments():
     # behind by delete_symbol).
     dc = "x = 1\n\n\n# Data.\n@dataclass\nclass D:\n    a: int = 1\n"
     _exact("py decorated class: listed as a class",
-           _read_result("d.py", dc, lambda a: a.list_symbols()), "class D (line 5)")
+           _read_result("d.py", dc, lambda a: a.list_symbols()), "variable x (line 1)\nclass D (line 5)\n  field D.a (line 7)")
     _exact("py decorated class: read_symbol includes the decorator",
            _read_result("d.py", dc, lambda a: a.read_symbol("D")),
            "@dataclass\nclass D:\n    a: int = 1")
@@ -5609,7 +5609,7 @@ def test_member_layout_followups():
         lambda a: a.list_symbols(),
     )
     _exact("list_symbols: decorated nested Python class listed as a class", outline,
-           "class O (line 1)\n  class O.I (line 2)\n  method O.m (line 6)")
+           "class O (line 1)\n  class O.I (line 2)\n    field O.I.x (line 4)\n  method O.m (line 6)")
 
 
 def test_config_key_followups():
@@ -5806,7 +5806,7 @@ def test_ts_abstract_classes():
 
     _exact("list_symbols: abstract classes with their abstract and regular methods",
            read(lambda a: a.list_symbols()),
-           "class A (line 1)\n  method A.m (line 5)\n  method A.n (line 7)\n"
+           "class A (line 1)\n  field A.x (line 2)\n  method A.m (line 5)\n  method A.n (line 7)\n"
            "class B (line 12)\n  method B.f (line 13)")
     _exact("read_symbol: exported abstract class includes `export`",
            read(lambda a: a.read_symbol("A")), ts[: ts.index("\n\nabstract class B")])
@@ -5994,8 +5994,9 @@ def test_js_ts_symbol_kinds():
                "enum E (line 1)\ntype T (line 2)\nfunction gen (line 3)\nfunction arrow (line 6)\n"
                "function ex (line 7)\ninterface I (line 8)")
 
-    # Functions bound to one name by const/let/var, exported or not; other
-    # values, and declarations of several names, are not functions.
+    # Functions bound to names by const/let/var, exported or not, each name
+    # of a declaration of several by its own value; other values are
+    # constants and variables.
     js_kinds = (
         "const add = (a, b) => {\n"
         "  return a + b;\n"
@@ -6011,7 +6012,7 @@ def test_js_ts_symbol_kinds():
     )
     listed_js = (
         "function add (line 1)\nfunction fe (line 4)\nfunction g2 (line 7)\nfunction gen (line 8)\n"
-        "function ex (line 11)"
+        "constant n (line 9)\nfunction two (line 10)\nconstant b (line 10)\nfunction ex (line 11)"
     )
     for ext in (".js", ".jsx", ".mjs", ".cjs", ".ts", ".tsx"):
         listed = _read_result("kinds" + ext, js_kinds, lambda a: a.list_symbols())
@@ -6119,7 +6120,7 @@ def test_js_ts_symbol_kinds():
                edit(lambda a: a.insert_sibling("gen", "const y = 2;", "after")),
                js + "\nconst y = 2;\n")
 
-    # One function among several names is not listed, but still targetable.
+    # One function among several names is a function.
     _exact("js insert_in_body: function in a declaration of several names",
            _edit_result("multi.js", "const a = () => {\n  return 1;\n}, b = 2;\n",
                         lambda a: a.insert_in_body("a", "x();", at="top")),
@@ -6436,7 +6437,7 @@ def test_yaml_keys_without_value():
         ("block keeps relative indentation", "a:\n", "a", "k:\n  m: 1", "a:\n  k:\n    m: 1\n"),
         ("quoted key with a dot", '"a.b":\nc: 1\n', '"a.b"', "3", '"a.b": 3\nc: 1\n'),
         ("block below a comment", "a: # c\nb: 1\n", "a", "k: 1\nm: 2", "a: # c\n  k: 1\n  m: 2\nb: 1\n"),
-        ("block on a last line with no newline", "b: 1\na:", "a", "k: 1\nm: 2", "b: 1\na:\n  k: 1\n  m: 2\n"),
+        ("block on a last line with no newline", "b: 1\na:", "a", "k: 1\nm: 2", "b: 1\na:\n  k: 1\n  m: 2"),
         # A block scalar header or node properties stay on the key's line.
         ("block scalar", "a:\nb: 1\n", "a", "|\n  line one\n  line two", "a: |\n  line one\n  line two\nb: 1\n"),
         ("block scalar before a comment", "a: # c\nb: 1\n", "a", "|\n  text", "a: | # c\n  text\nb: 1\n"),
@@ -6599,7 +6600,7 @@ def test_leading_comments_in_strings():
 
 
 def test_ts_ambiguous_names():
-    print("\n═══ TS: a name that is both a type and a value is refused ═══")
+    print("\n═══ TS: a name that is both a type and a value is the value's; `type User` is the type ═══")
 
     zod = (
         "import { z } from 'zod';\n\n"
@@ -6607,44 +6608,35 @@ def test_ts_ambiguous_names():
         "/** The user type. */\n"
         "export type User = z.infer<typeof User>;\n"
     )
-    zod_refusal = (
-        "REFUSED: 'User' is ambiguous: `const User` (line 3) and `type User` (line 6) "
-        "both declare it, and a target cannot say which one it means. Edit these "
-        "declarations with your normal edit tool."
-    )
-    _exact("zod pattern: list_symbols lists the type",
-           _read_result("amb.ts", zod, lambda a: a.list_symbols()), "type User (line 6)")
-    _exact("zod pattern: read_symbol is refused (reported)",
-           _read_result("amb.ts", zod, lambda a: a.read_symbol("User")), zod_refusal)
-    _exact("zod pattern: delete_symbol is refused, the file untouched (reported)",
-           _edit_result("amb.ts", zod, lambda a: a.delete_symbol("User")), zod_refusal)
-    _exact("zod pattern in .tsx: replace_function is refused",
-           _edit_result("amb.tsx", zod, lambda a: a.replace_function("User", "export type User = {};")),
-           zod_refusal)
+    _exact("zod pattern: list_symbols lists the type under its keyword",
+           _read_result("amb.ts", zod, lambda a: a.list_symbols()), "constant User (line 3)\ntype type User (line 6)")
+    _exact("zod pattern: read_symbol of the name is the value (reported)",
+           _read_result("amb.ts", zod, lambda a: a.read_symbol("User")),
+           "export const User = z.object({ name: z.string() });")
+    _exact("zod pattern: delete_symbol of the name deletes the value (reported)",
+           _edit_result("amb.ts", zod, lambda a: a.delete_symbol("User")),
+           "import { z } from 'zod';\n\n/** The user type. */\nexport type User = z.infer<typeof User>;\n")
+    _exact("zod pattern in .tsx: replace_function of `type User`",
+           _edit_result("amb.tsx", zod, lambda a: a.replace_function("type User", "export type User = {};")),
+           zod.replace("z.infer<typeof User>", "{}"))
 
     props = "export interface Props {\n  a: number;\n}\nexport const Props = (p: Props) => p.a;\n"
-    _exact("interface and function: read_symbol is refused",
-           _read_result("amb.ts", props, lambda a: a.read_symbol("Props")),
-           "REFUSED: 'Props' is ambiguous: `interface Props` (line 1) and `const Props` (line 4) "
-           "both declare it, and a target cannot say which one it means. Edit these "
-           "declarations with your normal edit tool.")
-    _exact("three declarations are all named",
-           _read_result("amb.ts", "const U = 1;\ntype U = number;\ninterface U {}\n",
-                        lambda a: a.read_symbol("U")),
-           "REFUSED: 'U' is ambiguous: `const U` (line 1), `type U` (line 2) and `interface U` "
-           "(line 3) all declare it, and a target cannot say which one it means. Edit these "
-           "declarations with your normal edit tool.")
-    _exact("declare const and type: refused",
-           _read_result("amb.ts", "declare const X: number;\ntype X = string;\n",
-                        lambda a: a.read_symbol("X")).split(" both ")[0],
-           "REFUSED: 'X' is ambiguous: `const X` (line 1) and `type X` (line 2)")
+    _exact("interface and function: read_symbol of the name is the function",
+           _read_result("amb.ts", props, lambda a: a.read_symbol("Props")), "export const Props = (p: Props) => p.a;")
+    _exact("three declarations: the name is the value",
+           _read_result("amb.ts", "const U = 1;\ntype U = number;\ninterface U {}\n", lambda a: a.read_symbol("U")),
+           "const U = 1;")
+    _exact("declare const and type: the name is the value",
+           _read_result("amb.ts", "declare const X: number;\ntype X = string;\n", lambda a: a.read_symbol("X")),
+           "declare const X: number;")
 
-    # Not ambiguous: overload signatures, merged interfaces, getter/setter
-    # pairs, a same-named local in another scope.
-    _exact("function overloads: the implementation",
+    # Overload signatures are part of their implementation; merged
+    # interfaces and getter/setter pairs are the first; a same-named local
+    # in another scope is no declaration of the scope.
+    _exact("function overloads: the implementation with its signatures",
            _read_result("amb.ts", "export function f(a: string): string;\nexport function f(a: any) { return a; }\n",
                         lambda a: a.read_symbol("f")),
-           "export function f(a: any) { return a; }")
+           "export function f(a: string): string;\nexport function f(a: any) { return a; }")
     _exact("merged interfaces: the first",
            _read_result("amb.ts", "interface A { x: number }\ninterface A { y: number }\n",
                         lambda a: a.read_symbol("A")),
@@ -6739,7 +6731,7 @@ def test_yaml_explicit_keys():
         ("a block scalar header stays after the `:`", "? a\nb: 1\n",
          lambda a: a.replace_value("a", "|\n  text\n  more"), "? a\n: |\n  text\n  more\nb: 1\n"),
         ("the last key of the file", "b: 1\n? a",
-         lambda a: a.replace_value("a", "3"), "b: 1\n? a\n: 3\n"),
+         lambda a: a.replace_value("a", "3"), "b: 1\n? a\n: 3"),
     ]
     for label, source, action, expected in cases:
         _exact(f"explicit key: {label}", _edit_result("x.yaml", source, action), expected)
@@ -7114,14 +7106,17 @@ def test_cpp_templates():
            _edit_result("t.cpp", spec, lambda a: a.delete_symbol("id")), "int q() { return 0; }\n")
 
     # Out-of-line member definitions are top-level functions under their
-    # own names, with or without a template header.
+    # qualified names (a template's without its arguments), with or without
+    # a template header; their own names alone find them too.
     plain_out = "struct A { int f(); };\n\nint A::f() { return 1; }\n"
     _exact("cpp out-of-line definition: list_symbols",
-           read(lambda a: a.list_symbols(), plain_out), "struct A (line 1)\n  method A.f (line 1)\nfunction f (line 3)")
+           read(lambda a: a.list_symbols(), plain_out), "struct A (line 1)\n  method A.f (line 1)\nfunction A::f (line 3)")
     out = ("template <typename T>\nT Box<T>::get() {\n    return v;\n}\n\n"
            "template <class T> template <class U> U Box<T>::as() { return U(v); }\n")
     _exact("cpp out-of-line template definitions: list_symbols",
-           read(lambda a: a.list_symbols(), out), "function get (line 1)\nfunction as (line 6)")
+           read(lambda a: a.list_symbols(), out), "function Box::get (line 1)\nfunction Box::as (line 6)")
+    _exact("cpp out-of-line template definition: read_symbol by its qualified name",
+           read(lambda a: a.read_symbol("Box::get"), out), "template <typename T>\nT Box<T>::get() {\n    return v;\n}")
     _exact("cpp out-of-line template definition: read_symbol",
            read(lambda a: a.read_symbol("get"), out), "template <typename T>\nT Box<T>::get() {\n    return v;\n}")
     _exact("cpp nested template headers: read_symbol",
@@ -8076,6 +8071,17 @@ def test_read_symbol_round_trips():
          "package main\n\nvar cmd = &Command{\n\tRunE: func() error {\n\tloop:\n\t\tfor {\n\t\t\tbreak loop\n\t\t}\n"
          "\t\treturn nil\n\t},\n}\n", ["cmd.RunE"]),
         ("go method", "r.go", "package main\n\nfunc (a *A) M() {\n\treturn\n}\n", ["A.M"]),
+        ("py module variable and class attribute over several lines", "r.py",
+         "X = [\n    1,\n]\n\n\nclass A:\n    y: dict = {\n        'a': 1,\n    }\n", ["X", "A.y"]),
+        ("js module constant over several lines", "r.js", "const n = {\n  a: 1,\n};\nlet m = 2, k = 3;\n", ["n", "k"]),
+        ("js class fields", "r.js", "class A {\n  x = 1;\n  static #y = [\n    1,\n  ];\n  z = 2 // z\n}\n",
+         ["A.x", "A.#y", "A.z"]),
+        ("ts class fields", "r.ts", "class A {\n  @Input() x: number;\n  private readonly r = {\n    a: 1,\n  };\n}\n",
+         ["A.x", "A.r"]),
+        ("js function with a comment after it (reported)", "r.js", "function b() {} // old\nfunction c() {}\n", ["b"]),
+        ("ts constant with a comment after it", "r.ts", "export const x = 1 // x\n", ["x"]),
+        ("rb constant in a module", "r.rb", "module M\n  X = [\n    1,\n  ]\nend\n", ["M.X"]),
+        ("c anonymous typedef struct", "r.c", "typedef struct {\n    int x;\n} P;\n", ["P", "P.x"]),
     ]
     for label, name, source, targets in cases:
         for target in targets:
@@ -8179,7 +8185,7 @@ def test_read_symbol_round_trips():
          "class B {\n    @Deprecated\n    void m() {\n        return;\n    }\n\n    void n() {\n    }\n}\n"),
         ("py add_top_level, read from a method", "r.py", "x = 1\n",
          lambda a: a.add_top_level("@staticmethod\n    def m():\n        return 1"),
-         "x = 1\n\n@staticmethod\ndef m():\n    return 1\n"),
+         "x = 1\n\n\n@staticmethod\ndef m():\n    return 1\n"),
         ("rb add_top_level, read from a nested class", "r.rb", "X = 1\n",
          lambda a: a.add_top_level("class B\n    def f\n      1\n    end\n  end"),
          "X = 1\n\nclass B\n  def f\n    1\n  end\nend\n"),
@@ -8281,25 +8287,37 @@ def _depth_text(target: str, kind_or_text: str, depth: str) -> str:
 
 def _listed_targets_resolve(label: str, name: str, source: str):
     """check() that every entry list_symbols lists for source is what its
-    name targets: read_symbol finds it, and finds the symbol at the listed
-    line."""
+    name targets: no other entry is listed under that name, read_symbol
+    finds it, at the listed line, its other depths read it or refuse it
+    for what it is, and replace_function given read_symbol's text leaves
+    the file as it was."""
     listed = _read_result(name, source, lambda a: a.list_symbols())
 
     def found_at(a, target):
         node = a.parser.find_node_by_name(target)
         return "no line" if node is None else str(a._symbol_span(node)[0].start_point[0] + 1)
 
+    seen = set()
     for line in listed.splitlines():
-        entry, number = line.split(" (line ")
+        entry, number = line.rsplit(" (line ", 1)
+        number = number.rstrip(")")
         target = " ".join(entry.split()[1:])
         result = _read_result(name, source, lambda a: a.read_symbol(target))
         at = _read_result(name, source, lambda a: found_at(a, target))
-        if result.startswith("REFUSED"):
+        depths = [_read_result(name, source, lambda a: a.read_symbol(target, depth)) for depth in ("signature", "interface")]
+        refused = [d for d in depths if d.startswith("REFUSED") and ", which has no " not in d]
+        if target in seen:
+            result = "FAIL: listed twice"
+        elif result.startswith("REFUSED"):
             result = "FAIL: " + result
-        elif at != number.rstrip(")"):
-            result = f"FAIL: listed at line {number.rstrip(')')}, found at {at}"
+        elif at != number:
+            result = f"FAIL: listed at line {number}, found at {at}"
+        elif refused:
+            result = "FAIL: " + refused[0]
         else:
-            result = "PASS"
+            trip = _round_trip(name, source, target)
+            result = "PASS" if trip == "<unchanged>" else f"FAIL: round trip: {trip}"
+        seen.add(target)
         check(f"{label}: listed '{target}' resolves", result, "PASS")
 
 
@@ -8360,43 +8378,50 @@ def test_symbol_discovery():
          "extern int g;\nint h(void);\n",
          "variable g (line 1)\nfunction h (line 2)",
          [("g", "extern int g;", "a variable", "int h(void);\n")]),
-        # A struct is found and listed rather than a typedef of its name,
-        # and a Java method rather than the field it shares its name with.
+        # A typedef of a struct's name is the name's target, the struct
+        # `struct Node`'s (its fields are found through the name), and a
+        # Java field the name's, the method `A.size()`'s.
         ("c typedef before its struct", "k.c",
          "typedef struct Node Node;\n\nstruct Node {\n    Node *next;\n};\n",
-         "struct Node (line 3)\n  field Node.next (line 4)",
-         [("Node", "struct Node {\n    Node *next;\n};", ("struct Node", "struct Node {\n    Node *next;\n};"),
+         "type Node (line 1)\nstruct struct Node (line 3)\n  field Node.next (line 4)",
+         [("Node", "typedef struct Node Node;",
+           ("REFUSED: 'Node' is a type alias, which has no signature (depth='signature' is for functions and "
+            "class headers); read it with depth='full', and the struct it names with 'struct Node'",
+            "REFUSED: 'Node' is a type alias, which has no interface (depth='interface' is for classes and "
+            "functions); read it with depth='full', and the struct it names with 'struct Node'"),
+           "struct Node {\n    Node *next;\n};\n"),
+          ("struct Node", "struct Node {\n    Node *next;\n};", ("struct Node", "struct Node {\n    Node *next;\n};"),
            "typedef struct Node Node;\n")]),
         ("java field and accessor sharing a name", "K.java",
          "class A {\n    private int size;\n\n    int size() {\n        return size;\n    }\n}\n",
-         "class A (line 1)\n  method A.size (line 4)",
-         [("A.size", "int size() {\n        return size;\n    }", "int size()", "class A {\n    private int size;\n}\n")]),
+         "class A (line 1)\n  field A.size (line 2)\n  method A.size() (line 4)",
+         [("A.size()", "int size() {\n        return size;\n    }", "int size()", "class A {\n    private int size;\n}\n"),
+          ("A.size", "private int size;", "a field", "class A {\n    int size() {\n        return size;\n    }\n}\n")]),
         ("cpp methods declared in their class", "k.cpp",
          "class A {\npublic:\n    A();\n    int g();\n    virtual void v() = 0;\n};\n\nint A::g() { return 1; }\n",
-         "class A (line 1)\n  method A.A (line 3)\n  method A.g (line 4)\n  method A.v (line 5)\nfunction g (line 8)",
+         "class A (line 1)\n  method A.A (line 3)\n  method A.g (line 4)\n  method A.v (line 5)\nfunction A::g (line 8)",
          [("A.A", "A();", "A()", "class A {\npublic:\n    int g();\n    virtual void v() = 0;\n};\n\nint A::g() { return 1; }\n"),
           ("A.g", "int g();", "int g()", "class A {\npublic:\n    A();\n    virtual void v() = 0;\n};\n\nint A::g() { return 1; }\n"),
           ("A.v", "virtual void v() = 0;", "virtual void v() = 0",
            "class A {\npublic:\n    A();\n    int g();\n};\n\nint A::g() { return 1; }\n"),
           ("g", "int A::g() { return 1; }", "int A::g()",
            "class A {\npublic:\n    A();\n    int g();\n    virtual void v() = 0;\n};\n")]),
-        # TS: an overload signature yields to the implementation, and a
-        # function declared without one (`declare function`) is a target.
-        # Known limitation, pinned so that a change shows: an overload group
-        # is not one symbol, so delete_symbol takes the implementation alone
-        # (leaving signatures tsc rejects) or the first `declare` signature.
+        # TS: overload signatures are one symbol with the implementation
+        # after them, and functions declared without one (`declare
+        # function` twice) one symbol of their own.
         ("ts overloads and declared functions", "k.ts",
          "function f(a: string): void;\nfunction f(a: any) {\n  return a;\n}\n"
          "declare function g(x: number): void;\ndeclare function g(x: string): void;\n",
-         "function f (line 2)\nfunction g (line 5)",
-         [("f", "function f(a: any) {\n  return a;\n}", "function f(a: any)",
-           "function f(a: string): void;\ndeclare function g(x: number): void;\ndeclare function g(x: string): void;\n"),
-          ("g", "declare function g(x: number): void;", "function g(x: number): void",
-           "function f(a: string): void;\nfunction f(a: any) {\n  return a;\n}\ndeclare function g(x: string): void;\n")]),
+         "function f (line 1)\nfunction g (line 5)",
+         [("f", "function f(a: string): void;\nfunction f(a: any) {\n  return a;\n}", "function f(a: any)",
+           "declare function g(x: number): void;\ndeclare function g(x: string): void;\n"),
+          ("g", "declare function g(x: number): void;\ndeclare function g(x: string): void;",
+           "declare function g(x: number): void",
+           "function f(a: string): void;\nfunction f(a: any) {\n  return a;\n}\n")]),
         ("ts method overloads (listed once, as before)", "k.ts",
          "class K {\n  m(a: string): void;\n  m(a: any) {}\n}\n",
-         "class K (line 1)\n  method K.m (line 3)",
-         [("K.m", "m(a: any) {}", "m(a: any)", "class K {\n  m(a: string): void;\n}\n")]),
+         "class K (line 1)\n  method K.m (line 2)",
+         [("K.m", "m(a: string): void;\n  m(a: any) {}", "m(a: any)", "class K {\n}\n")]),
 
         # Macros, typedefs, globals (reported).
         ("c macro, typedef and global (reported)", "k.c",
@@ -8419,9 +8444,9 @@ def test_symbol_discovery():
         ("c typedefs of structs", "k.c",
          "typedef struct N {\n    int v;\n} N;\ntypedef struct {\n    int x;\n} P;\ntypedef int (*cb)(int);\n",
          "struct N (line 1)\n  field N.v (line 2)\ntype P (line 4)\n  field P.x (line 5)\ntype cb (line 7)",
-         [("N", "typedef struct N {\n    int v;\n} N;", ("struct N", "struct N {\n    int v;\n}"),
+         [("N", "typedef struct N {\n    int v;\n} N;", ("typedef struct N", "typedef struct N {\n    int v;\n} N;"),
            "typedef struct {\n    int x;\n} P;\ntypedef int (*cb)(int);\n"),
-          ("P", "typedef struct {\n    int x;\n} P;", "a type alias",
+          ("P", "typedef struct {\n    int x;\n} P;", ("typedef struct", "typedef struct {\n    int x;\n} P;"),
            "typedef struct N {\n    int v;\n} N;\ntypedef int (*cb)(int);\n"),
           ("P.x", "int x;", "a field",
            "typedef struct N {\n    int v;\n} N;\ntypedef struct {\n} P;\ntypedef int (*cb)(int);\n"),
@@ -8440,7 +8465,7 @@ def test_symbol_discovery():
            "using U = int;\ntemplate <class T>\nusing V = T;\nconstexpr int N = 3;\nconst int K = 1;\nconst char *name = \"x\";\nstatic int s;\n")]),
         ("cpp static members and their definitions", "k.cpp",
          "struct A {\n    static int n;\n    static constexpr int N = 3;\n    using T = int;\n};\nint A::n = 0;\n",
-         "struct A (line 1)\n  field A.n (line 2)\n  field A.N (line 3)\n  type A.T (line 4)\nvariable n (line 6)",
+         "struct A (line 1)\n  field A.n (line 2)\n  field A.N (line 3)\n  type A.T (line 4)\nvariable A::n (line 6)",
          [("A.n", "static int n;", "a field",
            "struct A {\n    static constexpr int N = 3;\n    using T = int;\n};\nint A::n = 0;\n"),
           ("A.T", "using T = int;", "a type alias",
@@ -8497,7 +8522,8 @@ def test_symbol_discovery():
         ("python nested classes", "k.py",
          "class A:\n    class B:\n        def m(self):\n            return 1\n\n    @dataclass\n    class C:\n        x: int\n\n"
          "    def n(self):\n        pass\n",
-         "class A (line 1)\n  class A.B (line 2)\n    method A.B.m (line 3)\n  class A.C (line 6)\n  method A.n (line 10)",
+         "class A (line 1)\n  class A.B (line 2)\n    method A.B.m (line 3)\n  class A.C (line 6)\n    field A.C.x (line 8)\n"
+         "  method A.n (line 10)",
          [("A.C", "@dataclass\n    class C:\n        x: int", ("class C:", "@dataclass\nclass C:\n    x: int"),
            "class A:\n    class B:\n        def m(self):\n            return 1\n\n    def n(self):\n        pass\n")]),
         ("ruby nested modules and classes", "k.rb",
@@ -8505,7 +8531,7 @@ def test_symbol_discovery():
          "  def self.f\n  end\nend\n",
          "module M (line 1)\n  class M.A (line 2)\n    method M.A.m (line 3)\n    method M.A.p (line 6)\n"
          "  module M.N (line 10)\n    method M.N.s (line 11)\n  method M.f (line 14)",
-         [("M.A.p", "private def p\n    end", "def p",
+         [("M.A.p", "private def p\n    end", "private def p",
            "module M\n  class A\n    def m\n    end\n  end\n\n  module N\n    def self.s; end\n  end\n\n  def self.f\n  end\nend\n")]),
         ("ts namespaces", "k.ts",
          "namespace N {\n  export class C {\n    m() {}\n  }\n  export function f() {}\n  export const h = () => 1;\n}\n"
@@ -8544,7 +8570,7 @@ def test_symbol_discovery():
          "class A {\npublic:\n    ~A();\n    bool operator == (const A& o) const;\n    operator const char *() const;\n};\n\n"
          "A::~A() {\n}\n\nbool A::operator==(const A& o) const { return true; }\n\nA::operator const char*() const { return 0; }\n",
          "class A (line 1)\n  method A.~A (line 3)\n  method A.operator== (line 4)\n  method A.operator const char* (line 5)\n"
-         "function ~A (line 8)\nfunction operator== (line 11)\nfunction operator const char* (line 13)",
+         "function A::~A (line 8)\nfunction A::operator== (line 11)\nfunction A::operator const char* (line 13)",
          [("A.~A", "~A();", "~A()",
            "class A {\npublic:\n    bool operator == (const A& o) const;\n    operator const char *() const;\n};\n\n"
            "A::~A() {\n}\n\nbool A::operator==(const A& o) const { return true; }\n\nA::operator const char*() const { return 0; }\n"),
@@ -8915,7 +8941,7 @@ def test_byte_order_mark():
         ("py add_top_level into a file that is only the mark", "k.py", bom,
          lambda a: a.add_top_level("X = 1"), bom + "X = 1\n"),
         ("py add_import at the top", "k.py", bom + "def f():\n    pass\n", lambda a: a.add_import("import os"),
-         bom + "import os\ndef f():\n    pass\n"),
+         bom + "import os\n\n\ndef f():\n    pass\n"),
         ("go add_import", "k.go", bom + 'package main\n\nimport "os"\n\nfunc f() {}\n',
          lambda a: a.add_import('import "fmt"'),
          bom + 'package main\n\nimport "os"\nimport "fmt"\n\nfunc f() {}\n'),
@@ -9215,16 +9241,16 @@ def test_final_review_followups():
         ("cpp namespace reopened, a function (reported)", "k.cpp", prototype,
          "namespace n (line 1)\n  function n.f (line 5)", [("n.f", "void f() {}")]),
         ("ts class and namespace (reported)", "k.ts", ts_class,
-         "class Foo (line 1)\n  method Foo.bar (line 2)\n  function Foo.parse (line 9)",
+         "class Foo (line 1)\n  method Foo.bar (line 2)\n  constant Foo.VERSION (line 8)\n  function Foo.parse (line 9)",
          [("Foo", None), ("Foo.bar", "bar(): number {\n    return 1;\n  }"), ("Foo.parse", "export function parse() {}"),
           ("Foo.VERSION", "export const VERSION = 1;")]),
         ("ts class and a namespace not exported", "k.ts", ts_class.replace("export namespace", "namespace"),
-         "class Foo (line 1)\n  method Foo.bar (line 2)\n  function Foo.parse (line 9)",
+         "class Foo (line 1)\n  method Foo.bar (line 2)\n  constant Foo.VERSION (line 8)\n  function Foo.parse (line 9)",
          [("Foo.parse", "export function parse() {}")]),
         ("ts enum and namespace (reported)", "k.ts", ts_enum, "enum Color (line 1)\n  function Color.parse (line 3)",
          [("Color", "export enum Color { Red }"),
           ("Color.parse", "export function parse(s: string): Color { return Color.Red; }")]),
-        ("ts function and namespace (reported)", "k.ts", ts_function, "function build (line 1)",
+        ("ts function and namespace (reported)", "k.ts", ts_function, "function build (line 1)\n  constant build.x (line 3)",
          [("build", "export function build() {}"), ("build.x", "export const x = 1;")]),
         ("ts namespace reopened as a module", "k.ts", ts_reopened,
          "namespace N (line 1)\n  class N.C (line 2)\n  class N.D (line 5)",
@@ -9257,13 +9283,14 @@ def test_final_review_followups():
         _exact(f"final review merged ({label})", _edit_result(name, source, action), expected)
 
     # Alternatives in a C/C++ preprocessor conditional are listed once, as
-    # the name targets the first; C++ overloads are listed as before.
+    # the name targets the first; C++ overloads are listed by their
+    # parameter types.
     _exact("final review list_symbols (alternatives in #ifdef ... #else)",
            _read_result("k.c", "#ifdef X\nint f(void) { return 1; }\n#else\nint f(void) { return 2; }\n#endif\n",
                         lambda a: a.list_symbols()), "function f (line 2)")
     _exact("final review list_symbols (cpp overloads)",
            _read_result("k.cpp", "void g(int) {}\nvoid g(double) {}\n", lambda a: a.list_symbols()),
-           "function g (line 1)\nfunction g (line 2)")
+           "function g(int) (line 1)\nfunction g(double) (line 2)")
 
     # Removing one Go name of a declaration of several keeps the comments
     # of the others.
@@ -9320,12 +9347,2272 @@ def test_final_review_followups():
            bom + "def f():\n    return 1\n")
     _exact("final review byte order mark (add_top_level at the top with a marked content)",
            _edit_result("k.py", bom + "def f():\n    pass\n", lambda a: a.add_top_level(bom + "X = 1", "top")),
-           bom + "X = 1\n\ndef f():\n    pass\n")
+           bom + "X = 1\n\n\ndef f():\n    pass\n")
+
+
+# ──────────────────────────────────────────────
+# Targets: overloads by parameter types, overload groups, keyword-prefixed
+# tags and types, listed targets that resolve
+# ──────────────────────────────────────────────
+
+
+def test_overloaded_targets():
+    print("\n═══ targets: C++ and Java overloads named by their parameter types ═══")
+
+    # A name that one scope gives several functions with different
+    # parameter types is refused, naming each overload as its target; a
+    # last part `name(T1, T2)` picks one by its parameter types as written,
+    # without names and default values, whatever the spacing. list_symbols
+    # names only the overloads that way.
+    java = "class A {\n    int m(int x) { return x; }\n    int m(String s) { return 0; }\n}\n"
+    _exact("java overloads: list_symbols", _read_result("K.java", java, lambda a: a.list_symbols()),
+           "class A (line 1)\n  method A.m(int) (line 2)\n  method A.m(String) (line 3)")
+    _exact("java overloads: the name is refused (reported)",
+           _read_result("K.java", java, lambda a: a.read_symbol("A.m")),
+           "REFUSED: 'A.m' is overloaded: A.m(int) (line 2), A.m(String) (line 3); add the parameter types.")
+    # (target, read_symbol, or None for none found)
+    for target, full in [
+        ("A.m(String)", "int m(String s) { return 0; }"),
+        ("A.m( int )", "int m(int x) { return x; }"),
+        ("A.m(long)", None),
+        ("A.m()", None),
+        ("A.m(int, int)", None),
+    ]:
+        result = _read_result("K.java", java, lambda a: a.read_symbol(target))
+        if full is None:
+            check(f"java overloads: read_symbol('{target}') finds none", result, f"Target '{target}' not found")
+        else:
+            _exact(f"java overloads: read_symbol('{target}')", result, full)
+    _exact("java overloads: read_symbol('A.m(int)', 'signature')",
+           _read_result("K.java", java, lambda a: a.read_symbol("A.m(int)", "signature")), "int m(int x)")
+    _exact("java overloads: read_symbol('A.m(String)', 'interface')",
+           _read_result("K.java", java, lambda a: a.read_symbol("A.m(String)", "interface")), "int m(String s)")
+    # A name that is not overloaded takes its parameter types too.
+    _exact("java: a method that is not overloaded, by its parameter types",
+           _read_result("K.java", "class A {\n    void f(int a, String b) {}\n}\n",
+                        lambda a: a.read_symbol("A.f(int,String)")), "void f(int a, String b) {}")
+
+    # Java varargs, arrays (either way), generics, qualified names and
+    # modifiers; constructors are `A.A(...)`.
+    spelled = ("class A {\n    void f(String... a) {}\n    void f(java.util.List<String> l, int[] b) {}\n"
+               "    void f(final Map<String, Integer> m, int c[]) {}\n    A(int a) {}\n    A() {}\n}\n")
+    _exact("java parameter spellings: list_symbols", _read_result("K.java", spelled, lambda a: a.list_symbols()),
+           "class A (line 1)\n  method A.f(String...) (line 2)\n  method A.f(java.util.List<String>, int[]) (line 3)\n"
+           "  method A.f(Map<String, Integer>, int[]) (line 4)\n  method A.A(int) (line 5)\n  method A.A() (line 6)")
+    for target, full in [
+        ("A.f(String ...)", "void f(String... a) {}"),
+        ("A.f(String...)", "void f(String... a) {}"),
+        ("A.f(java.util.List<String>,int[])", "void f(java.util.List<String> l, int[] b) {}"),
+        ("A.f(Map<String,Integer>, int [])", "void f(final Map<String, Integer> m, int c[]) {}"),
+        ("A.A()", "A() {}"),
+        ("A.A(int)", "A(int a) {}"),
+    ]:
+        _exact(f"java parameter spellings: read_symbol('{target}')",
+               _read_result("K.java", spelled, lambda a: a.read_symbol(target)), full)
+
+    # C++: constructors, out-of-line definitions (`A::A(int)`), operators,
+    # const overloads (`A.get(int) const`), references, templates and
+    # default values.
+    cpp = ("class A {\npublic:\n    A();\n    A(int x);\n    ~A();\n    bool operator==(const A &o) const;\n"
+           "    int &get(int i);\n    const int &get(int i) const;\n    void s(const std::string &s, int n = 1);\n"
+           "    void s(std::map<int, int> m);\n};\n\nA::A() {}\n\nA::A(int x) {}\n\n"
+           "bool A::operator==(const A& o) const { return true; }\n")
+    _exact("cpp overloads: list_symbols (reported)", _read_result("k.cpp", cpp, lambda a: a.list_symbols()),
+           "class A (line 1)\n  method A.A() (line 3)\n  method A.A(int) (line 4)\n  method A.~A (line 5)\n"
+           "  method A.operator== (line 6)\n  method A.get(int) (line 7)\n  method A.get(int) const (line 8)\n"
+           "  method A.s(const std::string &, int) (line 9)\n  method A.s(std::map<int, int>) (line 10)\n"
+           "function A::A() (line 13)\nfunction A::A(int) (line 15)\nfunction A::operator== (line 17)")
+    for target, full in [
+        ("A.A(int)", "A(int x);"),
+        ("A.A( )", "A();"),
+        ("A::A(int)", "A::A(int x) {}"),
+        ("A::A()", "A::A() {}"),
+        ("A.operator==(const A &)", "bool operator==(const A &o) const;"),
+        ("A.operator==(const A&)", "bool operator==(const A &o) const;"),
+        ("A.operator ==", "bool operator==(const A &o) const;"),
+        ("A::operator==(const A &)", "bool A::operator==(const A& o) const { return true; }"),
+        ("operator==", "bool A::operator==(const A& o) const { return true; }"),
+        ("A.get(int)", "int &get(int i);"),
+        ("A.get(int) const", "const int &get(int i) const;"),
+        ("A.s(const std::string&, int)", "void s(const std::string &s, int n = 1);"),
+        ("A.s(const std::string &,int)", "void s(const std::string &s, int n = 1);"),
+        ("A.s(std::map<int,int>)", "void s(std::map<int, int> m);"),
+        ("A.~A()", "~A();"),
+        ("A.s(std::string)", None),
+        ("A.get(int) volatile", None),
+    ]:
+        result = _read_result("k.cpp", cpp, lambda a: a.read_symbol(target))
+        if full is None:
+            check(f"cpp overloads: read_symbol('{target}') finds none", result, f"Target '{target}' not found")
+        else:
+            _exact(f"cpp overloads: read_symbol('{target}')", result, full)
+    _exact("cpp overloads: read_symbol('A') is the class",
+           _read_result("k.cpp", cpp, lambda a: a.read_symbol("A")), cpp[: cpp.index("};") + 2])
+    for target, overloads in [
+        ("A.A", "A.A() (line 3), A.A(int) (line 4)"),
+        ("A::A", "A::A() (line 13), A::A(int) (line 15)"),
+        ("A.get", "A.get(int) (line 7), A.get(int) const (line 8)"),
+        ("A.s", "A.s(const std::string &, int) (line 9), A.s(std::map<int, int>) (line 10)"),
+    ]:
+        _exact(f"cpp overloads: '{target}' is refused",
+               _read_result("k.cpp", cpp, lambda a: a.read_symbol(target)),
+               f"REFUSED: '{target}' is overloaded: {overloads}; add the parameter types.")
+
+    # Every tool that takes a target takes the parameter types.
+    jsrc = ("class A {\n    // Doubles.\n    int m(int x) {\n        x++;\n        return x * 2;\n    }\n\n"
+            "    int m(String s) {\n        return 0;\n    }\n}\n")
+    one = "    // Doubles.\n    int m(int x) {\n        x++;\n        return x * 2;\n    }\n"
+    two = "    int m(String s) {\n        return 0;\n    }\n"
+    # (tool, target, other arguments, keyword arguments, expected file text)
+    edits = [
+        ("replace_function", "A.m(String)", ("int m(String s) {\n    return 1;\n}",), {},
+         jsrc.replace(two, two.replace("0", "1"))),
+        ("replace_function_body", "A.m(String)", ("return 1;",), {}, jsrc.replace(two, two.replace("0", "1"))),
+        ("replace_in_body", "A.m(int)", ("x * 2", "x * 3"), {}, jsrc.replace(one, one.replace("x * 2", "x * 3"))),
+        ("insert_in_body", "A.m(String)", ("log();",), {"at": "top"},
+         jsrc.replace(two, two.replace("        return", "        log();\n        return"))),
+        ("delete_in_body", "A.m(int)", ("        x++;\n",), {}, jsrc.replace(one, one.replace("        x++;\n", ""))),
+        ("replace_signature", "A.m(String)", ("int m(CharSequence s)",), {},
+         jsrc.replace("int m(String s)", "int m(CharSequence s)")),
+        ("add_parameter", "A.m(String)", ("int n",), {}, jsrc.replace("int m(String s)", "int m(String s, int n)")),
+        ("remove_parameter", "A.m(int)", ("x",), {}, jsrc.replace("int m(int x)", "int m()")),
+        ("delete_symbol", "A.m(int)", (), {}, jsrc.replace(one + "\n", "")),
+        ("insert_sibling", "A.m(String)", ("int k() {\n    return 2;\n}", "before"), {},
+         jsrc.replace(two, "    int k() {\n        return 2;\n    }\n\n" + two)),
+        ("edit_leading_comment", "A.m(String)", ("add", "// Zero."), {}, jsrc.replace(two, "    // Zero.\n" + two)),
+        ("edit_leading_comment", "A.m(int)", ("remove",), {}, jsrc.replace("    // Doubles.\n", "")),
+    ]
+    for tool, target, args, kwargs, expected in edits:
+        _exact(f"java overloads: {tool}('{target}')",
+               _edit_result("K.java", jsrc, lambda a: getattr(a, tool)(target, *args, **kwargs)), expected)
+        _refused(f"java overloads: {tool}('A.m')",
+                 _edit_result("K.java", jsrc, lambda a: getattr(a, tool)("A.m", *args, **kwargs)),
+                 "REFUSED: 'A.m' is overloaded: A.m(int) (line 3), A.m(String) (line 8); add the parameter types.")
+    # (label, edit, expected file text)
+    cpp_edits = [
+        ("delete_symbol of an out-of-line constructor", lambda a: a.delete_symbol("A::A(int)"),
+         cpp.replace("A::A(int x) {}\n\n", "")),
+        ("add_parameter to a constructor", lambda a: a.add_parameter("A.A(int)", "int y"),
+         cpp.replace("A(int x);", "A(int x, int y);")),
+        ("edit_leading_comment on a const overload", lambda a: a.edit_leading_comment("A.get(int) const", "add", "// Reads."),
+         cpp.replace("    const int &get", "    // Reads.\n    const int &get")),
+        ("replace_signature of an overload", lambda a: a.replace_signature("A.s(std::map<int, int>)", "void s(std::map<int, long> m)"),
+         cpp.replace("std::map<int, int> m", "std::map<int, long> m")),
+        ("replace_function of an operator", lambda a: a.replace_function("A::operator==(const A&)", "bool A::operator==(const A& o) const { return false; }"),
+         cpp.replace("{ return true; }", "{ return false; }")),
+    ]
+    for label, action, expected in cpp_edits:
+        _exact(f"cpp overloads: {label}", _edit_result("k.cpp", cpp, action), expected)
+
+    # Overloads by qualified name, prototypes, templates and free
+    # functions; a name that names functions of different classes is
+    # ambiguous, as one of them is no overload of another.
+    # (label, file name, source, list_symbols, [(target, read_symbol or refusal)])
+    cases = [
+        ("cpp out-of-line definitions of two classes", "k.cpp", "int A::g() { return 1; }\nint B::g() { return 2; }\n",
+         "function A::g (line 1)\nfunction B::g (line 2)",
+         [("g", "REFUSED: 'g' is ambiguous: A::g (line 1), B::g (line 2); use one of these targets."),
+          ("B::g", "int B::g() { return 2; }"), ("A::g()", "int A::g() { return 1; }")]),
+        ("cpp free overloads", "k.cpp", "void g(int) {}\nvoid g(double) {}\n",
+         "function g(int) (line 1)\nfunction g(double) (line 2)",
+         [("g(double)", "void g(double) {}"),
+          ("g", "REFUSED: 'g' is overloaded: g(int) (line 1), g(double) (line 2); add the parameter types.")]),
+        ("cpp a prototype and the definition of another overload", "k.cpp", "int f(int);\nint f(double x) { return 0; }\n",
+         "function f(int) (line 1)\nfunction f(double) (line 2)",
+         [("f(int)", "int f(int);"), ("f(double)", "int f(double x) { return 0; }")]),
+        ("cpp a prototype and its definition", "k.cpp", "int f(int);\nint f(int x) { return x; }\n",
+         "function f (line 2)", [("f", "int f(int x) { return x; }"), ("f(int)", "int f(int x) { return x; }")]),
+        ("cpp a template and an overload", "k.cpp", "template <class T>\nT id(T x) { return x; }\nint id(int x) { return x; }\n",
+         "function id(T) (line 1)\nfunction id(int) (line 3)",
+         [("id(T)", "template <class T>\nT id(T x) { return x; }"), ("id(int)", "int id(int x) { return x; }")]),
+        ("cpp variadic and function pointer parameters", "k.cpp",
+         "void h(int a, ...);\nvoid h(int (*cb)(int), char *argv[]);\n",
+         "function h(int, ...) (line 1)\nfunction h(int (*)(int), char *[]) (line 2)",
+         [("h(int,...)", "void h(int a, ...);"), ("h(int(*)(int), char*[])", "void h(int (*cb)(int), char *argv[]);")]),
+        ("cpp methods in a namespace", "k.cpp", "namespace n {\nvoid f(int);\nvoid f(long);\n}\n",
+         "namespace n (line 1)\n  function n.f(int) (line 2)\n  function n.f(long) (line 3)",
+         [("n.f(long)", "void f(long);"),
+          ("n.f", "REFUSED: 'n.f' is overloaded: n.f(int) (line 2), n.f(long) (line 3); add the parameter types.")]),
+        ("c (void) is no parameters", "k.c", "int f(void);\nint f(void) { return 0; }\n",
+         "function f (line 2)", [("f(void)", "int f(void) { return 0; }"), ("f()", "int f(void) { return 0; }")]),
+        ("java field and method sharing a name (reported)", "K.java",
+         "class A {\n    int x;\n    int x() { return x; }\n}\n",
+         "class A (line 1)\n  field A.x (line 2)\n  method A.x() (line 3)",
+         [("A.x", "int x;"), ("A.x()", "int x() { return x; }")]),
+        ("java field and overloaded methods sharing a name", "K.java",
+         "class A {\n    int x;\n    int x() { return x; }\n    void x(int v) { x = v; }\n}\n",
+         "class A (line 1)\n  field A.x (line 2)\n  method A.x() (line 3)\n  method A.x(int) (line 4)",
+         [("A.x", "int x;"), ("A.x()", "int x() { return x; }"), ("A.x(int)", "void x(int v) { x = v; }")]),
+        ("c macro and function sharing a name", "k.c", "#define size 3\nint size(void);\n",
+         "macro size (line 1)\nfunction size() (line 2)",
+         [("size", "#define size 3"), ("size()", "int size(void);")]),
+        ("cpp call operator overloads", "k.cpp",
+         "struct A {\n    int operator()(int x);\n    int operator()(int x, int y);\n    int operator()();\n};\n",
+         "struct A (line 1)\n  method A.operator()(int) (line 2)\n  method A.operator()(int, int) (line 3)\n"
+         "  method A.operator()() (line 4)",
+         [("A.operator() (int, int)", "int operator()(int x, int y);"), ("A.operator()()", "int operator()();"),
+          ("A.operator()", "REFUSED: 'A.operator()' is overloaded: A.operator()(int) (line 2), A.operator()(int, int) "
+           "(line 3), A.operator()() (line 4); add the parameter types.")]),
+        ("cpp overloads by ref-qualifier", "k.cpp", "struct S {\n  int &g() &;\n  int g() &&;\n};\n",
+         "struct S (line 1)\n  method S.g() & (line 2)\n  method S.g() && (line 3)",
+         [("S.g() &&", "int g() &&;"), ("S.g()&", "int &g() &;"),
+          ("S.g()", "REFUSED: 'S.g()' is overloaded: S.g() & (line 2), S.g() && (line 3); add the method qualifiers.")]),
+        ("cpp out-of-line template overloads", "k.cpp",
+         "template <class T>\nvoid Box<T>::f(T x) {}\ntemplate <class T>\nvoid Box<T>::f(int x) {}\n",
+         "function Box::f(T) (line 1)\nfunction Box::f(int) (line 3)",
+         [("Box::f(int)", "template <class T>\nvoid Box<T>::f(int x) {}"), ("f(T)", "template <class T>\nvoid Box<T>::f(T x) {}")]),
+        ("cpp overloads in two blocks of a namespace", "k.cpp", "namespace n {\nvoid f(int);\n}\nnamespace n {\nvoid f(long);\n}\n",
+         "namespace n (line 1)\n  function n.f(int) (line 2)\n  function n.f(long) (line 5)",
+         [("n.f(long)", "void f(long);"),
+          ("n.f", "REFUSED: 'n.f' is overloaded: n.f(int) (line 2), n.f(long) (line 5); add the parameter types.")]),
+        ("java interface and enum overloads", "K.java",
+         "interface I {\n    void m(int a);\n    void m(String s);\n}\nenum E {\n    A, B;\n    E() {}\n    E(int x) {}\n}\n",
+         "interface I (line 1)\n  method I.m(int) (line 2)\n  method I.m(String) (line 3)\nenum E (line 5)\n"
+         "  method E.E() (line 7)\n  method E.E(int) (line 8)",
+         [("I.m(String)", "void m(String s);"), ("E.E(int)", "E(int x) {}")]),
+    ]
+    for label, name, source, listing, targets in cases:
+        _exact(f"{label}: list_symbols", _read_result(name, source, lambda a: a.list_symbols()), listing)
+        _listed_targets_resolve(label, name, source)
+        for target, full in targets:
+            _exact(f"{label}: read_symbol('{target}')", _read_result(name, source, lambda a: a.read_symbol(target)), full)
+
+
+def test_overload_groups():
+    print("\n═══ TS overload signatures and Python @overload stubs are part of their function ═══")
+
+    # The signatures directly before a TS function or method, and the
+    # Python @overload stubs before a function, are one symbol with it, as
+    # its decorators are: read_symbol shows them, replace_function and
+    # delete_symbol take them, insert_sibling(before) and the leading
+    # comment go above the first, and replace_signature edits the
+    # implementation's signature. Signatures with no implementation
+    # (`declare function` twice) are one symbol too.
+    ts = "// Echoes.\nfunction f(a: string): void;\nfunction f(a: any) {\n  return a;\n}\n\nconst g = 1;\n"
+    group = "function f(a: string): void;\nfunction f(a: any) {\n  return a;\n}"
+    _exact("ts overloads: list_symbols", _read_result("k.ts", ts, lambda a: a.list_symbols()),
+           "function f (line 2)\nconstant g (line 7)")
+    _exact("ts overloads: read_symbol (reported)", _read_result("k.ts", ts, lambda a: a.read_symbol("f")), group)
+    _exact("ts overloads: read_symbol signature, the implementation's",
+           _read_result("k.ts", ts, lambda a: a.read_symbol("f", "signature")), "function f(a: any)")
+    check("ts overloads: round trip", _round_trip("k.ts", ts, "f"), "<unchanged>")
+    # (label, file name, source, edit, expected file text)
+    edits = [
+        ("ts delete_symbol (reported)", "k.ts", ts, lambda a: a.delete_symbol("f"), "const g = 1;\n"),
+        ("ts replace_function", "k.ts", ts,
+         lambda a: a.replace_function("f", "function f(a: number): number;\nfunction f(a: any) {\n  return a;\n}"),
+         ts.replace("a: string): void", "a: number): number")),
+        ("ts insert_sibling before", "k.ts", ts, lambda a: a.insert_sibling("f", "const h = 2;", "before"),
+         "const h = 2;\n\n" + ts),
+        ("ts insert_sibling after", "k.ts", ts, lambda a: a.insert_sibling("f", "const h = 2;", "after"),
+         ts.replace("}\n\n", "}\n\nconst h = 2;\n\n")),
+        ("ts edit_leading_comment replace", "k.ts", ts, lambda a: a.edit_leading_comment("f", "replace", "// Returns a."),
+         ts.replace("// Echoes.", "// Returns a.")),
+        ("ts edit_leading_comment add above the first signature", "k.ts", ts.replace("// Echoes.\n", ""),
+         lambda a: a.edit_leading_comment("f", "add", "// Returns a."), ts.replace("// Echoes.", "// Returns a.")),
+        ("ts replace_signature, the implementation's", "k.ts", ts,
+         lambda a: a.replace_signature("f", "function f(a: unknown)"), ts.replace("f(a: any)", "f(a: unknown)")),
+        ("ts exported overloads: delete_symbol", "k.ts",
+         "export function f(a: string): void;\nexport function f(a: any) {}\n\nlet y = 1;\n",
+         lambda a: a.delete_symbol("f"), "let y = 1;\n"),
+        ("ts method overloads: delete_symbol (reported)", "k.ts", "class K {\n  m(a: string): void;\n  m(a: any) {}\n}\n",
+         lambda a: a.delete_symbol("K.m"), "class K {\n}\n"),
+        ("ts method overloads: insert_sibling before", "k.ts",
+         "class K {\n  n() {}\n\n  m(a: string): void;\n  m(a: any) {}\n}\n",
+         lambda a: a.insert_sibling("K.m", "k() {}", "before"),
+         "class K {\n  n() {}\n\n  k() {}\n\n  m(a: string): void;\n  m(a: any) {}\n}\n"),
+        ("ts declared overloads: delete_symbol", "k.ts",
+         "declare function g(x: number): void;\ndeclare function g(x: string): void;\nlet y = 1;\n",
+         lambda a: a.delete_symbol("g"), "let y = 1;\n"),
+        ("py @overload stubs: delete_symbol (reported)", "k.py",
+         "from typing import overload\n\n\n@overload\ndef f(a: int) -> int: ...\n@overload\ndef f(a: str) -> str: ...\n"
+         "def f(a):\n    return a\n\n\ndef g():\n    pass\n",
+         lambda a: a.delete_symbol("f"), "from typing import overload\n\n\ndef g():\n    pass\n"),
+        ("py @overload stubs: insert_sibling before", "k.py",
+         "x = 1\n\n\n@overload\ndef f(a: int) -> int: ...\ndef f(a):\n    return a\n",
+         lambda a: a.insert_sibling("f", "y = 2", "before"),
+         "x = 1\n\ny = 2\n\n\n@overload\ndef f(a: int) -> int: ...\ndef f(a):\n    return a\n"),
+        ("py @overload stubs: replace_signature, the implementation's", "k.py",
+         "@overload\ndef f(a: int) -> int: ...\ndef f(a):\n    return a\n",
+         lambda a: a.replace_signature("f", "def f(a, b=None):"),
+         "@overload\ndef f(a: int) -> int: ...\ndef f(a, b=None):\n    return a\n"),
+    ]
+    for label, name, source, action, expected in edits:
+        _exact(label, _edit_result(name, source, action), expected)
+
+    # (label, file name, source, list_symbols, target, read_symbol, signature)
+    reads = [
+        ("ts method overloads", "k.ts", "class K {\n  m(a: string): void;\n  m(a: any) {}\n}\n",
+         "class K (line 1)\n  method K.m (line 2)", "K.m", "m(a: string): void;\n  m(a: any) {}", "m(a: any)"),
+        ("ts exported overloads", "k.ts", "export function f(a: string): void;\nexport function f(a: any) {}\n",
+         "function f (line 1)", "f", "export function f(a: string): void;\nexport function f(a: any) {}", "function f(a: any)"),
+        ("ts declared overloads without an implementation", "k.ts",
+         "declare function g(x: number): void;\ndeclare function g(x: string): void;\n",
+         "function g (line 1)", "g", "declare function g(x: number): void;\ndeclare function g(x: string): void;",
+         "declare function g(x: number): void"),
+        ("ts abstract method overloads", "k.ts",
+         "abstract class B {\n  abstract n(a: string): void;\n  abstract n(a: number): void;\n}\n",
+         "class B (line 1)\n  method B.n (line 2)", "B.n", "abstract n(a: string): void;\n  abstract n(a: number): void;",
+         "abstract n(a: string): void"),
+        ("py @overload stubs", "k.py",
+         "@overload\ndef f(a: int) -> int: ...\n@overload\ndef f(a: str) -> str: ...\ndef f(a):\n    return a\n",
+         "function f (line 1)", "f",
+         "@overload\ndef f(a: int) -> int: ...\n@overload\ndef f(a: str) -> str: ...\ndef f(a):\n    return a", "def f(a):"),
+        ("py typing.overload stubs of a method", "k.py",
+         "class A:\n    @typing.overload\n    def m(self, a: int) -> int: ...\n    @typing.overload\n"
+         "    def m(self, a: str) -> str: ...\n    def m(self, a):\n        return a\n",
+         "class A (line 1)\n  method A.m (line 2)", "A.m",
+         "@typing.overload\n    def m(self, a: int) -> int: ...\n    @typing.overload\n    def m(self, a: str) -> str: ...\n"
+         "    def m(self, a):\n        return a", "def m(self, a):"),
+        ("py @overload stubs without an implementation", "k.py",
+         "@overload\ndef f(a: int) -> int: ...\n@overload\ndef f(a: str) -> str: ...\n",
+         "function f (line 1)", "f", "@overload\ndef f(a: int) -> int: ...\n@overload\ndef f(a: str) -> str: ...",
+         "def f(a: int) -> int:"),
+        ("py @overload stubs of a static method", "k.py",
+         "class A:\n    @overload\n    @staticmethod\n    def m(a: int) -> int: ...\n    @staticmethod\n    def m(a):\n"
+         "        return a\n\n    def n(self):\n        pass\n",
+         "class A (line 1)\n  method A.m (line 2)\n  method A.n (line 9)", "A.m",
+         "@overload\n    @staticmethod\n    def m(a: int) -> int: ...\n    @staticmethod\n    def m(a):\n        return a",
+         "def m(a):"),
+        ("py @overload stubs over several lines (h11, cryptography)", "k.py",
+         "class C:\n    @overload\n    def send(self, event: Closed) -> None:\n        ...\n\n    @typing.overload\n"
+         "    def send(\n        self,\n        event: Data,\n    ) -> bytes: ...\n\n    def send(self, event):\n"
+         "        \"\"\"Send it.\"\"\"\n        return b''\n",
+         "class C (line 1)\n  method C.send (line 2)", "C.send",
+         "@overload\n    def send(self, event: Closed) -> None:\n        ...\n\n    @typing.overload\n    def send(\n"
+         "        self,\n        event: Data,\n    ) -> bytes: ...\n\n    def send(self, event):\n        \"\"\"Send it.\"\"\"\n"
+         "        return b''", "def send(self, event):"),
+        ("ts overloads in a namespace, a comment between", "k.ts",
+         "namespace N {\n  export function f(a: string): void;\n  // The implementation.\n  export function f(a: any) {}\n}\n",
+         "namespace N (line 1)\n  function N.f (line 2)", "N.f",
+         "export function f(a: string): void;\n  // The implementation.\n  export function f(a: any) {}", "function f(a: any)"),
+    ]
+    for label, name, source, listing, target, full, signature in reads:
+        _exact(f"{label}: list_symbols", _read_result(name, source, lambda a: a.list_symbols()), listing)
+        _listed_targets_resolve(label, name, source)
+        _exact(f"{label}: read_symbol", _read_result(name, source, lambda a: a.read_symbol(target)), full)
+        _exact(f"{label}: read_symbol signature", _read_result(name, source, lambda a: a.read_symbol(target, "signature")),
+               signature)
+        check(f"{label}: round trip", _round_trip(name, source, target), "<unchanged>")
+        check(f"{label}: round trip (crlf)", _round_trip(name, source, target, "\r\n"), "<unchanged>")
+
+    # Python redefinitions of a name are left as they were: each is listed,
+    # and the name targets the first (reported).
+    redefined = "def f():\n    return 1\n\n\ndef f():\n    return 2\n"
+    _exact("py redefinition: list_symbols (reported)", _read_result("k.py", redefined, lambda a: a.list_symbols()),
+           "function f (line 1)\nfunction f (line 5)")
+    _exact("py redefinition: read_symbol is the first (reported)",
+           _read_result("k.py", redefined, lambda a: a.read_symbol("f")), "def f():\n    return 1")
+
+
+def test_keyword_targets():
+    print("\n═══ targets: `struct stat`, `type User`: tags and types that share a name with a value ═══")
+
+    # A C/C++ struct, union, enum or class that shares its name with a
+    # function, variable or typedef is the target of `struct stat` (`union
+    # u`, `enum e`, `class C`), the name alone being the other symbol's,
+    # and list_symbols lists it so; alone, the name targets it as before.
+    # A TS type alias or interface that shares its name with a value
+    # (`const User`) is `type User` or `interface User`, the name alone
+    # being the value's. A dotted path takes the keyword in front of it
+    # all: `type N.User`, `struct outer.inner`.
+    stat = "struct stat {\n    int size;\n};\nint stat(const char *path, struct stat *st);\n"
+    tsuser = "const User = { a: 1 };\ntype User = { a: number };\n"
+    zod = (
+        "import { z } from 'zod';\n\n"
+        "export const User = z.object({ name: z.string() });\n\n"
+        "/** The user type. */\n"
+        "export type User = z.infer<typeof User>;\n"
+    )
+    props = "export interface Props {\n  a: number;\n}\nexport const Props = (p: Props) => p.a;\n"
+    nested = "struct outer {\n    struct inner {\n        int a;\n    } x;\n    int inner;\n};\n"
+    # (label, file name, source, list_symbols, [(target, read_symbol, or None for none found)])
+    cases = [
+        ("c struct and function (reported)", "k.c", stat,
+         "struct struct stat (line 1)\n  field stat.size (line 2)\nfunction stat (line 4)",
+         [("stat", "int stat(const char *path, struct stat *st);"), ("struct stat", "struct stat {\n    int size;\n};"),
+          ("stat.size", "int size;"), ("struct  stat", "struct stat {\n    int size;\n};"), ("union stat", None)]),
+        ("cpp struct and function", "k.cpp", stat,
+         "struct struct stat (line 1)\n  field stat.size (line 2)\nfunction stat (line 4)",
+         [("stat", "int stat(const char *path, struct stat *st);"), ("struct stat", "struct stat {\n    int size;\n};"),
+          ("class stat", None)]),
+        ("c struct alone", "k.c", "struct S {\n    int a;\n};\n", "struct S (line 1)\n  field S.a (line 2)",
+         [("S", "struct S {\n    int a;\n};"), ("struct S", "struct S {\n    int a;\n};")]),
+        ("c union and enum", "k.c", "union u {\n    int a;\n};\nint u;\nenum e { X };\nint e(void);\n",
+         "union union u (line 1)\n  field u.a (line 2)\nvariable u (line 4)\nenum enum e (line 5)\nfunction e (line 6)",
+         [("union u", "union u {\n    int a;\n};"), ("u", "int u;"), ("enum e", "enum e { X };"), ("e", "int e(void);")]),
+        ("c typedef before its struct (reported)", "k.c", "typedef struct Node Node;\n\nstruct Node {\n    Node *next;\n};\n",
+         "type Node (line 1)\nstruct struct Node (line 3)\n  field Node.next (line 4)",
+         [("Node", "typedef struct Node Node;"), ("struct Node", "struct Node {\n    Node *next;\n};"),
+          ("Node.next", "Node *next;")]),
+        ("c typedef of a struct of its name", "k.c", "typedef struct N {\n    int v;\n} N;\n",
+         "struct N (line 1)\n  field N.v (line 2)",
+         [("N", "typedef struct N {\n    int v;\n} N;"), ("struct N", "typedef struct N {\n    int v;\n} N;")]),
+        ("c nested struct and field of one name", "k.c", nested,
+         "struct outer (line 1)\n  struct struct outer.inner (line 2)\n    field outer.inner.a (line 3)\n"
+         "  field outer.x (line 2)\n  field outer.inner (line 5)",
+         [("outer.inner", "int inner;"), ("struct outer.inner", "struct inner {\n        int a;\n    } x;"),
+          ("outer.inner.a", "int a;")]),
+        ("cpp class and variable", "k.cpp", "class C {};\nint C;\n", "class class C (line 1)\nvariable C (line 2)",
+         [("class C", "class C {};"), ("C", "int C;"), ("struct C", None)]),
+        ("ts type and value (reported)", "k.ts", tsuser, "constant User (line 1)\ntype type User (line 2)",
+         [("User", "const User = { a: 1 };"), ("type User", "type User = { a: number };"), ("interface User", None)]),
+        ("ts zod pattern (reported)", "k.ts", zod, "constant User (line 3)\ntype type User (line 6)",
+         [("User", "export const User = z.object({ name: z.string() });"),
+          ("type User", "export type User = z.infer<typeof User>;")]),
+        ("ts interface and function", "k.ts", props, "interface interface Props (line 1)\nfunction Props (line 4)",
+         [("Props", "export const Props = (p: Props) => p.a;"),
+          ("interface Props", "export interface Props {\n  a: number;\n}")]),
+        ("ts three declarations", "k.ts", "const U = 1;\ntype U = number;\ninterface U {}\n",
+         "constant U (line 1)\ntype type U (line 2)\ninterface interface U (line 3)",
+         [("U", "const U = 1;"), ("type U", "type U = number;"), ("interface U", "interface U {}")]),
+        ("ts types alone", "k.ts", "type T = number;\ninterface I {}\n", "type T (line 1)\ninterface I (line 2)",
+         [("T", "type T = number;"), ("type T", "type T = number;"), ("I", "interface I {}"),
+          ("interface I", "interface I {}"), ("interface T", None)]),
+        ("ts a type and a value in a namespace", "k.ts", "namespace N {\n  export const T = 1;\n  export type T = number;\n}\n",
+         "namespace N (line 1)\n  constant N.T (line 2)\n  type type N.T (line 3)",
+         [("N.T", "export const T = 1;"), ("type N.T", "export type T = number;")]),
+        ("ts class and interface merged", "k.ts", "class A {\n  x = 1;\n}\ninterface A {\n  y: number;\n}\n",
+         "class A (line 1)\n  field A.x (line 2)\ninterface interface A (line 4)",
+         [("A", "class A {\n  x = 1;\n}"), ("interface A", "interface A {\n  y: number;\n}")]),
+        ("ts declared const and type", "k.ts", "declare const X: number;\ntype X = string;\n",
+         "constant X (line 1)\ntype type X (line 2)",
+         [("X", "declare const X: number;"), ("type X", "type X = string;")]),
+    ]
+    for label, name, source, listing, targets in cases:
+        _exact(f"{label}: list_symbols", _read_result(name, source, lambda a: a.list_symbols()), listing)
+        _listed_targets_resolve(label, name, source)
+        for target, full in targets:
+            result = _read_result(name, source, lambda a: a.read_symbol(target))
+            if full is None:
+                check(f"{label}: read_symbol('{target}') finds none", result, f"Target '{target}' not found")
+            else:
+                _exact(f"{label}: read_symbol('{target}')", result, full)
+
+    # The keyword target works with the other tools; the name alone edits
+    # the value.
+    # (label, file name, source, edit, expected file text)
+    edits = [
+        ("c delete_symbol of the struct", "k.c", stat, lambda a: a.delete_symbol("struct stat"),
+         "int stat(const char *path, struct stat *st);\n"),
+        ("c delete_symbol of the function", "k.c", stat, lambda a: a.delete_symbol("stat"), "struct stat {\n    int size;\n};\n"),
+        ("c add_field to the struct", "k.c", stat, lambda a: a.add_field("struct stat", "int mode;"),
+         stat.replace("{\n", "{\n    int mode;\n", 1)),
+        ("c add_method to the struct's fields", "k.c", stat, lambda a: a.add_method("struct stat", "int mode;"),
+         stat.replace("int size;\n", "int size;\n\n    int mode;\n")),
+        ("c replace_function of the struct", "k.c", stat,
+         lambda a: a.replace_function("struct stat", "struct stat {\n    long size;\n};"), stat.replace("int size", "long size")),
+        ("c edit_leading_comment on the struct", "k.c", stat,
+         lambda a: a.edit_leading_comment("struct stat", "add", "// File status."), "// File status.\n" + stat),
+        ("c insert_sibling after the struct", "k.c", stat, lambda a: a.insert_sibling("struct stat", "int n;", "after"),
+         stat.replace("};\n", "};\n\nint n;\n\n")),
+        ("c add_parameter to the function", "k.c", stat, lambda a: a.add_parameter("stat", "int flags"),
+         stat.replace("struct stat *st)", "struct stat *st, int flags)")),
+        ("ts delete_symbol of the type (reported)", "k.ts", zod, lambda a: a.delete_symbol("type User"),
+         "import { z } from 'zod';\n\nexport const User = z.object({ name: z.string() });\n"),
+        ("ts delete_symbol of the value", "k.ts", tsuser, lambda a: a.delete_symbol("User"), "type User = { a: number };\n"),
+        ("tsx replace_function of the type", "k.tsx", zod,
+         lambda a: a.replace_function("type User", "export type User = {};"), zod.replace("z.infer<typeof User>", "{}")),
+        ("ts add_field to the interface", "k.ts", props, lambda a: a.add_field("interface Props", "b: string;"),
+         props.replace("{\n  a", "{\n  b: string;\n  a")),
+        ("ts edit_leading_comment on the type", "k.ts", tsuser,
+         lambda a: a.edit_leading_comment("type User", "add", "// The shape."), tsuser.replace("type", "// The shape.\ntype")),
+    ]
+    for label, name, source, action, expected in edits:
+        _exact(label, _edit_result(name, source, action), expected)
+    for label, name, source, target in [("c struct", "k.c", stat, "struct stat"), ("ts type", "k.ts", zod, "type User"),
+                                        ("ts interface", "k.ts", props, "interface Props")]:
+        check(f"{label}: round trip of '{target}'", _round_trip(name, source, target), "<unchanged>")
+    _exact("c struct: read_symbol('struct stat', 'signature')",
+           _read_result("k.c", stat, lambda a: a.read_symbol("struct stat", "signature")), "struct stat")
+    _exact("c struct: read_symbol('struct stat', 'interface')",
+           _read_result("k.c", stat, lambda a: a.read_symbol("struct stat", "interface")), "struct stat {\n    int size;\n};")
+
+
+def test_listed_targets_everywhere():
+    print("\n═══ list_symbols: every listed name targets its own entry, in every language ═══")
+
+    # A C++ definition outside its class is listed under its qualified
+    # name (`A::A`, `A::B::f`, `A::n`), which targets it; its last name
+    # alone, or a shorter qualified name (`B::f`), still finds it when no
+    # symbol of the scope is named so. Alternative definitions in `#ifdef`
+    # branches and repeated declarations are listed once, at the first,
+    # which the name targets; so is a TS getter, whose setter no target
+    # reaches.
+    # (label, file name, source, list_symbols, [(target, read_symbol)])
+    cases = [
+        ("cpp out-of-line constructor (reported)", "k.cpp", "class A {\npublic:\n  A();\n};\nA::A() {}\n",
+         "class A (line 1)\n  method A.A (line 3)\nfunction A::A (line 5)",
+         [("A::A", "A::A() {}"), ("A.A", "A();"), ("A", "class A {\npublic:\n  A();\n};")]),
+        ("cpp nested qualified name (reported)", "k.cpp", "int A::B::f() { return 1; }\n", "function A::B::f (line 1)",
+         [("A::B::f", "int A::B::f() { return 1; }"), ("B::f", "int A::B::f() { return 1; }"),
+          ("f", "int A::B::f() { return 1; }"), ("C::f", "REFUSED: Target 'C::f' not found")]),
+        ("cpp out-of-line definitions beside a free function", "k.cpp",
+         "class A {\n  int g();\n};\nint A::g() { return 1; }\nint g() { return 2; }\n",
+         "class A (line 1)\n  method A.g (line 2)\nfunction A::g (line 4)\nfunction g (line 5)",
+         [("g", "int g() { return 2; }"), ("A::g", "int A::g() { return 1; }"), ("A.g", "int g();")]),
+        ("cpp static member definition", "k.cpp", "struct A {\n    static int n;\n};\nint A::n = 0;\n",
+         "struct A (line 1)\n  field A.n (line 2)\nvariable A::n (line 4)",
+         [("A::n", "int A::n = 0;"), ("n", "int A::n = 0;"), ("A.n", "static int n;")]),
+        ("cpp destructor and conversion defined outside", "k.cpp",
+         "struct A {\n    ~A();\n    operator bool() const;\n};\nA::~A() {}\nA::operator bool() const { return true; }\n",
+         "struct A (line 1)\n  method A.~A (line 2)\n  method A.operator bool (line 3)\nfunction A::~A (line 5)\n"
+         "function A::operator bool (line 6)",
+         [("A::~A", "A::~A() {}"), ("~A", "A::~A() {}"), ("A::operator bool", "A::operator bool() const { return true; }"),
+          ("A::operator bool()", "A::operator bool() const { return true; }")]),
+        # A definition outside the conditionals is the one compiled, so it
+        # is the target, not one in `#ifdef X` (or `#if 0`) before it.
+        ("c definition in #ifdef and outside (reported)", "k.c",
+         "#ifdef X\nint f(void) { return 1; }\n#endif\nint f(void) { return 2; }\n",
+         "function f (line 4)", [("f", "int f(void) { return 2; }")]),
+        ("c alternatives in #ifdef and #else", "k.c",
+         "#ifdef X\nint f(void) { return 1; }\n#else\nint f(void) { return 2; }\n#endif\n",
+         "function f (line 2)", [("f", "int f(void) { return 1; }")]),
+        ("c repeated typedef", "k.c", "typedef int T;\ntypedef int T;\n", "type T (line 1)", [("T", "typedef int T;")]),
+        ("cpp repeated prototype", "k.cpp", "void f(int);\nvoid f(int);\n", "function f (line 1)", [("f", "void f(int);")]),
+        ("ts getter and setter", "k.ts", "class A {\n  get x() { return 1; }\n  set x(v) {}\n}\n",
+         "class A (line 1)\n  method A.x (line 2)", [("A.x", "get x() { return 1; }")]),
+    ]
+    for label, name, source, listing, targets in cases:
+        _exact(f"{label}: list_symbols", _read_result(name, source, lambda a: a.list_symbols()), listing)
+        _listed_targets_resolve(label, name, source)
+        for target, full in targets:
+            result = _read_result(name, source, lambda a: a.read_symbol(target))
+            if full.startswith("REFUSED"):
+                check(f"{label}: read_symbol('{target}')", result, full)
+            else:
+                _exact(f"{label}: read_symbol('{target}')", result, full)
+
+    # One file per language with the shapes above and the usual ones.
+    corpus = [
+        ("python", "k.py",
+         "import typing\nfrom typing import overload\n\n\nclass A:\n    \"\"\"Doc.\"\"\"\n\n    @overload\n"
+         "    def m(self, a: int) -> int: ...\n    @overload\n    def m(self, a: str) -> str: ...\n    def m(self, a):\n"
+         "        return a\n\n    @property\n    def p(self):\n        return 1\n\n    class B:\n        def n(self):\n"
+         "            pass\n\n\n@typing.overload\ndef f(a: int) -> int: ...\n@typing.overload\ndef f(a: str) -> str: ...\n"
+         "def f(a):\n    return a\n\n\nasync def g():\n    pass\n"),
+        ("javascript", "k.js",
+         "class A {\n  constructor() {}\n  m() {\n    return 1;\n  }\n  static s() {}\n  get x() {\n    return 1;\n  }\n}\n\n"
+         "function f() {}\n\nfunction* gen() {}\n\nconst h = () => 1;\n\nexport default class {}\n"),
+        ("typescript", "k.ts",
+         "export function f(a: string): void;\nexport function f(a: any) {\n  return a;\n}\n\n"
+         "declare function g(x: number): void;\ndeclare function g(x: string): void;\n\n"
+         "const User = { a: 1 };\ntype User = { a: number };\n\ninterface Props {\n  a: number;\n}\n"
+         "const Props = (p: Props) => p.a;\n\nclass K {\n  m(a: string): void;\n  m(a: any) {}\n  get v() {\n    return 1;\n  }\n}\n\n"
+         "abstract class B {\n  abstract n(): void;\n}\n\nnamespace N {\n  export const T = 1;\n  export type T = number;\n"
+         "  export class C {}\n}\n\nenum E {\n  X,\n}\n\ntype Only = string;\n\ninterface I {}\n"),
+        ("c", "k.c",
+         "#include <stdio.h>\n#define M 1\n\nstruct stat {\n    int size;\n};\nint stat(const char *path, struct stat *st);\n\n"
+         "typedef struct Node Node;\nstruct Node {\n    Node *next;\n};\n\ntypedef struct N {\n    int v;\n} N;\n\n"
+         "union u {\n    int a;\n};\nint u;\n\nenum e { X };\nint e(void);\n\n"
+         "#ifdef X\nint f(void) { return 1; }\n#endif\nint f(void) { return 2; }\n\n"
+         "typedef int T;\ntypedef int T;\n\nint g(int);\nint g(int x) { return x; }\n\nextern int v;\nint v = 1;\n"),
+        ("c header", "k.h",
+         "#ifndef H\n#define H\nstruct stat {\n    int size;\n};\nint stat(const char *path);\nint h(int);\n"
+         "typedef struct { int x; } P, *PP;\n#endif\n"),
+        ("cpp", "k.cpp",
+         "namespace ns {\nclass A {\npublic:\n    A();\n    A(int x);\n    ~A();\n    bool operator==(const A &o) const;\n"
+         "    int &get(int i);\n    const int &get(int i) const;\n    template <class T>\n    T t(T x) { return x; }\n};\n}\n\n"
+         "ns::A::A() {}\n\nns::A::A(int x) {}\n\nint A::B::f() { return 1; }\n\nstruct stat {\n    int size;\n};\n"
+         "int stat(const char *p);\n\nclass C {};\nint C;\n\nvoid o(int) {}\nvoid o(double) {}\n\n"
+         "struct S {\n    static int n;\n};\nint S::n = 0;\n"),
+        ("ruby", "k.rb",
+         "module M\n  class A\n    def m\n    end\n\n    private def p\n    end\n\n    class << self\n      def s\n      end\n"
+         "    end\n  end\n\n  def self.f\n  end\nend\n"),
+        ("go", "k.go",
+         "package main\n\ntype A struct {\n\tx int\n}\n\nfunc (a *A) M() {}\n\ntype T = int\n\nvar v = 1\n\nconst C = 2\n\n"
+         "func f() {}\n"),
+        ("java", "K.java",
+         "class A {\n    int x;\n\n    int x() {\n        return x;\n    }\n\n    int m(int a) {\n        return a;\n    }\n\n"
+         "    int m(String s) {\n        return 0;\n    }\n\n    void v(String... a) {}\n\n    A() {}\n\n    A(int a) {}\n\n"
+         "    enum E {\n        P;\n\n        void e() {}\n    }\n\n    interface I {\n        void i();\n    }\n}\n"),
+    ]
+    for label, name, source in corpus:
+        _listed_targets_resolve(f"corpus {label}", name, source)
+        check(f"corpus {label}: lists symbols", _read_result(name, source, lambda a: a.list_symbols()), " (line ")
+
+
+def test_listed_data():
+    print("\n═══ list_symbols: module data, class attributes and fields, Ruby constants ═══")
+
+    # Data is listed with the kinds C, C++, Go and Java give it: a Python
+    # module-level name is a `variable` and a class attribute a `field`, a
+    # JS/TS `const` a `constant` and a `let` or `var` a `variable` (each
+    # name of a declaration of several, one bound to a function being a
+    # `function`), a JS/TS class field a `field`, a Ruby constant a
+    # `constant` and a Ruby local a `variable`. A name assigned again is
+    # listed once, at the first assignment, which the name targets; the
+    # names a pattern binds (`a, b = 1, 2`, `const { p } = o`), which are
+    # no targets, and fields named by a string key are not listed.
+    # (label, file name, source, list_symbols)
+    cases = [
+        ("python module variables and class attributes (reported)", "d.py",
+         "import os\n\nX = 1\nY: int = 2\na, b = 1, 2\n__all__ = [\"A\"]\n\n\nclass A:\n    \"\"\"Doc.\"\"\"\n\n"
+         "    x = 1\n    y: int\n\n    def m(self):\n        z = 1\n        return z\n\n\nX = 3\n",
+         "variable X (line 3)\nvariable Y (line 4)\nvariable __all__ (line 6)\nclass A (line 9)\n  field A.x (line 12)\n"
+         "  field A.y (line 13)\n  method A.m (line 15)"),
+        ("js module constants and variables (reported)", "d.js",
+         "const n = 1;\nlet m;\nvar a = 1, b = () => 2;\nconst { p, q } = obj;\nexport const e = 3;\nfunction f() {}\n",
+         "constant n (line 1)\nvariable m (line 2)\nvariable a (line 3)\nfunction b (line 3)\nconstant e (line 5)\n"
+         "function f (line 6)"),
+        ("js class fields", "d.js", "class A {\n  x = 1;\n  static #y = 2;\n  'q-r' = 3;\n  m() {}\n}\n",
+         "class A (line 1)\n  field A.x (line 2)\n  field A.#y (line 3)\n  method A.m (line 5)"),
+        ("ts declarations and class fields (reported)", "d.ts",
+         "declare const d: number;\nexport let e = 1;\nnamespace N {\n  export const T = 1;\n}\nabstract class A {\n"
+         "  @Input() x: number;\n  declare z: string;\n  abstract w: string;\n  private readonly r = 1;\n  m(): void {}\n}\n",
+         "constant d (line 1)\nvariable e (line 2)\nnamespace N (line 3)\n  constant N.T (line 4)\nclass A (line 6)\n"
+         "  field A.x (line 7)\n  field A.z (line 8)\n  field A.w (line 9)\n  field A.r (line 10)\n  method A.m (line 11)"),
+        ("ts value and type of one name", "d.ts", "const User = { a: 1 };\ntype User = { a: number };\n",
+         "constant User (line 1)\ntype type User (line 2)"),
+        ("ruby constants and variables (reported)", "d.rb",
+         "X = 1\ny = 2\n\nmodule M\n  LIMIT = 10\n\n  class A\n    NAME = <<~EOS\n      text\n    EOS\n\n    def f\n    end\n"
+         "  end\nend\n",
+         "constant X (line 1)\nvariable y (line 2)\nmodule M (line 4)\n  constant M.LIMIT (line 5)\n  class M.A (line 7)\n"
+         "    constant M.A.NAME (line 8)\n    method M.A.f (line 12)"),
+    ]
+    for label, name, source, listing in cases:
+        _exact(f"{label}: list_symbols", _read_result(name, source, lambda a: a.list_symbols()), listing)
+        _listed_targets_resolve(label, name, source)
+    tsx = "class A {\n  x: number = 1;\n  render() {\n    return <div />;\n  }\n}\n"
+    _exact("tsx class field: list_symbols", _read_result("d.tsx", tsx, lambda a: a.list_symbols()),
+           "class A (line 1)\n  field A.x (line 2)\n  method A.render (line 3)")
+    _listed_targets_resolve("tsx class field", "d.tsx", tsx)
+
+    # JS/TS class fields are targets for every whole-symbol tool: their
+    # decorators and the `;` after them are part of them, a comment after
+    # them on their line is not, and the other depths refuse them as fields.
+    ts = "class A {\n  // The x.\n  @Input() x: number;\n  y = 1; // why\n  m() {}\n}\n"
+    reads = [
+        ("ts field with its decorator (reported)", "f.ts", ts, "A.x", "full", "@Input() x: number;"),
+        ("ts field with a comment after it", "f.ts", ts, "A.y", "full", "y = 1;"),
+        ("js private static field", "f.js", "class A {\n  static #y = 2;\n}\n", "A.#y", "full", "static #y = 2;"),
+        ("js field without its ;", "f.js", "class A {\n  x = 1\n}\n", "A.x", "full", "x = 1"),
+        ("ts field at depth signature", "f.ts", ts, "A.x", "signature",
+         _depth_text("A.x", "a field", "signature")),
+        ("js field at depth interface", "f.js", "class A {\n  x = 1;\n}\n", "A.x", "interface",
+         _depth_text("A.x", "a field", "interface")),
+        ("js constant at depth signature", "f.js", "const n = 1;\n", "n", "signature",
+         _depth_text("n", "a constant", "signature")),
+    ]
+    for label, name, source, target, depth, expected in reads:
+        _exact(f"read_symbol ({label})", _read_result(name, source, lambda a: a.read_symbol(target, depth)), expected)
+    # (label, edit, expected file text)
+    edits = [
+        ("replace_function keeps the comment after it", lambda a: a.replace_function("A.y", "y = 2;"),
+         ts.replace("y = 1;", "y = 2;")),
+        ("replace_function with its decorator", lambda a: a.replace_function("A.x", "@Input() x: string;"),
+         ts.replace("x: number", "x: string")),
+        ("delete_symbol with its decorator and comment", lambda a: a.delete_symbol("A.x"),
+         "class A {\n  y = 1; // why\n  m() {}\n}\n"),
+        ("insert_sibling after", lambda a: a.insert_sibling("A.y", "z = 3;", "after"),
+         "class A {\n  // The x.\n  @Input() x: number;\n  y = 1; // why\n\n  z = 3;\n\n  m() {}\n}\n"),
+        ("insert_sibling before, above its comment", lambda a: a.insert_sibling("A.x", "w = 0;", "before"),
+         "class A {\n  w = 0;\n\n  // The x.\n  @Input() x: number;\n  y = 1; // why\n  m() {}\n}\n"),
+        ("edit_leading_comment replace", lambda a: a.edit_leading_comment("A.x", "replace", "// X."),
+         ts.replace("// The x.", "// X.")),
+        ("edit_leading_comment add", lambda a: a.edit_leading_comment("A.y", "add", "// Y."),
+         ts.replace("  y = 1;", "  // Y.\n  y = 1;")),
+    ]
+    for label, action, expected in edits:
+        _exact(f"ts class field: {label}", _edit_result("f.ts", ts, action), expected)
+    _exact("js class field: delete_symbol",
+           _edit_result("f.js", "class A {\n  x = 1;\n  m() {}\n}\n", lambda a: a.delete_symbol("A.x")),
+           "class A {\n  m() {}\n}\n")
+
+
+def test_depths_agree():
+    print("\n═══ read_symbol: depth signature and interface start where depth full does ═══")
+
+    # The signature and interface depths start where depth="full" starts,
+    # at the code that wraps the symbol: the key of a closure, a Go `type`
+    # (a type in a group is its spec alone), a TS `declare`, a C++ `extern
+    # "C"`, a Ruby `private` and the C typedef or declaration a struct is
+    # the type of; a typedef of a struct, union or enum without a tag
+    # reads as the type it defines. A closure's interface is its signature,
+    # as a function's is, and a Ruby endless method's signature ends before
+    # its `=`. replace_signature takes the signature back as it is.
+    # (label, file name, source, target, full, signature, interface)
+    cases = [
+        ("js closure (reported)", "c.js", "const app = {\n  handler: () => {\n    return 1;\n  },\n};\n", "app.handler",
+         "handler: () => {\n    return 1;\n  }", "handler: () =>", "handler: () =>"),
+        ("js closure with an expression body (reported)", "c.js", "const app = {\n  handler: () => 1,\n  other: 1,\n};\n",
+         "app.handler", "handler: () => 1", "handler: () =>", "handler: () =>"),
+        ("js closure function expression", "c.js",
+         "const app = {\n  handler: function (a) {\n    return a;\n  },\n};\n", "app.handler",
+         "handler: function (a) {\n    return a;\n  }", "handler: function (a)", "handler: function (a)"),
+        ("go closure in a composite literal", "c.go",
+         "package main\n\nvar cmd = &Command{\n\tRunE: func(c *Command) error {\n\t\treturn nil\n\t},\n}\n", "cmd.RunE",
+         "RunE: func(c *Command) error {\n\t\treturn nil\n\t}", "RunE: func(c *Command) error", "RunE: func(c *Command) error"),
+        ("go type in a group (reported)", "c.go", "package main\n\ntype (\n\tA struct{ x int }\n\tB int\n)\n", "A",
+         "A struct{ x int }", "A struct", "A struct{ x int }"),
+        ("go type in a group with a method", "c.go",
+         "package main\n\ntype (\n\tA struct {\n\t\tx int\n\t}\n\tB int\n)\n\nfunc (a *A) M() int {\n\treturn a.x\n}\n", "A",
+         "A struct {\n\t\tx int\n\t}", "A struct", "A struct {\n\t\tx int\n\t}\n\nfunc (a *A) M() int ..."),
+        ("go type alone", "c.go", "package main\n\ntype A struct {\n\tx int\n}\n", "A",
+         "type A struct {\n\tx int\n}", "type A struct", "type A struct {\n\tx int\n}"),
+        ("ts declare function", "c.ts", "declare function f(a: number): void;\n", "f",
+         "declare function f(a: number): void;", "declare function f(a: number): void", "declare function f(a: number): void"),
+        ("ts exported declare function", "c.ts", "export declare function f(a: number): void;\n", "f",
+         "export declare function f(a: number): void;", "declare function f(a: number): void",
+         "declare function f(a: number): void"),
+        ("ts declare class", "c.ts", "declare class A {\n  m(): void;\n}\n", "A",
+         "declare class A {\n  m(): void;\n}", "declare class A", "declare class A {\n  m(): void;\n}"),
+        ("rb private def (reported)", "c.rb", "class A\n  private def m(x)\n    x\n  end\nend\n", "A.m",
+         "private def m(x)\n    x\n  end", "private def m(x)", "private def m(x)"),
+        ("rb empty private def", "c.rb", "class A\n  private def m(x)\n  end\nend\n", "A.m",
+         "private def m(x)\n  end", "private def m(x)", "private def m(x)"),
+        ("rb endless method (reported)", "c.rb", "class A\n  def f = 1\nend\n", "A.f", "def f = 1", "def f", "def f"),
+        ("rb endless method with parameters", "c.rb", "class A\n  def f(x) = x + 1\nend\n", "A.f",
+         "def f(x) = x + 1", "def f(x)", "def f(x)"),
+        ("c typedef struct (reported)", "c.c", "typedef struct N {\n    int a;\n} N;\n", "N",
+         "typedef struct N {\n    int a;\n} N;", "typedef struct N", "typedef struct N {\n    int a;\n} N;"),
+        ("c typedef struct by its keyword", "c.c", "typedef struct N {\n    int a;\n} N;\n", "struct N",
+         "typedef struct N {\n    int a;\n} N;", "typedef struct N", "typedef struct N {\n    int a;\n} N;"),
+        ("c typedef of a struct under another name", "c.c", "typedef struct node {\n    int v;\n} Node;\n", "Node",
+         "typedef struct node {\n    int v;\n} Node;", "typedef struct node", "typedef struct node {\n    int v;\n} Node;"),
+        ("c struct with a declarator", "c.c", "struct S {\n    int a;\n} s;\n", "S",
+         "struct S {\n    int a;\n} s;", "struct S", "struct S {\n    int a;\n} s;"),
+        ("c anonymous typedef struct (reported)", "c.c", "typedef struct {\n    int x;\n    int y;\n} P;\n", "P",
+         "typedef struct {\n    int x;\n    int y;\n} P;", "typedef struct", "typedef struct {\n    int x;\n    int y;\n} P;"),
+        ("c anonymous typedef enum", "c.c", "typedef enum {\n    A,\n    B\n} E;\n", "E",
+         "typedef enum {\n    A,\n    B\n} E;", "typedef enum", "typedef enum {\n    A,\n    B\n} E;"),
+        ("cpp extern \"C\" function", "c.cpp", "extern \"C\" int f(int a) {\n    return a;\n}\n", "f",
+         "extern \"C\" int f(int a) {\n    return a;\n}", "extern \"C\" int f(int a)", "extern \"C\" int f(int a)"),
+    ]
+    for label, name, source, target, full, signature, interface in cases:
+        for depth, expected in (("full", full), ("signature", signature), ("interface", interface)):
+            _exact(f"{label}: depth={depth}", _read_result(name, source, lambda a: a.read_symbol(target, depth)), expected)
+        _exact(f"{label}: replace_signature with the signature read",
+               _edit_result(name, source, lambda a: a.replace_signature(target, a.read_symbol(target, "signature"))), source)
+    _exact("go type B in a group: depth=interface",
+           _read_result("c.go", "package main\n\ntype (\n\tA struct{ x int }\n\tB int\n)\n",
+                        lambda a: a.read_symbol("B", "interface")), "B int")
+
+    # A new signature with the wrapping code replaces it, one without keeps it.
+    app = "const app = {\n  handler: (a) => {\n    return a;\n  },\n};\n"
+    cmd = "package main\n\nvar cmd = &Command{\n\tRunE: func(c *Command) error {\n\t\treturn nil\n\t},\n}\n"
+    rb = "class A\n  private def m(x)\n    x\n  end\nend\n"
+    # (label, file name, source, target, new signature, expected file text)
+    signatures = [
+        ("js closure with its key", "c.js", app, "app.handler", "handler: (a, b) =>", app.replace("(a)", "(a, b)")),
+        ("js closure, the function only", "c.js", app, "app.handler", "(a, b) =>", app.replace("(a)", "(a, b)")),
+        ("js closure renamed", "c.js", app, "app.handler", "onClick: (a) =>", app.replace("handler", "onClick")),
+        ("go closure, the function only", "c.go", cmd, "cmd.RunE", "func(c *Command, a []string) error",
+         cmd.replace("(c *Command)", "(c *Command, a []string)")),
+        ("go closure with its key", "c.go", cmd, "cmd.RunE", "RunE: func() error", cmd.replace("(c *Command)", "()")),
+        ("go type keeps its `type`", "c.go", "package main\n\ntype A struct {\n\tx int\n}\n", "A", "B struct",
+         "package main\n\ntype B struct {\n\tx int\n}\n"),
+        ("ts declare kept", "c.ts", "declare function f(a: number): void;\n", "f", "function f(a: string): void",
+         "declare function f(a: string): void;\n"),
+        ("rb private kept", "c.rb", rb, "A.m", "def m(x, y)", rb.replace("m(x)", "m(x, y)")),
+        ("rb private replaced", "c.rb", rb, "A.m", "protected def m(x)", rb.replace("private", "protected")),
+        ("rb endless method", "c.rb", "class A\n  def f = 1\nend\n", "A.f", "def f(y)", "class A\n  def f(y) = 1\nend\n"),
+        ("c typedef kept", "c.c", "typedef struct N {\n    int a;\n} N;\n", "N", "struct M",
+         "typedef struct M {\n    int a;\n} N;\n"),
+        ("c anonymous typedef named", "c.c", "typedef struct {\n    int x;\n} P;\n", "P", "typedef struct P",
+         "typedef struct P {\n    int x;\n} P;\n"),
+    ]
+    for label, name, source, target, new, expected in signatures:
+        _exact(f"replace_signature ({label})", _edit_result(name, source, lambda a: a.replace_signature(target, new)), expected)
+
+    # In a Ruby class's interface every method is its signature and ` ...`:
+    # an empty one, an endless one, a `private def` and those in `class <<
+    # self`, which shows as a block of its own.
+    rb_class = (
+        "class A\n  X = 1\n  attr_reader :a\n\n  def f(a)\n    a\n  end\n\n  def g; end\n\n  def e\n  end\n\n  def h = 1\n\n"
+        "  private def p(x)\n    x\n  end\n\n  class << self\n    def s\n      1\n    end\n  end\n\n  def self.t\n  end\nend\n"
+    )
+    _exact("rb class interface: empty, endless and private methods (reported)",
+           _read_result("c.rb", rb_class, lambda a: a.read_symbol("A", "interface")),
+           "class A\n  X = 1\n  attr_reader :a\n  def f(a) ...\n  def g ...\n  def e ...\n  def h ...\n  private def p(x) ...\n"
+           "  class << self\n    def s ...\n  end\n  def self.t ...\nend")
+    _exact("rb module interface: an empty singleton method",
+           _read_result("c.rb", "module M\n  def self.f\n  end\nend\n", lambda a: a.read_symbol("M", "interface")),
+           "module M\n  def self.f ...\nend")
+
+
+def test_js_trailing_comments():
+    print("\n═══ JS/TS: a comment after a symbol on its last line is not part of it ═══")
+
+    # tree-sitter-javascript puts a comment that follows a function's `}`
+    # on its line, or a class's, a namespace's or a declaration's that has
+    # no `;`, inside that symbol. It is a comment after the symbol, as in
+    # the other languages: read_symbol leaves it out, replace_function
+    # keeps it after the new code (unless the content ends with a comment
+    # of its own), and the body tools end at the `}`.
+    # (label, source, target, read_symbol)
+    cases = [
+        ("function (reported)", "function b() {} // old\nfunction c() {}\n", "b", "function b() {}"),
+        ("function over several lines", "function b() {\n  return 1;\n} // old\nfunction c() {}\n", "b",
+         "function b() {\n  return 1;\n}"),
+        ("two comments", "function b() {\n} /* x */ // y\n", "b", "function b() {\n}"),
+        ("generator", "function* g() {} // g\n", "g", "function* g() {}"),
+        ("exported function", "export function h() {} // h\n", "h", "export function h() {}"),
+        ("arrow function", "const f = () => {} // f\n", "f", "const f = () => {}"),
+        ("constant without its ;", "const x = 1 // x\n", "x", "const x = 1"),
+        ("class", "class A {} // a\n", "A", "class A {}"),
+    ]
+    for ext in (".js", ".ts"):
+        name = "t" + ext
+        for label, source, target, full in cases + ([("namespace", "namespace N {} // n\n", "N", "namespace N {}")]
+                                                     if ext == ".ts" else []):
+            _exact(f"{ext} {label}: read_symbol", _read_result(name, source, lambda a: a.read_symbol(target)), full)
+            check(f"{ext} {label}: round trip", _round_trip(name, source, target), "<unchanged>")
+        src = "function b() {} // old\nfunction c() {}\n"
+        lines = "function b() {\n  x();\n} // old\n"
+        # (label, source, edit, expected file text)
+        edits = [
+            ("replace_function keeps the comment (reported)", src,
+             lambda a: a.replace_function("b", "function b() { return 2; }"),
+             "function b() { return 2; } // old\nfunction c() {}\n"),
+            ("replace_function with a comment of its own", src,
+             lambda a: a.replace_function("b", "function b() { return 2; } // new"),
+             "function b() { return 2; } // new\nfunction c() {}\n"),
+            ("delete_symbol takes its line", src, lambda a: a.delete_symbol("b"), "function c() {}\n"),
+            ("replace_function_body", src, lambda a: a.replace_function_body("b", "x();"),
+             "function b() {\n  x();\n} // old\nfunction c() {}\n"),
+            ("insert_in_body at the bottom", lines, lambda a: a.insert_in_body("b", "y();", at="bottom"),
+             "function b() {\n  x();\n  y();\n} // old\n"),
+            ("insert_in_body at the top", lines, lambda a: a.insert_in_body("b", "y();", at="top"),
+             "function b() {\n  y();\n  x();\n} // old\n"),
+            ("insert_sibling after", src, lambda a: a.insert_sibling("b", "function z() {}", "after"),
+             "function b() {} // old\n\nfunction z() {}\n\nfunction c() {}\n"),
+            ("replace_function of a constant", "const x = 1 // x\n", lambda a: a.replace_function("x", "const x = 2"),
+             "const x = 2 // x\n"),
+            ("replace_function of a symbol after other code", "x(); function d() {} // d\n",
+             lambda a: a.replace_function("d", "function d() { y(); }"), "x(); function d() { y(); } // d\n"),
+            ("replace_function of a class", "class A {} // a\nclass B {}\n",
+             lambda a: a.replace_function("A", "class A { m() {} }"), "class A { m() {} } // a\nclass B {}\n"),
+        ]
+        for label, source, action, expected in edits:
+            _exact(f"{ext} {label}", _edit_result(name, source, action), expected)
+        _refused(f"{ext} replace_in_body: the comment is not in the body",
+                 _edit_result(name, src, lambda a: a.replace_in_body("b", "// old", "// new")),
+                 "Snippet not found in body of 'b'")
+        _exact(f"{ext} class interface without the comment",
+               _read_result(name, "class A {\n  m() {}\n} // a\n", lambda a: a.read_symbol("A", "interface")),
+               "class A {\n  m() ...\n}")
+
+
+def test_find_references_line_order():
+    print("\n═══ find_references: in line order ═══")
+
+    # (label, file name, source, target, expected)
+    cases = [
+        ("python (reported)", "r.py", "def f():\n    return x\nx = 1\n", "x", "line 2: return x\nline 3: x = 1"),
+        ("python, two on a line", "r.py", "def f():\n    return g(x, x)\nx = 1\n", "x",
+         "line 2: return g(x, x)\nline 2: return g(x, x)\nline 3: x = 1"),
+        ("js", "r.js", "function f() {\n  return g(x);\n}\nconst x = 1;\n", "x",
+         "line 2: return g(x);\nline 4: const x = 1;"),
+        ("ts", "r.ts", "class A {\n  m() {\n    return this.x;\n  }\n  x = 1;\n}\n", "x",
+         "line 3: return this.x;\nline 5: x = 1;"),
+        ("go", "r.go", "package main\n\nfunc f() int {\n\treturn x\n}\n\nvar x = 1\n", "x",
+         "line 4: return x\nline 7: var x = 1"),
+        ("ruby", "r.rb", "def f\n  g(y)\nend\ny = 1\n", "y", "line 2: g(y)\nline 4: y = 1"),
+        ("java", "R.java", "class A {\n    int f() {\n        return x;\n    }\n    int x = 1;\n}\n", "x",
+         "line 3: return x;\nline 5: int x = 1;"),
+        ("c", "r.c", "int f(void) {\n    return x;\n}\nint x = 1;\n", "x", "line 2: return x;\nline 4: int x = 1;"),
+        ("cpp destructor", "r.cpp", "struct A {\n    void f() { this->~A(); }\n    ~A();\n};\nA::~A() {}\n", "~A",
+         "line 2: void f() { this->~A(); }\nline 3: ~A();\nline 5: A::~A() {}"),
+    ]
+    for label, name, source, target, expected in cases:
+        _exact(f"find_references ({label})", _read_result(name, source, lambda a: a.find_references(target)), expected)
+
+
+def test_config_whole_symbol_tools():
+    print("\n═══ config files: replace_function, delete_symbol and insert_sibling point to the key tools ═══")
+
+    # A config target is a key path, and its value is what read_symbol
+    # reads; the tools that edit whole symbols of source files are refused
+    # there, naming the key tool that makes the edit.
+    files = [
+        ("c.json", '{\n  "a": {\n    "b": 1\n  },\n  "c": 2\n}\n'),
+        ("c.yaml", "a:\n  b: 1\nc: 2\n"),
+        ("c.yml", "a:\n  b: 1\nc: 2\n"),
+        ("c.toml", "[a]\nb = 1\n\n[t]\nc = 2\n"),
+    ]
+    for name, source in files:
+        ext = os.path.splitext(name)[1]
+        for target in ("a", "a.b", "missing"):
+            _refused(f"{ext} replace_function('{target}') (reported)",
+                     _edit_result(name, source, lambda a: a.replace_function(target, "5")),
+                     f"replace_function is for symbols of source files, not the keys of a {ext} file: use "
+                     f"replace_value to change the value of '{target}', add_key to add a key, or delete_key "
+                     "to remove one")
+            _refused(f"{ext} delete_symbol('{target}')", _edit_result(name, source, lambda a: a.delete_symbol(target)),
+                     f"delete_symbol is for symbols of source files, not the keys of a {ext} file: use "
+                     f"delete_key to remove '{target}' with its value")
+            _refused(f"{ext} insert_sibling('{target}')",
+                     _edit_result(name, source, lambda a: a.insert_sibling(target, "z = 1", "after")),
+                     f"insert_sibling is for symbols of source files, not the keys of a {ext} file: use "
+                     f"add_key to add a key next to '{target}', its parent's path being the parent_target")
+        _exact(f"{ext} read_symbol still reads a value", _read_result(name, source, lambda a: a.read_symbol("a.b")), "1")
+        _exact(f"{ext} replace_value makes the edit",
+               _edit_result(name, source, lambda a: a.replace_value("a.b", "2")), source.replace("1", "2"))
+    _exact("yaml edit_leading_comment still works",
+           _edit_result("c.yaml", "a:\n  b: 1\n", lambda a: a.edit_leading_comment("a.b", "add", "# B.")),
+           "a:\n  # B.\n  b: 1\n")
+
+
+def test_replace_value_variables():
+    print("\n═══ replace_value on variables, constants and fields: the value alone ═══")
+
+    # The value of a variable, constant or field is what follows its `=`
+    # (a C/C++ macro's, its replacement text); replace_value replaces that
+    # and nothing else. A name declared without a value gets one where it
+    # can have one.
+    go = "package main\n\n"
+    py_class = "class A:\n    x = 1\n    y: str\n"
+    js_class = "class A {\n  x = 1;\n  static y;\n  #p = 1;\n}\n"
+    ts_class = "class A {\n  x: number = 1;\n  y?: number;\n  @Input() z: string;\n}\n"
+    cpp_struct = "struct S {\n    int a = 1, b;\n    int c{2};\n    int f : 3;\n};\n"
+    java_class = "class A {\n    int x = 1, y;\n    int w[];\n}\n"
+    # (label, file name, source, target, content, expected file text)
+    cases = [
+        ("py module variable (reported)", "v.py", "X = 1\nY = 2\n", "X", "2", "X = 2\nY = 2\n"),
+        ("py annotated", "v.py", "X: int = 1\n", "X", "2", "X: int = 2\n"),
+        ("py annotated without a value", "v.py", "X: int\n", "X", "2", "X: int = 2\n"),
+        ("py class attribute", "v.py", py_class, "A.x", "2", "class A:\n    x = 2\n    y: str\n"),
+        ("py class attribute without a value", "v.py", py_class, "A.y", '"s"',
+         'class A:\n    x = 1\n    y: str = "s"\n'),
+        ("py dict variable", "v.py", 'CONFIG = {"a": 1}\n', "CONFIG", '{"b": 2}', 'CONFIG = {"b": 2}\n'),
+        ("py value over several lines", "v.py", "X = [\n    1,\n]\nY = 2\n", "X", "[2]", "X = [2]\nY = 2\n"),
+        ("py comment after the value", "v.py", "X = 1  # one\n", "X", "2", "X = 2  # one\n"),
+        ("py name assigned twice: the first", "v.py", "X = 1\nX = 2\n", "X", "3", "X = 3\nX = 2\n"),
+        ("py dict key still works", "v.py", 'C = {"a": 1}\n', 'C."a"', "2", 'C = {"a": 2}\n'),
+        ("js const (reported)", "v.js", "const X = 1;\n", "X", "2", "const X = 2;\n"),
+        ("js first of two names", "v.js", "let a = 1, b = 2;\n", "a", "3", "let a = 3, b = 2;\n"),
+        ("js second of two names", "v.js", "let a = 1, b = 2;\n", "b", "3", "let a = 1, b = 3;\n"),
+        ("js let without a value", "v.js", "let x;\n", "x", "2", "let x = 2;\n"),
+        ("js name without a value after one with", "v.js", "var a = 1, b;\n", "b", "2", "var a = 1, b = 2;\n"),
+        ("js exported", "v.js", "export const X = 1;\n", "X", "2", "export const X = 2;\n"),
+        ("js comment after a value with no semicolon", "v.js", "const X = 1 // one\n", "X", "2",
+         "const X = 2 // one\n"),
+        ("js bound function", "v.js", "const f = () => 1;\n", "f", "() => 2", "const f = () => 2;\n"),
+        ("js class field", "v.js", js_class, "A.x", "2", js_class.replace("x = 1", "x = 2")),
+        ("js class field without a value", "v.js", js_class, "A.y", "3",
+         js_class.replace("static y;", "static y = 3;")),
+        ("js private class field", "v.js", js_class, "A.#p", "2", js_class.replace("#p = 1", "#p = 2")),
+        ("js object key still works", "v.js", "const C = { a: 1 };\n", "C.a", "2", "const C = { a: 2 };\n"),
+        ("js closure key still works", "v.js", "const app = {\n  handler: () => 1,\n};\n", "app.handler",
+         "() => 2", "const app = {\n  handler: () => 2,\n};\n"),
+        ("ts annotated", "v.ts", "let X: number = 1;\n", "X", "2", "let X: number = 2;\n"),
+        ("ts annotated without a value", "v.ts", "let x: number;\n", "x", "2", "let x: number = 2;\n"),
+        ("ts class field", "v.ts", ts_class, "A.x", "2", ts_class.replace("x: number = 1", "x: number = 2")),
+        ("ts optional field without a value", "v.ts", ts_class, "A.y", "2",
+         ts_class.replace("y?: number;", "y?: number = 2;")),
+        ("ts decorated field without a value", "v.ts", ts_class, "A.z", '"s"',
+         ts_class.replace("z: string;", 'z: string = "s";')),
+        ("ts namespace constant", "v.ts", "namespace N {\n  export const T = 1;\n}\n", "N.T", "2",
+         "namespace N {\n  export const T = 2;\n}\n"),
+        ("ts value sharing its name with a type", "v.ts", "const User = { a: 1 };\ntype User = { a: number };\n",
+         "User", "{ a: 2 }", "const User = { a: 2 };\ntype User = { a: number };\n"),
+        ("go var", "v.go", go + "var x = 1\n", "x", "2", go + "var x = 2\n"),
+        ("go var with a type", "v.go", go + "var x int = 1\n", "x", "2", go + "var x int = 2\n"),
+        ("go var without a value", "v.go", go + "var y int\n", "y", "2", go + "var y int = 2\n"),
+        ("go second of two names", "v.go", go + "var a, b = 1, 2\n", "b", "3", go + "var a, b = 1, 3\n"),
+        ("go const", "v.go", go + "const K = 1\n", "K", "2", go + "const K = 2\n"),
+        ("go const in a group", "v.go", go + "const (\n\tA = iota\n\tB\n)\n", "B", "5",
+         go + "const (\n\tA = iota\n\tB = 5\n)\n"),
+        ("go func literal", "v.go", go + "var h = func() int { return 1 }\n", "h", "func() int { return 2 }",
+         go + "var h = func() int { return 2 }\n"),
+        ("c global", "v.c", "int g = 1;\n", "g", "2", "int g = 2;\n"),
+        ("c global without a value", "v.c", "int g;\n", "g", "2", "int g = 2;\n"),
+        ("c second of two names", "v.c", "int a = 1, b;\n", "b", "2", "int a = 1, b = 2;\n"),
+        ("c pointer", "v.c", 'static const char *s = "a";\n', "s", '"b"', 'static const char *s = "b";\n'),
+        ("c array without a value", "v.c", "int arr[3];\n", "arr", "{1, 2, 3}", "int arr[3] = {1, 2, 3};\n"),
+        ("c initializer list", "v.c", "int arr[] = {1, 2};\n", "arr", "{3}", "int arr[] = {3};\n"),
+        ("c definition after its extern declaration", "v.c", "extern int e;\nint e = 1;\n", "e", "2",
+         "extern int e;\nint e = 2;\n"),
+        ("c macro", "v.c", "#define N 3\nint x;\n", "N", "4", "#define N 4\nint x;\n"),
+        ("c macro without a value", "v.c", "#define F\n", "F", "1", "#define F 1\n"),
+        ("c macro with parameters", "v.c", "#define SQ(x) ((x) * (x))\n", "SQ", "((x) + (x))",
+         "#define SQ(x) ((x) + (x))\n"),
+        ("cpp direct initialization", "v.cpp", "int x(1);\n", "x", "2", "int x(2);\n"),
+        ("cpp brace initialization", "v.cpp", "int y{1};\n", "y", "2", "int y{2};\n"),
+        ("cpp member", "v.cpp", cpp_struct, "S.a", "3", cpp_struct.replace("a = 1", "a = 3")),
+        ("cpp member without a value", "v.cpp", cpp_struct, "S.b", "4", cpp_struct.replace(" b;", " b = 4;")),
+        ("cpp member with braces", "v.cpp", cpp_struct, "S.c", "5", cpp_struct.replace("c{2}", "c{5}")),
+        ("cpp static member definition", "v.cpp", "struct A {\n    static int n;\n};\nint A::n = 1;\n", "A::n", "2",
+         "struct A {\n    static int n;\n};\nint A::n = 2;\n"),
+        ("java field", "V.java", java_class, "A.x", "2", java_class.replace("x = 1", "x = 2")),
+        ("java field without a value", "V.java", java_class, "A.y", "3", java_class.replace(" y;", " y = 3;")),
+        ("java array field without a value", "V.java", java_class, "A.w", "{1}",
+         java_class.replace("w[];", "w[] = {1};")),
+        ("java interface constant", "V.java", "interface I {\n    int K = 1;\n}\n", "I.K", "2",
+         "interface I {\n    int K = 2;\n}\n"),
+        ("rb constant", "v.rb", "X = 1\ny = 2\n", "X", "2", "X = 2\ny = 2\n"),
+        ("rb local variable", "v.rb", "X = 1\ny = 2\n", "y", "3", "X = 1\ny = 3\n"),
+        ("rb constant in a module", "v.rb", "module M\n  NAME = 'a'\nend\n", "M.NAME", "'b'",
+         "module M\n  NAME = 'b'\nend\n"),
+        # A heredoc's body is part of the value that opens it.
+        ("rb heredoc", "v.rb", "X = <<~EOS\n  text\nEOS\nY = 2\n", "X", "1", "X = 1\nY = 2\n"),
+        ("rb heredoc in a class", "v.rb", "class A\n  N = <<~EOS.strip\n    t\n  EOS\n  M = 1\nend\n", "A.N", "'x'",
+         "class A\n  N = 'x'\n  M = 1\nend\n"),
+        # A TS definite assignment `!` goes when the name gets a value.
+        ("ts definite assignment", "v.ts", "let y!: number;\n", "y", "2", "let y: number = 2;\n"),
+        ("ts definite field", "v.ts", "class A {\n  x!: number;\n}\n", "A.x", "1", "class A {\n  x: number = 1;\n}\n"),
+        ("c function pointer without a value", "v.c", "int (*fp)(int);\n", "fp", "g", "int (*fp)(int) = g;\n"),
+        ("c macro with a comment after it", "v.c", '#define URL "http://x" // the url\n', "URL", '"y"',
+         '#define URL "y" // the url\n'),
+        ("cpp spaces inside the braces", "v.cpp", "std::vector<int> v{ 1, 2 };\n", "v", "3",
+         "std::vector<int> v{ 3 };\n"),
+    ]
+    for label, name, source, target, content, expected in cases:
+        _exact(f"replace_value ({label})", _edit_result(name, source, lambda a: a.replace_value(target, content)),
+               expected)
+    _exact("replace_value (py module variable, crlf)",
+           _edit_result("v.py", "X = 1\nY = 2\n", lambda a: a.replace_value("X", "2"), "\r\n"), "X = 2\r\nY = 2\r\n")
+
+    shared = "gets its value together with other names, so it has none of its own to replace; rewrite the " \
+             "declaration with replace_function"
+    nothing = "has no value (replace_value is for keys and for the values of variables, constants and fields); " \
+              "rewrite it with replace_function"
+    # (label, file name, source, target, the refusal)
+    refusals = [
+        ("py chained assignment", "v.py", "a = b = 1\n", "a", f"'a' {shared}"),
+        ("rb chained assignment", "v.rb", "A = B = 1\n", "A", f"'A' {shared}"),
+        ("go one value for two names", "v.go", go + "var c, d = f()\n", "c", f"'c' {shared}"),
+        ("cpp structured binding", "v.cpp", "auto [p, q] = r;\n", "p", f"'p' {shared}"),
+        ("go two names without values", "v.go", go + "var e, g int\n", "e",
+         "'e' is declared with other names and no values, and a value for it needs one for each of them; "
+         "rewrite the declaration with replace_function"),
+        ("c extern declaration", "v.c", "extern int e;\n", "e",
+         "'e' has no value, and an `extern` declaration takes none: the variable's definition holds its value"),
+        ("ts declare", "v.ts", "declare let y: number;\n", "y",
+         "'y' has no value, and a `declare` declaration cannot have one"),
+        ("ts in a declared namespace", "v.ts", "declare namespace N {\n  let y: number;\n}\n", "N.y",
+         "'N.y' has no value, and a `declare` declaration cannot have one"),
+        ("ts declare field", "v.ts", "class A {\n  declare w: string;\n}\n", "A.w",
+         "'A.w' has no value, and a `declare` declaration cannot have one"),
+        ("ts abstract field", "v.ts", "abstract class A {\n  abstract z: number;\n}\n", "A.z",
+         "'A.z' has no value, and an abstract field cannot have one"),
+        ("c struct field", "v.c", "struct S {\n    int x;\n};\n", "S.x",
+         "'S.x' has no value, and a field of a C struct cannot have one"),
+        ("py function", "v.py", "def f():\n    pass\n", "f", f"'f' is a function, which {nothing}"),
+        ("py decorated class", "v.py", "@d\nclass A:\n    pass\n", "A", f"'A' is a class, which {nothing}"),
+        ("js function", "v.js", "function f() {}\n", "f", f"'f' is a function, which {nothing}"),
+        ("js method", "v.js", "class A {\n  m() {}\n}\n", "A.m", f"'A.m' is a function, which {nothing}"),
+        ("ts type alias", "v.ts", "type T = string;\n", "T", f"'T' is a type alias, which {nothing}"),
+        ("ts enum", "v.ts", "enum E { A }\n", "E", f"'E' is an enum, which {nothing}"),
+        ("ts interface", "v.ts", "interface I {}\n", "I", f"'I' is an interface, which {nothing}"),
+        ("ts namespace", "v.ts", "namespace N {}\n", "N", f"'N' is a namespace, which {nothing}"),
+        ("c prototype", "v.c", "int f(void);\n", "f", f"'f' is a function, which {nothing}"),
+        ("c struct", "v.c", "struct S {\n    int x;\n};\n", "S", f"'S' is a struct, which {nothing}"),
+        ("c typedef", "v.c", "typedef int T;\n", "T", f"'T' is a type alias, which {nothing}"),
+        ("cpp class", "v.cpp", "class K {};\n", "K", f"'K' is a class, which {nothing}"),
+        ("go type", "v.go", go + "type T int\n", "T", f"'T' is a type definition, which {nothing}"),
+        ("go function", "v.go", go + "func f() {}\n", "f", f"'f' is a function, which {nothing}"),
+        ("java method", "V.java", "class A {\n    void m() {}\n}\n", "A.m", f"'A.m' is a function, which {nothing}"),
+        ("rb method", "v.rb", "def f\nend\n", "f", f"'f' is a function, which {nothing}"),
+        ("rb module", "v.rb", "module M\nend\n", "M", f"'M' is a module, which {nothing}"),
+    ]
+    for label, name, source, target, reason in refusals:
+        _refused(f"replace_value ({label})", _edit_result(name, source, lambda a: a.replace_value(target, "2")),
+                 f"REFUSED: {reason}")
+    # A C++20 bit-field's value goes after its width, which the grammar does
+    # not parse yet.
+    _refused("replace_value (cpp bit-field without a value)",
+             _edit_result("v.cpp", cpp_struct, lambda a: a.replace_value("S.f", "1")),
+             "REFUSED: Edit refused: the result would have a syntax error at line 4, column 11 (cannot parse ': 3')")
+    # A destructured name is no target, as for the other tools.
+    _refused("replace_value (js destructured name)",
+             _edit_result("v.js", "const { a, b } = o;\n", lambda a: a.replace_value("a", "2")),
+             "REFUSED: Target 'a' not found")
+
+
+def test_first_import_placement():
+    print("\n═══ add_import: a first import after the file's preamble, a next one after the last ═══")
+
+    go = "package main\n\n"
+    java_import = "import java.util.List;"
+    js_import = "import x from 'x';"
+    # (label, file name, source, import text, expected file text)
+    cases = [
+        ("java after the package (reported)", "P.java", "package p;\n\nclass A {}\n", java_import,
+         "package p;\n\nimport java.util.List;\n\nclass A {}\n"),
+        ("java class right after the package", "P.java", "package p;\nclass A {}\n", java_import,
+         "package p;\n\nimport java.util.List;\n\nclass A {}\n"),
+        ("java comment above the package", "P.java", "// License.\npackage p;\n\nclass A {}\n", java_import,
+         "// License.\npackage p;\n\nimport java.util.List;\n\nclass A {}\n"),
+        ("java no package", "P.java", "class A {}\n", java_import, "import java.util.List;\n\nclass A {}\n"),
+        ("go after the package (reported)", "i.go", go + "func f() {}\n", 'import "fmt"',
+         go + 'import "fmt"\n\nfunc f() {}\n'),
+        ("go only a package", "i.go", "package main\n", 'import "fmt"', go + 'import "fmt"\n'),
+        ("go build constraint and package comment", "i.go",
+         "//go:build linux\n\n// Package main runs.\npackage main\nfunc f() {}\n", 'import "fmt"',
+         "//go:build linux\n\n// Package main runs.\npackage main\n\nimport \"fmt\"\n\nfunc f() {}\n"),
+        ("py shebang and docstring (reported)", "i.py", '#!/usr/bin/env python\n"""Doc."""\ndef f():\n    pass\n',
+         "import os", '#!/usr/bin/env python\n"""Doc."""\n\nimport os\n\n\ndef f():\n    pass\n'),
+        ("py shebang and encoding", "i.py", "#!/usr/bin/env python\n# -*- coding: utf-8 -*-\nx = 1\n", "import os",
+         "#!/usr/bin/env python\n# -*- coding: utf-8 -*-\n\nimport os\n\nx = 1\n"),
+        ("py docstring over lines, then a blank line", "i.py", '"""Doc.\n\nMore.\n"""\n\nx = 1\n', "import os",
+         '"""Doc.\n\nMore.\n"""\n\nimport os\n\nx = 1\n'),
+        ("py header comment", "i.py", "# Copyright A.\n\ndef f():\n    pass\n", "import os",
+         "# Copyright A.\n\nimport os\n\n\ndef f():\n    pass\n"),
+        ("py comment on the first def stays on it", "i.py", "# Helper.\ndef f():\n    pass\n", "import os",
+         "import os\n\n\n# Helper.\ndef f():\n    pass\n"),
+        ("py only the first block of comments is the header", "i.py", "# Copyright A.\n\n# Helpers.\n\nx = 1\n",
+         "import os", "# Copyright A.\n\nimport os\n\n# Helpers.\n\nx = 1\n"),
+        ("go comment after the package belongs to the code", "i.go",
+         "// Copyright A.\n\npackage main\n\n// Notes.\n\n// F runs.\nfunc F() {}\n", 'import "fmt"',
+         "// Copyright A.\n\npackage main\n\nimport \"fmt\"\n\n// Notes.\n\n// F runs.\nfunc F() {}\n"),
+        ("ts pragma after the header", "i.ts", "// Copyright A.\n\n// @ts-nocheck\nexport const x = 1;\n", js_import,
+         "// Copyright A.\n\n// @ts-nocheck\n\nimport x from 'x';\n\nexport const x = 1;\n"),
+        ("py docstring, then a comment on the first def", "i.py", '"""Doc."""\n# Helper.\ndef f():\n    pass\n',
+         "import os", '"""Doc."""\n\nimport os\n\n\n# Helper.\ndef f():\n    pass\n'),
+        ("py nothing before", "i.py", "def f():\n    pass\n", "import os", "import os\n\n\ndef f():\n    pass\n"),
+        ("py a statement after", "i.py", "x = 1\n", "import os", "import os\n\nx = 1\n"),
+        ("py empty file", "i.py", "", "import os", "import os\n"),
+        ("py only a docstring", "i.py", '"""Doc."""\n', "import os", '"""Doc."""\n\nimport os\n'),
+        ("py after a __future__ import", "i.py", '"""Doc."""\nfrom __future__ import annotations\nx = 1\n',
+         "import os", '"""Doc."""\nfrom __future__ import annotations\nimport os\nx = 1\n'),
+        ("rb magic comment (reported)", "i.rb", "# frozen_string_literal: true\ndef f\nend\n", "require 'x'",
+         "# frozen_string_literal: true\n\nrequire 'x'\n\ndef f\nend\n"),
+        ("rb shebang and magic comment", "i.rb", "#!/usr/bin/env ruby\n# frozen_string_literal: true\n\nputs 1\n",
+         "require 'x'", "#!/usr/bin/env ruby\n# frozen_string_literal: true\n\nrequire 'x'\n\nputs 1\n"),
+        ("rb after a require", "i.rb", "require 'a'\nputs 1\n", "require 'x'", "require 'a'\nrequire 'x'\nputs 1\n"),
+        ("js use strict", "i.js", "'use strict';\n\nfunction f() {}\n", js_import,
+         "'use strict';\n\nimport x from 'x';\n\nfunction f() {}\n"),
+        ("js shebang", "i.js", "#!/usr/bin/env node\nfunction f() {}\n", js_import,
+         "#!/usr/bin/env node\n\nimport x from 'x';\n\nfunction f() {}\n"),
+        ("js doc comment on the first function stays on it", "i.js", "/** Doc. */\nfunction f() {}\n", js_import,
+         "import x from 'x';\n\n/** Doc. */\nfunction f() {}\n"),
+        ("ts triple-slash directive", "i.ts", '/// <reference types="node" />\nfunction f() {}\n', js_import,
+         '/// <reference types="node" />\n\nimport x from \'x\';\n\nfunction f() {}\n'),
+        ("tsx use client", "i.tsx", '"use client";\nexport function f() {}\n', js_import,
+         '"use client";\n\nimport x from \'x\';\n\nexport function f() {}\n'),
+        ("c code right after the last include (reported)", "i.c", "#include <x.h>\nint f(void) { return 0; }\n",
+         "#include <y.h>", "#include <x.h>\n#include <y.h>\nint f(void) { return 0; }\n"),
+        ("c blank line after the last include", "i.c", "#include <x.h>\n\nint f(void);\n", "#include <y.h>",
+         "#include <x.h>\n#include <y.h>\n\nint f(void);\n"),
+        ("c include in a conditional", "i.c", "#include <x.h>\n#ifdef W\n#include <w.h>\n#endif\nint f(void);\n",
+         "#include <y.h>", "#include <x.h>\n#ifdef W\n#include <w.h>\n#endif\n#include <y.h>\nint f(void);\n"),
+        ("c no includes", "i.c", "int f(void) { return 0; }\n", "#include <y.h>",
+         "#include <y.h>\n\nint f(void) { return 0; }\n"),
+        ("h include guard", "i.h", "#ifndef X_H\n#define X_H\n\nint f(void);\n\n#endif\n", "#include <y.h>",
+         "#ifndef X_H\n#define X_H\n\n#include <y.h>\n\nint f(void);\n\n#endif\n"),
+        ("h include guard with includes", "i.h", "#ifndef X_H\n#define X_H\n#include <a.h>\nint f(void);\n#endif\n",
+         "#include <y.h>", "#ifndef X_H\n#define X_H\n#include <a.h>\n#include <y.h>\nint f(void);\n#endif\n"),
+        ("h license and include guard", "i.h",
+         "/* License. */\n#ifndef X_H\n#define X_H\nint f(void);\n#endif /* X_H */\n", "#include <y.h>",
+         "/* License. */\n#ifndef X_H\n#define X_H\n\n#include <y.h>\n\nint f(void);\n#endif /* X_H */\n"),
+        ("hpp pragma once", "i.hpp", "#pragma once\nint f();\n", "#include <y>",
+         "#pragma once\n\n#include <y>\n\nint f();\n"),
+        ("h not an include guard", "i.h", "#ifdef W\nint f(void);\n#endif\n", "#include <y.h>",
+         "#include <y.h>\n\n#ifdef W\nint f(void);\n#endif\n"),
+    ]
+    for label, name, source, text, expected in cases:
+        _exact(f"add_import ({label})", _edit_result(name, source, lambda a: a.add_import(text)), expected)
+    _exact("add_import (java after the package, crlf)",
+           _edit_result("P.java", "package p;\n\nclass A {}\n", lambda a: a.add_import(java_import), "\r\n"),
+           "package p;\r\n\r\nimport java.util.List;\r\n\r\nclass A {}\r\n")
+
+    # add_top_level(position="top") goes after the same directives.
+    top = [
+        ("js use strict", "t.js", "'use strict';\nfunction f() {}\n", "const X = 1;",
+         "'use strict';\n\nconst X = 1;\n\nfunction f() {}\n"),
+        ("js shebang", "t.js", "#!/usr/bin/env node\nfunction f() {}\n", "const X = 1;",
+         "#!/usr/bin/env node\n\nconst X = 1;\n\nfunction f() {}\n"),
+        ("h include guard", "t.h", "#ifndef X_H\n#define X_H\n#include <a.h>\nint f(void);\n#endif\n",
+         "int g(void);", "#ifndef X_H\n#define X_H\n#include <a.h>\n\nint g(void);\n\nint f(void);\n#endif\n"),
+        ("hpp pragma once", "t.hpp", "#pragma once\nint f();\n", "int g();", "#pragma once\n\nint g();\n\nint f();\n"),
+        ("py comment on the first code after the imports", "t.py", "import os\n\n# Doc.\ndef f():\n    pass\n",
+         "X = 1", "import os\n\nX = 1\n\n\n# Doc.\ndef f():\n    pass\n"),
+    ]
+    for label, name, source, content, expected in top:
+        _exact(f"add_top_level top ({label})",
+               _edit_result(name, source, lambda a: a.add_top_level(content, "top")), expected)
+
+
+def test_destructured_parameters():
+    print("\n═══ remove_parameter: one name of a destructured parameter ═══")
+
+    # A name bound by a destructuring pattern goes alone; the pattern's last
+    # name takes the whole parameter. Positions in an array pattern (a hole)
+    # and a Ruby one (`_`) are kept, so the names after it bind what they did.
+    # (label, file name, source, target, name, expected file text)
+    cases = [
+        ("js renamed key (reported)", "p.js", "function f({a: x, b}) {}\n", "f", "x", "function f({b}) {}\n"),
+        ("js first shorthand name", "p.js", "function f({a, b}) {}\n", "f", "a", "function f({b}) {}\n"),
+        ("js last shorthand name", "p.js", "function f({a, b}) {}\n", "f", "b", "function f({a}) {}\n"),
+        ("js spaces inside the braces", "p.js", "function f({ a, b }) {}\n", "f", "a", "function f({ b }) {}\n"),
+        ("js the last name takes the parameter", "p.js", "function f({a}, c) {}\n", "f", "a", "function f(c) {}\n"),
+        ("js name with a default", "p.js", "function f({a = 1, b}) {}\n", "f", "a", "function f({b}) {}\n"),
+        ("js pattern with a default", "p.js", "function f({a, b} = {}) {}\n", "f", "a",
+         "function f({b} = {}) {}\n"),
+        ("js rest of a pattern", "p.js", "function f({a, ...rest}) {}\n", "f", "rest", "function f({a}) {}\n"),
+        ("js nested pattern", "p.js", "function f({a: {b, c}, d}) {}\n", "f", "b", "function f({a: {c}, d}) {}\n"),
+        ("js last name of a nested pattern", "p.js", "function f({a: {c}, d}) {}\n", "f", "c",
+         "function f({d}) {}\n"),
+        ("js last of an array", "p.js", "function f([a, b]) {}\n", "f", "b", "function f([a]) {}\n"),
+        ("js first of an array keeps its position", "p.js", "function f([a, b]) {}\n", "f", "a",
+         "function f([, b]) {}\n"),
+        ("js array after a hole", "p.js", "function f([, b], c) {}\n", "f", "b", "function f(c) {}\n"),
+        ("js last of an array after a hole", "p.js", "function f([a, , c]) {}\n", "f", "c", "function f([a]) {}\n"),
+        ("js arrow function", "p.js", "const g = ({a, b}) => a;\n", "g", "b", "const g = ({a}) => a;\n"),
+        ("js one name per line", "p.js", "function f({\n  a,\n  b,\n}) {}\n", "f", "a",
+         "function f({\n  b,\n}) {}\n"),
+        ("js method", "p.js", "class A {\n  m({a, b}) {}\n}\n", "A.m", "b", "class A {\n  m({a}) {}\n}\n"),
+        ("ts typed pattern", "p.ts", "function f({a, b}: Props) {}\n", "f", "a", "function f({b}: Props) {}\n"),
+        ("ts typed pattern, its last name", "p.ts", "function f({a}: Props, c: number) {}\n", "f", "a",
+         "function f(c: number) {}\n"),
+        ("ts array pattern", "p.ts", "function f([a, b]: number[]) {}\n", "f", "a",
+         "function f([, b]: number[]) {}\n"),
+        ("rb first keeps its position (reported)", "p.rb", "def f((a, b), c)\nend\n", "f", "a",
+         "def f((_, b), c)\nend\n"),
+        ("rb last", "p.rb", "def f((a, b), c)\nend\n", "f", "b", "def f((a), c)\nend\n"),
+        ("rb the last name takes the parameter", "p.rb", "def f((a), c)\nend\n", "f", "a", "def f(c)\nend\n"),
+        ("rb after a placeholder", "p.rb", "def f((_, b), c)\nend\n", "f", "b", "def f(c)\nend\n"),
+        ("rb nested", "p.rb", "def f((a, (b, c)))\nend\n", "f", "c", "def f((a, (b)))\nend\n"),
+        ("rb splat in a pattern", "p.rb", "def f((a, *r))\nend\n", "f", "r", "def f((a))\nend\n"),
+    ]
+    for label, name, source, target, parameter, expected in cases:
+        _exact(f"remove_parameter ({label})",
+               _edit_result(name, source, lambda a: a.remove_parameter(target, parameter)), expected)
+    # A key is no name: `{a: x}` binds x.
+    _refused("remove_parameter (js key of a renamed name)",
+             _edit_result("p.js", "function f({a: x, b}) {}\n", lambda a: a.remove_parameter("f", "a")),
+             "REFUSED: Parameter 'a' not found in 'f'")
+    _refused("remove_parameter (rb placeholder)",
+             _edit_result("p.rb", "def f((_, b))\nend\n", lambda a: a.remove_parameter("f", "_")),
+             "REFUSED: Parameter '_' not found in 'f'")
+
+
+def test_parameter_followups():
+    print("\n═══ add_parameter and remove_parameter: duplicates, Go closures, empty lists, comments ═══")
+
+    go = "package main\n\n"
+    # add_parameter refuses a name the function already has, wherever the
+    # name is (a Go group, a destructuring pattern) and whatever the new
+    # parameter's text around it (a type, a default, `*`, `&`).
+    # (label, file name, source, target, parameter, name it repeats)
+    duplicates = [
+        ("py (reported)", "d.py", "def f(a):\n    pass\n", "f", "a", "a"),
+        ("py typed", "d.py", "def f(a: int):\n    pass\n", "f", "a: str", "a"),
+        ("py default", "d.py", "def f(a=1):\n    pass\n", "f", "a=2", "a"),
+        ("py star", "d.py", "def f(*args):\n    pass\n", "f", "args", "args"),
+        ("py keywords", "d.py", "def f(**kw):\n    pass\n", "f", "kw=None", "kw"),
+        ("py one per line", "d.py", "def f(\n    a,\n):\n    pass\n", "f", "a", "a"),
+        ("js", "d.js", "function f(a) {}\n", "f", "a = 1", "a"),
+        ("js destructured", "d.js", "function f({a, b}) {}\n", "f", "b", "b"),
+        ("js new pattern", "d.js", "function f(a) {}\n", "f", "{a, c}", "a"),
+        ("js rest", "d.js", "function f(a) {}\n", "f", "...a", "a"),
+        ("js bare arrow parameter", "d.js", "const g = x => x;\n", "g", "x", "x"),
+        ("ts", "d.ts", "function f(a: number) {}\n", "f", "a?: string", "a"),
+        ("go group", "d.go", go + "func f(a, b int) {}\n", "f", "b string", "b"),
+        ("go new group", "d.go", go + "func f(a int) {}\n", "f", "b, a string", "a"),
+        ("c", "d.c", "int f(int a) { return a; }\n", "f", "int a", "a"),
+        ("cpp pointer", "d.cpp", "int f(char *s) { return 0; }\n", "f", "const char *s", "s"),
+        ("java", "D.java", "class A {\n    void m(int a) {}\n}\n", "A.m", "String a", "a"),
+        ("rb", "d.rb", "def f(a)\nend\n", "f", "a = 1", "a"),
+        ("rb block", "d.rb", "def f(a)\nend\n", "f", "&a", "a"),
+        ("rb destructured", "d.rb", "def f((a, b))\nend\n", "f", "b", "b"),
+    ]
+    for label, name, source, target, parameter, repeated in duplicates:
+        for position in ("end", "start"):
+            _refused(f"add_parameter duplicate ({label}, {position})",
+                     _edit_result(name, source, lambda a: a.add_parameter(target, parameter, position)),
+                     f"REFUSED: Parameter '{repeated}' already exists in '{target}'")
+    # Names that do not repeat, and those the language lets repeat.
+    for label, name, source, target, parameter, expected in [
+        ("py another name", "d.py", "def f(a):\n    pass\n", "f", "b", "def f(a, b):\n    pass\n"),
+        ("py a type that names a parameter", "d.py", "def f(a):\n    pass\n", "f", "b: a",
+         "def f(a, b: a):\n    pass\n"),
+        ("go blank names", "d.go", go + "func f(_ int) {}\n", "f", "_ string", go + "func f(_ int, _ string) {}\n"),
+        ("c unnamed parameters", "d.c", "int f(int);\n", "f", "int", "int f(int, int);\n"),
+        ("rb placeholders", "d.rb", "def f(_)\nend\n", "f", "_", "def f(_, _)\nend\n"),
+    ]:
+        _exact(f"add_parameter ({label})", _edit_result(name, source, lambda a: a.add_parameter(target, parameter)),
+               expected)
+
+    # A Go func literal bound to a var is a function for the parameter and
+    # body tools.
+    closure = go + "var x = func(a, b int) {\n\treturn\n}\n"
+    for label, action, expected in [
+        ("remove_parameter (reported)", lambda a: a.remove_parameter("x", "a"),
+         go + "var x = func(b int) {\n\treturn\n}\n"),
+        ("add_parameter", lambda a: a.add_parameter("x", "c string"),
+         go + "var x = func(a, b int, c string) {\n\treturn\n}\n"),
+        ("replace_function_body", lambda a: a.replace_function_body("x", "println()"),
+         go + "var x = func(a, b int) {\n\tprintln()\n}\n"),
+        ("insert_in_body top", lambda a: a.insert_in_body("x", "println()", at="top"),
+         go + "var x = func(a, b int) {\n\tprintln()\n\treturn\n}\n"),
+        ("replace_in_body", lambda a: a.replace_in_body("x", "return", "println()"),
+         go + "var x = func(a, b int) {\n\tprintln()\n}\n"),
+        ("delete_in_body", lambda a: a.delete_in_body("x", "\treturn\n"), go + "var x = func(a, b int) {\n}\n"),
+        ("replace_signature of the function", lambda a: a.replace_signature("x", "func(c int)"),
+         go + "var x = func(c int) {\n\treturn\n}\n"),
+        ("replace_signature from the var", lambda a: a.replace_signature("x", "var y = func()"),
+         go + "var y = func() {\n\treturn\n}\n"),
+    ]:
+        _exact(f"go var func literal: {label}", _edit_result("c.go", closure, action), expected)
+    for depth in ("signature", "interface"):
+        _exact(f"go var func literal: depth {depth}",
+               _read_result("c.go", closure, lambda a: a.read_symbol("x", depth)), "var x = func(a, b int)")
+    _exact("go var func literal: replace_signature with its signature",
+           _edit_result("c.go", closure, lambda a: a.replace_signature("x", a.read_symbol("x", "signature"))), closure)
+    for label, source, target, name, expected in [
+        ("in a var group", go + "var (\n\tx = func(a int) {}\n\ty = 1\n)\n", "x", "a",
+         go + "var (\n\tx = func() {}\n\ty = 1\n)\n"),
+        ("second of two names", go + "var p, q = func(a int) {}, func(b int) {}\n", "q", "b",
+         go + "var p, q = func(a int) {}, func() {}\n"),
+    ]:
+        _exact(f"go var func literal: remove_parameter ({label})",
+               _edit_result("c.go", source, lambda a: a.remove_parameter(target, name)), expected)
+    _refused("go var that is no func literal",
+             _edit_result("c.go", go + "var n = 1\n", lambda a: a.remove_parameter("n", "a")),
+             "REFUSED: Could not find parameter list for 'n'")
+
+    # An empty list whose `)` is on a line below its `(` gets the parameter
+    # on a line of its own, one level deeper than the function's line, with
+    # a trailing comma where the language takes one and the file's other
+    # lists written one parameter per line do not go without it (Go needs it).
+    # (label, file name, source, target, parameter, expected file text)
+    empty = [
+        ("py (reported)", "e.py", "def f(\n):\n    pass\n", "f", "c", "def f(\n    c,\n):\n    pass\n"),
+        ("py file without trailing commas", "e.py", "def g(\n    a\n):\n    pass\n\n\ndef f(\n):\n    pass\n",
+         "f", "c", "def g(\n    a\n):\n    pass\n\n\ndef f(\n    c\n):\n    pass\n"),
+        ("py file with trailing commas", "e.py", "def g(\n    a,\n):\n    pass\n\n\ndef f(\n):\n    pass\n",
+         "f", "c", "def g(\n    a,\n):\n    pass\n\n\ndef f(\n    c,\n):\n    pass\n"),
+        ("py method", "e.py", "class A:\n    def f(\n        self,\n    ):\n        pass\n\n    @staticmethod\n"
+         "    def g(\n    ):\n        pass\n", "A.g", "c",
+         "class A:\n    def f(\n        self,\n    ):\n        pass\n\n    @staticmethod\n"
+         "    def g(\n        c,\n    ):\n        pass\n"),
+        ("py at the start", "e.py", "def f(\n):\n    pass\n", "f", "c", "def f(\n    c,\n):\n    pass\n"),
+        ("js", "e.js", "function f(\n) {}\n", "f", "c", "function f(\n  c,\n) {}\n"),
+        ("ts", "e.ts", "function f(\n): void {}\n", "f", "c: number", "function f(\n  c: number,\n): void {}\n"),
+        ("go needs the comma", "e.go", go + "func f(\n) {}\n", "f", "c int", go + "func f(\n\tc int,\n) {}\n"),
+        ("go comment after the (", "e.go", go + "func f( // none yet\n) {}\n", "f", "c int",
+         go + "func f( // none yet\n\tc int,\n) {}\n"),
+        ("c takes no comma", "e.c", "int f(\n) { return 0; }\n", "f", "int c", "int f(\n  int c\n) { return 0; }\n"),
+        ("java takes no comma", "E.java", "class A {\n    void m(\n    ) {}\n}\n", "A.m", "int c",
+         "class A {\n    void m(\n        int c\n    ) {}\n}\n"),
+        ("rb takes no comma", "e.rb", "def f(\n)\nend\n", "f", "c", "def f(\n  c\n)\nend\n"),
+        ("py blank line inside", "e.py", "def f(\n\n):\n    pass\n", "f", "c", "def f(\n    c,\n):\n    pass\n"),
+        ("py on one line stays there", "e.py", "def f():\n    pass\n", "f", "c", "def f(c):\n    pass\n"),
+    ]
+    for label, name, source, target, parameter, expected in empty:
+        position = "start" if "start" in label else "end"
+        _exact(f"add_parameter empty list over lines ({label})",
+               _edit_result(name, source, lambda a: a.add_parameter(target, parameter, position)), expected)
+    _exact("add_parameter empty list over lines (crlf)",
+           _edit_result("e.go", go + "func f(\n) {}\n", lambda a: a.add_parameter("f", "c int"), "\r\n"),
+           (go + "func f(\n\tc int,\n) {}\n").replace("\n", "\r\n"))
+
+    # A comment between the names of a Go group stays when the last one goes.
+    # (label, source, parameter, expected)
+    comments = [
+        ("line comment after the comma (reported)", "func f(a, // x\n\tb int) {}\n", "b",
+         "func f(a int, // x\n) {}\n"),
+        ("line comment, another parameter after", "func f(a, // x\n\tb int, c string) {}\n", "b",
+         "func f(a int, // x\n\tc string) {}\n"),
+        ("block comment after the comma", "func f(a, /* x */ b int) {}\n", "b", "func f(a /* x */ int) {}\n"),
+        ("method", "type T struct{}\n\nfunc (t T) m(a, // x\n\tb int) {}\n", "b",
+         "type T struct{}\n\nfunc (t T) m(a int, // x\n) {}\n"),
+    ]
+    for label, source, parameter, expected in comments:
+        target = "T.m" if "method" in label else "f"
+        _exact(f"go remove_parameter ({label})",
+               _edit_result("g.go", go + source, lambda a: a.remove_parameter(target, parameter)), go + expected)
+
+
+# ──────────────────────────────────────────────
+# Final line breaks, encodings, layout, YAML empty sequences, Ruby
+# documents and signatures, comments that end the code above
+# ──────────────────────────────────────────────
+
+
+def test_final_newline_state():
+    print("\n═══ a file whose last line has no line break keeps it so, and new code starts a line ═══")
+
+    bom = chr(0xFEFF)
+    two_defs = "def f():\n    pass\n\n\ndef g():\n    pass"
+    # (label, file name, source without a final line break, action, expected file text)
+    cases = [
+        ("cpp replace_function (reported)", "n.cpp", "int y;\nint f() { return 1; }",
+         lambda a: a.replace_function("f", "int f() { return 2; }"), "int y;\nint f() { return 2; }"),
+        ("py replace_function_body", "n.py", "def f():\n    return 1",
+         lambda a: a.replace_function_body("f", "return 2"), "def f():\n    return 2"),
+        ("py add_top_level at the bottom", "n.py", "def f():\n    pass",
+         lambda a: a.add_top_level("def g():\n    pass"), "def f():\n    pass\n\n\ndef g():\n    pass"),
+        ("c add_top_level at the bottom", "n.c", "int y;",
+         lambda a: a.add_top_level("int g(void);"), "int y;\n\nint g(void);"),
+        ("py add_top_level at the top", "n.py", "def f():\n    pass",
+         lambda a: a.add_top_level("X = 1", "top"), "X = 1\n\n\ndef f():\n    pass"),
+        ("py add_import after the last", "n.py", "import os",
+         lambda a: a.add_import("import sys"), "import os\nimport sys"),
+        ("c add_import after the last", "n.c", "#include <x.h>",
+         lambda a: a.add_import("#include <y.h>"), "#include <x.h>\n#include <y.h>"),
+        ("go first add_import", "n.go", "package main",
+         lambda a: a.add_import('import "fmt"'), 'package main\n\nimport "fmt"'),
+        ("js insert_sibling after the last", "n.js", "function f() {}",
+         lambda a: a.insert_sibling("f", "function g() {}", "after"), "function f() {}\n\nfunction g() {}"),
+        ("py insert_sibling after the last", "n.py", "def f():\n    pass",
+         lambda a: a.insert_sibling("f", "def g():\n    pass", "after"), "def f():\n    pass\n\n\ndef g():\n    pass"),
+        ("py add_method", "n.py", "class A:\n    def f(self):\n        pass",
+         lambda a: a.add_method("A", "def g(self):\n    pass"),
+         "class A:\n    def f(self):\n        pass\n\n    def g(self):\n        pass"),
+        ("rb add_method", "n.rb", "class A\n  def f\n  end\nend",
+         lambda a: a.add_method("A", "def g\nend"), "class A\n  def f\n  end\n\n  def g\n  end\nend"),
+        ("py insert_in_body at the bottom", "n.py", "def f():\n    pass",
+         lambda a: a.insert_in_body("f", "x = 1", at="bottom"), "def f():\n    pass\n    x = 1"),
+        ("java remove_parameter", "N.java", "class A {\n    void f(int a, int b) {}\n}",
+         lambda a: a.remove_parameter("A.f", "b"), "class A {\n    void f(int a) {}\n}"),
+        ("py edit_leading_comment", "n.py", "def f():\n    pass",
+         lambda a: a.edit_leading_comment("f", "add", "# Doc."), "# Doc.\ndef f():\n    pass"),
+        ("py delete_symbol of the last", "n.py", two_defs, lambda a: a.delete_symbol("g"), "def f():\n    pass"),
+        ("py delete_symbol of the only one", "n.py", "def g():\n    pass", lambda a: a.delete_symbol("g"), ""),
+        ("yaml add_key at the root", "n.yaml", "a: 1", lambda a: a.add_key("", "b", "2"), "a: 1\nb: 2"),
+        ("yaml append_to_array", "n.yaml", "a:\n  - 1", lambda a: a.append_to_array("a", "2"), "a:\n  - 1\n  - 2"),
+        ("yaml delete_key of the last", "n.yaml", "a: 1\nb: 2", lambda a: a.delete_key("b"), "a: 1"),
+        ("toml add_key", "n.toml", "[t]\na = 1", lambda a: a.add_key("t", "b", "2"), "[t]\na = 1\nb = 2"),
+        ("json add_key", "n.json", '{"a": 1}', lambda a: a.add_key("", "b", "2"), '{"a": 1, "b": 2}'),
+        ("json replace_value", "n.json", '{"a": 1}', lambda a: a.replace_value("a", "2"), '{"a": 2}'),
+        ("rb heredoc on the last line", "n.rb", "X = <<~EOS\n  a\nEOS",
+         lambda a: a.add_top_level("Y = 1"), "X = <<~EOS\n  a\nEOS\n\nY = 1"),
+        ("c macro on the last line", "n.c", "#define X 1",
+         lambda a: a.add_top_level("int y;"), "#define X 1\n\nint y;"),
+        ("py comment on the last line", "n.py", "def f():\n    pass\n# end",
+         lambda a: a.add_top_level("def g():\n    pass"), "def f():\n    pass\n# end\n\n\ndef g():\n    pass"),
+        ("two edits in a row", "n.py", "def f():\n    pass",
+         lambda a: (a.add_top_level("X = 1"), a.add_top_level("Y = 2")), "def f():\n    pass\n\n\nX = 1\n\nY = 2"),
+        ("byte order mark", "n.py", bom + "def f():\n    pass",
+         lambda a: a.replace_function("f", "def f():\n    return 1"), bom + "def f():\n    return 1"),
+        # A file that ends with its line break keeps it, and an empty file
+        # gets one with its first line.
+        ("a final line break stays", "n.cpp", "int f() { return 1; }\n",
+         lambda a: a.replace_function("f", "int f() { return 2; }"), "int f() { return 2; }\n"),
+        ("an empty file", "n.py", "", lambda a: a.add_top_level("X = 1"), "X = 1\n"),
+    ]
+    for label, name, source, action, expected in cases:
+        _exact(f"no final line break ({label})", _edit_result(name, source, action), expected)
+    _exact("no final line break (crlf)",
+           _edit_result("n.py", "def f():\n    pass", lambda a: a.replace_function("f", "def f():\n    return 1"), "\r\n"),
+           "def f():\r\n    return 1")
+    _exact("no final line break (crlf add_top_level)",
+           _edit_result("n.py", "X = 1\nY = 2", lambda a: a.add_top_level("Z = 3"), "\r\n"), "X = 1\r\nY = 2\r\n\r\nZ = 3")
+    # The syntax check still guards such files, and a refused edit leaves
+    # them as they were.
+    _refused("no final line break (syntax error refused)",
+             _edit_result("n.py", "def f():\n    pass", lambda a: a.replace_function("f", "def f(:\n    pass")),
+             "syntax error at line 1")
+    # Reading is unchanged.
+    _exact("no final line break (read_symbol)",
+           _read_result("n.py", "def f():\n    pass", lambda a: a.read_symbol("f")), "def f():\n    pass")
+    _exact("no final line break (list_symbols)",
+           _read_result("n.py", "X = 1\ndef f():\n    pass", lambda a: a.list_symbols()),
+           "variable X (line 1)\nfunction f (line 2)")
+
+
+def test_text_encodings():
+    print("\n═══ files that are not UTF-8 text are refused, also without a byte order mark ═══")
+
+    source = "def f():\n    pass\n"
+    advice = "; ast-editor reads and writes UTF-8 files only. Convert it to UTF-8, or make this edit with your normal edit tool."
+    # (label, raw bytes, what the refusal says the file is)
+    cases = [
+        ("utf-16 le without a mark (reported)", source.encode("utf-16-le"), "looks like UTF-16 text without a byte order mark"),
+        ("utf-16 be without a mark", source.encode("utf-16-be"), "looks like UTF-16 text without a byte order mark"),
+        ("utf-32 le without a mark", source.encode("utf-32-le"), "looks like UTF-32 text without a byte order mark"),
+        ("utf-32 be without a mark", source.encode("utf-32-be"), "looks like UTF-32 text without a byte order mark"),
+        ("utf-16 without a mark, mostly not ascii",
+         "def f():\n    return '\u4e2d\u6587\u4e2d\u6587\u4e2d'\n".encode("utf-16-le"),
+         "looks like UTF-16 text without a byte order mark"),
+        ("utf-16 without a mark, astral characters", "x = '\U0001F600'\n".encode("utf-16-le"),
+         "looks like UTF-16 text without a byte order mark"),
+        ("utf-32 without a mark, astral characters", "x = '\U0001F600'\n".encode("utf-32-le"),
+         "looks like UTF-32 text without a byte order mark"),
+        ("utf-16 after a utf-8 mark", b"\xef\xbb\xbf" + source.encode("utf-16-le"),
+         "looks like UTF-16 text without a byte order mark"),
+        ("utf-16 with a mark", source.encode("utf-16"), "is UTF-16 text (it starts with a UTF-16 byte order mark)"),
+        ("a NUL byte in utf-8 text", b"x = 1\ny = '\x00'\n", "is not text (it has a NUL byte on line 2)"),
+        ("binary", bytes(range(256)), "is not text (it has a NUL byte on line 1)"),
+    ]
+    tools = [
+        ("list_symbols", lambda a: a.list_symbols()),
+        ("read_symbol", lambda a: a.read_symbol("f")),
+        ("replace_function", lambda a: a.replace_function("f", "def f():\n    return 1")),
+        ("add_top_level", lambda a: a.add_top_level("X = 1")),
+    ]
+    for label, data, what in cases:
+        path = os.path.join(TESTS_DIR, "k.py")
+        for tool, action in tools:
+            with open(path, "wb") as f:
+                f.write(data)
+            result = _refusal(lambda: action(Applier(path)))
+            _exact(f"encodings: {label} ({tool})", result, f"{path} {what}{advice}")
+            check(f"encodings: {label} ({tool}) file unchanged",
+                  "<unchanged>" if _read_bytes(path) == data else "CHANGED", "<unchanged>")
+        os.remove(path)
+    # Other languages and config files too.
+    for name in ("k.js", "k.c", "k.yaml", "k.json"):
+        path = os.path.join(TESTS_DIR, name)
+        with open(path, "wb") as f:
+            f.write("a = 1\n".encode("utf-16-le"))
+        _exact(f"encodings: utf-16 without a mark ({name})", _refusal(lambda: Applier(path).list_symbols()),
+               f"{path} looks like UTF-16 text without a byte order mark{advice}")
+        os.remove(path)
+    # UTF-8 text without NUL bytes still reads.
+    _exact("encodings: utf-8 text reads", _read_result("k.py", "x = '\u4e2d'\n", lambda a: a.list_symbols()),
+           "variable x (line 1)")
+
+
+def test_layout_followups():
+    print("\n═══ layout: empty bodies, access labels, tabs, PEP 8 top-level spacing, member templates ═══")
+
+    # replace_function_body on an empty body over two lines indents the
+    # content one level deeper than the function.
+    body = [
+        ("cpp method (reported)", "b.cpp", "class A {\n    void f() {\n    }\n};\n", "A.f", "free(p);",
+         "class A {\n    void f() {\n        free(p);\n    }\n};\n"),
+        ("cpp blank line inside", "b.cpp", "class A {\n    void f() {\n\n    }\n};\n", "A.f", "free(p);",
+         "class A {\n    void f() {\n        free(p);\n    }\n};\n"),
+        ("cpp function, file without indentation", "b.cpp", "void f() {\n}\n", "f", "free(p);",
+         "void f() {\n  free(p);\n}\n"),
+        ("cpp allman braces", "b.cpp", "class A\n{\n    void f()\n    {\n    }\n};\n", "A.f", "free(p);",
+         "class A\n{\n    void f()\n    {\n        free(p);\n    }\n};\n"),
+        ("cpp tabs", "b.cpp", "class A {\n\tvoid f() {\n\t}\n};\n", "A.f", "free(p);",
+         "class A {\n\tvoid f() {\n\t\tfree(p);\n\t}\n};\n"),
+        ("java method", "B.java", "class A {\n    void f() {\n    }\n}\n", "A.f", "g();\nh();",
+         "class A {\n    void f() {\n        g();\n        h();\n    }\n}\n"),
+        ("js method", "b.js", "class A {\n  f() {\n  }\n}\n", "A.f", "g();", "class A {\n  f() {\n    g();\n  }\n}\n"),
+        ("js function", "b.js", "function f() {\n}\n", "f", "g();", "function f() {\n  g();\n}\n"),
+        ("ts method", "b.ts", "class A {\n    f(): void {\n    }\n}\n", "A.f", "g();",
+         "class A {\n    f(): void {\n        g();\n    }\n}\n"),
+        ("go function", "b.go", "package main\n\nfunc f() {\n}\n", "f", "g()", "package main\n\nfunc f() {\n\tg()\n}\n"),
+        ("go method", "b.go", "package main\n\ntype T struct{}\n\nfunc (t T) f() {\n}\n", "T.f", "g()",
+         "package main\n\ntype T struct{}\n\nfunc (t T) f() {\n\tg()\n}\n"),
+        ("c function", "b.c", "int g(void) {\n    return 1;\n}\n\nvoid f(void) {\n}\n", "f", "g();",
+         "int g(void) {\n    return 1;\n}\n\nvoid f(void) {\n    g();\n}\n"),
+        # A body with code or a comment keeps the indentation of its first one.
+        ("cpp comment only", "b.cpp", "class A {\n    void f() {\n        // todo\n    }\n};\n", "A.f", "free(p);",
+         "class A {\n    void f() {\n        free(p);\n    }\n};\n"),
+        ("js blank line before the code", "b.js", "function f() {\n\n    x();\n}\n", "f", "g();",
+         "function f() {\n    g();\n}\n"),
+    ]
+    for label, name, source, target, content, expected in body:
+        _exact(f"replace_function_body on an empty body ({label})",
+               _edit_result(name, source, lambda a: a.replace_function_body(target, content)), expected)
+    _exact("replace_function_body on an empty body (cpp crlf)",
+           _edit_result("b.cpp", "class A {\n    void f() {\n    }\n};\n",
+                        lambda a: a.replace_function_body("A.f", "free(p);"), "\r\n"),
+           "class A {\r\n    void f() {\r\n        free(p);\r\n    }\r\n};\r\n")
+
+    # add_field into a C++ class whose body opens with an access label goes
+    # below the label, among the members it gives that access to.
+    box = "class Box {\npublic:\n    int get() { return v; }\nprivate:\n    int v;\n};\n"
+    fields = [
+        ("first section (reported)", box, "Box",
+         "class Box {\npublic:\n    int n;\n\n    int get() { return v; }\nprivate:\n    int v;\n};\n"),
+        ("field below", "class Box {\nprivate:\n    int v;\n};\n", "Box", "class Box {\nprivate:\n    int n;\n    int v;\n};\n"),
+        ("blank line below the label", "class Box {\npublic:\n\n    int get() { return v; }\n};\n", "Box",
+         "class Box {\npublic:\n    int n;\n\n    int get() { return v; }\n};\n"),
+        ("comment after the label", "class Box {\npublic:  // API\n    int get() { return v; }\n};\n", "Box",
+         "class Box {\npublic:  // API\n    int n;\n\n    int get() { return v; }\n};\n"),
+        ("comment above the label", "class Box {\n    // c\npublic:\n    int v;\n};\n", "Box",
+         "class Box {\n    // c\npublic:\n    int n;\n    int v;\n};\n"),
+        ("indented label", "class Box {\n  public:\n    int get() { return v; }\n};\n", "Box",
+         "class Box {\n  public:\n    int n;\n\n    int get() { return v; }\n};\n"),
+        ("only a label", "class Box {\npublic:\n};\n", "Box", "class Box {\npublic:\n  int n;\n};\n"),
+        ("the brace after the label", "class Box {\npublic: };\n", "Box", "class Box {\npublic:\n  int n;\n};\n"),
+        ("a member after the label", "class Box {\npublic: int v;\n};\n", "Box",
+         "class Box {\npublic:\n  int n;\n  int v;\n};\n"),
+        ("body on one line", "class C { public: int x; };\n", "C", "class C {\npublic:\n  int n;\n  int x;\n};\n"),
+        ("body on one line, empty section", "class C { public: };\n", "C", "class C {\npublic:\n  int n;\n};\n"),
+        ("struct", "struct S {\nprivate:\n    int v;\n};\n", "S", "struct S {\nprivate:\n    int n;\n    int v;\n};\n"),
+        ("nested class", "namespace N {\nclass Box {\n public:\n  int v;\n};\n}\n", "N.Box",
+         "namespace N {\nclass Box {\n public:\n  int n;\n  int v;\n};\n}\n"),
+        ("member template below", "class Box {\npublic:\n    template <typename U>\n    U get() { return U(); }\n};\n", "Box",
+         "class Box {\npublic:\n    int n;\n\n    template <typename U>\n    U get() { return U(); }\n};\n"),
+        # A class that opens with a member keeps the field first.
+        ("no label first", "class Box {\n    int v;\npublic:\n    int get();\n};\n", "Box",
+         "class Box {\n    int n;\n    int v;\npublic:\n    int get();\n};\n"),
+    ]
+    for label, source, target, expected in fields:
+        _exact(f"add_field below an access label ({label})",
+               _edit_result("f.cpp", source, lambda a: a.add_field(target, "int n;")), expected)
+    _exact("add_field below an access label (crlf)",
+           _edit_result("f.cpp", "class Box {\npublic:\n    int v;\n};\n", lambda a: a.add_field("Box", "int n;"), "\r\n"),
+           "class Box {\r\npublic:\r\n    int n;\r\n    int v;\r\n};\r\n")
+    # add_method still goes after the last member.
+    _exact("add_method after an access label section",
+           _edit_result("f.cpp", box, lambda a: a.add_method("Box", "void f() {}")),
+           "class Box {\npublic:\n    int get() { return v; }\nprivate:\n    int v;\n\n    void f() {}\n};\n")
+
+    # insert_sibling next to a member indented with tabs writes the content's
+    # indentation in tabs, as add_method does.
+    tabs = [
+        ("py after (reported)", "t.py", "class A:\n\tdef a(self):\n\t\tpass\n", "A.a", "def c(self):\n    return 1", "after",
+         "class A:\n\tdef a(self):\n\t\tpass\n\n\tdef c(self):\n\t\treturn 1\n"),
+        ("py before", "t.py", "class A:\n\tdef a(self):\n\t\tpass\n", "A.a", "def c(self):\n    return 1", "before",
+         "class A:\n\tdef c(self):\n\t\treturn 1\n\n\tdef a(self):\n\t\tpass\n"),
+        ("py two levels", "t.py", "class A:\n\tdef a(self):\n\t\tpass\n", "A.a",
+         "def c(self):\n    if x:\n        return 1", "after",
+         "class A:\n\tdef a(self):\n\t\tpass\n\n\tdef c(self):\n\t\tif x:\n\t\t\treturn 1\n"),
+        ("js", "t.js", "class A {\n\tm() {\n\t\treturn 1;\n\t}\n}\n", "A.m", "k() {\n  return 2;\n}", "after",
+         "class A {\n\tm() {\n\t\treturn 1;\n\t}\n\n\tk() {\n\t\treturn 2;\n\t}\n}\n"),
+        ("java", "T.java", "class A {\n\tvoid m() {\n\t}\n}\n", "A.m", "void k() {\n    x();\n}", "after",
+         "class A {\n\tvoid m() {\n\t}\n\n\tvoid k() {\n\t\tx();\n\t}\n}\n"),
+        ("go struct field", "t.go", "package main\n\ntype T struct {\n\tA int\n}\n", "T", "type U struct {\n    B int\n}", "after",
+         "package main\n\ntype T struct {\n\tA int\n}\n\ntype U struct {\n    B int\n}\n"),
+        ("rb", "t.rb", "class A\n\tdef m\n\t\t1\n\tend\nend\n", "A.m", "def k\n  2\nend", "before",
+         "class A\n\tdef k\n\t\t2\n\tend\n\n\tdef m\n\t\t1\n\tend\nend\n"),
+        # Content already in tabs, and members indented with spaces, are
+        # left as they are.
+        ("py content in tabs", "t.py", "class A:\n\tdef a(self):\n\t\tpass\n", "A.a", "def c(self):\n\treturn 1", "after",
+         "class A:\n\tdef a(self):\n\t\tpass\n\n\tdef c(self):\n\t\treturn 1\n"),
+        ("py spaces", "t.py", "class A:\n    def a(self):\n        pass\n", "A.a", "def c(self):\n  return 1", "after",
+         "class A:\n    def a(self):\n        pass\n\n    def c(self):\n      return 1\n"),
+    ]
+    for label, name, source, target, content, position, expected in tabs:
+        _exact(f"insert_sibling into tab indentation ({label})",
+               _edit_result(name, source, lambda a: a.insert_sibling(target, content, position)), expected)
+
+    # add_top_level separates a new top-level Python def or class by two
+    # blank lines (PEP 8), at the bottom and at the top, as insert_sibling does.
+    top_level = [
+        ("def after a def (reported)", "def f():\n    pass\n", "def g():\n    pass", "bottom",
+         "def f():\n    pass\n\n\ndef g():\n    pass\n"),
+        ("variable after a def", "def f():\n    pass\n", "X = 1", "bottom", "def f():\n    pass\n\n\nX = 1\n"),
+        ("def after a variable", "X = 1\n", "def g():\n    pass", "bottom", "X = 1\n\n\ndef g():\n    pass\n"),
+        ("variable after a variable", "X = 1\n", "Y = 2", "bottom", "X = 1\n\nY = 2\n"),
+        ("decorated def", "X = 1\n", "@dec\ndef g():\n    pass", "bottom", "X = 1\n\n\n@dec\ndef g():\n    pass\n"),
+        ("def with a comment", "X = 1\n", "# Doc.\ndef g():\n    pass", "bottom", "X = 1\n\n\n# Doc.\ndef g():\n    pass\n"),
+        ("class after blank lines", "def f():\n    pass\n\n\n\n", "class A:\n    pass", "bottom",
+         "def f():\n    pass\n\n\nclass A:\n    pass\n"),
+        ("top: def before a def (reported)", "def f():\n    pass\n", "def g():\n    pass", "top",
+         "def g():\n    pass\n\n\ndef f():\n    pass\n"),
+        ("top: variable before a def", "def f():\n    pass\n", "X = 1", "top", "X = 1\n\n\ndef f():\n    pass\n"),
+        ("top: def after an import", "import os\n\ndef f():\n    pass\n", "def g():\n    pass", "top",
+         "import os\n\n\ndef g():\n    pass\n\n\ndef f():\n    pass\n"),
+        ("top: variable between an import and a variable", "import os\n\nX = 1\n", "Y = 2", "top",
+         "import os\n\nY = 2\n\nX = 1\n"),
+        ("top: def after a docstring", '"""Doc."""\ndef f():\n    pass\n', "def g():\n    pass", "top",
+         '"""Doc."""\n\n\ndef g():\n    pass\n\n\ndef f():\n    pass\n'),
+        ("top: more blank lines below kept", "import os\n\n\n\nX = 1\n", "Y = 2", "top",
+         "import os\n\nY = 2\n\n\n\nX = 1\n"),
+        ("top: only imports", "import os\n", "def g():\n    pass", "top", "import os\n\n\ndef g():\n    pass\n"),
+        ("top: empty file", "", "def g():\n    pass", "top", "def g():\n    pass\n"),
+    ]
+    for label, source, content, position, expected in top_level:
+        _exact(f"py add_top_level spacing ({label})",
+               _edit_result("s.py", source, lambda a: a.add_top_level(content, position)), expected)
+    # Other languages get one blank line on each side, also below the new
+    # code when the file had none after its preamble.
+    _exact("add_top_level spacing (js top)",
+           _edit_result("s.js", "import x from 'x';\nfunction f() {}\n", lambda a: a.add_top_level("function g() {}", "top")),
+           "import x from 'x';\n\nfunction g() {}\n\nfunction f() {}\n")
+    _exact("add_top_level spacing (js bottom)",
+           _edit_result("s.js", "function f() {}\n", lambda a: a.add_top_level("function g() {}")),
+           "function f() {}\n\nfunction g() {}\n")
+
+    # add_method counts C++ member templates as methods when it decides on
+    # the blank line before the new method.
+    templates = [
+        ("no blank lines (reported)", "class A {\n    int a() { return 1; }\n    template <typename U>\n    U b() { return U(); }\n};\n",
+         "class A {\n    int a() { return 1; }\n    template <typename U>\n    U b() { return U(); }\n    int c() { return 3; }\n};\n"),
+        ("blank lines", "class A {\n    int a() { return 1; }\n\n    template <typename U>\n    U b() { return U(); }\n};\n",
+         "class A {\n    int a() { return 1; }\n\n    template <typename U>\n    U b() { return U(); }\n\n    int c() { return 3; }\n};\n"),
+        ("template first", "class A {\n    template <typename U>\n    U b() { return U(); }\n    int a() { return 1; }\n};\n",
+         "class A {\n    template <typename U>\n    U b() { return U(); }\n    int a() { return 1; }\n    int c() { return 3; }\n};\n"),
+        ("only templates", "class A {\n    template <typename U>\n    U a() { return U(); }\n    template <typename U>\n    U b() { return U(); }\n};\n",
+         "class A {\n    template <typename U>\n    U a() { return U(); }\n    template <typename U>\n    U b() { return U(); }\n    int c() { return 3; }\n};\n"),
+        # A member class template is no method.
+        ("class template", "class A {\n    int a() { return 1; }\n    template <typename U>\n    struct S {};\n};\n",
+         "class A {\n    int a() { return 1; }\n    template <typename U>\n    struct S {};\n\n    int c() { return 3; }\n};\n"),
+    ]
+    for label, source, expected in templates:
+        _exact(f"add_method spacing with member templates ({label})",
+               _edit_result("m.cpp", source, lambda a: a.add_method("A", "int c() { return 3; }")), expected)
+    _exact("add_field above a member template",
+           _edit_result("m.cpp", "class A {\n    template <typename U>\n    U b() { return U(); }\n};\n",
+                        lambda a: a.add_field("A", "int n;")),
+           "class A {\n    int n;\n\n    template <typename U>\n    U b() { return U(); }\n};\n")
+
+
+def test_yaml_only_item():
+    print("\n═══ remove_from_array on the only item of a YAML block sequence leaves [] ═══")
+
+    # (label, source, target, value, expected file text)
+    cases = [
+        ("reported", "a:\n  - 1\nb: 2\n", "a", "1", "a: []\nb: 2\n"),
+        ("not indented", "a:\n- 1\nb: 2\n", "a", "1", "a: []\nb: 2\n"),
+        ("anchor, tag and comment", "a: &x !!seq # c\n  - 1\nb: 2\n", "a", "1", "a: &x !!seq [] # c\nb: 2\n"),
+        ("comment after the colon", "a:   # list\n  - 1\n", "a", "1", "a: []   # list\n"),
+        ("comment line above the item", "c:\n  # lead\n  - 3  # three\nd: 1\n", "c", "3", "c: []\n  # lead\nd: 1\n"),
+        ("mapping item", "d:\n  - e: 1\n    f: 2\nz: 1\n", "d", "e: 1\n    f: 2", "d: []\nz: 1\n"),
+        ("mapping item at the end of the file", "d:\n  - e: 1\n    f: 2\n", "d", "e: 1\n    f: 2", "d: []\n"),
+        ("nested", "a:\n  b:\n    - 1\n  c: 2\n", "a.b", "1", "a:\n  b: []\n  c: 2\n"),
+        ("quoted key", '"a b":\n  - 1\n', '"a b"', "1", '"a b": []\n'),
+        ("not ascii", "\u00e9:\n  - 1\n", "\u00e9", "1", "\u00e9: []\n"),
+        # Other items leave a block sequence.
+        ("one of two", "a:\n  - 1\n  - 2\nb: 2\n", "a", "1", "a:\n  - 2\nb: 2\n"),
+        ("a mapping item before the next key", "d:\n  - e: 1\n    f: 2\n  - 3\nz: 1\n", "d", "e: 1\n    f: 2",
+         "d:\n  - 3\nz: 1\n"),
+    ]
+    for label, source, target, value, expected in cases:
+        _exact(f"yaml remove_from_array ({label})",
+               _edit_result("y.yaml", source, lambda a: a.remove_from_array(target, value)), expected)
+    _exact("yaml remove_from_array (crlf)",
+           _edit_result("y.yaml", "a:\n  - 1\nb: 2\n", lambda a: a.remove_from_array("a", "1"), "\r\n"), "a: []\r\nb: 2\r\n")
+    _exact("yaml remove_from_array (then append_to_array)",
+           _edit_result("y.yaml", "a:\n  - 1\nb: 2\n",
+                        lambda a: (a.remove_from_array("a", "1"), a.append_to_array("a", "5"))), "a: [5]\nb: 2\n")
+    _exact("yaml remove_from_array (read back)",
+           _read_result("y.yaml", "a:\n  - 1\nb: 2\n",
+                        lambda a: (a.remove_from_array("a", "1"), a.read_symbol("a"))[1]), "[]")
+
+
+def test_ruby_attached_lines():
+    print("\n═══ Ruby: a =begin document above a method is its comment, a Sorbet sig part of it ═══")
+
+    doc = "class A\n=begin\nOld doc.\n=end\n  def f\n    1\n  end\nend\n"
+    # (label, source, action, expected file text)
+    documents = [
+        ("remove (reported)", doc, lambda a: a.edit_leading_comment("A.f", "remove"), "class A\n  def f\n    1\n  end\nend\n"),
+        ("replace", doc, lambda a: a.edit_leading_comment("A.f", "replace", "# New doc."),
+         "class A\n  # New doc.\n  def f\n    1\n  end\nend\n"),
+        ("replace with a document", doc, lambda a: a.edit_leading_comment("A.f", "replace", "=begin\nNew.\n=end"),
+         "class A\n=begin\nNew.\n=end\n  def f\n    1\n  end\nend\n"),
+        ("delete_symbol", doc, lambda a: a.delete_symbol("A.f"), "class A\nend\n"),
+        ("delete_symbol keeping the comment", doc, lambda a: a.delete_symbol("A.f", include_leading_comments=False),
+         "class A\n=begin\nOld doc.\n=end\nend\n"),
+        ("insert_sibling before", doc, lambda a: a.insert_sibling("A.f", "def g\nend", "before"),
+         "class A\n  def g\n  end\n\n=begin\nOld doc.\n=end\n  def f\n    1\n  end\nend\n"),
+        ("top level", "=begin\nDoc.\n=end\ndef f\nend\n", lambda a: a.edit_leading_comment("f", "remove"), "def f\nend\n"),
+        ("with line comments around it", "# a\n=begin\nDoc.\n=end\n# b\ndef f\nend\n",
+         lambda a: a.edit_leading_comment("f", "remove"), "def f\nend\n"),
+    ]
+    for label, source, action, expected in documents:
+        _exact(f"rb embedded document as the leading comment ({label})", _edit_result("d.rb", source, action), expected)
+    _refused("rb embedded document as the leading comment (add)",
+             _edit_result("d.rb", doc, lambda a: a.edit_leading_comment("A.f", "add", "# New doc.")),
+             "REFUSED: 'A.f' already has a leading comment (lines 2-4):\n=begin\nOld doc.\n=end\n")
+    # A blank line ends it, and an `=end` inside a heredoc is text.
+    _refused("rb embedded document as the leading comment (blank line between)",
+             _edit_result("d.rb", "x = 1\n=begin\nDoc.\n=end\n\ndef f\nend\n", lambda a: a.edit_leading_comment("f", "remove")),
+             "REFUSED: No leading comment found above 'f'")
+    _exact("rb embedded document as the leading comment (=end in a heredoc)",
+           _edit_result("d.rb", "def g\n  x = <<~EOS\n=end\n  EOS\nend\ndef f\nend\n",
+                        lambda a: a.edit_leading_comment("f", "add", "# c")),
+           "def g\n  x = <<~EOS\n=end\n  EOS\nend\n# c\ndef f\nend\n")
+
+    # A Sorbet signature directly above a method is part of it.
+    sig = "class A\n  sig { void }\n  def f; end\nend\n"
+    block = "class A\n  # Doc.\n  sig do\n    params(x: Integer).void\n  end\n  def f(x)\n    x\n  end\n\n  def g; end\nend\n"
+    private = "class A\n  sig { void }\n  private def m(x)\n    x\n  end\nend\n"
+    reads = [
+        ("full", sig, "A.f", "full", "sig { void }\n  def f; end"),
+        ("signature", sig, "A.f", "signature", "def f"),
+        ("interface", sig, "A.f", "interface", "def f"),
+        ("do block", block, "A.f", "full", "sig do\n    params(x: Integer).void\n  end\n  def f(x)\n    x\n  end"),
+        ("private def", private, "A.m", "full", "sig { void }\n  private def m(x)\n    x\n  end"),
+        ("private def signature", private, "A.m", "signature", "private def m(x)"),
+        ("singleton method", "class A\n  sig { void }\n  def self.f; end\nend\n", "A.f", "full", "sig { void }\n  def self.f; end"),
+        ("final sig", "class A\n  sig(:final) { void }\n  def f; end\nend\n", "A.f", "full", "sig(:final) { void }\n  def f; end"),
+        ("comment between", "class A\n  sig { void }\n  # rubocop:disable X\n  def f; end\nend\n", "A.f", "full",
+         "sig { void }\n  # rubocop:disable X\n  def f; end"),
+        ("top level", "sig { void }\ndef f\nend\n", "f", "full", "sig { void }\ndef f\nend"),
+        # A blank line between them, a sig with a receiver or without a block,
+        # is no part of the method.
+        ("blank line between", "class A\n  sig { void }\n\n  def f; end\nend\n", "A.f", "full", "def f; end"),
+        ("receiver", "class A\n  T.sig { void }\n  def f; end\nend\n", "A.f", "full", "def f; end"),
+        ("no block", "class A\n  sig\n  def f; end\nend\n", "A.f", "full", "def f; end"),
+    ]
+    for label, source, target, depth, expected in reads:
+        _exact(f"rb sorbet signature read_symbol ({label})",
+               _read_result("s.rb", source, lambda a: a.read_symbol(target, depth)), expected)
+    _exact("rb sorbet signature list_symbols (at the sig's line, as decorators)",
+           _read_result("s.rb", block, lambda a: a.list_symbols()), "class A (line 1)\n  method A.f (line 3)\n  method A.g (line 10)")
+    _listed_targets_resolve("rb sorbet signatures", "s.rb", block)
+    _listed_targets_resolve("rb sorbet signature on a private def", "s.rb", private)
+    edits = [
+        ("insert_sibling before (reported)", sig, lambda a: a.insert_sibling("A.f", "def g; end", "before"),
+         "class A\n  def g; end\n\n  sig { void }\n  def f; end\nend\n"),
+        ("insert_sibling before, with a comment", block, lambda a: a.insert_sibling("A.f", "def h; end", "before"),
+         "class A\n  def h; end\n\n  # Doc.\n  sig do\n    params(x: Integer).void\n  end\n  def f(x)\n    x\n  end\n\n  def g; end\nend\n"),
+        ("delete_symbol", sig, lambda a: a.delete_symbol("A.f"), "class A\nend\n"),
+        ("delete_symbol with its comment", block, lambda a: a.delete_symbol("A.f"), "class A\n  def g; end\nend\n"),
+        ("delete_symbol of a private def", private, lambda a: a.delete_symbol("A.m"), "class A\nend\n"),
+        ("replace_function", sig, lambda a: a.replace_function("A.f", "sig { returns(Integer) }\ndef f; 1; end"),
+         "class A\n  sig { returns(Integer) }\n  def f; 1; end\nend\n"),
+        ("edit_leading_comment add", sig, lambda a: a.edit_leading_comment("A.f", "add", "# Doc."),
+         "class A\n  # Doc.\n  sig { void }\n  def f; end\nend\n"),
+        ("edit_leading_comment remove", block, lambda a: a.edit_leading_comment("A.f", "remove"),
+         "class A\n  sig do\n    params(x: Integer).void\n  end\n  def f(x)\n    x\n  end\n\n  def g; end\nend\n"),
+        ("replace_signature keeps it", block, lambda a: a.replace_signature("A.f", "def f(y)"),
+         "class A\n  # Doc.\n  sig do\n    params(x: Integer).void\n  end\n  def f(y)\n    x\n  end\n\n  def g; end\nend\n"),
+        ("replace_signature with its own", sig, lambda a: a.replace_signature("A.f", "sig { params(x: Integer).void }\ndef f(x)"),
+         "class A\n  sig { params(x: Integer).void }\n  def f(x); end\nend\n"),
+        ("replace_signature of a private def", private, lambda a: a.replace_signature("A.m", "protected def m(y)"),
+         "class A\n  sig { void }\n  protected def m(y)\n    x\n  end\nend\n"),
+        ("replace_signature of a private def with its own", private,
+         lambda a: a.replace_signature("A.m", "sig { params(y: Integer).void }\nprivate def m(y)"),
+         "class A\n  sig { params(y: Integer).void }\n  private def m(y)\n    x\n  end\nend\n"),
+        ("add_parameter", block, lambda a: a.add_parameter("A.f", "y"),
+         "class A\n  # Doc.\n  sig do\n    params(x: Integer).void\n  end\n  def f(x, y)\n    x\n  end\n\n  def g; end\nend\n"),
+        # A sig counts as a decorator does in member spacing.
+        ("add_method after signed methods",
+         "class A\n  sig { void }\n  def a; end\n\n  sig { void }\n  def b; end\nend\n", lambda a: a.add_method("A", "def c; end"),
+         "class A\n  sig { void }\n  def a; end\n\n  sig { void }\n  def b; end\n\n  def c; end\nend\n"),
+        ("add_field above a signed method", sig, lambda a: a.add_field("A", "X = 1"),
+         "class A\n  X = 1\n\n  sig { void }\n  def f; end\nend\n"),
+    ]
+    for label, source, action, expected in edits:
+        _exact(f"rb sorbet signature ({label})", _edit_result("s.rb", source, action), expected)
+    for label, source, target in (("braces", sig, "A.f"), ("do block", block, "A.f"), ("private def", private, "A.m")):
+        _exact(f"rb sorbet signature round trip ({label})", _round_trip("s.rb", source, target), "<unchanged>")
+
+
+def test_comments_ending_code():
+    print("\n═══ comment lines below a symbol, indented deeper, end it; block comments over lines ═══")
+
+    js = "class A {\n  m() {}\n    // deep\n  n() {}\n}\n"
+    c = "int f(void) {\n    return 1;\n}\n    /* end of f */\n    // more\nint g(void);\n"
+    go = "package main\n\nfunc f() {\n}\n\t// end of f\n\nfunc g() {}\n"
+    java = "class A {\n    void m() {\n    }\n        // deep\n    /* block\n       more */\n    void n() {}\n}\n"
+    rb = "class A\n  def m\n  end\n    # deep\n  def n\n  end\nend\n"
+    # (label, file name, source, action, expected file text)
+    cases = [
+        ("js insert_sibling after (reported)", "c.js", js, lambda a: a.insert_sibling("A.m", "k() {}", "after"),
+         "class A {\n  m() {}\n    // deep\n\n  k() {}\n\n  n() {}\n}\n"),
+        ("js delete_symbol", "c.js", js, lambda a: a.delete_symbol("A.m"), "class A {\n  n() {}\n}\n"),
+        ("js delete_symbol of the method below", "c.js", js, lambda a: a.delete_symbol("A.n"),
+         "class A {\n  m() {}\n    // deep\n}\n"),
+        ("js leading comment of the method below", "c.js", js, lambda a: a.edit_leading_comment("A.n", "add", "// n"),
+         "class A {\n  m() {}\n    // deep\n  // n\n  n() {}\n}\n"),
+        ("c two comments", "c.c", c, lambda a: a.insert_sibling("f", "int h(void);", "after"),
+         "int f(void) {\n    return 1;\n}\n    /* end of f */\n    // more\n\nint h(void);\n\nint g(void);\n"),
+        ("c delete_symbol", "c.c", c, lambda a: a.delete_symbol("f"), "int g(void);\n"),
+        ("go insert_sibling after", "c.go", go, lambda a: a.insert_sibling("f", "func h() {}", "after"),
+         "package main\n\nfunc f() {\n}\n\t// end of f\n\nfunc h() {}\n\nfunc g() {}\n"),
+        ("go delete_symbol", "c.go", go, lambda a: a.delete_symbol("f"), "package main\n\nfunc g() {}\n"),
+        # A comment at the symbol's indentation is the next one's.
+        ("java insert_sibling after", "C.java", java, lambda a: a.insert_sibling("A.m", "void k() {}", "after"),
+         "class A {\n    void m() {\n    }\n        // deep\n\n    void k() {}\n\n    /* block\n       more */\n    void n() {}\n}\n"),
+        ("java delete_symbol", "C.java", java, lambda a: a.delete_symbol("A.m"),
+         "class A {\n    /* block\n       more */\n    void n() {}\n}\n"),
+        ("block comment over lines", "c.js", "class A {\n  m() {}\n      /* deep\n  more */\n  n() {}\n}\n",
+         lambda a: a.insert_sibling("A.m", "k() {}", "after"),
+         "class A {\n  m() {}\n      /* deep\n  more */\n\n  k() {}\n\n  n() {}\n}\n"),
+        ("rb insert_sibling after", "c.rb", rb, lambda a: a.insert_sibling("A.m", "def k\nend", "after"),
+         "class A\n  def m\n  end\n    # deep\n\n  def k\n  end\n\n  def n\n  end\nend\n"),
+        ("rb delete_symbol", "c.rb", rb, lambda a: a.delete_symbol("A.m"), "class A\n  def n\n  end\nend\n"),
+        # A blank line, or code after the comment on its line, ends them.
+        ("blank line", "c.js", "class A {\n  m() {}\n\n    // deep\n  n() {}\n}\n",
+         lambda a: a.insert_sibling("A.m", "k() {}", "after"), "class A {\n  m() {}\n\n  k() {}\n\n    // deep\n  n() {}\n}\n"),
+        ("code after the comment", "c.c", "int f(void);\n    /* x */ int g(void);\n",
+         lambda a: a.insert_sibling("f", "int h(void);", "after"), "int f(void);\n\nint h(void);\n\n    /* x */ int g(void);\n"),
+    ]
+    for label, name, source, action, expected in cases:
+        _exact(f"comments ending the code above ({label})", _edit_result(name, source, action), expected)
+    # read_symbol and replace_function leave the comment out, as before.
+    _exact("comments ending the code above (read_symbol)", _read_result("c.js", js, lambda a: a.read_symbol("A.m")), "m() {}")
+    _exact("comments ending the code above (round trip)", _round_trip("c.js", js, "A.m"), "<unchanged>")
+    _exact("comments ending the code above (replace_function)",
+           _edit_result("c.js", js, lambda a: a.replace_function("A.m", "m() { return 1; }")),
+           "class A {\n  m() { return 1; }\n    // deep\n  n() {}\n}\n")
+
+    # A block comment after a symbol that goes on over lines, with code
+    # after it: the code on both sides shares those lines.
+    shared = "int x; /* a\n b */ int y;\n"
+    for target in ("x", "y"):
+        _exact(f"block comment over lines between symbols (round trip of {target}, reported)",
+               _round_trip("b.c", shared, target), "<unchanged>")
+    for name, source, target in (
+        ("b.js", "function f() {} /* a\n b */ function g() {}\n", "f"),
+        ("b.js", "function f() {} /* a\n b */ function g() {}\n", "g"),
+        ("b.cpp", "class A {\n  int x; /* a\n   b */ int y;\n};\n", "A.x"),
+        ("b.cpp", "class A {\n  int x; /* a\n   b */ int y;\n};\n", "A.y"),
+    ):
+        _exact(f"block comment over lines between symbols (round trip of {target} in {name})",
+               _round_trip(name, source, target), "<unchanged>")
+    edits = [
+        ("replace_function", shared, lambda a: a.replace_function("x", "int x = 1;"), "int x = 1; /* a\n b */ int y;\n"),
+        ("delete_symbol of the first", shared, lambda a: a.delete_symbol("x"), "/* a\n b */ int y;\n"),
+        ("delete_symbol of the second", shared, lambda a: a.delete_symbol("y"), "int x; /* a\n b */\n"),
+        ("a line break after the comment", "int x; /* a\n b */\nint y;\n", lambda a: a.insert_sibling("x", "int z;", "after"),
+         "int x; /* a\n b */\n\nint z;\n\nint y;\n"),
+        ("delete_symbol, a line break after the comment", "int x; /* a\n b */\nint y;\n", lambda a: a.delete_symbol("x"),
+         "int y;\n"),
+    ]
+    for label, source, action, expected in edits:
+        _exact(f"block comment over lines between symbols ({label})", _edit_result("b.c", source, action), expected)
+    _refused("block comment over lines between symbols (insert_sibling after)",
+             _edit_result("b.c", shared, lambda a: a.insert_sibling("x", "int z;", "after")),
+             "REFUSED: 'x' shares its last line with other code")
+    _refused("block comment over lines between symbols (insert_sibling before)",
+             _edit_result("b.c", shared, lambda a: a.insert_sibling("y", "int z;", "before")),
+             "REFUSED: 'y' shares its first line with other code")
+    _refused("block comment over lines between symbols (edit_leading_comment)",
+             _edit_result("b.c", shared, lambda a: a.edit_leading_comment("y", "add", "// y")),
+             "REFUSED: 'y' does not start its line")
 
 
 # ──────────────────────────────────────────────
 # Main
 # ──────────────────────────────────────────────
+
+def test_target_resolution_followups():
+    print("\n═══ containers, namespaces, qualified names, overload spellings, JS fields and methods ═══")
+
+    # add_method and add_field add to the container a name targets among the
+    # containers of its scope: the struct a function shares its name with,
+    # the struct a typedef declared apart names. A function is refused.
+    stat = "struct stat {\n    int size;\n};\nint stat(const char *p) {\n    return 0;\n}\n"
+    sigaction = "struct sigaction {\n    int sa_flags;\n};\nint sigaction(int sig) {\n    return 0;\n}\n"
+    props = "export interface Props {\n  a: number;\n}\nexport function Props(p: Props) {\n  return p.a;\n}\n"
+    node = "typedef struct Node Node;\n\nstruct Node {\n    Node *next;\n};\n"
+    # (label, file name, source, action, expected file text)
+    cases = [
+        ("c add_field to a struct a function shares its name with (reported)", "k.c", stat,
+         lambda a: a.add_field("stat", "int mode;"),
+         "struct stat {\n    int mode;\n    int size;\n};\nint stat(const char *p) {\n    return 0;\n}\n"),
+        ("cpp add_method", "k.cpp", sigaction, lambda a: a.add_method("sigaction", "void reset();"),
+         "struct sigaction {\n    int sa_flags;\n\n    void reset();\n};\nint sigaction(int sig) {\n    return 0;\n}\n"),
+        ("cpp add_field", "k.cpp", sigaction, lambda a: a.add_field("sigaction", "int sa_mask;"),
+         "struct sigaction {\n    int sa_mask;\n    int sa_flags;\n};\nint sigaction(int sig) {\n    return 0;\n}\n"),
+        ("ts add_field to an interface a function shares its name with", "k.ts", props,
+         lambda a: a.add_field("Props", "b: string;"),
+         "export interface Props {\n  b: string;\n  a: number;\n}\nexport function Props(p: Props) {\n  return p.a;\n}\n"),
+        ("c add_field through a typedef declared apart", "k.c", node, lambda a: a.add_field("Node", "int v;"),
+         "typedef struct Node Node;\n\nstruct Node {\n    int v;\n    Node *next;\n};\n"),
+        ("c add_field to the struct by its keyword", "k.c", stat, lambda a: a.add_field("struct stat", "int mode;"),
+         "struct stat {\n    int mode;\n    int size;\n};\nint stat(const char *p) {\n    return 0;\n}\n"),
+    ]
+    for label, name, source, action, expected in cases:
+        _exact(f"container targets ({label})", _edit_result(name, source, action), expected)
+    for label, name, source, target in [
+        ("cpp", "k.cpp", "void f() {\n  return;\n}\n", "f"),
+        ("java", "K.java", "class A {\n  void f() {\n    return;\n  }\n}\n", "A.f"),
+        ("rb", "k.rb", "def f\n  1\nend\n", "f"),
+        ("ts", "k.ts", "function f() {\n  return;\n}\n", "f"),
+        ("js const function", "k.js", "const f = () => {\n  return;\n};\n", "f"),
+        ("py", "k.py", "def f():\n    return 1\n", "f"),
+        ("c prototype", "k.h", "int f(void);\n", "f"),
+    ]:
+        for tool in ("add_field", "add_method"):
+            _refused(f"container targets ({tool} on a function, {label})",
+                     _edit_result(name, source, lambda a: getattr(a, tool)(target, "int x;")),
+                     f"'{target}' is a function, not a class, so add_method and add_field cannot add to it; "
+                     "add to its body with insert_in_body")
+
+    # In a namespace opened again, a name declared in one of its blocks is
+    # found before a member of a class in another.
+    ns = "namespace ns {\nstruct A {\n    int count;\n};\n}\n\nnamespace ns {\nint count() { return 1; }\n}\n"
+    tsns = "namespace N {\n  export class A {\n    reset = 1;\n  }\n}\n\nnamespace N {\n  export function reset() {}\n}\n"
+    outside = ("namespace ns {\nclass A {\npublic:\n    void f(int);\n    void f(double);\n    template <typename T> T g(T);\n};\n}\n\n"
+               "namespace ns {\nvoid A::f(int) {}\nvoid A::f(double) {}\ntemplate <typename T> T A::g(T t) { return t; }\n}\n")
+    cases = [
+        ("cpp read_symbol (reported)", "k.cpp", ns, lambda a: a.read_symbol("ns.count"), "int count() { return 1; }"),
+        ("ts read_symbol", "k.ts", tsns, lambda a: a.read_symbol("N.reset"), "export function reset() {}"),
+        ("cpp out-of-line definition in another block", "k.cpp", outside, lambda a: a.read_symbol("ns.g"),
+         "template <typename T> T A::g(T t) { return t; }"),
+        ("cpp overloads defined in another block", "k.cpp", outside, lambda a: a.read_symbol("ns.f"),
+         "REFUSED: 'ns.f' is overloaded: ns.A::f(int) (line 11), ns.A::f(double) (line 12); add the parameter types."),
+        ("cpp the class member by its path", "k.cpp", ns, lambda a: a.read_symbol("ns.A.count"), "int count;"),
+    ]
+    for label, name, source, action, expected in cases:
+        _exact(f"reopened namespaces ({label})", _read_result(name, source, action), expected)
+    _exact("reopened namespaces (cpp delete_symbol)", _edit_result("k.cpp", ns, lambda a: a.delete_symbol("ns.count")),
+           "namespace ns {\nstruct A {\n    int count;\n};\n}\n\nnamespace ns {\n}\n")
+    _exact("reopened namespaces (ts delete_symbol)", _edit_result("k.ts", tsns, lambda a: a.delete_symbol("N.reset")),
+           "namespace N {\n  export class A {\n    reset = 1;\n  }\n}\n\nnamespace N {\n}\n")
+    for label, name, source in [("cpp", "k.cpp", ns), ("ts", "k.ts", tsns), ("cpp out-of-line", "k.cpp", outside)]:
+        _listed_targets_resolve(f"reopened namespaces ({label})", name, source)
+
+    # A class or namespace declared with its scope, and a partial
+    # specialization whose template arguments hold a `::`.
+    pimpl = "struct A {\n    struct B;\n};\nstruct A::B {\n    int x;\n};\n"
+    nested = "namespace a::b {\nvoid f();\n}\n"
+    special = ("#include <vector>\ntemplate <typename T>\nstruct S {\n    int a;\n};\n\n"
+               "template <typename U>\nstruct S<std::vector<U>> {\n    int b;\n};\n")
+    cases = [
+        ("read_symbol of a class defined with its scope (reported)", "k.cpp", pimpl, lambda a: a.read_symbol("A::B"),
+         "struct A::B {\n    int x;\n};"),
+        ("its last name", "k.cpp", pimpl, lambda a: a.read_symbol("B"), "struct A::B {\n    int x;\n};"),
+        ("its field", "k.cpp", pimpl, lambda a: a.read_symbol("A::B.x"), "int x;"),
+        ("the declaration in its class", "k.cpp", pimpl, lambda a: a.read_symbol("A.B"), "struct B;"),
+        ("a nested namespace definition", "k.cpp", nested, lambda a: a.read_symbol("a::b"), "namespace a::b {\nvoid f();\n}"),
+        ("a partial specialization", "k.cpp", special, lambda a: a.read_symbol("S<std::vector<U>>"),
+         "template <typename U>\nstruct S<std::vector<U>> {\n    int b;\n};"),
+        ("the template it specializes", "k.cpp", special, lambda a: a.read_symbol("S"),
+         "template <typename T>\nstruct S {\n    int a;\n};"),
+    ]
+    for label, name, source, action, expected in cases:
+        _exact(f"qualified names ({label})", _read_result(name, source, action), expected)
+    cases = [
+        ("delete_symbol of a nested namespace", "k.cpp", nested, lambda a: a.delete_symbol("a::b"), "\n"),
+        ("edit_leading_comment of a nested namespace", "k.cpp", nested,
+         lambda a: a.edit_leading_comment("a::b", "add", "// ns"), "// ns\nnamespace a::b {\nvoid f();\n}\n"),
+        ("add_field to a class defined with its scope", "k.cpp", pimpl, lambda a: a.add_field("A::B", "int y;"),
+         "struct A {\n    struct B;\n};\nstruct A::B {\n    int y;\n    int x;\n};\n"),
+        ("delete_symbol of a partial specialization", "k.cpp", special, lambda a: a.delete_symbol("S<std::vector<U>>"),
+         "#include <vector>\ntemplate <typename T>\nstruct S {\n    int a;\n};\n"),
+    ]
+    for label, name, source, action, expected in cases:
+        _exact(f"qualified names ({label})", _edit_result(name, source, action), expected)
+    for label, source in [("class defined with its scope", pimpl), ("nested namespace", nested), ("partial specialization", special)]:
+        _listed_targets_resolve(f"qualified names ({label})", "k.cpp", source)
+
+    # A definition outside the preprocessor conditionals is the target, not
+    # one in `#if 0` before it.
+    dead = "#if 0\nint f(void) {\n    return 0; /* old */\n}\n#endif\n\nint f(void) {\n    return 1;\n}\n"
+    _exact("#if 0 (list_symbols, reported)", _read_result("k.c", dead, lambda a: a.list_symbols()), "function f (line 7)")
+    _exact("#if 0 (read_symbol)", _read_result("k.c", dead, lambda a: a.read_symbol("f")), "int f(void) {\n    return 1;\n}")
+    _exact("#if 0 (replace_in_body)", _edit_result("k.c", dead, lambda a: a.replace_in_body("f", "return 1;", "return 2;")),
+           dead.replace("return 1;", "return 2;"))
+    _listed_targets_resolve("#if 0", "k.c", dead)
+
+    # Spellings of one C/C++ type are one type: a prototype and a definition
+    # that spell their parameters differently declare one function.
+    same = [
+        ("a const parameter (reported)", "void f(int a);\nvoid f(const int a) {}\n", "void f(const int a) {}"),
+        ("unsigned", "void f(unsigned);\nvoid f(unsigned int x) {}\n", "void f(unsigned int x) {}"),
+        ("const after the type", "void f(const char*);\nvoid f(char const *s) {}\n", "void f(char const *s) {}"),
+        ("long long int", "void f(long long);\nvoid f(long long int v) {}\n", "void f(long long int v) {}"),
+        ("struct keyword", "struct S;\nvoid f(struct S *);\nvoid f(S *s) {}\n", "void f(S *s) {}"),
+        ("array and pointer", "void f(int a[]);\nvoid f(int *a) {}\n", "void f(int *a) {}"),
+        ("const pointer", "void f(char *const p);\nvoid f(char *p) {}\n", "void f(char *p) {}"),
+        ("names in a function pointer", "void f(int (*cb)(int x));\nvoid f(int (*cb)(int y)) {}\n",
+         "void f(int (*cb)(int y)) {}"),
+    ]
+    for label, source, definition in same:
+        _exact(f"type spellings ({label})", _read_result("k.cpp", source, lambda a: a.read_symbol("f")), definition)
+        _listed_targets_resolve(f"type spellings ({label})", "k.cpp", source)
+    _exact("type spellings (list_symbols)", _read_result("k.cpp", same[0][1], lambda a: a.list_symbols()), "function f (line 2)")
+    overloads = "void f(int a);\nvoid f(double a);\nvoid f(const int a) {}\n"
+    _exact("type spellings (overloads, list_symbols)", _read_result("k.cpp", overloads, lambda a: a.list_symbols()),
+           "function f(double) (line 2)\nfunction f(const int) (line 3)")
+    for written in ("f(int)", "f(const int)", "f(int const)"):
+        _exact(f"type spellings (overloads, read_symbol('{written}'))",
+               _read_result("k.cpp", overloads, lambda a: a.read_symbol(written)), "void f(const int a) {}")
+    _exact("type spellings (overloads, read_symbol('f(double)'))",
+           _read_result("k.cpp", overloads, lambda a: a.read_symbol("f(double)")), "void f(double a);")
+    # Parameter types are shown and matched without the names of a function
+    # pointer's parameters, and without attributes.
+    pointer = "void f(int (*cb)(int x)) {}\nvoid f(double d) {}\n"
+    _exact("parameter names in a function pointer (list_symbols)", _read_result("k.cpp", pointer, lambda a: a.list_symbols()),
+           "function f(int (*)(int)) (line 1)\nfunction f(double) (line 2)")
+    _exact("parameter names in a function pointer (read_symbol)",
+           _read_result("k.cpp", pointer, lambda a: a.read_symbol("f(int (*)(int))")), "void f(int (*cb)(int x)) {}")
+    attribute = "class A {\n  void m([[maybe_unused]] int x);\n  void m(long double);\n};\n"
+    _exact("parameter attribute (list_symbols)", _read_result("k.cpp", attribute, lambda a: a.list_symbols()),
+           "class A (line 1)\n  method A.m(int) (line 2)\n  method A.m(long double) (line 3)")
+    _exact("parameter attribute (read_symbol)", _read_result("k.cpp", attribute, lambda a: a.read_symbol("A.m(int)")),
+           "void m([[maybe_unused]] int x);")
+    for label, source in [("pointer", pointer), ("attribute", attribute)]:
+        _listed_targets_resolve(f"parameter {label}", "k.cpp", source)
+    # A struct has no parameters.
+    tag = "struct A {\n    void m(int);\n    void m(double);\n};\nint A(int);\n"
+    _exact("keyword target with parameter types", _read_result("k.cpp", tag, lambda a: a.read_symbol("struct A(int)")),
+           "REFUSED: Target 'struct A(int)' not found in " + os.path.join(TESTS_DIR, "k.cpp"))
+    _exact("keyword target with parameter types (the function)", _read_result("k.cpp", tag, lambda a: a.read_symbol("A(int)")),
+           "int A(int);")
+
+    # A typedef of a struct declared apart points to the struct's target.
+    for depth, reason in [("signature", "which has no signature (depth='signature' is for functions and class headers)"),
+                          ("interface", "which has no interface (depth='interface' is for classes and functions)")]:
+        _exact(f"typedef of a struct declared apart (depth {depth})", _read_result("k.c", node, lambda a: a.read_symbol("Node", depth)),
+               f"REFUSED: 'Node' is a type alias, {reason}; read it with depth='full', and the struct it names with 'struct Node'")
+    _exact("typedef of a struct defined in it (depth interface)",
+           _read_result("k.c", "typedef struct N {\n    int v;\n} N;\n", lambda a: a.read_symbol("N", "interface")),
+           "typedef struct N {\n    int v;\n} N;")
+
+    # replace_value on a C variable that its struct's tag name shares.
+    for label, source, target, expected in [
+        ("with a value (reported)", "struct S { int x; } S = {0};\n", "S", "struct S { int x; } S = {1};\n"),
+        ("without one", "struct S { int x; } S;\n", "S", "struct S { int x; } S = {1};\n"),
+        ("union", "union u { int i; } u;\n", "u", "union u { int i; } u = {1};\n"),
+    ]:
+        _exact(f"replace_value on a variable of its struct's name ({label})",
+               _edit_result("k.c", source, lambda a: a.replace_value(target, "{1}")), expected)
+    _refused("replace_value on a struct by its keyword",
+             _edit_result("k.c", "struct S { int x; } S;\n", lambda a: a.replace_value("struct S", "{1}")),
+             "'struct S' is a struct, which has no value")
+
+    # A Go constant without a value repeats the expression before it, as do
+    # those after it without one: a value for it would change them.
+    iota = "package p\n\nconst (\n\tA = iota\n\tB\n\tC\n)\n"
+    _refused("go constant repeated by the next (reported)", _edit_result("k.go", iota, lambda a: a.replace_value("B", "5")),
+             "'B' has no value of its own: it repeats the expression of the constant above it, and so does 'C' below "
+             "it, which a value for 'B' would change too; give 'C' its own value first")
+    _refused("go constant repeated by several",
+             _edit_result("k.go", "package p\n\nconst (\n\tA = iota\n\tB\n\t// c\n\tC\n\tD\n\tE = 9\n)\n",
+                          lambda a: a.replace_value("B", "5")),
+             "and so do 'C', 'D' below it, which a value for 'B' would change too; give 'C', 'D' their own values first")
+    _exact("go last constant of the group", _edit_result("k.go", iota, lambda a: a.replace_value("C", "5")),
+           "package p\n\nconst (\n\tA = iota\n\tB\n\tC = 5\n)\n")
+    _exact("go constant before one with a value",
+           _edit_result("k.go", "package p\n\nconst (\n\tA = iota\n\tB\n\tC = 7\n)\n", lambda a: a.replace_value("B", "5")),
+           "package p\n\nconst (\n\tA = iota\n\tB = 5\n\tC = 7\n)\n")
+
+    # JS/TS: a name a method shares with a class field (a static one, as a
+    # flag) or a `var` targets the method or function.
+    run = "class A {\n  static run = false;\n\n  run() {\n    return 1;\n  }\n}\n"
+    cases = [
+        ("list_symbols (reported)", "k.js", run, lambda a: a.list_symbols(), "class A (line 1)\n  method A.run (line 4)"),
+        ("read_symbol", "k.js", run, lambda a: a.read_symbol("A.run"), "run() {\n    return 1;\n  }"),
+        ("getter", "k.js", "class A {\n  static name = null;\n  get name() {\n    return 1;\n  }\n}\n",
+         lambda a: a.list_symbols(), "class A (line 1)\n  method A.name (line 3)"),
+        ("var and function", "k.js", "var f = 1;\n\nfunction f() {\n  return 2;\n}\n", lambda a: a.list_symbols(),
+         "function f (line 3)"),
+        ("var and function (read_symbol)", "k.js", "var f = 1;\n\nfunction f() {\n  return 2;\n}\n",
+         lambda a: a.read_symbol("f"), "function f() {\n  return 2;\n}"),
+    ]
+    for label, name, source, action, expected in cases:
+        _exact(f"method and field of one name ({label})", _read_result(name, source, action), expected)
+    cases = [
+        ("replace_function", "k.js", run, lambda a: a.replace_function("A.run", "run() {\n  return 2;\n}"),
+         "class A {\n  static run = false;\n\n  run() {\n    return 2;\n  }\n}\n"),
+        ("delete_symbol", "k.js", run, lambda a: a.delete_symbol("A.run"), "class A {\n  static run = false;\n}\n"),
+        ("replace_function_body", "k.js", run, lambda a: a.replace_function_body("A.run", "return 2;"),
+         "class A {\n  static run = false;\n\n  run() {\n    return 2;\n  }\n}\n"),
+        ("ts add_parameter", "k.ts", "class A {\n  static run: boolean = false;\n\n  run(): number {\n    return 1;\n  }\n}\n",
+         lambda a: a.add_parameter("A.run", "x: number"),
+         "class A {\n  static run: boolean = false;\n\n  run(x: number): number {\n    return 1;\n  }\n}\n"),
+    ]
+    for label, name, source, action, expected in cases:
+        _exact(f"method and field of one name ({label})", _edit_result(name, source, action), expected)
+    _listed_targets_resolve("method and field of one name", "k.js", run)
+
+    # replace_function of a JS/TS class field with a method drops the `;`
+    # that read_symbol shows as the field's.
+    cases = [
+        ("js (reported)", "k.js", "class A {\n  x = 1;\n  m() {}\n}\n", "k() {\n  return 1;\n}",
+         "class A {\n  k() {\n    return 1;\n  }\n  m() {}\n}\n"),
+        ("ts", "k.ts", "class A {\n  x: number = 1;\n  m() {}\n}\n", "k(): number {\n  return 1;\n}",
+         "class A {\n  k(): number {\n    return 1;\n  }\n  m() {}\n}\n"),
+        ("a field keeps it", "k.js", "class A {\n  x = 1;\n  m() {}\n}\n", "y = 2", "class A {\n  y = 2;\n  m() {}\n}\n"),
+        ("on one line", "k.js", "class A { x = 1; m() {} }\n", "k() {}", "class A { k() {} m() {} }\n"),
+        ("a field on one line", "k.js", "class A { x = 1; m() {} }\n", "y = 2", "class A { y = 2; m() {} }\n"),
+    ]
+    for label, name, source, content, expected in cases:
+        _exact(f"field replaced by a method ({label})",
+               _edit_result(name, source, lambda a: a.replace_function("A.x", content)), expected)
+
+    # TS overload signatures are one symbol with a decorated implementation
+    # (decorators go on the implementation), and with a #private or quoted
+    # name.
+    decorated = "class K {\n  // m lead\n  m(a: string): void;\n  m(a: number): void;\n  @dec()\n  m(a: any) {}\n\n  n() {}\n}\n"
+    cases = [
+        ("list_symbols (reported)", lambda a: a.list_symbols(), "class K (line 1)\n  method K.m (line 3)\n  method K.n (line 8)"),
+        ("read_symbol", lambda a: a.read_symbol("K.m"), "m(a: string): void;\n  m(a: number): void;\n  @dec()\n  m(a: any) {}"),
+        ("signature", lambda a: a.read_symbol("K.m", "signature"), "m(a: any)"),
+    ]
+    for label, action, expected in cases:
+        _exact(f"overloads of a decorated method ({label})", _read_result("k.ts", decorated, action), expected)
+    cases = [
+        ("delete_symbol", lambda a: a.delete_symbol("K.m"), "class K {\n  n() {}\n}\n"),
+        ("insert_sibling before", lambda a: a.insert_sibling("K.m", "q() {}", "before"),
+         "class K {\n  q() {}\n\n  // m lead\n  m(a: string): void;\n  m(a: number): void;\n  @dec()\n  m(a: any) {}\n\n  n() {}\n}\n"),
+        ("edit_leading_comment remove", lambda a: a.edit_leading_comment("K.m", "remove"),
+         "class K {\n  m(a: string): void;\n  m(a: number): void;\n  @dec()\n  m(a: any) {}\n\n  n() {}\n}\n"),
+        ("add_parameter", lambda a: a.add_parameter("K.m", "b: any"), decorated.replace("m(a: any) {}", "m(a: any, b: any) {}")),
+    ]
+    for label, action, expected in cases:
+        _exact(f"overloads of a decorated method ({label})", _edit_result("k.ts", decorated, action), expected)
+    _exact("overloads of a decorated method (round trip)", _round_trip("k.ts", decorated, "K.m"), "<unchanged>")
+    _exact("overloads of a decorated method (replace_signature round trip)",
+           _edit_result("k.ts", decorated, lambda a: a.replace_signature("K.m", a.read_symbol("K.m", "signature"))), decorated)
+    _listed_targets_resolve("overloads of a decorated method", "k.ts", decorated)
+    for label, source, target in [
+        ("#private (reported)", "class E {\n  #m(a: true): number;\n  #m(a: boolean): number {\n    return 1;\n  }\n}\n", "E.#m"),
+        ("quoted", "class E {\n  'm'(a: true): number;\n  'm'(a: boolean): number {\n    return 1;\n  }\n}\n", "E.'m'"),
+        ("double-quoted", 'class E {\n  "m"(a: true): number;\n  "m"(a: boolean): number {\n    return 1;\n  }\n}\n', 'E."m"'),
+    ]:
+        _exact(f"overloads of a {label} method (round trip)", _round_trip("k.ts", source, target), "<unchanged>")
+        _exact(f"overloads of a {label} method (crlf round trip)", _round_trip("k.ts", source, target, "\r\n"), "<unchanged>")
+
+    # Computed and quoted method names with dots in them are targets.
+    computed = "class E {\n  [Symbol.iterator]() {\n    return 1;\n  }\n  'a.b'() {}\n  m() {}\n}\n"
+    _exact("computed method name (read_symbol)", _read_result("k.ts", computed, lambda a: a.read_symbol("E.[Symbol.iterator]")),
+           "[Symbol.iterator]() {\n    return 1;\n  }")
+    _exact("quoted method name with a dot (read_symbol)", _read_result("k.ts", computed, lambda a: a.read_symbol("E.'a.b'")),
+           "'a.b'() {}")
+    _exact("computed method name (replace_function_body)",
+           _edit_result("k.ts", computed, lambda a: a.replace_function_body("E.[Symbol.iterator]", "return 2;")),
+           computed.replace("return 1;", "return 2;"))
+    _listed_targets_resolve("computed and quoted method names", "k.ts", computed)
+    _listed_targets_resolve("computed and quoted method names (js)", "k.js", computed)
+
+    # Members are listed once, under the first of the merged declarations.
+    merged = "class C {\n  m() {}\n}\nnamespace C {\n  export const k = 1;\n}\ninterface C {\n  n(): void;\n}\n"
+    _exact("class, namespace and interface merged (list_symbols)", _read_result("k.ts", merged, lambda a: a.list_symbols()),
+           "class C (line 1)\n  method C.m (line 2)\n  constant C.k (line 5)\ninterface interface C (line 7)")
+    _listed_targets_resolve("class, namespace and interface merged", "k.ts", merged)
+    # A Java class that a field's name takes: its members are listed, as
+    # they are found through it.
+    java = "class A {\n  int B;\n  class B {\n    void m() {}\n  }\n  void B() {}\n  enum C { X }\n  int C;\n}\n"
+    _exact("java class sharing a field's name (list_symbols)", _read_result("A.java", java, lambda a: a.list_symbols()),
+           "class A (line 1)\n  field A.B (line 2)\n  method A.B.m (line 4)\n  method A.B() (line 6)\n  enum A.C (line 7)")
+    _listed_targets_resolve("java class sharing a field's name", "A.java", java)
+
+    # TS namespace interface with a comment after its `}`.
+    for label, source, expected in [
+        ("namespace (reported)", "namespace N {\n  export const k = 1;\n} // n\n", "namespace N {\n  export const k = 1;\n}"),
+        ("empty namespace", "namespace N {} // n\n", "namespace N {\n}"),
+        ("exported", "export namespace N {\n  export function g() {}\n} // N\n", "export namespace N {\n  export function g() ...\n}"),
+        ("declared", "declare namespace N {\n  function g(): void;\n} // N\n", "declare namespace N {\n  function g(): void;\n}"),
+        ("module", "module M {\n  export const k = 1;\n} // n\n", "module M {\n  export const k = 1;\n}"),
+    ]:
+        target = "M" if label == "module" else "N"
+        _exact(f"interface of a {label} with a comment after it",
+               _read_result("k.ts", source, lambda a: a.read_symbol(target, "interface")), expected)
+
+    # Go: a func literal that is one value of several has a signature of
+    # its own.
+    pq = "package main\n\nvar p, q = func(x int) {\n\tprintln(x)\n}, func(y int) {\n\tprintln(y)\n}\n"
+    for target, signature in [("q", "func(y int)"), ("p", "func(x int)")]:
+        for depth in ("signature", "interface"):
+            _exact(f"go func literal of several values ({target}, {depth})",
+                   _read_result("k.go", pq, lambda a: a.read_symbol(target, depth)), signature)
+        _exact(f"go func literal of several values ({target}, replace_signature round trip)",
+               _edit_result("k.go", pq, lambda a: a.replace_signature(target, a.read_symbol(target, "signature"))), pq)
+    _exact("go func literal of several values (replace_signature)",
+           _edit_result("k.go", pq, lambda a: a.replace_signature("q", "func(z int)")), pq.replace("func(y int)", "func(z int)"))
+
+    # A second TS `this` parameter is a repeated name.
+    _refused("add_parameter of a second this", _edit_result("k.ts", "function f(this: Window, a: number) {}\n",
+                                                               lambda a: a.add_parameter("f", "this: Foo")),
+             "Parameter 'this' already exists in 'f'")
+
+    # CommonJS requires are imports: a new import goes after them.
+    cjs = "const fs = require('fs');\nconst path = require('path');\n\nfunction f() {}\n"
+    for label, text, expected in [
+        ("require (reported)", "const os = require('os');",
+         "const fs = require('fs');\nconst path = require('path');\nconst os = require('os');\n\nfunction f() {}\n"),
+        ("es import", "import os from 'os';",
+         "const fs = require('fs');\nconst path = require('path');\nimport os from 'os';\n\nfunction f() {}\n"),
+    ]:
+        _exact(f"add_import after requires ({label})", _edit_result("k.js", cjs, lambda a: a.add_import(text)), expected)
+    _exact("add_import after requires (destructured and bare)",
+           _edit_result("k.js", "const { a } = require('b').c;\nrequire('x');\n\nf();\n", lambda a: a.add_import("const y = require('y');")),
+           "const { a } = require('b').c;\nrequire('x');\nconst y = require('y');\n\nf();\n")
+    _exact("add_import after requires (a call is no require)",
+           _edit_result("k.js", "const v = load('x');\n", lambda a: a.add_import("const y = require('y');")),
+           "const y = require('y');\n\nconst v = load('x');\n")
+    _exact("add_top_level top after requires",
+           _edit_result("k.js", "'use strict';\nconst fs = require('fs');\n\nfunction f() {}\n",
+                        lambda a: a.add_top_level("const X = 1;", position="top")),
+           "'use strict';\nconst fs = require('fs');\n\nconst X = 1;\n\nfunction f() {}\n")
+
+    # add_top_level at the bottom of a header goes inside its include guard.
+    for label, source, expected in [
+        ("reported", "/* license */\n#ifndef X_H\n#define X_H\n\nint f(void);\n\n#endif /* X_H */\n",
+         "/* license */\n#ifndef X_H\n#define X_H\n\nint f(void);\n\nint g(void);\n\n#endif /* X_H */\n"),
+        ("no blank lines", "#ifndef X_H\n#define X_H\nint f(void);\n#endif\n",
+         "#ifndef X_H\n#define X_H\nint f(void);\n\nint g(void);\n#endif\n"),
+        ("empty guard", "#ifndef X_H\n#define X_H\n#endif\n", "#ifndef X_H\n#define X_H\n\nint g(void);\n#endif\n"),
+        ("code after the guard", "#ifndef X_H\n#define X_H\n#endif\nint f(void);\n",
+         "#ifndef X_H\n#define X_H\n#endif\nint f(void);\n\nint g(void);\n"),
+    ]:
+        _exact(f"add_top_level bottom in a header ({label})",
+               _edit_result("k.h", source, lambda a: a.add_top_level("int g(void);")), expected)
+        _exact(f"add_top_level bottom in a header ({label}, crlf)",
+               _edit_result("k.h", source, lambda a: a.add_top_level("int g(void);"), "\r\n"), expected.replace("\n", "\r\n"))
+
 
 if __name__ == "__main__":
     test_python()
@@ -9418,6 +11705,26 @@ if __name__ == "__main__":
     test_byte_order_mark()
     test_python_list_append()
     test_final_review_followups()
+    test_overloaded_targets()
+    test_overload_groups()
+    test_keyword_targets()
+    test_listed_targets_everywhere()
+    test_listed_data()
+    test_depths_agree()
+    test_js_trailing_comments()
+    test_find_references_line_order()
+    test_config_whole_symbol_tools()
+    test_replace_value_variables()
+    test_first_import_placement()
+    test_destructured_parameters()
+    test_parameter_followups()
+    test_final_newline_state()
+    test_text_encodings()
+    test_layout_followups()
+    test_yaml_only_item()
+    test_ruby_attached_lines()
+    test_comments_ending_code()
+    test_target_resolution_followups()
 
     # Reset all fixtures to clean state after tests
     for lang in FIXTURES:

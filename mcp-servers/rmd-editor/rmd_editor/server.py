@@ -28,31 +28,24 @@ logger = logging.getLogger("rmd-editor")
 
 # Condensed RMD-EDITOR.md, sent to clients as MCP server instructions.
 _INSTRUCTIONS = (
-    "rmd-editor edits and runs R Markdown (.rmd) documents at the chunk and prose level. "
-    "Use it instead of generic text edit/write tools for .rmd files, and use create_rmd "
-    "to create one. Every file_path must be absolute. Call list_cells first: cell indices "
-    "are zero-based and shift when cells are added or deleted. Inspect with get_cell, "
-    "find_in_rmd, get_chunk_options, and get_frontmatter. To add a few lines use "
-    "prepend_to_cell or append_to_cell, not replace_cell_source; to rewrite a cell use "
-    "replace_cell_source (it keeps the chunk language, label, and options), not add_cell. "
-    "Chunk text has no final newline: one at the end leaves a blank line before the closing "
-    "fence. "
-    "Edit chunk options with set_chunk_option and remove_chunk_option, using key=\"label\" "
-    "for the chunk label; these tools reject markdown cells. Edit the YAML header with "
-    "set_frontmatter_key and remove_frontmatter_key: values are parsed as YAML, and only "
-    "that key's lines change, so comments, quoting, and R tags such as !r elsewhere in the "
-    "header are kept. Adjacent markdown cells merge on save, so put new prose between "
-    "chunks or append to an existing markdown cell. execute_cell and execute_all_cells "
-    "lazily start one Jupyter kernel per file, chosen from the language of the first "
-    "chunk run (r uses ir, python "
-    "uses python3, julia uses the installed IJulia kernelspec: julia, julia-1, or the "
-    "newest julia-X.Y); that kernel must be installed. The kernel runs "
-    "in the .rmd file's folder, so relative paths in chunks resolve there. State "
-    "persists across calls: use interrupt_kernel to stop a runaway chunk, restart_kernel "
-    "for a clean namespace, and shutdown_kernel to free resources. A chunk that runs "
-    "past its timeout is interrupted with the kernel's state kept; if the error says "
-    "the kernel is still busy, use restart_kernel. Outputs are returned "
-    "inline (errors with their traceback) and never written to the .rmd file."
+    "Chunk- and prose-level tools for creating, editing and running R Markdown (.rmd) documents. "
+    "Use them instead of generic edit or write tools for .rmd files, pass absolute file paths, and "
+    "create files with create_rmd. "
+    "Start with list_cells for cell indices, types, labels and previews; indices are zero-based and "
+    "shift after adds, deletes, splits and merges, so re-run it. "
+    "Pick the narrowest edit: prepend_to_cell or append_to_cell to add lines, replace_cell_source "
+    "only to rewrite a cell (a chunk keeps its language, label and options), add_cell for a new "
+    "cell (index -1 appends). Chunk text has no final newline: one at the end leaves a blank line "
+    "before the closing fence. Adjacent markdown cells merge on save. "
+    "Edit chunk options with set_chunk_option and remove_chunk_option (key=\"label\" for the label), "
+    "which work where knitr reads them: the chunk header or the #| lines at its top. "
+    "set_frontmatter_key and remove_frontmatter_key parse values as YAML and change only that "
+    "key's lines. Edits that would change how the file reads back are refused. "
+    "execute_cell and execute_all_cells start one Jupyter kernel per file, picked by the first "
+    "chunk's language (r uses ir), in the file's folder; outputs come back inline, never written "
+    "to the file. State persists: interrupt_kernel stops a chunk, restart_kernel resets the "
+    "namespace, shutdown_kernel frees the kernel. A chunk past its timeout is interrupted with the "
+    "state kept; if the error says the kernel is still busy, use restart_kernel."
 )
 
 
@@ -143,6 +136,17 @@ def create_rmd(
 def list_cells(file_path: FilePath) -> str:
     """List all cells in the .rmd with index, type (code/markdown), language/label/option-count for code chunks, line count, and a one-line preview.
 
+    Chunks are found where knitr finds them: a header line (```{r}, also
+    indented, after >, with more backticks or a space before the {) opens one,
+    and only a closing fence with the header's indentation and backticks
+    closes it, but for a chunk on the first line of the file, which any
+    closing fence closes (once a cell or a YAML header goes before it, it is
+    written with its own). A header with the chunk's own fence inside it starts
+    a new chunk, and a chunk nothing closes runs to the end of the file.
+
+    A chunk's label and option count are those knitr reads, from its header and
+    its #| lines, as get_chunk_options shows them.
+
     Only a line break (\\n, \\r\\n or a lone \\r) ends a line, as in knitr: a form
     feed or U+2028 stays inside its line. split_cell and find_in_rmd count lines
     the same way.
@@ -162,7 +166,9 @@ def get_cell(file_path: FilePath, index: CellIndex) -> str:
 
     A chunk's text leaves off the line break before its closing fence, so text
     ending in \\n means a blank line there. A chunk of blank lines only comes back
-    as those line breaks: "" is an empty chunk, "\\n" one blank line.
+    as those line breaks: "" is an empty chunk, "\\n" one blank line. A chunk
+    whose fence is indented or in a blockquote comes back as knitr runs it,
+    without that indentation or those > marks, and edits write them back.
 
     Args:
         file_path: Absolute path to a .rmd file.
@@ -186,12 +192,16 @@ def add_cell(
 ) -> str:
     """Insert a new cell at the given index.
 
-    Markdown text with a line that would open a chunk (```{r}, or for knitr also
-    indented, after >, or with more backticks) is refused, since the prose after
-    it would become chunk code; the error gives its line in the text passed. So
-    is markdown that would put a --- line at the top of a document without a
-    header, with another --- line further down, which would read back as the
-    YAML header.
+    Chunk code with a line knitr reads as a closing fence (backticks alone,
+    after nothing but spaces, tabs or >) or a chunk header (```{r}, or with
+    such indentation, more backticks or a space before the {) is refused, since
+    knitr would end the chunk there. Markdown text with a line that would open
+    a chunk is refused, since the prose after it would become chunk code; each
+    error gives its line in the text passed. So is markdown that would put a
+    --- line at the top of a document without a header, with another --- line
+    further down, which would read back as the YAML header. A chunk before the
+    new cell that has no closing fence (knitr ends it at the next chunk's
+    header or the end of the file) gets one first.
 
     Args:
         file_path: Absolute path to a .rmd file.
@@ -275,6 +285,11 @@ def merge_cells(
 ) -> str:
     """Merge consecutive cells [start_index..end_index] inclusive. All cells must share the same cell_type (and language for code chunks).
 
+    Merged chunks take the first one's header and fence. A line knitr read as
+    code in its own chunk but would read as a closing fence or a chunk header
+    under that fence (```, or ```{r}, from a chunk opened with ````) is
+    refused, with its cell and line.
+
     Args:
         file_path: Absolute path to a .rmd file.
         start_index: Zero-based index of the first cell to merge.
@@ -306,10 +321,12 @@ def replace_cell_source(
     leaves a blank line before the closing fence, so write "x <- 1", not
     "x <- 1\\n". Passing the text get_cell returned leaves the file byte for byte
     as it was. In a chunk's text, a line knitr reads as a closing fence
-    (backticks alone on a line, after nothing but spaces, tabs or >) would close
-    the chunk, so it is refused; the error gives its line in the text passed.
-    In a markdown cell's text, a line that would open a chunk is refused the
-    same way (prepend_to_cell and append_to_cell check the text they add).
+    (backticks alone on a line, after nothing but spaces, tabs or >) or as a
+    chunk header (such backticks, then {engine} or {engine options}) would end
+    the chunk there, so it is refused; the error gives its line in the text
+    passed. In a markdown cell's text, a line that would open a chunk is
+    refused the same way (prepend_to_cell and append_to_cell check the text
+    they add).
 
     Args:
         file_path: Absolute path to a .rmd file.
@@ -326,9 +343,16 @@ def replace_cell_source(
 def prepend_to_cell(
     file_path: FilePath,
     index: CellIndex,
-    source: Annotated[str, Field(description="Text to insert at the top of the cell body; a newline separator is added when needed.")],
+    source: Annotated[
+        str,
+        Field(description="Text to insert at the top of the cell body. One line break separates it from the cell's text, added unless the text ends with one; the cell's own blank lines stay."),
+    ],
 ) -> str:
     """Prepend text to an existing cell's source.
+
+    The text goes on lines of its own above the cell's text: one line break
+    separates them, added unless the text ends with one, and a blank line the
+    cell starts with stays. On prose "\\nMore\\n", "Top" gives "Top\\n\\nMore\\n".
 
     Args:
         file_path: Absolute path to a .rmd file.
@@ -345,9 +369,18 @@ def prepend_to_cell(
 def append_to_cell(
     file_path: FilePath,
     index: CellIndex,
-    source: Annotated[str, Field(description="Text to add at the bottom of the cell body; a newline separator is added when needed.")],
+    source: Annotated[
+        str,
+        Field(description="Text to add at the bottom of the cell body, after one line break: in prose, the one that ends the cell's last line; else one added unless the text starts with one. The cell's own blank lines stay, a chunk's blank line before its fence too."),
+    ],
 ) -> str:
     """Append text to an existing cell's source.
+
+    The text goes on lines of its own below the cell's text, after one line
+    break: in prose, the one that ends its last line; in a chunk, one added
+    unless the text starts with one. A blank line the cell ends with stays: on
+    a chunk whose text is "x\\n" (a blank line before the fence), "y" gives
+    "x\\n\\ny", and text ending in \\n leaves a blank line before the fence.
 
     Args:
         file_path: Absolute path to a .rmd file.
@@ -367,12 +400,26 @@ def append_to_cell(
 
 @mcp.tool(annotations=_READ_ONLY)
 def get_chunk_options(file_path: FilePath, index: ChunkIndex) -> str:
-    """Return the chunk's language, label, and all key=value options.
+    """Return the chunk's language, label, and every option knitr reads, from its header and its #| lines.
 
     The label is the one knitr uses: a #| label: (else #| id:) line at the top
-    of the chunk, else a label= option, else the bare name first in the header.
-    One not written as that bare name is shown with where it is written, and
-    label= is not listed among the options. A line break in a label shows as \\n.
+    of the chunk, else a label= option, else the one name in the header written
+    without a value, wherever it is (```{r echo=FALSE, foo} is labelled foo).
+    The names written before the first key=value are one label to knitr,
+    commas and all, which is noted, unless the first is one character, which
+    knitr quotes alone. A header with any other name without a value, which
+    knitr fails on, shows label: (none: ...) saying so. A name after other
+    options is R code, which knitr writes without its spaces. A label not
+    written as a bare name is shown with where it is written, and label= is
+    not listed among the options. A line break in a label shows as \\n.
+
+    Each option knitr reads is listed once, as the spelling it uses: key=value
+    in the header, or the option line as written (#| for r and python, --| for
+    sql, //| for Rcpp and js, /*| ... */ for c, as knitr reads each engine's
+    comment). knitr reads a #| line over the header, a dashed name such as
+    fig-width over the dotted fig.width, and the last copy of a key the header
+    repeats; the spellings it reads one over are noted, and so is a key the #|
+    lines repeat, which R's yaml package rejects, so knitr fails on the chunk.
 
     Args:
         file_path: Absolute path to a .rmd file.
@@ -394,23 +441,39 @@ def set_chunk_option(
     ],
     value: Annotated[
         str,
-        Field(description='Option value written into the chunk header as R code, e.g. FALSE, 7, or a quoted string, without its surrounding whitespace. It must fit on one line, close every bracket, quote and backtick it opens, and read back as this one option, so quote text holding a comma, "#" or "=" as an R string (x == 1 is fine). For key "label" an empty value clears the label; any other key needs a value.'),
+        Field(description='Option value as R code, e.g. FALSE, 7, or a quoted string, without its surrounding whitespace: written into the chunk header, or as YAML into the #| line that holds the key. It must fit on one line, close every bracket, quote and backtick it opens, and read back as this one option, so quote text holding a comma, "#" or "=" as an R string (x == 1 is fine). For key "label" an empty value clears the label; any other key needs a value.'),
     ],
 ) -> str:
     """Set or overwrite one chunk option. Special key "label" sets the chunk label.
 
-    Only the chunk's header line is rewritten: its body and closing fence keep
-    their bytes. The header must read back with exactly the new label and
-    options, and knitr reads keys and values as R code, so the edit is refused,
-    leaving the file unchanged, for a line break, an unmatched bracket or quote,
-    a comma outside a quoted string, an "=" in a key or label, or, in a key or
-    value, a backtick left open or a # or "=" outside quotes and brackets
-    (x == 1 is fine). So is an empty value for any key but "label".
+    The option is set where knitr reads it from: the #| line that holds the key,
+    written as YAML (TRUE, FALSE and NULL as true, false and null, a number as
+    written, an R string as a YAML string, other R code tagged !expr), else the
+    copy in the chunk header knitr uses, the last if the key is repeated there.
+    The other spellings of the key (other copies, a header copy a #| line
+    overrides, fig.width beside a #| fig-width line) are removed, so one is
+    left. A key not written yet goes at the end of the header. Only those lines
+    are rewritten: the body's other lines and the closing fence keep their bytes.
+
+    knitr reads keys and values as R code, and the header must read back with
+    exactly the new label and options, so the edit is refused, leaving the file
+    unchanged, for a line break, an unmatched bracket or quote, a comma outside
+    a quoted string, an "=" in a key or label, or, in a key or value, a
+    backtick left open or a # or "=" outside quotes and brackets (x == 1 is
+    fine). So is an empty value for any key but "label".
 
     The label is set where knitr reads it from: a #| label: (or #| id:) line at
     the top of the chunk, whose lines alone are rewritten, else a label= option
     (kept as an R string, any text allowed but a line break), else the bare name
-    first in the header. Spellings knitr reads it over are removed, so one is left.
+    or names in the header, in their place (after other options as an R name or
+    a quoted string); a chunk without a label gets it first in the header.
+    Spellings knitr reads it over are removed, so one is left. A header with
+    more than one name without a value, which knitr fails on, is refused: give
+    those names values, or remove them, first. When the first #| key goes, the
+    comment and blank #| lines under it move to after the next key. An edit to
+    the #| lines that would change how the others read (an alias losing its
+    anchor) or make code below them option lines is refused, and so is one to
+    c, css or sas option lines written as one comment over several lines.
 
     Args:
         file_path: Absolute path to a .rmd file.
@@ -432,9 +495,14 @@ def remove_chunk_option(
 ) -> str:
     """Remove one chunk option. Use key="label" to clear the chunk label.
 
-    Clearing the label removes it wherever it is written (the bare name first in
-    the header, a label= option, #| label: and #| id: lines at the top of the
-    chunk), so no other spelling becomes the label.
+    Every spelling of the option goes: each copy in the header, its #| line,
+    and a dashed or dotted name knitr reads as the same option (fig-width for
+    fig.width). Clearing the label removes it wherever it is written (the bare
+    name or names in the header, a label= option, #| label: and #| id: lines at
+    the top of the chunk), so no other spelling becomes the label. knitr reads
+    the #| lines as YAML only when the first holds a key, so when the first key
+    goes, the comment and blank #| lines under it move to after the next key,
+    or go too when no key is left.
 
     Args:
         file_path: Absolute path to a .rmd file.
@@ -490,7 +558,9 @@ def set_frontmatter_key(
     Only that key's lines change (the key line and its indented lines): comments,
     quoting, tags such as !r, and key order elsewhere in the header are kept. A
     new key goes just before the closing ---; a document without a header gets
-    one. A header that is not valid YAML is still edited line by line. A value
+    one. A new key longer than 1024 characters as written (quotes included) is
+    refused: YAML reads no longer key on a key: value line. A header that is
+    not valid YAML is still edited line by line. A value
     that can't be built (such as !!bool maybe, or nested too deep to sit under
     a key) is written as a quoted string, like other text that isn't YAML.
 

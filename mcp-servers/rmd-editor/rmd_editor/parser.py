@@ -4,7 +4,10 @@ R Markdown (.rmd) parser and serializer.
 A .rmd file is markdown text that may contain:
   - An optional YAML frontmatter delimited by `---` fences at the very top.
   - Interleaved markdown prose and "executable code chunks" opened by a fence
-    of the form  ```{lang [label][, opt1=val1, ...]}  and closed by ``` .
+    of the form  ```{lang [label][, opt1=val1, ...]}  and closed by ``` ,
+    found where knitr finds them (see _chunk_stop): a fence may be indented
+    or in a blockquote, and have more backticks, as long as the closing one
+    matches it.
   - Regular markdown code blocks (```python, ``` , etc. — no braces) stay as
     part of the surrounding prose and are NOT treated as cells.
 
@@ -38,9 +41,10 @@ round-trips byte for byte.
 """
 from __future__ import annotations
 
+import bisect
 import re
 import textwrap
-from collections import Counter, OrderedDict
+from collections import Counter
 from dataclasses import dataclass, field
 from typing import NamedTuple, Optional
 
@@ -162,8 +166,15 @@ class Cell:
     source: str                                # body only (no fences, no frontmatter markers), "\n" line breaks; a chunk's as _chunk_source gives it
     # Code-cell-only fields
     language: str = "r"                        # "r", "python", "bash", "sql", ... for code cells
-    label: Optional[str] = None                # chunk label, e.g. "setup" in  ```{r setup, echo=FALSE}
-    options: "OrderedDict[str, str]" = field(default_factory=OrderedDict)
+    label: Optional[str] = None                # the bare name first in the header, e.g. "setup" in  ```{r setup, echo=FALSE}
+    # The header's other parts in the order written, as (key, value) pairs: a key written twice is there twice, and a
+    # bare name (one after a leading comma or an option too) has the value "". knitr's own reading of the label and
+    # options, #| lines included, is the manager's to work out.
+    options: list = field(default_factory=list)
+    # The header line before its {: indentation or > marks, backticks and any spaces, as "```" or "  ````". The
+    # closing fence repeats it up to its last backtick, and the source is the code without the indentation.
+    fence: str = "```"
+    closed: bool = True                        # raw ends with the closing fence; False if knitr ends the chunk at the next chunk's header or the end
     # Bookkeeping
     raw: str = ""                              # original full text (with fences and the file's own line breaks)
     dirty: bool = False                        # True after any structural edit
@@ -181,16 +192,16 @@ class Cell:
 # ──────────────────────────────────────────────
 
 
-_CHUNK_OPEN = re.compile(r"^```\{\s*([A-Za-z][A-Za-z0-9_]*)\s*(.*?)\s*\}\s*$")
-# A chunk's closing fence: a bare ``` (or ``` followed by spaces and tabs) on its own line.
-_CHUNK_CLOSE = re.compile(r"^```[ \t]*$")
-# A line knitr reads as a closing fence (its R Markdown chunk.end pattern): three or more backticks
-# alone, after nothing but spaces, tabs or >. Wider than _CHUNK_CLOSE; new chunk text is checked with it.
-_KNITR_CHUNK_END = re.compile(r"^[\t >]*```+\s*$")
-# A line knitr reads as a chunk's opening fence (its R Markdown chunk.begin pattern): three or more
-# backticks after nothing but spaces, tabs or >, then {engine} or {engine options}. It and _CHUNK_OPEN
-# each take lines the other doesn't; new prose is checked with both.
-_KNITR_CHUNK_BEGIN = re.compile(r"^[\t >]*```+\s*\{[a-zA-Z0-9_]+(?: *[ ,].*)?\}\s*$")
+# A chunk's header line, as knitr reads it (the chunk.begin pattern of its R Markdown patterns, R/pattern.R):
+# three or more backticks after nothing but spaces, tabs or >, maybe spaces, then {engine} or {engine options},
+# the engine being letters, digits and underscores. The groups are the fence (the indentation or > marks and the
+# backticks), the spaces after it, the engine, and what follows the engine inside the braces. knitr writes that last
+# part ( *[ ,].*)?, which takes the same text as ([ ,].*)? but backtracks over a long run of spaces in time that
+# grows with its length squared.
+_KNITR_CHUNK_BEGIN = re.compile(r"([\t >]*```+)(\s*)\{([a-zA-Z0-9_]+)((?:[ ,].*)?)\}\s*\Z")
+# A line knitr reads as a closing fence (its chunk.end pattern): three or more backticks alone, after nothing but
+# spaces, tabs or >. Which of these closes a chunk is _chunk_stop's to say.
+_KNITR_CHUNK_END = re.compile(r"[\t >]*```+\s*\Z")
 
 # A UTF-8 byte order mark as decoded text; editors on Windows may write one before the --- fence.
 _BOM = "\ufeff"
@@ -212,7 +223,7 @@ def parse(text: str) -> tuple[Frontmatter, list[Cell]]:
     frontmatter.newline = _detect_newline(text)
     frontmatter.bom = bom
     body = text[body_start_idx:]
-    cells = _split_body(body)
+    cells = _split_body(body, at_start=body_start_idx == 0)
     return frontmatter, cells
 
 
@@ -234,19 +245,24 @@ def _extract_frontmatter(text: str) -> tuple[Frontmatter, int]:
     return fm, close.end()
 
 
-def _split_body(body: str) -> list[Cell]:
+def _split_body(body: str, at_start: bool = False) -> list[Cell]:
     """
-    Walk body line by line, splitting into markdown prose cells and code chunks.
+    Walk body line by line, splitting into markdown prose cells and code chunks,
+    where knitr's split_file finds chunks (see _chunk_stop); at_start says body
+    begins on the file's first line, which knitr reads a chunk on differently.
     Each cell's raw text preserves its original line breaks so serialization can
-    replay unchanged cells byte-for-byte; its source has "\\n" breaks. Only
-    "\\n", "\\r\\n" and a lone "\\r" end a line, as for knitr (R's readLines):
-    form feeds, U+2028 and the other breaks str.splitlines knows stay inside a
-    line, so every cell but the last ends with a line break.
+    replay unchanged cells byte-for-byte; its source has "\\n" breaks, a chunk's
+    being its code as knitr reads it, without the indentation or > marks of its
+    fence (see _strip_indent). Only "\\n", "\\r\\n" and a lone "\\r" end a line,
+    as for knitr (R's readLines): form feeds, U+2028 and the other breaks
+    str.splitlines knows stay inside a line, so every cell but the last ends
+    with a line break.
     """
     cells: list[Cell] = []
     lines = _lines(body)
     # The same lines ending in "\n": fences are matched, and sources built, on these.
     plain = [_with_newline(line, "\n") for line in lines]
+    texts = [line.rstrip("\n") for line in plain]
     i = 0
     n = len(lines)
     # First line of the prose not yet in a cell
@@ -263,32 +279,89 @@ def _split_body(body: str) -> list[Cell]:
         prose_start = end
 
     while i < n:
-        header = _read_chunk_header(plain[i].rstrip("\n"))
-        if header:
-            lang, label, options = header
-            # Find the closing fence: a bare ``` on its own line (no braces)
-            j = i + 1
-            while j < n and not _CHUNK_CLOSE.match(plain[j].rstrip("\n")):
-                j += 1
-            # j now points at the closing fence line, OR == n (unterminated)
-            if j >= n:
-                # Unterminated chunk -- fall back: the whole remainder is prose, one cell with the prose before it
-                break
-            flush_prose(i)
-            cells.append(Cell(
-                cell_type="code",
-                source=_chunk_source("".join(plain[i + 1:j])),
-                language=lang,
-                label=label,
-                options=options,
-                raw="".join(lines[i:j + 1]),
-            ))
-            i = j + 1
-            prose_start = i
-        else:
+        opening = _read_chunk_opening(texts[i])
+        if opening is None:
             i += 1
+            continue
+        stop, closed = _chunk_stop(texts, i, exact=not (at_start and i == 0))
+        indent = _fence_indent(opening.fence)
+        code = "".join(_strip_indent(texts[j], indent) + plain[j][len(texts[j]):] for j in range(i + 1, stop - closed))
+        flush_prose(i)
+        cells.append(Cell(
+            cell_type="code",
+            source=_chunk_source(code),
+            language=opening.language,
+            label=opening.label,
+            options=opening.options,
+            fence=opening.fence,
+            closed=closed,
+            raw="".join(lines[i:stop]),
+        ))
+        i = prose_start = stop
     flush_prose(n)
     return cells
+
+
+def _chunk_stop(lines: list[str], start: int, exact: bool = True) -> tuple[int, bool]:
+    """
+    Where the chunk whose header is lines[start] ends, as knitr's
+    group_indices finds it (R/parser.R): (stop, closed), the chunk being
+    lines [start, stop) and closed saying whether its last line is its closing
+    fence. lines are without line breaks. The closing fence is the first line
+    that _KNITR_CHUNK_END takes and that is the header's fence (its indentation
+    or > marks and backticks) and nothing but spaces: in ```{r}, "```" closes
+    the chunk, while "````" and "  ```" are code. On the file's first line
+    (exact false) knitr has no fence to match yet, and any such line closes it.
+    A header line whose fence is followed right away by its {, as ```{python} in
+    ```{r}, starts a new chunk, the one before it having no closing fence;
+    other header lines are code, and a chunk nothing closes runs to the end.
+    knitr refuses some chunks outright (one on the first line that holds a
+    header line, or one with a closing fence of another fence and no fence of
+    its own after it); their lines are read here as in any other chunk.
+    """
+    fence = _KNITR_CHUNK_BEGIN.match(lines[start]).group(1)
+    for j in range(start + 1, len(lines)):
+        line = lines[j]
+        if _KNITR_CHUNK_BEGIN.match(line):
+            if line.startswith(fence + "{"):
+                return j, False
+        elif _KNITR_CHUNK_END.match(line) and (not exact or line[:len(fence)] == fence and not line[len(fence):].strip()):
+            return j + 1, True
+    return len(lines), False
+
+
+def _fence_indent(fence: str) -> str:
+    """The indentation or > marks a chunk's fence (see Cell.fence) starts with."""
+    return fence[:len(fence) - len(fence.lstrip("\t >"))]
+
+
+def _fence_close(fence: str) -> str:
+    """The closing fence of a chunk whose header starts with fence: its indentation or > marks and its backticks."""
+    return fence[:fence.rindex("`") + 1]
+
+
+def _strip_indent(line: str, indent: str) -> str:
+    """
+    A line of a chunk's body, without its line break, as knitr's parse_block
+    reads it in a chunk whose fence starts with indent: without indent at its
+    start, then without indent's text before its trailing spaces and tabs (so a
+    blank line of a blockquote, written ">", is blank too).
+    """
+    if line.startswith(indent):
+        line = line[len(indent):]
+    bare = indent.rstrip(" \t")
+    return line[len(bare):] if bare and line.startswith(bare) else line
+
+
+def _indented(code: str, indent: str) -> str:
+    """
+    code, lines with "\\n" breaks, as the body of a chunk whose fence starts
+    with indent writes it, which _strip_indent reads back: each line after
+    indent, a blank one after indent without its trailing spaces and tabs.
+    """
+    if not indent:
+        return code
+    return "".join(indent.rstrip(" \t") + line if not line.strip("\n") else indent + line for line in _lines(code))
 
 
 def _chunk_source(body: str) -> str:
@@ -313,37 +386,45 @@ def _chunk_body(source: str) -> str:
 # ──────────────────────────────────────────────
 
 
-def _read_chunk_header(line: str) -> Optional[tuple[str, Optional[str], "OrderedDict[str, str]"]]:
-    """(language, label, options) of a chunk header line, without its line break; None if it isn't one."""
-    m = _CHUNK_OPEN.match(line)
+class _ChunkOpening(NamedTuple):
+    fence: str                       # the line before its {, as Cell.fence
+    language: str
+    label: Optional[str]             # as Cell.label and Cell.options
+    options: list[tuple[str, str]]
+
+
+def _read_chunk_opening(line: str) -> Optional[_ChunkOpening]:
+    """A chunk header line, without its line break, as knitr reads one (see _KNITR_CHUNK_BEGIN); None if it isn't one."""
+    m = _KNITR_CHUNK_BEGIN.match(line)
     if not m:
         return None
-    label, options = _parse_label_and_options(m.group(2))
-    return m.group(1), label, options
+    label, options = _parse_label_and_options(m.group(4).strip())
+    return _ChunkOpening(m.group(1) + m.group(2), m.group(3), label, options)
 
 
-def _parse_label_and_options(inside: str) -> tuple[Optional[str], "OrderedDict[str, str]"]:
+def _parse_label_and_options(inside: str) -> tuple[Optional[str], list[tuple[str, str]]]:
     """
     Given the text between `{r ` and `}` (e.g. `label, echo=FALSE, fig.width=7`),
-    return (label, options). Label is the first bare token without '='.
-    Options preserve insertion order.
+    return (label, options). Label is the first part when it is a bare token
+    without '='. Options are the other parts as (key, value) pairs in the order
+    written, a key written twice included twice; a bare token has the value "".
     """
     label: Optional[str] = None
-    options: "OrderedDict[str, str]" = OrderedDict()
+    options: list[tuple[str, str]] = []
     parts = _split_top_level_commas(inside)
     for idx, part in enumerate(parts):
         if not part:
             continue
         if "=" not in part:
-            # Bare token -- if this is the first part and we don't have a label yet, it's the label
-            if idx == 0 and label is None:
+            # Bare token -- if this is the first part, it's the label
+            if idx == 0:
                 label = part.strip()
-            # Otherwise it's a stray bare flag; stash as key with empty value
+            # Otherwise it's a bare name after a comma or an option; stash as key with empty value
             else:
-                options[part.strip()] = ""
+                options.append((part.strip(), ""))
         else:
             k, _, v = part.partition("=")
-            options[k.strip()] = v.strip()
+            options.append((k.strip(), v.strip()))
     return label, options
 
 
@@ -439,8 +520,39 @@ def _r_trouble(s: str) -> Optional[str]:
 
 # A quoted R string, as a whole: its quote, then its text with backslash escapes.
 _R_STRING = re.compile(r"""(["'])((?:\\.|(?!\1)[^\\])*)\1""", re.S)
-# The first of a chunk's "#| " option lines, when knitr reads them as YAML: "key:" then a space or nothing.
-_PIPE_YAML = re.compile(r"#\| [^ :]+:(?:\s|$)")
+# A quoted R string whose only escapes are \\, \", \', \n and \t, which _r_string_value undoes as R does.
+_SIMPLE_R_STRING = re.compile(r"""(["'])(?:\\[\\"'nt]|(?!\1)[^\\])*\1""", re.S)
+# An R number that YAML reads as the same number: decimal digits without leading zeros, a minus sign and a fraction.
+_DECIMAL = re.compile(r"-?(?:0|[1-9][0-9]*)(?:\.[0-9]+)?")
+# Plain text that R's yaml package, which knitr reads option lines with, reads as something other than a string where
+# PyYAML reads a string (its implicit.re): y and n as booleans, .na as NA, numbers with commas among their digits,
+# floats without a digit (., -., .e+1, which it reads as NA) and base-60 numbers such as 0:30. Anything that looks like
+# a number is taken, to be safe.
+_R_YAML_NOT_TEXT = re.compile(
+    r"[yYnN]|\.na(?:\.integer|\.real|\.character)?|[-+]?[0-9.,]*[0-9][0-9.,eE+-]*|[-+]?0x[0-9a-fA-F,]+"
+    r"|[-+]?(?:[0-9][0-9,]*)?\.[0-9,]*|[-+]?(?:[0-9][0-9,]*)?\.[0-9.]*[eE][-+][0-9]+"
+    r"|[-+]?[0-9][0-9,]*(?::[0-5]?[0-9])+(?:\.[0-9,]*)?"
+)
+# The first of a chunk's option lines, without the characters it starts with, when knitr reads them as YAML:
+# "key:" then a space or nothing.
+_YAML_OPTIONS = re.compile(r"[^ :]+:(?:\s|$)")
+# The comment characters an engine's option lines start with, before "| ", and those they end with ("" for none):
+# xfun's comment_chars table, which knitr's divide_chunk reads them by. Engine names match exactly, as in knitr;
+# one not listed here, such as r, python or bash, uses "#".
+_OPTION_COMMENTS = {
+    **dict.fromkeys(("asy", "cc", "csharp", "d3", "dot", "fsharp", "go", "groovy", "java", "js", "node", "ojs", "Rcpp",
+                     "rust", "sass", "scss", "scala"), ("//", "")),
+    "mermaid": ("%%", ""),
+    **dict.fromkeys(("matlab", "tikz"), ("%", "")),
+    **dict.fromkeys(("c", "css"), ("/*", "*/")),
+    "sas": ("*", ";"),
+    **dict.fromkeys(("haskell", "lua", "mysql", "psql", "sql"), ("--", "")),
+    **dict.fromkeys(("fortran", "fortran95"), ("!", "")),
+    "stata": ("*", ""),
+    "apl": (chr(0x235D), ""),
+}
+# The characters R's trimws() takes as space, which divide_chunk trims before it looks for the closing characters.
+_R_SPACE = " \t\r\n"
 
 
 def _r_string_value(text: str) -> Optional[str]:
@@ -451,38 +563,141 @@ def _r_string_value(text: str) -> Optional[str]:
     return re.sub(r"\\(.)", lambda e: {"n": "\n", "t": "\t"}.get(e.group(1), e.group(1)), m.group(2), flags=re.S)
 
 
-def _pipe_labels(source: str) -> list[tuple[int, int, str, str]]:
+def _option_text(text: str) -> str:
     """
-    Where a chunk's "#| " option lines give its label, as (start, end, key,
-    label): lines [start, end) of its source hold the key "label" or "id" with
-    its value. The option lines are the "#| " lines its body starts with, read
-    without the "#| " as one YAML document, as knitr and Quarto read them when
-    the first is "#| key:" (otherwise they are R key=value text, not read here).
-    knitr takes label: and else id:, so label: keys come first; one with no
-    value gives no label. A value that isn't a string is given as written.
+    text as a one-line YAML string for an option line that R's yaml package reads
+    back as that string too: yaml_string's, quoted also where that package reads
+    plain text as something else (see _R_YAML_NOT_TEXT).
     """
-    lines = _lines(source)
-    count = next((i for i, line in enumerate(lines) if not line.startswith("#| ")), len(lines))
-    if not count or not _PIPE_YAML.match(lines[0]):
-        return []
-    meta = [line[len("#| "):] for line in lines[:count]]
+    return yaml_string(text, quote=bool(_R_YAML_NOT_TEXT.fullmatch(text)))
+
+
+def _r_to_yaml(value: str) -> str:
+    """
+    value, R code as a chunk header holds it, as the YAML scalar an option
+    line ("#| key: value") holds for it, which knitr reads as the same value:
+    TRUE, FALSE and NULL as true, false and null, a decimal number as written,
+    a quoted R string with no escapes but \\\\, \\", \\', \\n and \\t as a YAML
+    string (see _option_text), and any other code tagged !expr, which knitr
+    evaluates as R (as a quoted YAML string when it wouldn't read back plain).
+    """
+    if value in ("TRUE", "FALSE", "NULL"):
+        return value.lower()
+    if _DECIMAL.fullmatch(value):
+        return value
+    if _SIMPLE_R_STRING.fullmatch(value):
+        return _option_text(_r_string_value(value))
+    try:
+        loaded = load_yaml(f"k: !expr {value}")
+        plain = isinstance(loaded, dict) and isinstance(loaded.get("k"), TaggedScalar) and loaded["k"].value == value
+    except (yaml.YAMLError, ValueError):
+        plain = False
+    return "!expr " + (value if plain else yaml_string(value, quote=True))
+
+
+class _OptionEntry(NamedTuple):
+    key: Optional[str]   # the key as YAML reads it; None for a key that isn't a scalar
+    prefix: str          # its first line, without the block's start, up to and including the ":"
+    start: int           # lines [start, end) of the chunk's source hold the key and its value
+    end: int
+    text: str            # those lines as written, without the last line break
+    value: object        # the value as YAML reads it on its own; as written if it doesn't read
+    written: str         # the value as written after the ":", without surrounding whitespace
+
+
+class _OptionBlock(NamedTuple):
+    start: str                  # what its lines start with: comment characters and "| ", as "#| " or "--| "
+    end: str                    # what they end with, as "*/" for c; "" for most engines
+    lines: list[str]            # the source lines it is, from the first, each ending with "\n"
+    meta: list[str]             # those lines as YAML reads them: without start and end, each ending with "\n"
+    entries: list[_OptionEntry]
+
+
+def _option_extent(language: str, lines: list[str]) -> Optional[tuple[str, str, int]]:
+    """
+    Which of lines, a chunk's source lines, are its option lines, found as
+    knitr's xfun::divide_chunk finds them: (start, end, count), the first count
+    lines starting with start, the engine's comment characters and "| " (see
+    _OPTION_COMMENTS), or else "#| ", and ending with end ("" for most
+    engines). Where those characters open a comment that a line closes
+    ("/*| x */" for c), the lines run while they end with end, or else to the
+    first that does. None if the first line doesn't start with either.
+    """
+    if not lines:
+        return None
+    char, end = _OPTION_COMMENTS.get(language, ("#", ""))
+    start = char + "| "
+    if not lines[0].startswith(start):
+        start, end = "#| ", ""
+        if not lines[0].startswith(start):
+            return None
+    if not end:
+        return start, end, next((i for i, line in enumerate(lines) if not line.startswith(start)), len(lines))
+    # As divide_chunk counts them with R's which.min() and which.max()
+    closed = [line.rstrip(_R_SPACE).endswith(end) for line in lines]
+    if closed[0]:
+        # Up to the first line not closed; when every line is, its 1:0 is the first line alone
+        return start, end, next((i for i, c in enumerate(closed) if not c), 0) or 1
+    # Up to the first closed line, or the first line alone if none is
+    return start, end, next((i + 1 for i, c in enumerate(closed) if c), 1)
+
+
+def _option_block(language: str, source: str) -> Optional[_OptionBlock]:
+    """
+    The option lines a chunk's source starts with (see _option_extent). Their
+    text without the comment characters is one YAML document, as knitr and
+    Quarto read it when its first line is "key:" (otherwise the lines are R
+    key=value text, not read here, and this is None, as it is when the keys
+    aren't one per line at the start of a line). Each top-level key is an
+    entry, holding its lines up to the next key but for trailing blank and
+    comment lines.
+    """
+    lines = [line.rstrip("\n") + "\n" for line in _lines(source)]
+    extent = _option_extent(language, lines)
+    if extent is None:
+        return None
+    start, end, count = extent
+    lines = lines[:count]
+    meta = []
+    for line in lines:
+        text = line[:-1]
+        text = text[len(start):] if text.startswith(start) else text
+        if end and text.rstrip(_R_SPACE).endswith(end):
+            # divide_chunk takes as many characters off the end as the closing characters have, spaces after them or not
+            text = text[:-len(end)]
+        meta.append(text + "\n")
+    if not _YAML_OPTIONS.match(meta[0]):
+        return None
     _, _, keys = _read_header("".join(meta))
     if keys is None:
-        return []
-    labels: list[tuple[int, int, str, str]] = []
-    for key, start, end in _key_spans(meta, keys):
-        if key.name not in ("label", "id"):
-            continue
-        entry = "".join(meta[start:end])
-        text = entry[len(key.prefix):].strip()
+        return None
+    entries = []
+    for key, first, last in _key_spans(meta, keys):
+        entry = "".join(meta[first:last])
+        written = entry[len(key.prefix):].strip()
         try:
             loaded = load_yaml(entry)
-            value = loaded.get(key.name) if isinstance(loaded, dict) else text
+            value = loaded.get(key.name) if isinstance(loaded, dict) else written
         except (yaml.YAMLError, ValueError):
-            value = text
-        if value is not None:
-            labels.append((start, end, key.name, value if isinstance(value, str) else text))
-    return sorted(labels, key=lambda label: label[2] != "label")
+            value = written
+        text = "".join(lines[first:last]).rstrip("\n")
+        entries.append(_OptionEntry(key.name, key.prefix, first, last, text, value, written))
+    return _OptionBlock(start, end, lines, meta, entries)
+
+
+def _pipe_labels(block: Optional[_OptionBlock]) -> list[tuple[int, str]]:
+    """
+    Where a chunk's option lines (see _option_block) give its label, as
+    (entry, label): block.entries[entry] holds the key "label" or "id" with a
+    value. knitr takes label: and else id:, so label: keys come first; one
+    with no value gives no label. A value that isn't a string is given as
+    written.
+    """
+    labels: list[tuple[int, str]] = []
+    for index, entry in enumerate(block.entries if block else []):
+        if entry.key in ("label", "id") and entry.value is not None:
+            labels.append((index, entry.value if isinstance(entry.value, str) else entry.written))
+    return sorted(labels, key=lambda label: block.entries[label[0]].key != "label")
 
 
 # ──────────────────────────────────────────────
@@ -498,15 +713,24 @@ def serialize(frontmatter: Frontmatter, cells: list[Cell]) -> str:
     body and closing fence. A part without a trailing newline (the file's last
     line had none) gets one only when another part follows it, so fences never
     run together and an unedited document still round-trips byte for byte.
-    Edited cells, header lines and that newline use frontmatter.newline, the
-    document's line break, whatever breaks the cell source was given with. A
-    byte order mark that parse set aside (frontmatter.bom) goes back at the very
-    start, whichever part comes first.
+    A chunk written without a closing fence (see Cell.closed) gets one when
+    another part follows it, unless that is a chunk as written in the file
+    whose header line ends it, as it did when it was read. Edited cells, header
+    lines, that newline and that fence use frontmatter.newline, the document's
+    line break, whatever breaks the cell source was given with. A byte order
+    mark that parse set aside (frontmatter.bom) goes back at the very start,
+    whichever part comes first.
     """
     newline = frontmatter.newline
+    texts = [_cell_text(cell, newline) for cell in cells]
     parts: list[str] = [frontmatter.raw] if frontmatter.present else []
-    for cell in cells:
-        parts.append(_cell_text(cell, newline))
+    for index, (cell, text) in enumerate(zip(cells, texts)):
+        after = next((i for i in range(index + 1, len(cells)) if texts[i]), None)
+        if text and after is not None and _needs_closing(cell, cells[after], texts[after]):
+            if not text.endswith(("\n", "\r")):
+                text += newline
+            text = _join([text, _fence_close(cell.fence) + newline], newline)
+        parts.append(text)
     out_parts: list[str] = []
     for part in parts:
         if not part:
@@ -518,6 +742,20 @@ def serialize(frontmatter: Frontmatter, cells: list[Cell]) -> str:
     return (_BOM if frontmatter.bom else "") + _join(out_parts, newline)
 
 
+def _needs_closing(cell: Cell, following: Cell, text: str) -> bool:
+    """
+    Whether cell, a chunk replayed without a closing fence, needs one before
+    following, the next cell written (as text): unless following is a chunk
+    replayed from the file whose header line has cell's fence right before its
+    {, which knitr ends cell at.
+    """
+    if cell.cell_type != "code" or cell.dirty or not cell.raw or cell.closed:
+        return False
+    first = _LINE.match(text).group().rstrip("\r\n")
+    ends = following.cell_type == "code" and following.raw and not following.dirty and _KNITR_CHUNK_BEGIN.match(first)
+    return not (ends and first.startswith(_fence_close(cell.fence) + "{"))
+
+
 def _cell_text(cell: Cell, newline: str) -> str:
     """
     A cell as serialize writes it: its raw text if unedited; after label or option
@@ -527,7 +765,7 @@ def _cell_text(cell: Cell, newline: str) -> str:
     if cell.dirty or not cell.raw:
         return _with_newline(_render_cell(cell), newline)
     if cell.header_dirty:
-        header = _render_chunk_header(cell.language, cell.label, cell.options) + newline
+        header = _render_chunk_header(cell.language, cell.label, cell.options, cell.fence) + newline
         return _join([header, cell.raw[_LINE.match(cell.raw).end():]], newline)
     return cell.raw
 
@@ -539,21 +777,22 @@ def _render_cell(cell: Cell) -> str:
         if src and not src.endswith("\n"):
             src = src + "\n"
         return src
-    # code cell: the body its source stands for, so a source ending in "\n" keeps its blank line
-    header = _render_chunk_header(cell.language, cell.label, cell.options)
-    return f"{header}\n{_chunk_body(cell.source)}```\n"
+    # code cell: the body its source stands for, so a source ending in "\n" keeps its blank line, under its fence
+    header = _render_chunk_header(cell.language, cell.label, cell.options, cell.fence)
+    return f"{header}\n{_indented(_chunk_body(cell.source), _fence_indent(cell.fence))}{_fence_close(cell.fence)}\n"
 
 
-def _render_chunk_header(language: str, label: Optional[str], options: "OrderedDict[str, str]") -> str:
+def _render_chunk_header(language: str, label: Optional[str], options: list[tuple[str, str]], fence: str = "```") -> str:
     # An option without a value is a bare name; one with neither name nor value (a lone "=") stays "=".
-    parts = [f"{k}={v}" if v or not k else k for k, v in options.items()]
+    parts = [f"{k}={v}" if v or not k else k for k, v in options]
     if label:
         parts.insert(0, label)
     if not parts:
-        return "```{" + language + "}"
-    # A bare option first would read back as the label: a comma before it keeps it an option, as in ```{r, echo}.
+        return fence + "{" + language + "}"
+    # A bare name first among the options came after a leading comma, as in ```{r, echo}: the comma is written back,
+    # so it reads back as it was (knitr reads it as the label either way).
     lead = " " if label or "=" in parts[0] else ", "
-    return "```{" + language + lead + ", ".join(parts) + "}"
+    return fence + "{" + language + lead + ", ".join(parts) + "}"
 
 
 def _layout(frontmatter: Frontmatter, cells: list[Cell]) -> tuple[Optional[str], list[tuple[int, tuple]]]:
@@ -561,7 +800,7 @@ def _layout(frontmatter: Frontmatter, cells: list[Cell]) -> tuple[Optional[str],
     The document as parse reads back what serialize writes for it: the YAML
     header's text (None without a header), and the cells as (index, shape) pairs,
     index being that of the first cell the shape stands for. A chunk's shape is
-    ("code", language, label, options, source). A markdown cell's is ("markdown",
+    ("code", language, label, options, fence, source). A markdown cell's is ("markdown",
     text), each text ending in a line break, with adjacent markdown cells (and
     text kept after the header's closing fence) joined, as nothing marks where
     one ends, and empty ones left out.
@@ -575,7 +814,7 @@ def _layout(frontmatter: Frontmatter, cells: list[Cell]) -> tuple[Optional[str],
         if cell.cell_type == "markdown":
             entries.append((index, ("markdown", cell.source)))
         else:
-            entries.append((index, ("code", cell.language, cell.label, tuple(cell.options.items()), cell.source)))
+            entries.append((index, ("code", cell.language, cell.label, tuple(cell.options), cell.fence, cell.source)))
     layout: list[tuple[int, tuple]] = []
     for index, shape in entries:
         if shape[0] == "markdown":
@@ -768,14 +1007,17 @@ class _TaggedDumper(yaml.SafeDumper):
     """SafeDumper that writes TaggedScalar values back as tags and multi-line strings as | blocks."""
 
     def choose_scalar_style(self):
-        # SafeDumper quotes every explicitly tagged scalar ("!r '1 + 1'"); keep it
-        # plain ("!r 1 + 1") whenever plain style could hold an untagged value.
+        # SafeDumper quotes every explicitly tagged scalar ("!r '1 + 1'", "!!merge 'x'"); keep it plain
+        # ("!r 1 + 1") whenever plain style could hold an untagged value. A scalar whose tag is written
+        # whatever its style (neither implicit flag set) is a TaggedScalar, a tag under "!" or under YAML's
+        # own tag:yaml.org,2002: prefix (!!merge); a string that plain style would read as something else
+        # ('true') has its quoted flag set, and stays quoted.
         style = super().choose_scalar_style()
         analysis = self.analysis
         if (
             style == "'"
             and not self.event.style
-            and (self.event.tag or "").startswith("!")
+            and not any(self.event.implicit)
             and not (self.simple_key_context and (analysis.empty or analysis.multiline))
             and (analysis.allow_flow_plain if self.flow_level else analysis.allow_block_plain)
         ):
@@ -826,6 +1068,8 @@ _KEY_LINE = re.compile(r"""("(?:[^"\\\n]|\\.)*"|'(?:[^'\n]|'')*'|[^\s#'"?:,\[\]{
 _DOC_END = re.compile(r"\.\.\.(?:[ \t\r\n]|\Z)")
 # Characters YAML treats as line breaks but line-level editing doesn't.
 _OTHER_BREAKS = re.compile(r"[\x85\u2028\u2029]")
+# The most characters YAML reads a key in before its ":" on a key: value line (an implicit key).
+_MAX_IMPLICIT_KEY = 1024
 
 
 class _Key(NamedTuple):
@@ -929,31 +1173,44 @@ def _node_keys(root: yaml.Node, body: str) -> Optional[list[_Key]]:
     """The keys of a parsed header, or None unless it is a block mapping with one key per line at column 0."""
     if not isinstance(root, yaml.MappingNode) or root.flow_style:
         return None
+    # Where the line breaks are, so finding a position's line is a binary search, not a count from the top
+    breaks = [m.start() for m in re.finditer("\n", body)]
     keys: list[_Key] = []
     for key_node, value_node in root.value:
         start, end = key_node.start_mark.index, key_node.end_mark.index
         colon = body.find(":", end)
         if start != body.rfind("\n", 0, start) + 1 or colon < 0 or body[end:colon].strip(" \t"):
             return None
-        line = body.count("\n", 0, start)
+        line = bisect.bisect_left(breaks, start)
         if keys and line <= keys[-1].line:
             return None
         name = key_node.value if isinstance(key_node, yaml.ScalarNode) else None
-        keys.append(_Key(name, line, body[start:colon + 1], _value_end_line(value_node, body)))
+        keys.append(_Key(name, line, body[start:colon + 1], _value_end_line(value_node, body, breaks)))
     return keys
 
 
-def _value_end_line(node: yaml.Node, body: str) -> int:
+def _value_end_line(node: yaml.Node, body: str, breaks: list[int]) -> int:
     """
-    The line holding the last character of a value node. A block collection's end
-    mark lies past the comments and blank lines after it, so follow its last entry;
-    a block scalar's takes in trailing line breaks, which are skipped.
+    The line holding the last character of a value node, breaks being the
+    positions of body's line breaks. A block collection's end mark lies past the
+    comments and blank lines after it, so follow its last entry; a block scalar's
+    takes in trailing line breaks, which are skipped. An entry that starts no
+    later than its collection is an alias, the node of an anchor written before
+    it (or the collection itself): it isn't followed, and the collection's first
+    line is given, no later than the alias's own. Each step goes to a node that
+    starts later, so the walk stays within the value's text and doesn't loop.
     """
     while isinstance(node, (yaml.MappingNode, yaml.SequenceNode)) and not node.flow_style and node.value:
         last = node.value[-1]
-        node = last[1] if isinstance(node, yaml.MappingNode) else last
-    end = len(body[:node.end_mark.index].rstrip())
-    return body.count("\n", 0, max(end - 1, 0))
+        child = last[1] if isinstance(node, yaml.MappingNode) else last
+        if child.start_mark.index <= node.start_mark.index:
+            return bisect.bisect_left(breaks, node.start_mark.index)
+        node = child
+    # The last character that isn't whitespace, as rstrip() finds it, without copying the text before it
+    end = node.end_mark.index
+    while end > 0 and body[end - 1].isspace():
+        end -= 1
+    return bisect.bisect_left(breaks, max(end - 1, 0))
 
 
 def _guess_keys(lines: list[str]) -> list[_Key]:
@@ -1019,7 +1276,7 @@ def _key_spans(lines: list[str], keys: list[_Key]) -> list[tuple[_Key, int, int]
     stops = sorted({k.line for k in keys} | {i for i, line in enumerate(lines) if _DOC_END.match(line)} | {len(lines)})
     spans = []
     for key in keys:
-        end = next(stop for stop in stops if stop > key.line)
+        end = stops[bisect.bisect_right(stops, key.line)]
         while end - 1 > max(key.line, key.value_end) and (not lines[end - 1].strip() or lines[end - 1].startswith("#")):
             end -= 1
         spans.append((key, key.line, end))
@@ -1038,8 +1295,20 @@ def _parse_yaml_value(value: str):
 
 
 def _new_key_prefix(key: str) -> str:
-    """How a new top-level key is written: "key:", quoted when YAML needs it."""
-    return yaml_string(key) + ":"
+    """
+    How a new top-level key is written: "key:", quoted when YAML needs it.
+    Raises FrontmatterError for a key longer as written than the 1024
+    characters YAML reads before the ":" of a key: value line (an implicit key:
+    PyYAML and the libyaml in R's yaml package both stop there).
+    """
+    written = yaml_string(key)
+    if len(written) > _MAX_IMPLICIT_KEY:
+        shown = key if len(key) <= 40 else key[:37] + "..."
+        raise FrontmatterError(
+            f"Frontmatter key {shown!r} is {len(written)} characters long as written, and YAML reads a key: value line "
+            f"only for a key of up to {_MAX_IMPLICIT_KEY} characters, so the file was left unchanged"
+        )
+    return written + ":"
 
 
 def _render_entry(prefix: str, value: str, parsed) -> str:

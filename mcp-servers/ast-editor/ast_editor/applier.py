@@ -7,7 +7,9 @@ from ast_editor.parser import (
     C_EXTS,
     CPP_EXTS,
     DEFAULT_EXPORT_KINDS,
+    JS_FUNCTION_VALUES,
     ApplierError,
+    Target,
     TreeSitterParser,
     c_name,
     first_syntax_error,
@@ -122,6 +124,14 @@ _UNIT_WRAPPERS = (
     "linkage_specification",
     "argument_list",
     "call",
+)
+
+# The start of a TS function or method and its name (`function f(`,
+# `abstract m<T>(`), which a later member of its overload group starts with
+# (see Applier._overload_member).
+_TS_MEMBER_HEAD = (
+    r"(?:(?:export|declare|default|async|function|public|private|protected|static|abstract|override|readonly)\s+)*"
+    r"""\*?\s*(#?[\w$]+|'(?:[^'\\]|\\.)*'|"(?:[^"\\]|\\.)*")\s*[<(]"""
 )
 
 # The string literals that can span lines, by file extension (see
@@ -475,7 +485,9 @@ class Applier:
     def _fits_read_shape(self, lines: list[str], read_at: str, anchor: int | None) -> bool:
         """Whether the content `lines` reads as read_symbol shows a symbol
         read at the indentation `read_at` (see _read_shape_indent), with the
-        line `anchor`, if given, one of its lines of code at `read_at`."""
+        line `anchor`, if given, one of its lines of code at `read_at`. The
+        later members of an overload group start at `read_at` too
+        (_overload_member)."""
         absolute = [read_at + lines[0]] + lines[1:]
         free = {i for rows, _ in self._literal_rows(absolute) for i in rows}
         root = None
@@ -488,6 +500,8 @@ class Applier:
         # `@property` of a method, relative content).
         header = self._is_header_line(lines[0])
         anchored = anchor is None
+        # The last line at `read_at` and the lines of code below it.
+        group, previous, below = self._overload_name(lines), lines[0].strip(" \t"), []
         for i in range(1, len(lines)):
             line = lines[i]
             if not line.strip(" \t") or i in free or self._free_line(root, absolute, i):
@@ -498,9 +512,66 @@ class Applier:
             if at_level and header:
                 header = self._is_header_line(line) or self._symbol_level_line(line, closing=True)
             elif at_level and (self._is_header_line(line) or not self._symbol_level_line(line, closing=False)):
-                return False
+                if not self._overload_member(line, previous, below, group):
+                    return False
+                header = self._is_header_line(line)
+            if at_level:
+                previous, below = line.strip(" \t"), []
+            else:
+                below.append(line.strip(" \t"))
             anchored = anchored or (i == anchor and at_level)
         return anchored
+
+    def _overload_name(self, lines: list[str]) -> str | None:
+        """The name of the function that the content `lines` starts with, for
+        the later members of its overload group (_overload_member): a Python
+        def's (after its decorators), a TS function's or method's; None in
+        other languages or when the content starts with something else."""
+        ext = self.parser.ext
+        for line in lines:
+            code = line.strip(" \t")
+            if not code or (ext == ".py" and code.startswith("@")):
+                continue
+            if ext == ".py":
+                found = re.match(r"(?:async\s+)?def\s+(\w+)", code)
+            elif ext in (".ts", ".tsx"):
+                found = re.match(_TS_MEMBER_HEAD, code)
+            else:
+                found = None
+            return found.group(1) if found else None
+        return None
+
+    def _overload_member(self, line: str, previous: str, below: list[str], name: str | None) -> bool:
+        """Whether `line`, at the indentation of the symbol it is part of,
+        starts another member of the overload group of the function `name`
+        (TreeSitterParser.python_overload, _overload_group), the line at that
+        indentation before it being `previous` and the lines of code between
+        them `below`: in TS a signature or the implementation after a
+        signature that ends with `;`, in Python a decorator or a def of that
+        name after an @overload stub, a def (or the `)` that ends its
+        parameters) whose body is `...`, `pass` or a docstring, on its line
+        (`def f(a: int) -> int: ...`) or below it."""
+        if name is None:
+            return False
+        code = line.strip(" \t")
+        if self.parser.ext in (".ts", ".tsx"):
+            if not previous.rstrip().endswith(";"):
+                return False
+            # A decorator of the implementation, after the signatures.
+            head = re.match(_TS_MEMBER_HEAD, code)
+            return code.startswith("@") or (head is not None and head.group(1) == name)
+        definition = rf"(?:async\s+)?def\s+{re.escape(name)}\b"
+        if not (re.match(definition, previous) or previous.startswith(")")):
+            return False
+        inline = re.search(r":\s*\.\.\.\s*(?:#.*)?$", previous) is not None and not below
+        empty = (
+            re.search(r":\s*(?:#.*)?$", previous) is not None
+            and below
+            and all(text in ("...", "pass") or text.startswith(("'", '"')) for text in below)
+        )
+        if not (inline or empty):
+            return False
+        return code.startswith("@") or re.match(definition, code) is not None
 
     def _symbol_level_line(self, line: str, closing: bool) -> bool:
         """Whether `line` is one that sits at the indentation of the symbol it
@@ -524,13 +595,16 @@ class Applier:
 
     def _is_header_line(self, line: str) -> bool:
         """Whether `line` is a decorator or annotation (`@...`, in Python,
-        JS/TS and Java) or a C++ `template <...>` header or `[[attribute]]`,
+        JS/TS and Java), a C++ `template <...>` header or `[[attribute]]`,
+        or the start of a Ruby Sorbet signature (`sig { void }`, `sig do`),
         which the rest of a symbol follows at the same indentation."""
         code = line.strip(" \t")
         if self.parser.ext in (".py", ".java") + _JS_EXTS:
             return code.startswith("@")
         if self.parser.ext in CPP_EXTS:
             return re.match(r"template\s*<", code) is not None or code.startswith("[[")
+        if self.parser.ext == ".rb":
+            return re.match(r"sig\b\s*(?:[({]|do\b)", code) is not None
         return False
 
     def _free_line(self, root, lines: list[str], row: int) -> bool:
@@ -573,13 +647,24 @@ class Applier:
         union or enum ends with the `;` after it, as a template class does
         (a member one is its field_declaration), a Ruby statement that opens
         heredocs (`X = <<~EOS`) ends with their bodies, which the grammar
-        places after it, and a TS class
+        places after it, a Ruby method starts at its Sorbet signature
+        (`sig { void }`, _sorbet_signature), and a TS class
         member starts at the first of the decorators the grammar places
         beside it in the class body, comments between them included.
         Decorated Python functions are found as their decorated_definition,
         and JS method decorators and Java annotations are inside the node,
-        already.
+        already. A TS function's overload signatures and a Python function's
+        @overload stubs are part of it (_overload_group).
         """
+        group = self._overload_group(node)
+        if group is not None:
+            first, last = group
+            prev = first.prev_named_sibling
+            while prev is not None and (prev.type == "decorator" or "comment" in prev.type):
+                if prev.type == "decorator":
+                    first = prev
+                prev = prev.prev_named_sibling
+            return first, last
         parent = node.parent
         if parent is not None and parent.type in ("export_statement", "decorated_definition"):
             return parent, parent
@@ -608,7 +693,7 @@ class Applier:
                 and last.next_sibling.start_point[0] == last.end_point[0]
             ):
                 last = last.next_sibling
-            return node, last
+            return self._sorbet_signature(node) or node, last
         if self.parser.ext not in _JS_EXTS:
             return node, node
         first = node
@@ -618,6 +703,112 @@ class Applier:
                 first = prev
             prev = prev.prev_named_sibling
         return first, node
+
+    def _sorbet_signature(self, node):
+        """
+        The Sorbet signature of the Ruby method `node`, which is part of the
+        method as a decorator is (_symbol_span): the `sig { ... }` or `sig
+        do ... end` call (`sig(:final) { ... }` too) that is the statement
+        right before the method, or before the `private def` it is in, with
+        only comments and no blank line between them; else None.
+        """
+        if node.type not in ("method", "singleton_method"):
+            return None
+        statement = node
+        while (
+            statement.parent is not None
+            and statement.parent.type == "argument_list"
+            and statement.parent.parent is not None
+            and statement.parent.parent.type == "call"
+        ):
+            statement = statement.parent.parent
+        prev = statement.prev_named_sibling
+        while prev is not None and prev.type == "comment":
+            prev = prev.prev_named_sibling
+        if prev is None or not self._is_sorbet_signature(prev):
+            return None
+        between = self.lines[prev.end_point[0] + 1 : statement.start_point[0]]
+        return None if any(not line.strip(" \t") for line in between) else prev
+
+    def _is_sorbet_signature(self, node) -> bool:
+        """Whether `node` is a Ruby `sig` call with a block (`sig { void }`,
+        `sig do ... end`), Sorbet's signature for the method below it."""
+        method = node.child_by_field_name("method") if node.type == "call" else None
+        return (
+            self.parser.ext == ".rb"
+            and method is not None
+            and node.child_by_field_name("receiver") is None
+            and node.child_by_field_name("block") is not None
+            and self.parser.node_text(method) == "sig"
+        )
+
+    def _overload_group(self, node):
+        """
+        The first and last statements of the overload group of `node`, a
+        function or method, when it has one, else None: in TS the overload
+        signatures directly before an implementation (`function f(a:
+        string): void;` before `function f(a: any) {...}`, `m(a: string):
+        void;` before `m(a: any) {}`, through their `export` and `declare`)
+        and in Python the @overload stubs directly before a function
+        (TreeSitterParser.python_overload), comments between them included;
+        a run of signatures or stubs with no implementation after them is a
+        group of its own, from the first. The group is one symbol, as the
+        decorators of a function are part of it.
+        """
+        parser = self.parser
+        if parser.ext in (".ts", ".tsx"):
+            wrappers = ("export_statement", "ambient_declaration")
+            signatures = ("function_signature", "method_signature", "abstract_method_signature")
+            functions = signatures + ("function_declaration", "generator_function_declaration", "method_definition")
+        elif parser.ext == ".py":
+            wrappers, signatures, functions = (), (), ("function_definition", "decorated_definition")
+        else:
+            return None
+        if node.type not in functions:
+            return None
+
+        def declaration(statement):
+            while statement is not None and statement.type in wrappers:
+                statement = statement.child_by_field_name("declaration") or next(
+                    (c for c in statement.named_children if "comment" not in c.type), None
+                )
+            return statement
+
+        def name_of(declaration):
+            if declaration is not None and declaration.type == "decorated_definition":
+                declaration = declaration.child_by_field_name("definition")
+            name = declaration.child_by_field_name("name") if declaration is not None else None
+            return parser.node_text(name) if name is not None else None
+
+        name = name_of(node)
+
+        def announces(statement) -> bool:
+            # A signature or stub of the same name.
+            inner = declaration(statement)
+            if inner is None or name_of(inner) != name:
+                return False
+            return inner.type in signatures or parser.python_overload(inner)
+
+        statement = node
+        while statement.parent is not None and statement.parent.type in wrappers:
+            statement = statement.parent
+        first = last = statement
+        sibling = statement.prev_named_sibling
+        # The decorators the TS grammar places beside a method come between
+        # its signatures and it.
+        while sibling is not None and ("comment" in sibling.type or sibling.type == "decorator" or announces(sibling)):
+            if announces(sibling):
+                first = sibling
+            sibling = sibling.prev_named_sibling
+        if announces(statement):
+            sibling = statement.next_named_sibling
+            while sibling is not None and ("comment" in sibling.type or announces(sibling)):
+                if "comment" not in sibling.type:
+                    last = sibling
+                sibling = sibling.next_named_sibling
+        if name is None or (first == statement and last == statement):
+            return None
+        return first, last
 
     @staticmethod
     def _template_entity(node):
@@ -644,11 +835,17 @@ class Applier:
         struct Node {...} Node;`), all listed in _UNIT_WRAPPERS. Any other
         container (a class body, a Java enum's body declarations, a C #else
         or a Ruby else branch) holds the code before the symbol as siblings,
-        never as part of it.
+        never as part of it. A Ruby method's Sorbet signature starts the
+        unit of a `private def` too.
         """
         first, last = self._symbol_span(node)
+        # A Ruby method's Sorbet signature stays first, before the `private
+        # def` the method is widened over.
+        sig = first if first != node and self._is_sorbet_signature(first) else None
+        if sig is not None:
+            first = node
         if first != last or self.parser.ext in _CONFIG_EXTS:
-            return first, last
+            return sig or first, last
         while True:
             parent = last.parent
             if parent is None or parent.parent is None:
@@ -670,13 +867,22 @@ class Applier:
                 # `private def f`, not `foo x, def f`
                 break
             last = parent
-        return last, last
+        return sig or last, last
 
     def _same_line(self, end: int, start: int) -> bool:
         """Whether the code that ends at byte `end` and the code that starts
         at `start` share a line (a node such as a C #include can end with
-        its line break)."""
-        return b"\n" not in self.parser.source_bytes[max(end - 1, 0) : start]
+        its line break). A block comment between them that goes on over
+        lines (`int x; /* a\\n b */ int y;`) does not end the line: code on
+        both sides of it shares the lines it takes."""
+        src, root = self.parser.source_bytes, self.parser.tree.root_node
+        pos = src.find(b"\n", max(end - 1, 0), start)
+        while pos != -1:
+            node = root.descendant_for_byte_range(pos, pos + 1)
+            if node is None or "comment" not in node.type or node.start_byte < end:
+                return False
+            pos = src.find(b"\n", node.end_byte, start)
+        return True
 
     @staticmethod
     def _is_separator(node) -> bool:
@@ -741,11 +947,15 @@ class Applier:
         The function that `node`, found for `target`, defines: the
         function_definition inside a Python decorated_definition, the arrow
         function, function expression or generator a JS/TS `const`/`let`/`var`
-        binds to the target's name (`const f = () => {}`), else node itself.
+        binds to the target's name (`const f = () => {}`), the func literal
+        a Go `var` gives it (`var f = func() {}`), else node itself.
         """
         if node.type == "decorated_definition":
             return next((c for c in node.named_children if c.type == "function_definition"), node)
-        bound = self.parser.js_bound_function(node, target.split(".")[-1])
+        leaf = self.parser.target_leaf(target)
+        bound = self.parser.js_bound_function(node, leaf)
+        if bound is None:
+            bound = self.parser.go_bound_function(node, leaf)
         return bound if bound is not None else node
 
     def _declares_c_function(self, node, target: str) -> bool:
@@ -755,8 +965,21 @@ class Applier:
         `~A();`, `operator bool() const;`)."""
         if self.parser.ext not in C_EXTS + CPP_EXTS or node.type not in ("declaration", "field_declaration"):
             return False
-        name = self.parser.declared_name(node, target.split(".")[-1])
+        name = self.parser.declared_name(node, self.parser.target_leaf(target))
         return name is not None and self.parser.c_declares_function(name)
+
+    def _refuse_config(self, tool: str, target: str, instead: str) -> None:
+        """
+        Refuse `tool`, an edit of a whole symbol of a source file
+        (replace_function, delete_symbol, insert_sibling), in a JSON, YAML or
+        TOML file, where a target is a key path and read_symbol reads its
+        value: `instead` names the key tool that makes the edit there.
+        """
+        ext = self.parser.ext
+        if ext in _CONFIG_EXTS:
+            raise ApplierError(
+                f"{tool} is for symbols of source files, not the keys of a {ext} file: use {instead}"
+            )
 
     def replace_function(self, target: str, content: str) -> str:
         """
@@ -772,8 +995,16 @@ class Applier:
         replace_function(t, read_symbol(t)) leaves the file as it was. A
         name declared together with others (`int a = 1, b = 2;`) has their
         declaration replaced, and content that drops them is refused
-        (_check_declared_with).
+        (_check_declared_with). A comment that the JS/TS grammar puts inside
+        the symbol after its code (`function f() {} // f`) is a comment
+        after it (_code_end). In a JSON, YAML or TOML file, whose targets
+        are keys, it is refused for replace_value (_refuse_config).
         """
+        self._refuse_config(
+            "replace_function",
+            target,
+            f"replace_value to change the value of '{target}', add_key to add a key, or delete_key to remove one",
+        )
         node = self.parser.find_node_by_name(target)
         if not node:
             raise ApplierError(f"Target '{target}' not found in {self.filepath}")
@@ -784,8 +1015,10 @@ class Applier:
         first, last = self._symbol_unit(node)
         before, separator, after = self._line_sharing(first, last)
         others = self._declared_with(node, target)
+        # A JS/TS class field's `;` goes when the content is a method.
+        drop = self._field_separator_goes(node, separator, content)
         if before or after:
-            return self._replace_inline(target, first, last, separator, content, others)
+            return self._replace_inline(target, first, last, separator, content, others, drop)
         start_line = first.start_point[0]
         end_line = self._last_row(last) + 1
 
@@ -800,7 +1033,7 @@ class Applier:
         # The `;` or `,` after the symbol on its last line (JS's `class A {};`)
         # is not part of it, so it stays unless the content ends with it.
         code = [i for i, line in enumerate(content_lines) if line.strip()]
-        if separator is not None and code and separator.start_point[0] == last.end_point[0]:
+        if separator is not None and code and separator.start_point[0] == last.end_point[0] and not drop:
             mark = self.parser.node_text(separator)
             if not content_lines[code[-1]].rstrip().endswith(mark):
                 content_lines[code[-1]] = content_lines[code[-1]].rstrip() + mark
@@ -819,17 +1052,37 @@ class Applier:
         self.lines = lines
         return self._save()
 
+    def _field_separator_goes(self, node, separator, content: str) -> bool:
+        """Whether replace_function drops `separator`, the `;` after `node`,
+        for `content`: when `node` is a JS/TS class field, whose `;`
+        read_symbol shows as its own, and the content ends with a member
+        that is no field (a method, `k() {}`), which takes none."""
+        if (
+            self.parser.ext not in _JS_EXTS
+            or node.type not in ("field_definition", "public_field_definition")
+            or separator is None
+            or separator.type != ";"
+        ):
+            return False
+        root = self.parser.parse(("class _ {\n" + content + "\n}").encode("utf-8")).root_node
+        body = root.named_children[0].child_by_field_name("body") if root.named_children else None
+        members = [c for c in body.named_children if "comment" not in c.type] if body is not None else []
+        return bool(members) and members[-1].type not in ("field_definition", "public_field_definition")
+
     def _trailing_comment(self, node) -> tuple[str, int]:
         """The comments after `node` on the line it ends on, with the spaces
         before them (`  // the x` after `int x;`), and the line the last of
         them ends on, which a block comment may take past that line (`int
         x; /* ... */` over two lines); ('', that line) when there are none,
-        or code follows them. Config files have none."""
+        or code follows them. Config files have none. The comments that the
+        JS/TS grammar puts inside `node` after its code count (_code_end)."""
         row = self._last_row(node)
         if self.parser.ext in _CONFIG_EXTS or row != node.end_point[0]:
             return "", row
         src, root = self.parser.source_bytes, self.parser.tree.root_node
-        pos, end, last = node.end_byte, src.find(b"\n", node.end_byte), row
+        start = self._code_end(node)
+        last = src.count(b"\n", 0, start)
+        pos, end = start, src.find(b"\n", start)
         end = len(src) if end < 0 else end
         while pos < end:
             if src[pos : pos + 1] in (b" ", b"\t"):
@@ -843,7 +1096,28 @@ class Applier:
                 last = found.end_point[0]
                 end = src.find(b"\n", pos)
                 end = len(src) if end < 0 else end
-        return src[node.end_byte : end].decode("utf-8").rstrip(), last
+        return src[start:end].decode("utf-8").rstrip(), last
+
+    def _code_end(self, node) -> int:
+        """
+        The byte where the code of `node` ends: its end, but in JS and TS
+        before the comments that the grammar puts last inside it, after its
+        code. tree-sitter-javascript makes a comment after a function's or a
+        namespace's `}` on its line part of the function's body, and one
+        after a class or after a declaration with no `;` part of that node
+        (`function f() {} // f`, `const x = 1 // x`); like a comment after
+        a symbol in the other languages, it is no part of the symbol
+        (read_symbol), and stays after it (_trailing_comment).
+        """
+        if self.parser.ext not in _JS_EXTS:
+            return node.end_byte
+        end = node
+        while end.child_count:
+            code = [c for c in end.children if "comment" not in c.type]
+            if not code:
+                break
+            end = code[-1]
+        return end.end_byte
 
     def _ends_with_comment(self, lines: list[str]) -> bool:
         """Whether the last line of code of the content `lines`, at its file
@@ -861,7 +1135,9 @@ class Applier:
         node = root.descendant_for_point_range((row, column), (row, column))
         return node is not None and "comment" in node.type
 
-    def _replace_inline(self, target: str, first, last, separator, content: str, others: list[str]) -> str:
+    def _replace_inline(
+        self, target: str, first, last, separator, content: str, others: list[str], drop: bool = False
+    ) -> str:
         """
         replace_function for a symbol that shares a line with other code:
         its text, first..last, is replaced, and the code around it on its
@@ -872,7 +1148,8 @@ class Applier:
         and absolute content keep theirs, as in replace_function). The `;`
         or `,` after the symbol (`separator`, or None) is replaced too when
         the content ends with it, as read_symbol shows a `;`, and stays
-        otherwise. Content that ends with a line comment is refused when
+        otherwise, unless `drop` (_field_separator_goes). Content that ends
+        with a line comment is refused when
         code follows the symbol on its line, and so is content that drops
         `others`, the names declared together with the target
         (_check_declared_with).
@@ -892,8 +1169,8 @@ class Applier:
                 lines[0] = lines[0][len(indent) :]
         text = "\n".join(lines).rstrip(" \t").encode("utf-8")
         src = self.parser.source_bytes
-        end = last.end_byte
-        if separator is not None and text.endswith(src[separator.start_byte : separator.end_byte]):
+        end = self._code_end(last)
+        if separator is not None and (drop or text.endswith(src[separator.start_byte : separator.end_byte])):
             end = separator.end_byte
         new = src[: first.start_byte] + text + src[end:]
         # The code after the symbol on its line, comments skipped, must stay
@@ -923,8 +1200,16 @@ class Applier:
         return "Update successful"
 
     def replace_value(self, target: str, content: str) -> str:
+        """
+        Replace the value of `target`: a config key's value, a Python dict
+        or JS/TS object entry's (_find_entry_value), a closure in an object
+        or composite literal, or the value of a source file's variable,
+        constant or field, which a name declared without one gets
+        (_declared_value).
+        """
         node = self.parser.find_node_by_name(target)
         prefix = ""
+        entry = node is None
         if not node:
             try:
                 found = self._find_entry_value(target)
@@ -962,13 +1247,14 @@ class Applier:
                 return self._replace_yaml_block_sequence(resolved, content)
 
         source_bytes = self.parser.source_bytes
+        start, end = node.start_byte, node.end_byte
+        if not entry and ext not in _CONFIG_EXTS:
+            # A variable, constant or field of a source file: its value
+            # alone, not the declaration that find_node_by_name returns.
+            start, end, prefix = self._declared_value(node, target)
         content_bytes = (prefix + content).encode("utf-8")
 
-        new_bytes = (
-            source_bytes[: node.start_byte]
-            + content_bytes
-            + source_bytes[node.end_byte :]
-        )
+        new_bytes = source_bytes[:start] + content_bytes + source_bytes[end:]
         self._write_bytes(new_bytes)
         return "Update successful"
 
@@ -1002,14 +1288,279 @@ class Applier:
             raise ApplierError(f"'{target}' is a {kind}, not a key-value pair")
         return entry.child_by_field_name("value"), ""
 
+    def _declared_value(self, node, target: str) -> tuple[int, int, str]:
+        """
+        For replace_value on `node`, which the source-file `target` found:
+        the bytes of the value to replace, and the text to put before the
+        new one. The value of a variable, constant or field is what follows
+        its `=` (that of the target's own declarator in `let a = 1, b = 2;`,
+        the k-th expression of a Go `var a, b = 1, 2` for its k-th name), of
+        a C/C++ macro its replacement text, and of a C++ direct
+        initialization (`int x(1);`, `int x{1};`) what is inside its
+        parentheses or braces; a closure that a key path found
+        (`app.handler`) is a value itself. A name declared without a value
+        gets one where it can have one alone: the range is empty, after its
+        name, type and C++ bit-field width, with ` = ` (for a macro, a
+        space) before the content.
+
+        Refused, with ApplierError: a symbol that is no variable, constant
+        or field (a function, class or type), a name that gets one value
+        with others (`a = b = 1`, `var a, b = f()`, `auto [a, b] = p;`), and
+        one without a value that cannot get one alone (`var a, b int`, an
+        `extern` or TS `declare` declaration, an abstract field, a field of
+        a C struct, a Go constant that the constants after it repeat, see
+        _repeating_constants). A C variable that its struct's name targets
+        with it (`struct S {...} S = {0};`) has the declaration's value.
+        """
+        ext = self.parser.ext
+        if node.type in JS_FUNCTION_VALUES + ("func_literal",):
+            return node.start_byte, node.end_byte, ""
+        shared = ApplierError(
+            f"'{target}' gets its value together with other names, so it has none of its own to replace; "
+            "rewrite the declaration with replace_function"
+        )
+
+        def cannot(reason: str) -> ApplierError:
+            return ApplierError(f"'{target}' has no value, and {reason}")
+
+        if (node.type == "expression_statement" and ext == ".py") or (node.type == "assignment" and ext == ".rb"):
+            assignment = node.named_children[0] if node.type == "expression_statement" else node
+            value = assignment.child_by_field_name("right")
+            if value is None:
+                # `x: int`
+                return assignment.end_byte, assignment.end_byte, " = "
+            if value.type in ("assignment", "augmented_assignment", "operator_assignment"):
+                raise shared
+            # The bodies of the heredocs a Ruby value opens (`X = <<~EOS`)
+            # are part of it.
+            return value.start_byte, max(value.end_byte, self._symbol_span(node)[1].end_byte), ""
+        leaf = self.parser.target_leaf(target)
+        if node.type in ("lexical_declaration", "variable_declaration") and ext in _JS_EXTS:
+            declarator = self.parser.declared_name(node, leaf).parent
+            value = declarator.child_by_field_name("value")
+            if value is not None:
+                return value.start_byte, value.end_byte, ""
+            if self._ambient(node):
+                raise cannot("a `declare` declaration cannot have one")
+            return self._added_value(declarator)
+        if node.type in ("field_definition", "public_field_definition"):
+            value = node.child_by_field_name("value")
+            if value is not None:
+                return value.start_byte, value.end_byte, ""
+            if any(c.type == "abstract" for c in node.children):
+                raise cannot("an abstract field cannot have one")
+            if any(c.type == "declare" for c in node.children) or self._ambient(node):
+                raise cannot("a `declare` declaration cannot have one")
+            return self._added_value(node)
+        if node.type in ("var_spec", "const_spec") and ext == ".go":
+            names = [c for c in node.children_by_field_name("name") if c.type == "identifier"]
+            k = next(i for i, n in enumerate(names) if self.parser.node_text(n) == leaf)
+            value = node.child_by_field_name("value")
+            if value is None:
+                if len(names) > 1:
+                    raise ApplierError(
+                        f"'{target}' is declared with other names and no values, and a value for it needs one "
+                        "for each of them; rewrite the declaration with replace_function"
+                    )
+                repeating = self._repeating_constants(node)
+                if repeating:
+                    # They repeat the expression this one repeats now.
+                    names = ", ".join(f"'{name}'" for name in repeating)
+                    one = len(repeating) == 1
+                    raise ApplierError(
+                        f"'{target}' has no value of its own: it repeats the expression of the constant above it, "
+                        f"and so {'does' if one else 'do'} {names} below it, which a value for '{target}' would "
+                        f"change too; give {names} {'its own value' if one else 'their own values'} first"
+                    )
+                return node.end_byte, node.end_byte, " = "
+            values = [c for c in value.named_children if "comment" not in c.type]
+            if len(values) != len(names):
+                raise shared
+            return values[k].start_byte, values[k].end_byte, ""
+        if node.type in ("field_declaration", "constant_declaration") and ext == ".java":
+            declarator = self.parser.declared_name(node, leaf).parent
+            value = declarator.child_by_field_name("value")
+            if value is not None:
+                return value.start_byte, value.end_byte, ""
+            return declarator.end_byte, declarator.end_byte, " = "
+        if ext in C_EXTS + CPP_EXTS:
+            unit = node.parent
+            if (
+                node.type in _C_TYPE_SPECIFIERS
+                and self.parser.parse_target(target).keyword is None
+                and unit.type in ("declaration", "field_declaration")
+                and unit.child_by_field_name("type") == node
+                and self.parser.declared_name(unit, leaf) is not None
+            ):
+                # `struct S {...} S = {0};`: the variable the name targets
+                # with its struct.
+                node = unit
+            if node.type in ("preproc_def", "preproc_function_def"):
+                value = node.child_by_field_name("value")
+                if value is not None:
+                    return value.start_byte, self._macro_value_end(value), ""
+                after = node.child_by_field_name("parameters") or node.child_by_field_name("name")
+                return after.end_byte, after.end_byte, " "
+            if node.type in ("declaration", "field_declaration") and not self._declares_c_function(node, target):
+                return self._c_declared_value(node, target, shared, cannot)
+        raise ApplierError(
+            f"'{target}' is {self._value_kind(node, target)}, which has no value (replace_value is for keys and "
+            "for the values of variables, constants and fields); rewrite it with replace_function"
+        )
+
+    def _repeating_constants(self, spec) -> list[str]:
+        """For a Go const spec without a value in a `const (...)` group, the
+        names of the specs right after it that have none either: Go gives
+        them the expression the one before them repeats (`B` and `C` of `A =
+        iota`, `B`, `C`), so a value for `spec` would be theirs too."""
+        names = []
+        sibling = spec.next_named_sibling
+        while sibling is not None and (sibling.type == "comment" or sibling.type == "const_spec"):
+            if sibling.type == "const_spec":
+                if sibling.child_by_field_name("value") is not None:
+                    break
+                names.extend(self.parser.node_text(n) for n in sibling.children_by_field_name("name"))
+            sibling = sibling.next_named_sibling
+        return names
+
+    def _added_value(self, node) -> tuple[int, int, str]:
+        """_declared_value for a JS/TS declarator or class field without a
+        value: the empty range after its code, with ` = ` before the
+        content. A TS definite assignment `!`, which a declaration with a
+        value cannot have, goes (`x!: number` gets `x: number = ...`)."""
+        end = self._code_end(node)
+        bang = next((c for c in node.children if c.type == "!"), None)
+        if bang is None:
+            return end, end, " = "
+        return bang.start_byte, end, self.parser.source_bytes[bang.end_byte : end].decode("utf-8") + " = "
+
+    def _c_declared_value(self, node, target: str, shared: ApplierError, cannot) -> tuple[int, int, str]:
+        """_declared_value for a C/C++ variable or field: the value of the
+        declarator of `node` that declares the target, or the empty range
+        after that declarator (and a C++ bit-field's width) where it has
+        none. A C++ field's declarators and default values are children of
+        the field itself, in turn."""
+        name = self.parser.declared_name(node, self.parser.target_leaf(target))
+        declarator = name
+        while declarator.parent is not None and declarator.parent != node:
+            declarator = declarator.parent
+        if node.type == "declaration":
+            if declarator.type == "init_declarator":
+                binding = declarator.child_by_field_name("declarator")
+                if binding is not None and binding.type == "structured_binding_declarator":
+                    raise shared
+                direct = not any(c.type == "=" for c in declarator.children)
+                return self._initializer(declarator.child_by_field_name("value"), direct)
+            if any(c.type == "storage_class_specifier" and self.parser.node_text(c) == "extern" for c in node.children):
+                raise cannot("an `extern` declaration takes none: the variable's definition holds its value")
+            return declarator.end_byte, declarator.end_byte, " = "
+        if self.parser.ext in C_EXTS:
+            raise cannot("a field of a C struct cannot have one")
+        value, direct, end = None, True, declarator.end_byte
+        i = next(i for i, c in enumerate(node.children) if c == declarator) + 1
+        while i < len(node.children) and node.children[i].type not in (",", ";"):
+            child = node.children[i]
+            if node.field_name_for_child(i) == "default_value":
+                value = child
+            elif child.type == "=":
+                direct = False
+            elif "comment" not in child.type:
+                # `int f : 3`
+                end = child.end_byte
+            i += 1
+        if value is not None:
+            return self._initializer(value, direct)
+        return end, end, " = "
+
+    def _initializer(self, value, direct: bool) -> tuple[int, int, str]:
+        """The range of a C/C++ initializer `value` that replace_value
+        replaces: all of it after an `=`, and what is inside the
+        parentheses or braces of a direct initialization (`x(1)`, `x{1}`),
+        without the spaces around it there."""
+        if not direct or value.type not in ("argument_list", "initializer_list"):
+            return value.start_byte, value.end_byte, ""
+        start, end = value.start_byte + 1, value.end_byte - 1
+        inner = self.parser.source_bytes[start:end]
+        if inner.strip():
+            start += len(inner) - len(inner.lstrip())
+            end -= len(inner) - len(inner.rstrip())
+        return start, end, ""
+
+    def _macro_value_end(self, value) -> int:
+        """Where the replacement text of a C/C++ macro ends: before the
+        spaces and a comment that the grammar ends its `preproc_arg` with
+        (`#define N 3 // three`), a `//` or `/*` inside a string or
+        character literal not counting."""
+        text = self.parser.source_bytes[value.start_byte : value.end_byte]
+        quote, i = None, 0
+        while i < len(text):
+            char = text[i : i + 1]
+            if quote:
+                if char == b"\\":
+                    i += 1
+                elif char == quote:
+                    quote = None
+            elif char in (b'"', b"'"):
+                quote = char
+            elif text[i : i + 2] in (b"//", b"/*"):
+                text = text[:i]
+                break
+            i += 1
+        return value.start_byte + len(text.rstrip())
+
+    @staticmethod
+    def _ambient(node) -> bool:
+        """Whether a TS declaration is inside a `declare` (ambient)
+        declaration, which gives no values: `declare let x: number;`, or a
+        member of `declare namespace N { ... }`."""
+        parent = node.parent
+        while parent is not None:
+            if parent.type == "ambient_declaration":
+                return True
+            parent = parent.parent
+        return False
+
+    def _value_kind(self, node, target: str) -> str:
+        """What replace_value calls `node`, found for `target`, a symbol
+        that has no value, with its article: a function, a class, struct,
+        union, enum, interface, namespace or Ruby module, or what
+        _symbol_kind calls a symbol of another kind (a type alias, a Go
+        type definition)."""
+        if node.type == "decorated_definition":
+            node = node.child_by_field_name("definition") or node
+        _, functions, _ = self.parser.target_types()
+        if node.type in functions or node.type in _BODILESS_FUNCTIONS or self._declares_c_function(node, target):
+            return "a function"
+        if node.type in _C_TYPE_SPECIFIERS and node.child_by_field_name("body") is None:
+            return self._symbol_kind(node, target)
+        kinds = {
+            "class_definition": "a class",
+            "class_declaration": "a class",
+            "abstract_class_declaration": "a class",
+            "class_specifier": "a class",
+            "class": "a class",
+            "record_declaration": "a class",
+            "struct_specifier": "a struct",
+            "union_specifier": "a union",
+            "enum_specifier": "an enum",
+            "enum_declaration": "an enum",
+            "interface_declaration": "an interface",
+            "namespace_definition": "a namespace",
+            "internal_module": "a namespace",
+            "module": "a module" if self.parser.ext == ".rb" else "a namespace",
+        }
+        return kinds.get(node.type) or self._symbol_kind(node, target)
+
     def replace_function_body(self, target: str, content: str) -> str:
         """
         Replace the body of a function, keeping its signature: the lines
         between its `{` and `}` lines, or the lines of a Python or Ruby body,
-        with content re-indented to the body's indentation. A body that
-        shares a line with its signature or braces (`function f() { return
-        1; }`, `def f(): return 1`) is rebuilt over lines of its own
-        (_rebuild_body).
+        with content re-indented to the body's indentation, that of its first
+        line of code or comment; an empty body (`{` and `}` on lines of their
+        own) is one indentation unit deeper than the line the function starts
+        on. A body that shares a line with its signature or braces
+        (`function f() { return 1; }`, `def f(): return 1`) is rebuilt over
+        lines of its own (_rebuild_body).
         """
         func_node, block_node = self._get_function_body_node(target)
         if self._body_shares_line(func_node, block_node):
@@ -1024,11 +1575,16 @@ class Applier:
             start_line = block_node.start_point[0] + 1
             end_line = block_node.end_point[0]
 
-        target_indent = self._get_indent(self.lines[start_line]) if start_line < len(self.lines) else ""
-        if not target_indent and start_line < len(self.lines) and self.lines[start_line].strip() == "":
-             sig_indent = self._get_indent(self.lines[func_node.start_point[0]])
-             default_indent = "    " if self.parser.ext in (".py", ".rb", ".java") else "  "
-             target_indent = sig_indent + default_indent
+        # The body's indentation is that of its first line with code or a
+        # comment; an empty body (`{` and `}` on lines of their own, maybe
+        # with blank lines between them) is one level deeper than the line
+        # the function starts on.
+        first = next((line for line in self.lines[start_line:end_line] if line.strip()), None)
+        if first is not None:
+            target_indent = self._get_indent(first)
+        else:
+            unit = self._indent_unit({".py": "    ", ".java": "    ", ".go": "\t"}.get(self.parser.ext, "  "))
+            target_indent = self._get_indent(self.lines[func_node.start_point[0]]) + unit
 
         content_lines = self._reindent(_content_lines(content), target_indent)
 
@@ -1096,7 +1652,7 @@ class Applier:
         if ext == ".py":
             self._write_bytes(src[:opening] + b"\n" + text + src[body.end_byte :])
             return "Update successful"
-        close = func_node.children[-1].start_byte if ext == ".rb" else body.end_byte - 1
+        close = func_node.children[-1].start_byte if ext == ".rb" else self._code_end(body) - 1
         line_end = src.find(b"\n", opening)
         code = next((c for c in body.named_children if "comment" not in c.type), None)
         if 0 <= line_end < close and (code is None or code.start_byte > line_end):
@@ -1113,10 +1669,7 @@ class Applier:
           - Go: as a top-level sibling immediately after the type declaration
                 (Go methods are not lexically inside struct definitions).
         """
-        node = self.parser.find_node_by_name(class_target)
-        if not node:
-            raise ApplierError(f"Target class '{class_target}' not found")
-        self._refuse_ts_non_class(class_target, node)
+        node = self._class_target(class_target)
         node = self._typedef_struct(node)
 
         # Go: methods live outside the struct. Insert after the enclosing type_declaration.
@@ -1145,20 +1698,24 @@ class Applier:
         """
         Delete a function/class/method definition. By default also removes the
         contiguous leading comment block (Godoc, Javadoc, `#` comments, `//`
-        comments, or C-style `/* ... */` blocks) directly above the symbol --
-        pass `include_leading_comments=False` to keep that comment in place.
-        The blank lines that separated the symbol from its neighbours go with
-        it (see _separator_lines). A symbol that shares a line with other
-        code is cut out of it (_delete_inline). A name declared together
-        with others (`int a, *b;`) is refused, as the declaration would go
-        with them (_declared_with).
+        comments, C-style `/* ... */` blocks or a Ruby `=begin` document)
+        directly above the symbol -- pass `include_leading_comments=False` to
+        keep that comment in place. The comment lines right below the symbol
+        that are indented deeper than it, which end its code, go with it
+        (_rows_below). The blank lines that separated the symbol from its
+        neighbours go with it (see _separator_lines). A symbol that shares a
+        line with other code is cut out of it (_delete_inline). A name
+        declared together with others (`int a, *b;`) is refused, as the
+        declaration would go with them (_declared_with). In a JSON, YAML or
+        TOML file it is refused for delete_key (_refuse_config).
         """
+        self._refuse_config("delete_symbol", target, f"delete_key to remove '{target}' with its value")
         node = self.parser.find_node_by_name(target)
         if not node:
             raise ApplierError(f"Target '{target}' not found")
         others = self._declared_with(node, target)
         if others:
-            name = target.split(".")[-1]
+            name = self.parser.target_leaf(target)
             quoted = [f"'{other}'" for other in others]
             listed = quoted[0] if len(quoted) == 1 else f"{', '.join(quoted[:-1])} and {quoted[-1]}"
             raise ApplierError(
@@ -1176,7 +1733,7 @@ class Applier:
         if before or after:
             return self._delete_inline(first, last, separator, before, after, include_leading_comments)
         start_line = first.start_point[0]
-        end_line = self._last_row(last) + 1
+        end_line = self._rows_below(first, last, separator)
 
         if include_leading_comments:
             comment_range = self._find_leading_comment_range(start_line)
@@ -1206,8 +1763,9 @@ class Applier:
             names.insert(0, tag)
         if len(names) < 2:
             return []
-        own = self.parser.declared_name(declaration, target.split(".")[-1])
-        name = self.parser.symbol_name(own) if own is not None else target.split(".")[-1]
+        leaf = self.parser.target_leaf(target)
+        own = self.parser.declared_name(declaration, leaf)
+        name = self.parser.symbol_name(own) if own is not None else leaf
         if name in names:
             names.remove(name)
         return names
@@ -1240,7 +1798,9 @@ class Applier:
         """
         if not others:
             return
-        prefix = target[: len(target) - len(target.split(".")[-1])]
+        # The others are in the target's container, its keyword and
+        # parameter types not theirs.
+        prefix = "".join(part + "." for part in self.parser.parse_target(target).parts[:-1])
         parser = self.parser
         saved = parser.tree, parser.source_bytes
         lost = []
@@ -1256,7 +1816,7 @@ class Applier:
             parser.tree, parser.source_bytes = saved
         if not lost:
             return
-        name = target.split(".")[-1]
+        name = self.parser.target_leaf(target)
         quoted = [f"'{other}'" for other in lost]
         listed = quoted[0] if len(quoted) == 1 else f"{', '.join(quoted[:-1])} and {quoted[-1]}"
         raise ApplierError(
@@ -1285,7 +1845,7 @@ class Applier:
         """
         src = self.parser.source_bytes
         start = first.start_byte
-        end = last.end_byte if separator is None else separator.end_byte
+        end = self._code_end(last) if separator is None else separator.end_byte
         # The `;` or `,` before the symbol goes with it when no separator of
         # its own parts it from what follows it: the rest of its line, or the
         # `}` or `)` closing the code it is part of.
@@ -1329,6 +1889,36 @@ class Applier:
                 head = src[:comment_start] + src[line_start:start]
         self._write_bytes(head + gap + src[end:])
         return "Update successful"
+
+    def _rows_below(self, first, last, separator) -> int:
+        """
+        The line after the last line of the symbol first..last (with the
+        `;` or `,` that ends it, `separator`, or None), for the edits that
+        take its lines or add lines below it (delete_symbol, insert_sibling
+        "after"): after the line it ends on, a block comment after it there
+        that goes on over lines (`int x; /* a\\n b */`), and the comment lines
+        right below it that are indented deeper than its first line. Those
+        end its code, as the Python grammar makes such comments the end of
+        the body above them; a blank line, a line with code and a comment at
+        the symbol's own indentation or less end them.
+        """
+        end = separator if separator is not None and separator.start_point[0] == last.end_point[0] else last
+        row = max(self._last_row(last), self._trailing_comment(end)[1]) + 1
+        indent = self._get_indent(self.lines[first.start_point[0]])
+        src, root = self.parser.source_bytes, self.parser.tree.root_node
+        while row < len(self.lines):
+            line = self.lines[row]
+            if not line.strip(" \t") or not self._indented_deeper(line, indent):
+                break
+            column = len(line[: len(line) - len(line.lstrip())].encode("utf-8"))
+            node = root.descendant_for_point_range((row, column), (row, column))
+            if node is None or "comment" not in node.type:
+                break
+            line_end = src.find(b"\n", node.end_byte)
+            if src[node.end_byte : len(src) if line_end < 0 else line_end].strip():
+                break
+            row = node.end_point[0] + 1
+        return row
 
     def _separator_lines(self, first, last, start_line: int, end_line: int) -> tuple[int, int]:
         """
@@ -1407,7 +1997,8 @@ class Applier:
         """
         Single exit point for every edit (_save and _write_bytes both end
         here): normalise line endings, refuse a result that would not parse,
-        then write the file in its own newline style and refresh the parser.
+        then write the file in its own newline style, its last line without
+        a line break when the file's had none, and refresh the parser.
         """
         # Internal text is LF (see TreeSitterParser); caller-provided content
         # may still carry CRLF.
@@ -1425,6 +2016,10 @@ class Applier:
             # this instance still mirrors the untouched file.
             self.lines = _split_lines(self.parser.source_code)
             raise
+        if not self.parser.final_newline:
+            # The file's last line had no line break (see TreeSitterParser),
+            # and the new last line gets none either.
+            new_source = new_source[:-1]
         if self.parser.newline != "\n":
             new_source = new_source.replace("\n", self.parser.newline)
         if bom:
@@ -1566,7 +2161,14 @@ class Applier:
           - Ruby:   "require 'foo'" or "require_relative 'bar'"
           - Java:   "import java.util.List;"
         Skips insertion if an identical import already exists.
-        Places the new import after existing imports, or at the top of the file if none exist.
+        Places the new import on the line after the last existing one (a
+        C/C++ conditional that only includes counts as one, and so do the
+        includes inside a header's include guard and a JS CommonJS
+        `require`, see _is_import). A first import goes
+        after the preamble (_find_preamble_end: a package clause, `#!` and
+        magic comments, a module docstring, 'use strict', `#pragma once`,
+        an include guard's `#define`), with a blank line between them and
+        one (two before a Python def or class) before the code after it.
         """
         valid_types = self._import_node_types()
         if not valid_types:
@@ -1585,23 +2187,32 @@ class Applier:
             if line.strip() == stripped:
                 return "Import already exists -- no change made"
 
-        last_import_end = -1
-        for child in self.parser.tree.root_node.named_children:
-            if child.type not in valid_types:
-                continue
-            # Ruby: filter "call" to only require/require_relative calls
-            if self.parser.ext == ".rb" and child.type == "call":
-                if not self._is_ruby_require_call(child):
-                    continue
-            if child.end_point[0] > last_import_end:
-                last_import_end = child.end_point[0]
+        imports = [c for c in self._top_level_nodes() if self._is_import(c)]
+        if imports:
+            # After the line the last import ends on (an #include ends
+            # with its line break).
+            insert_line = max(self._last_row(c) for c in imports) + 1
+            self.lines = self.lines[:insert_line] + [import_text] + self.lines[insert_line:]
+            return self._save()
 
-        if last_import_end >= 0:
-            insert_line = last_import_end + 1
-        else:
-            insert_line = 0
-
-        self.lines = self.lines[:insert_line] + [import_text] + self.lines[insert_line:]
+        # The first import: after the preamble, a blank line on each side.
+        at = self._find_preamble_end()
+        before, after = self.lines[:at], self.lines[at:]
+        blank = 0
+        while blank < len(after) and not after[blank].strip():
+            blank += 1
+        rest = after[blank:]
+        gap = 0
+        if rest:
+            nodes = self.parser.tree.root_node.named_children
+            code = next((c for c in nodes if c.start_point[0] >= at and "comment" not in c.type), None)
+            pep8 = self.parser.ext == ".py" and code is not None and code.type in (
+                "function_definition",
+                "class_definition",
+                "decorated_definition",
+            )
+            gap = max(blank, 2 if pep8 else 1)
+        self.lines = before + ([""] if before else []) + [import_text] + [""] * gap + rest
         return self._save()
 
     def _find_go_import_block(self):
@@ -2674,7 +3285,8 @@ class Applier:
         one on a line of its own goes with that line, a comment at its end
         included (comments on other lines stay), and a last element with no
         comma after it takes the comma before it. A YAML block sequence item
-        goes with its lines.
+        goes with its lines; the only one leaves `[]` after its key
+        (_empty_yaml_sequence).
         """
         ext = self.parser.ext
         if ext == ".py":
@@ -2738,28 +3350,58 @@ class Applier:
                     f"Value '{value_match}' not found in YAML sequence at '{target}'"
                 )
             start_line = items[match_idx].start_point[0]
-            end_line = items[match_idx].end_point[0] + 1
+            end_line = self._last_row(items[match_idx]) + 1
+            if len(items) == 1:
+                # The only item: the sequence becomes an empty flow sequence
+                # after its key's `:` (or its anchor or tag), as a value of
+                # its own (no value would be null).
+                return self._empty_yaml_sequence(collection, start_line, end_line)
             self.lines = self.lines[:start_line] + self.lines[end_line:]
             return self._save()
 
         raise ApplierError(f"remove_from_array is not supported for {ext}")
 
+    def _empty_yaml_sequence(self, seq, start_line: int, end_line: int) -> str:
+        """
+        For remove_from_array: remove the lines [start_line, end_line) of the
+        only item of the YAML block sequence `seq`, and write `[]` after the
+        code its value follows (`a:` gives `a: []`, `a: &x` gives `a: &x
+        []`), so that the key keeps an empty sequence rather than becoming
+        null. A comment after that code stays after the `[]`, and comment
+        lines between the key and the item stay where they are. A sequence
+        with no code before it (a document's root) loses the item's lines.
+        """
+        before = seq
+        while before is not None:
+            prev = before.prev_sibling
+            while prev is not None and "comment" in prev.type:
+                prev = prev.prev_sibling
+            if prev is not None:
+                break
+            before = before.parent
+        lines = self.lines[:start_line] + self.lines[end_line:]
+        if before is not None:
+            row, column = prev.end_point
+            line = lines[row]
+            at = len(line.encode("utf-8")[:column].decode("utf-8"))
+            lines[row] = line[:at] + " []" + line[at:]
+        self.lines = lines
+        return self._save()
+
     def add_field(self, class_target: str, content: str) -> str:
         """
         Add a field/attribute/member at the top of a class body (fields-before-methods
         convention): before its first member, but after a Python class
-        docstring or a Java enum's constants. Indentation and spacing as for
-        add_method (_insert_member).
+        docstring, a Java enum's constants or the access label a C++ class
+        body opens with. Indentation and spacing as for add_method
+        (_insert_member).
 
         Design decision: option (a) -- the caller provides the literal text to insert.
         The tool does NOT auto-wrap in language-specific constructs (e.g. no implicit
         `attr_accessor :foo` for Ruby, no implicit type inference for Go). Pass exactly
         what you want to appear in the source.
         """
-        node = self.parser.find_node_by_name(class_target)
-        if not node:
-            raise ApplierError(f"Target class '{class_target}' not found")
-        self._refuse_ts_non_class(class_target, node)
+        node = self._class_target(class_target)
         node = self._typedef_struct(node)
 
         # Go: field goes inside the struct_type's braces (which live inside type_spec)
@@ -2781,6 +3423,30 @@ class Applier:
             raise ApplierError(f"Could not find class body for '{class_target}'")
         return self._insert_member(class_target, node, body, content, at_end=False)
 
+    def _class_target(self, class_target: str):
+        """
+        For add_method and add_field: the container `class_target` names
+        (TreeSitterParser.find_container: a struct rather than a function
+        or variable of its name). A target that names no container is
+        refused: a function, whose body insert_in_body adds to, and a TS
+        enum or type alias (_refuse_ts_non_class).
+        """
+        node = self.parser.find_container(class_target) or self.parser.find_node_by_name(class_target)
+        if not node:
+            raise ApplierError(f"Target class '{class_target}' not found")
+        self._refuse_ts_non_class(class_target, node)
+        functions = self._interface_func_types() | set(_BODILESS_FUNCTIONS)
+        if (
+            node.type in functions
+            or self._callable(node, class_target) is not node
+            or self._declares_c_function(node, class_target)
+        ):
+            raise ApplierError(
+                f"'{class_target}' is a function, not a class, so add_method and add_field cannot add to it; "
+                "add to its body with insert_in_body"
+            )
+        return node
+
     def _refuse_ts_non_class(self, class_target: str, node) -> None:
         """
         For add_method and add_field: refuse a TS enum or type alias. They
@@ -2796,17 +3462,16 @@ class Applier:
             )
 
     @staticmethod
-    def _typedef_struct(node):
+    def _typedef_struct(node, enums: bool = False):
         """For add_method and add_field: the struct, union or class that a
         C/C++ typedef found for the target defines (`typedef struct {...}
-        P;`), whose body holds the typedef's members; else node itself."""
+        P;`), whose body holds the typedef's members; else node itself. With
+        `enums`, an enum too (`typedef enum {...} E;`), which the signature
+        and interface depths read the typedef as."""
         if node.type == "type_definition":
             spec = node.child_by_field_name("type")
-            if (
-                spec is not None
-                and spec.type in ("class_specifier", "struct_specifier", "union_specifier")
-                and spec.child_by_field_name("body") is not None
-            ):
+            kinds = ("class_specifier", "struct_specifier", "union_specifier") + (("enum_specifier",) if enums else ())
+            if spec is not None and spec.type in kinds and spec.child_by_field_name("body") is not None:
                 return spec
         return node
 
@@ -2816,7 +3481,9 @@ class Applier:
         holds (None for an empty Ruby class): after the last member for
         add_method (at_end=True), else before the first one, but after a
         Python class docstring, for add_field. A Java enum's members are
-        those after its constants, which stay first (_java_enum_members).
+        those after its constants, which stay first (_java_enum_members),
+        and a C++ body that opens with an access label (`public:`) has the
+        field below it, in the first member's section (_insert_under_label).
 
         The content is re-indented like the class's existing members (see
         _member_indent), keeping its own relative indentation (content in
@@ -2904,9 +3571,12 @@ class Applier:
         indent = member_indent.encode("utf-8")
         text = "\n".join(lines).encode("utf-8")
         following = next((m for m in members if not self._is_aside(m)), None)
-        gap = b"\n" if not at_end and following is not None and following.type in method_types else b""
+        gap = b"\n" if not at_end and following is not None and self._is_method(following, method_types) else b""
         constants = src[open_b + 1 : start].strip()
-        if (body.start_point[0] == body.end_point[0] and (members or constants)) or (semi and not constants):
+        label = next((m for m in members if "comment" not in m.type), None)
+        if not at_end and label is not None and label.type == "access_specifier":
+            new = self._insert_under_label(body, members, label, text, method_types, class_indent, indent)
+        elif (body.start_point[0] == body.end_point[0] and (members or constants)) or (semi and not constants):
             # A body on one line (or an enum with no constants) is rebuilt
             # over several lines: the enum constants (or a lone `;`), the
             # existing members and the new one each on their own.
@@ -2976,6 +3646,48 @@ class Applier:
         self._write_bytes(new)
         return "Update successful"
 
+    def _insert_under_label(self, body, members, label, text: bytes, method_types, class_indent: bytes, indent: bytes) -> bytes:
+        """
+        add_field's new source for the C++ class body `body` whose first
+        member is an access label (`public:`), `label`: the field, `text`
+        (indented already), goes below the label, before the members of its
+        section, so that it gets their access rather than the class's
+        default. Comments after the label on its line stay there, and a
+        blank line goes after the field when a method follows it directly.
+        A member (or the `}`) on the label's line moves to a line of its own
+        below the field, and a body on one line is rebuilt over several, the
+        label on a line of its own at the class's indentation.
+        """
+        src = self.parser.source_bytes
+        close_b = body.end_byte - 1
+        colon = label.next_sibling
+        end = colon.end_byte if colon is not None and colon.type == ":" else label.end_byte
+        rest = [m for m in members if m.start_byte >= end]
+        following = next((m for m in rest if not self._is_aside(m)), None)
+        gap = b"\n" if following is not None and self._is_method(following, method_types) else b""
+        if body.start_point[0] == body.end_point[0]:
+            existing = src[end:close_b].strip()
+            parts = [class_indent + src[label.start_byte : end], text]
+            if existing:
+                parts += [b""] * len(gap) + [indent + existing]
+            return src[: body.start_byte + 1] + b"\n" + b"\n".join(parts) + b"\n" + class_indent + src[close_b:]
+        n, row = 0, label.start_point[0]
+        while n < len(rest) and "comment" in rest[n].type and rest[n].start_point[0] == row:
+            row = rest[n].end_point[0]
+            n += 1
+        after = rest[n - 1].end_byte if n else end
+        nl = src.find(b"\n", after)
+        if n < len(rest) and rest[n].start_point[0] == row:
+            # A member follows the label on its line.
+            return src[:after] + b"\n" + text + b"\n" + gap + indent + src[after:].lstrip(b" \t")
+        if not 0 <= nl < close_b:
+            # The `}` follows the label on its line.
+            return src[:after] + b"\n" + text + b"\n" + class_indent + src[after:].lstrip(b" \t")
+        pos = nl + 1
+        if n < len(rest) and b"\n" in src[pos : rest[n].start_byte]:
+            gap = b""
+        return src[:pos] + text + b"\n" + gap + src[pos:]
+
     def _java_enum_members(self, body):
         """
         Where the members of the Java enum `body` start, as (byte, semi,
@@ -3033,11 +3745,15 @@ class Applier:
         src = self.parser.source_bytes
         return not src[src.rfind(b"\n", 0, byte) + 1 : byte].strip()
 
-    @staticmethod
-    def _is_aside(node) -> bool:
+    def _is_aside(self, node) -> bool:
         """Class-body nodes that are not members of their own: comments,
-        decorators (TS puts a method's beside it) and C++ access labels."""
-        return node.type in ("decorator", "access_specifier") or "comment" in node.type
+        decorators (TS puts a method's beside it), C++ access labels and
+        Ruby Sorbet signatures (`sig { void }`, part of the method below)."""
+        return (
+            node.type in ("decorator", "access_specifier")
+            or "comment" in node.type
+            or self._is_sorbet_signature(node)
+        )
 
     def _member_indent(self, node, members) -> str:
         """
@@ -3060,8 +3776,9 @@ class Applier:
     def _method_gap(self, body, members, method_types) -> int:
         """
         Blank lines (0 or 1) to put between a new method and the member
-        before it, the way the class separates its methods: 1 if any method
-        has a blank line between it (or its decorators and leading comment)
+        before it, the way the class separates its methods (C++ member
+        templates included, _is_method): 1 if any method has a blank line
+        between it (or its decorators, Sorbet signature and leading comment)
         and the member before it, 0 if there are such pairs and none does.
         A class with no such pair gets 1, a TS interface 0, as interface
         members are usually written one per line. A method added right
@@ -3073,7 +3790,7 @@ class Applier:
         code = [m for m in members if not self._is_aside(m)]
         stacked = False
         for prev, cur in zip(code, code[1:]):
-            if cur.type not in method_types:
+            if not self._is_method(cur, method_types):
                 continue
             start = self._symbol_span(cur)[0].start_point[0]
             if any(not line.strip() for line in self.lines[prev.end_point[0] + 1 : start]):
@@ -3082,6 +3799,12 @@ class Applier:
         if stacked:
             return 0
         return 0 if body.type == "interface_body" and self.parser.ext in _JS_EXTS else 1
+
+    def _is_method(self, node, method_types) -> bool:
+        """Whether the class member `node` is a method, one of method_types:
+        a C++ member template is what its `template <...>` declares."""
+        entity = self._template_entity(node)
+        return entity is not None and entity.type in method_types
 
     def replace_signature(self, target: str, new_signature: str) -> str:
         """
@@ -3102,6 +3825,15 @@ class Applier:
         For a JS/TS function bound to a name, a new_signature that starts
         with const/let/var (`const f = (x) =>`) replaces the declaration's
         head as well, and one that does not (`(x) =>`) only the function's.
+        So does the other code that starts the signature as
+        read_symbol(depth="signature") reads it (_signature_head): a
+        new_signature that starts with a key (`handler: (x) =>`, `RunE:
+        func() error`), with something else than `def` for a Ruby `private
+        def`, or with the first word of that code (`declare`, `extern`,
+        `typedef`, a Go `type`) replaces it, and one without keeps it
+        (_brings_head). A typedef of a struct without a tag has the header
+        of its struct (`typedef struct`). A Ruby endless method's signature
+        ends before its `=`.
         A method declared without a body (a TS abstract method, a Java
         interface or abstract method, a C++ `A() = default;`, a Go function
         without one, a C/C++ prototype or a method declared in its class)
@@ -3115,7 +3847,7 @@ class Applier:
         if not node:
             raise ApplierError(f"Target '{target}' not found in {self.filepath}")
 
-        func_node = self._callable(node, target)
+        func_node = self._typedef_struct(self._callable(node, target), enums=True)
 
         body = func_node.child_by_field_name("body")
         header = self._header_span(func_node) if body is None else None
@@ -3137,11 +3869,7 @@ class Applier:
         # signature but the `;` that ends it, and a class the grammar gives
         # no body (a Go struct, an empty Ruby class) its header, as
         # _get_signature reads them.
-        sig_end = func_node.start_byte
-        for child in func_node.children:
-            if child == body:
-                break
-            sig_end = child.end_byte
+        sig_end = self._signature_end(func_node, body)
         if header is not None:
             sig_end = header[1]
         elif body is None:
@@ -3186,10 +3914,7 @@ class Applier:
         # the span back over them; Java annotations (in `modifiers`) and JS
         # decorators are inside it, so keeping them narrows the span.
         replace_from, kept = func_node.start_byte, ""
-        if header is not None:
-            # From a Go type's `type`, as _header_without_body reads it.
-            replace_from = header[0]
-        elif func_node is not node and node.type in ("lexical_declaration", "variable_declaration"):
+        if func_node is not node and node.type in ("lexical_declaration", "variable_declaration"):
             # A JS/TS function bound to a name: `const f = (x) =>`, as
             # read_symbol(depth="signature") gives it, replaces the
             # declaration's head too; `(x) =>` only the function's own.
@@ -3210,6 +3935,21 @@ class Applier:
                 prev = prev.prev_named_sibling
         else:
             replace_from, kept = self._annotation_span(func_node)
+        # The code that wraps the function and starts its signature as
+        # read_symbol(depth="signature") reads it (a Go `type`, a closure's
+        # key, a TS `declare`, a C++ `extern "C"`, a Ruby `private`, a C
+        # typedef) stays unless new_signature brings its own.
+        head = self._signature_head(node, func_node)
+        if (
+            head is not func_node
+            and head.type not in ("lexical_declaration", "variable_declaration", "template_declaration")
+            and self._brings_head(head, func_node, new_signature)
+        ):
+            replace_from, kept = head.start_byte, ""
+        # So does a Ruby method's Sorbet signature, as decorators do.
+        sig = self._sorbet_signature(func_node) if self.parser.ext == ".rb" else None
+        if sig is not None and re.match(r"sig\b\s*(?:[({]|do\b)", new_signature.lstrip()):
+            replace_from, kept = sig.start_byte, ""
 
         source_bytes = self.parser.source_bytes
         new_bytes = (
@@ -3294,9 +4034,16 @@ class Applier:
         and modules. Read-only. Output is a multi-line string: one entry per
         line, formatted as `<kind> <name> (line N)`, the name being the
         symbol's target (`A.B.m`), each member indented two spaces deeper
-        than its container (see _list_scope). In JS/TS, generator functions
-        and a `const`/`let`/`var` that declares one name bound to an arrow
-        function or function expression are functions; TS abstract classes
+        than its container (see _list_scope). Data is listed in every
+        language: a Python module-level name is a `variable` and a class
+        attribute a `field` (one assigned again is listed once), a JS/TS
+        `const` a `constant` and a `let` or `var` a `variable`, each name of
+        it, a JS/TS class field a `field`, a Ruby constant a `constant` and
+        a Ruby local a `variable`; names that a pattern binds (`a, b = 1,
+        2`), which are no targets, and fields named by a string or computed
+        key are not listed. In JS/TS, generator functions and each name of a
+        `const`/`let`/`var` bound to an arrow function or function
+        expression are functions; TS abstract classes
         are classes (their abstract methods listed with the other methods,
         an overloaded one once), enums, type aliases, interfaces and
         namespaces are `enum`, `type`, `interface` and `namespace`, and a
@@ -3311,15 +4058,20 @@ class Applier:
         declarations of one name in a scope, the target's are listed
         (_list_scope): a definition rather than what only announces it
         (`struct S;`, a prototype, an `extern` variable, a TS overload
-        signature), which is listed once when the scope has no definition
-        of it. C++ templates (functions, classes and member
-        templates) are listed as what they declare, at the line of their
-        `template <...>` header; a definition outside its class (`int
-        A::f()`) is a function under its own name, and destructors and
-        operators are named `~A`, `operator==`, `operator bool`. Java fields
-        are fields (but one that shares its name with a method, which the
-        name targets), and Ruby methods include `private def` ones and those
-        in `class << self`. Go has its own listing (_list_symbols_go).
+        signature, a Python @overload stub), which is listed once when the
+        scope has no definition of it. In C, C++, Java, JS and TS each entry
+        is listed under the target that finds it (_listed_names): C++ and
+        Java overloads with their parameter types (`A.m(int)`), a method
+        beside a field of its name too (`A.x()`), and a C/C++ tag or TS type
+        that shares its name with another symbol after its keyword (`struct
+        stat`, `type User`), so that the line reads `struct struct stat`.
+        C++ templates (functions, classes and member templates) are listed
+        as what they declare, at the line of their `template <...>` header;
+        a definition outside its class is a function under its qualified
+        name (`A::f`, `A::A`), and destructors and operators are named `~A`,
+        `operator==`, `operator bool`. Java fields are fields, and Ruby
+        methods include `private def` ones and those in `class << self`. Go
+        has its own listing (_list_symbols_go).
         """
         ext = self.parser.ext
         root = self.parser.tree.root_node
@@ -3340,18 +4092,26 @@ class Applier:
         file's root, a class, namespace or module body, or the blocks of a
         merged namespace (below). `prefix` (`A.`) goes before their names,
         each entry is indented two spaces per `depth`, and each container is
-        followed by its own members. Of the entries for one name
-        (_list_entries), only those of the rank the target has
-        (TreeSitterParser.definition_rank) are listed: a definition rather
-        than what announces it (`struct S;`, a prototype, an `extern`
-        variable), a struct rather than a typedef of its name, a Java method
-        rather than the field it shares its name with, a TS class, function
-        or enum rather than the namespace merged with it; and of
-        declarations that only announce, the first, as of the alternatives
-        in a C/C++ preprocessor conditional (`#ifdef X` ... `#else` ...
-        `#endif`, see _in_conditional). A namespace opened more
-        than once in a scope, or merged with a TS class, function or enum,
-        is listed once, as what its name targets, with the members of all of
+        followed by its own members. In C, C++, Java, JS and TS each entry
+        is listed under the target that finds it (_listed_names), and one
+        that no target finds is left out: a declaration that only announces
+        a definition (`struct S;`, a prototype, an `extern` variable, a TS
+        overload signature), a second alternative in a C/C++ preprocessor
+        conditional (`#ifdef X` ... `#else` ... `#endif`), a repeated
+        declaration, a TS setter beside its getter, a JS/TS class field
+        beside a method of its name; the members of the one container of a
+        name that something else takes (a Java class and a field of its
+        name) are still listed, at its depth, as they are found through it.
+        A TS interface merged with a class and a namespace lists no members
+        of its own, theirs being under the first. In Python and Ruby, of
+        the entries for one name (_list_entries), those of the rank the
+        target has (TreeSitterParser.definition_rank) are listed, the first
+        of them once when they only announce it (Python @overload stubs);
+        a name defined again is listed again, but a name assigned again
+        (`X = 1` ... `X = 2`, or after a def of its name) is not, as its
+        name targets the first. A namespace opened more than
+        once in a scope, or merged with a TS class, function or enum, is
+        listed once, as what its name targets, with the members of all of
         its blocks (TreeSitterParser.merged_containers).
         """
         entries = [
@@ -3364,37 +4124,100 @@ class Applier:
             best[name] = min(best.get(name, rank), rank)
             if body is not None:
                 bodies.setdefault(name, []).append((body, kind != "namespace"))
+        targeted = self.parser.ext in C_EXTS + CPP_EXTS + _JS_EXTS + (".java",)
+        shown = self._listed_names(entries, [scope for scope, _ in scopes]) if targeted else None
         listed = set()
-        for kind, name, node, rank, body in entries:
-            if rank > best[name] or (
-                name in listed and (rank == 2 or name in merged or self._in_conditional(node))
+        for i, (kind, name, node, rank, body) in enumerate(entries):
+            if shown is not None:
+                if shown[i] is None:
+                    if body is not None and name not in merged and not any(
+                        j != i and e[1] == name and e[4] is not None for j, e in enumerate(entries)
+                    ):
+                        # The one container of a name that something else
+                        # takes (a Java field and a class of its name): its
+                        # members are found through it (`A.B.m`).
+                        self._list_scope([(body, kind != "namespace")], f"{prefix}{name}.", depth, out)
+                    continue
+                keyword, label = shown[i]
+                label = f"{keyword} {prefix}{label}" if keyword is not None else f"{prefix}{label}"
+            elif rank > best[name] or (
+                name in listed and (rank == 2 or name in merged or kind in ("variable", "field", "constant"))
             ):
                 continue
+            else:
+                label = f"{prefix}{name}"
             listed.add(name)
             line = self._symbol_span(node)[0].start_point[0] + 1
-            out.append(f"{'  ' * depth}{kind} {prefix}{name} (line {line})")
+            out.append(f"{'  ' * depth}{kind} {label} (line {line})")
             if name in merged:
-                members = bodies.get(name, [])
+                # Under the first entry of the name only (a TS interface
+                # merged with them too is listed apart, without them).
+                members = bodies.pop(name, [])
             else:
                 members = [(body, kind != "namespace")] if body is not None else []
             if members:
                 self._list_scope(members, f"{prefix}{name}.", depth + 1, out)
 
-    @staticmethod
-    def _in_conditional(node) -> bool:
-        """Whether a C/C++ declaration sits in a preprocessor conditional of
-        its scope, where a name defined again is an alternative (`#ifdef X`
-        ... `#else` ... `#endif`) that its target never reaches."""
-        parent = node.parent
-        while parent is not None and parent.type not in (
-            "translation_unit",
-            "declaration_list",
-            "field_declaration_list",
-        ):
-            if parent.type in _PREPROC_CONDITIONALS:
-                return True
-            parent = parent.parent
-        return False
+    def _listed_names(self, entries: list, scopes: list) -> list:
+        """
+        For the list_symbols entries of one container (_list_entries tuples)
+        declared in `scopes`, the target each is listed under, as (keyword or
+        None, last part), or None for one that no target finds: its name
+        when that finds it (a C++ definition outside its class by its
+        qualified name, `A::A`); else, for a C/C++ tag or TS type, its name
+        after its keyword (`struct stat`, `type User`); else, for a C, C++
+        or Java function that its name does not find another declaration
+        of (an overload, a method beside a field of its name), its name with
+        its parameter types (`m(int)`), and its C++ qualifiers when those
+        tell it apart (`get(int) const`). The declarations weighed are those
+        TreeSitterParser.select picks a target among, so each name targets
+        its entry. An entry that is no such declaration (an anonymous
+        `export default`) is listed under its name, once.
+        """
+        parser = self.parser
+        class_types, func_types, var_types = parser.target_types()
+        types = class_types + func_types + var_types
+        declared_in = set(scopes) | {parser._scope(node) for _kind, _name, node, _rank, _body in entries}
+        found = parser.scope_declarations(sorted(declared_in, key=lambda s: s.start_byte), types)
+        shown, taken = [], set()
+        for _kind, name, node, _rank, _body in entries:
+            own = next((c for c in found.get(name, []) if c.node == node), None)
+            if own is None:
+                label = None if (None, name) in taken else (None, name)
+            else:
+                label = self._listed_target(own, found[name])
+            if label is not None:
+                taken.add(label)
+            shown.append(label)
+        return shown
+
+    def _listed_target(self, own, found: list):
+        """_listed_names for the declaration `own` among `found`, the
+        declarations of its name in its scope (TreeSitterParser.Candidate
+        tuples)."""
+        parser = self.parser
+
+        def finds(keyword, params, qualifiers):
+            try:
+                return parser.select(found, Target("", keyword, [""], own.names, params, qualifiers))
+            except ApplierError:
+                return None
+
+        name = "::".join(own.names)
+        alone = finds(None, None, None)
+        if alone == own.node:
+            return None, name
+        if own.keyword is not None and finds(own.keyword, None, None) == own.node:
+            return own.keyword, name
+        typed = parser.ext in C_EXTS + CPP_EXTS + (".java",)
+        if not (own.function and typed) or any(c.node == alone and c.function for c in found):
+            return None
+        label = f"{name}({', '.join(own.params)})"
+        if finds(None, own.key, None) == own.node:
+            return None, label
+        if own.qualifiers and finds(None, own.key, own.qualifiers) == own.node:
+            return None, f"{label} {own.qualifiers}"
+        return None
 
     def _scope_members(self, scope):
         """The nodes that list_symbols looks at in `scope`, in document
@@ -3431,6 +4254,10 @@ class Applier:
         the body holding its members (else None). Wrappers (a JS/TS `export`
         or `declare`, a Python decorator, a C++ template, a Ruby `private`)
         are looked through. A function is a `method` in a class or module.
+        Data is a `variable`, `constant` or `field`, as in C/C++ and Go: a
+        Python assignment to a name (a `field` in a class), each name of a
+        JS/TS `const` (a `constant`) or `let`/`var` (bound to a function, a
+        function), a JS/TS class field, a Ruby constant or local.
         """
         parser, ext = self.parser, self.parser.ext
         function = "method" if in_class else "function"
@@ -3458,17 +4285,16 @@ class Applier:
             if definition.type == "class_definition":
                 node = definition
             else:
+                # An @overload stub ranks below its implementation.
                 name = definition.child_by_field_name("name")
-                return [(function, parser.node_text(name), node, 0, None)] if name is not None else []
+                return [(function, parser.node_text(name), node, parser.definition_rank(node, name), None)] if name is not None else []
         if node.type == "template_declaration":
             node = self._template_entity(node) or node
         if ext == ".rb" and node.type == "call":
             # `private def m`
-            arguments = node.child_by_field_name("arguments")
-            methods = [c for c in arguments.named_children if "comment" not in c.type] if arguments is not None else []
-            if len(methods) != 1 or methods[0].type not in ("method", "singleton_method"):
+            node = self._ruby_wrapped_method(node)
+            if node is None:
                 return []
-            node = methods[0]
         if ext in C_EXTS + CPP_EXTS:
             return self._c_list_entries(node, in_class)
 
@@ -3510,10 +4336,31 @@ class Applier:
             return [("type", name, node, 0, None)]
         if node.type in ("field_declaration", "constant_declaration") and ext == ".java":
             return [("field", parser.node_text(n), node, parser.definition_rank(node, n), None) for n in parser.declared_names(node)]
-        bound = parser.js_bound_function(node)
-        if bound is not None:
-            # `const f = () => {}`: the name's declarator holds the function.
-            return [(function, parser.node_text(bound.parent.child_by_field_name("name")), node, 0, None)]
+        if node.type in ("lexical_declaration", "variable_declaration") and ext in _JS_EXTS:
+            # Each name of a `const`/`let`/`var`: a function when the name's
+            # declarator binds one (`const f = () => {}`).
+            data = "constant" if node.children[0].type == "const" else "variable"
+            entries = []
+            for declarator in (c for c in node.named_children if c.type == "variable_declarator"):
+                name_node, value = declarator.child_by_field_name("name"), declarator.child_by_field_name("value")
+                if name_node is not None and name_node.type == "identifier":
+                    bound = value is not None and value.type in JS_FUNCTION_VALUES
+                    entries.append((function if bound else data, parser.node_text(name_node), node, 0, None))
+            return entries
+        if node.type in ("public_field_definition", "field_definition"):
+            # A JS/TS class field; one named by a string or computed key
+            # (`'a-b' = 1`, `[k] = 1`) is left out.
+            names = [n for n in parser.declared_names(node) if n.type in ("property_identifier", "private_property_identifier")]
+            return [("field", parser.node_text(n), node, 0, None) for n in names]
+        if node.type == "expression_statement" and ext == ".py":
+            # An assignment to a name (`X = 1`, `x: int`), not a pattern.
+            names = [n for n in parser.declared_names(node) if n.type == "identifier"]
+            return [("field" if in_class else "variable", parser.node_text(n), node, 0, None) for n in names]
+        if node.type == "assignment" and ext == ".rb":
+            return [
+                ("constant" if n.type == "constant" else "variable", parser.node_text(n), node, 0, None)
+                for n in parser.declared_names(node)
+            ]
         return []
 
     def _c_list_entries(self, node, in_class: bool) -> list:
@@ -3586,50 +4433,119 @@ class Applier:
     def _get_signature(self, target: str) -> str:
         """
         Return the signature text of a function (everything before its body),
-        with surrounding whitespace stripped. Read-only. A JS/TS function
-        bound to a name starts at its `const`/`let`/`var` (`const f = (x) =>`),
-        a C++ template function at its `template <...>` header;
-        a method or function with no body (a TS abstract method, a Java
-        interface method, a C++ `A() = default;`, a Go function declared
-        without one, a C/C++ prototype or method declared in its class, see
-        _declares_c_function) is its whole text, without the final `;`. A
-        class's signature is its header, also when the grammar gives it no
-        body (_header_without_body). Any other symbol (a variable, a
-        constant, a type alias, a macro) has no signature and is refused
-        (_depth_refusal).
+        with surrounding whitespace stripped. Read-only. It starts where
+        read_symbol's full text does, but after a JS/TS `export` and Python
+        decorators (_signature_head): at the `const`/`let`/`var` a JS/TS
+        function is bound to (`const f = (x) =>`), a closure's key
+        (`handler: () =>`), a C++ template's `template <...>` header or
+        `extern "C"`, a TS `declare`, a Ruby `private` and the C/C++ typedef
+        or declaration a struct is the type of (`typedef struct N`); a
+        typedef of a struct, union or enum without a tag is that type's
+        (`typedef struct`). A Ruby endless method's ends before its `=`
+        (_signature_end). A method or function with no body (a TS abstract
+        method, a Java interface method, a C++ `A() = default;`, a Go
+        function declared without one, a C/C++ prototype or method declared
+        in its class, see _declares_c_function) is its whole text, without
+        the final `;`. A class's signature is its header, also when the
+        grammar gives it no body (_header_without_body). Any other symbol (a
+        variable, a constant, a type alias, a macro) has no signature and is
+        refused (_depth_refusal).
         """
         node = self.parser.find_node_by_name(target)
         if not node:
             raise ApplierError(f"Target '{target}' not found in {self.filepath}")
 
-        func_node = self._callable(node, target)
+        func_node = self._typedef_struct(self._callable(node, target), enums=True)
+        head = self._signature_head(node, func_node)
+        src = self.parser.source_bytes
 
         body = func_node.child_by_field_name("body")
         if body is None:
-            header = self._header_without_body(func_node)
-            if header is not None:
-                return header
+            span = self._header_span(func_node)
+            if span is not None:
+                return src[min(head.start_byte, span[0]) : span[1]].decode("utf-8")
             if (
                 func_node.type in _BODILESS_FUNCTIONS
                 or func_node.type in self._interface_func_types()
                 or self._declares_c_function(func_node, target)
             ):
-                start = self._symbol_span(func_node)[0] if self.parser.ext in CPP_EXTS else func_node
-                text = self.parser.source_bytes[start.start_byte : func_node.end_byte].decode("utf-8")
+                text = src[head.start_byte : func_node.end_byte].decode("utf-8")
                 return text.strip().rstrip(";").rstrip()
             raise self._depth_refusal(target, func_node, "signature")
 
-        sig_end = func_node.start_byte
-        for child in func_node.children:
-            if child == body:
-                break
-            sig_end = child.end_byte
-
-        start = node if node.type in ("lexical_declaration", "variable_declaration") else func_node
-        if self.parser.ext in CPP_EXTS:
-            start = self._symbol_span(func_node)[0]
-        signature = self.parser.source_bytes[start.start_byte : sig_end].decode("utf-8")
+        signature = src[head.start_byte : self._signature_end(func_node, body)].decode("utf-8")
         return signature.strip()
+
+    def _signature_head(self, node, func_node):
+        """
+        The node whose start the signature of func_node, the function or
+        class found as `node`, starts at: the outermost of the nodes around
+        it that the symbol's full text starts with (_symbol_unit), short of
+        a JS/TS `export` and a Python decorated_definition, which the
+        signature leaves out. That is a Go `type` declaring only it, the key
+        of a closure (`handler: () => {}`, `RunE: func() error {}`), a TS
+        `declare`, a C++ `extern "C"` or `template <...>` header, a Ruby
+        `private def`, the `const`/`let`/`var` a JS/TS function is bound to
+        and the C/C++ typedef or declaration a struct is the type of; else
+        func_node itself, as when the full text starts with other nodes (a
+        TS function's overload signatures, a Python function's @overload
+        stubs, the decorators the TS grammar places beside a method) and for
+        a Go func literal that is one of several values (`var p, q =
+        func() {}, func() {}`).
+        """
+        values = func_node.parent if func_node.type == "func_literal" else None
+        if values is not None and values.type == "expression_list" and len(values.named_children) > 1:
+            # One of the values of a Go `var p, q = func() {...}, func()
+            # {...}`: the others are no part of it.
+            return func_node
+        first, last = self._symbol_unit(node)
+        if self._is_sorbet_signature(first):
+            # A Ruby method's Sorbet signature is no part of its own.
+            first = last
+        path, cur = [], func_node
+        while cur is not None and cur != first:
+            cur = cur.parent
+            path.append(cur)
+        head = func_node
+        if cur is None:
+            return head
+        for parent in path:
+            if parent.type in ("export_statement", "decorated_definition"):
+                break
+            head = parent
+        return head
+
+    def _brings_head(self, head, func_node, signature: str) -> bool:
+        """
+        For replace_signature: whether the new `signature` of func_node
+        starts with code of its own in place of what `head`
+        (_signature_head) writes before the function, which it then
+        replaces: a key and its `:` for a closure (`handler: (a) =>`, `RunE:
+        func() error`), anything before the `def` of a Ruby method that
+        follows other code (`protected def m`), and else the first word of
+        that code (`declare`, `extern`, `typedef`, `type`, `template`).
+        """
+        prefix = self.parser.source_bytes[head.start_byte : func_node.start_byte].decode("utf-8")
+        signature = signature.lstrip()
+        if head.type in ("pair", "keyed_element"):
+            key = r"""(?:[\w$]+|"(?:[^"\\]|\\.)*"|'(?:[^'\\]|\\.)*'|\[[^\]]*\])"""
+            return re.match(key + r"\s*:(?!:)", signature) is not None
+        if self.parser.ext == ".rb":
+            return re.match(r"def\b", signature) is None
+        word = re.match(r"[\w$]+", prefix.lstrip())
+        return word is not None and re.match(re.escape(word.group(0)) + r"\b", signature) is not None
+
+    def _signature_end(self, func_node, body) -> int:
+        """The byte where the signature of func_node, the function or class
+        whose body is `body`, ends: after its last child before the body,
+        or, for a Ruby endless method (`def f(x) = x + 1`), before its `=`."""
+        endless = self.parser.ext == ".rb" and func_node.type in ("method", "singleton_method")
+        end = func_node.start_byte
+        for child in func_node.children:
+            if child == body or (endless and child.type == "="):
+                break
+            end = child.end_byte
+        return end
 
     def _header_without_body(self, node) -> str | None:
         """
@@ -3669,8 +4585,8 @@ class Applier:
         nor a class, found for `target`, with its article: a constant (a
         JS/TS or Go `const`, a Ruby constant, a C/C++ `const` or `constexpr`
         that is no pointer), a variable (a Python assignment outside a class,
-        too), a field (a Python class attribute, a Java field, a C/C++ data
-        member), a type alias (a TS or Go alias, a C/C++ typedef or `using`
+        too), a field (a Python class attribute, a JS/TS class field, a Java
+        field, a C/C++ data member), a type alias (a TS or Go alias, a C/C++ typedef or `using`
         alias), a macro, a Go type definition (`type N int`) or a C/C++
         forward declaration (`struct S;`).
         """
@@ -3686,13 +4602,15 @@ class Applier:
         if node.type in _C_TYPE_SPECIFIERS:
             return "a forward declaration"
         if node.type == "declaration" and self.parser.ext in C_EXTS + CPP_EXTS:
-            name = self.parser.declared_name(node, target.split(".")[-1])
+            name = self.parser.declared_name(node, self.parser.target_leaf(target))
             return "a constant" if name is not None and self._c_constant(node, name) else "a variable"
         kinds = {
             "const_spec": "a constant",
             "var_spec": "a variable",
             "field_declaration": "a field",
             "constant_declaration": "a field",
+            "public_field_definition": "a field",
+            "field_definition": "a field",
             "type_alias_declaration": "a type alias",
             "type_alias": "a type alias",
             "type_definition": "a type alias",
@@ -3718,6 +4636,13 @@ class Applier:
         hint = "depth='full'"
         if node.type == "type_spec":
             hint = "depth='interface' for its methods, or depth='full'"
+        spec = node.child_by_field_name("type") if node.type == "type_definition" else None
+        tag = spec.child_by_field_name("name") if spec is not None and spec.type in _C_TYPE_SPECIFIERS else None
+        if tag is not None and spec.child_by_field_name("body") is None and self.parser.find_container(target) != node:
+            # `typedef struct Node Node;` names a struct declared apart.
+            keyword = spec.type.split("_")[0]
+            path = ".".join(self.parser.parse_target(target).parts[:-1] + [self.parser.node_text(tag)])
+            hint += f", and the {keyword} it names with '{keyword} {path}'"
         return ApplierError(f"'{target}' is {self._symbol_kind(node, target)}, {reason}; read it with {hint}")
 
     def _get_function_body_node(self, target: str):
@@ -3889,9 +4814,11 @@ class Applier:
         part of the searchable text, when only that indentation comes before
         it there (not the signature of a one-line function, or other code).
         For brace-delimited languages, returns
-        the body node's native byte range (which includes `{` and `}`)."""
+        the body node's native byte range (which includes `{` and `}`), up
+        to its `}`: a comment after that, which the JS/TS grammar puts in
+        the body, is no part of it (_code_end)."""
         start_byte = body_node.start_byte
-        end_byte = body_node.end_byte
+        end_byte = self._code_end(body_node)
         if self.parser.ext in (".py", ".rb"):
             source_bytes = self.parser.source_bytes
             line_start = source_bytes.rfind(b"\n", 0, start_byte) + 1
@@ -3912,7 +4839,9 @@ class Applier:
         """
         func_node, body = self._get_function_body_node(target)
         ext = self.parser.ext
-        stmts = list(body.named_children)
+        # Not a comment after the `}` that the JS/TS grammar puts in the body.
+        end = self._code_end(body)
+        stmts = [c for c in body.named_children if c.end_byte <= end]
         if len(stmts) == 1 and stmts[0].type == "statement_list":
             # Go wraps a block's statements in a statement_list that ends on the `}` line
             stmts = list(stmts[0].named_children)
@@ -4015,11 +4944,9 @@ class Applier:
         comment_range = self._find_leading_comment_range(insert_line)
         if comment_range is not None:
             insert_line = comment_range[0]
-        target_indent = (
-            self._get_indent(self.lines[insert_line])
-            if insert_line < len(self.lines)
-            else ""
-        )
+        # The symbol's indentation, which a comment above it need not have
+        # (a Ruby `=begin` is at column 0).
+        target_indent = self._get_indent(self.lines[first.start_point[0]])
         content_lines = self._sibling_content(content, target_indent)
 
         # The sibling above, a comment at the end of its line not counted.
@@ -4055,7 +4982,9 @@ class Applier:
         Insert content as a sibling immediately after a named symbol (function, class,
         method, or top-level assignment), separated from it and from the
         sibling below it (with that sibling's leading comment, decorators and
-        `export`) as _sibling_gap says. When nothing but the end of its body or
+        `export`) as _sibling_gap says. The comment lines right below the
+        symbol that are indented deeper than it end its code, so the content
+        goes below them (_rows_below). When nothing but the end of its body or
         file, or a C++ access label, follows the symbol, the blank lines after
         it stay below the new code. A symbol that shares its last line with
         other code is refused, as is one on the line where the code it is part
@@ -4066,7 +4995,7 @@ class Applier:
             raise ApplierError(f"Target '{target}' not found in {self.filepath}")
 
         first, last = self._symbol_unit(node)
-        before, _, after = self._line_sharing(first, last)
+        before, separator, after = self._line_sharing(first, last)
         if after:
             raise ApplierError(
                 f"'{target}' shares its last line with other code, so new lines below "
@@ -4079,7 +5008,8 @@ class Applier:
                 "so new lines below it would land outside that code. Make this edit "
                 "with your normal edit tool."
             )
-        insert_line = self._last_row(last) + 1
+        # Below the comment lines that end its code (_rows_below).
+        insert_line = self._rows_below(first, last, separator)
         target_indent = self._get_indent(self.lines[first.start_point[0]])
         content_lines = self._sibling_content(content, target_indent)
 
@@ -4107,7 +5037,8 @@ class Applier:
     def _sibling_content(self, content: str, indent: str) -> list[str]:
         """The lines of insert_sibling's content, without blank lines around
         them, re-indented to `indent` (content in read_symbol's shape from
-        the indentation it was read at, see _from_read_shape)."""
+        the indentation it was read at, see _from_read_shape), in tabs when
+        `indent` has one, as add_method writes them (_tab_indent)."""
         lines = _content_lines(content)
         while lines and not lines[0].strip():
             lines.pop(0)
@@ -4115,7 +5046,10 @@ class Applier:
             lines.pop()
         if not lines:
             raise ApplierError("content is empty: pass the source of the code to insert")
-        return self._reindent(self._from_read_shape(lines, indent), indent)
+        lines = self._from_read_shape(lines, indent)
+        if "\t" in indent:
+            lines = self._tab_indent(lines)
+        return self._reindent(lines, indent)
 
     def _sibling_gap(self, parent, a, b) -> int:
         """
@@ -4142,8 +5076,14 @@ class Applier:
     def insert_sibling(self, target: str, content: str, position: str) -> str:
         """
         Insert `content` as a sibling of the named symbol. `position` must be
-        'before' or 'after'. Dispatches to insert_before / insert_after.
+        'before' or 'after'. Dispatches to insert_before / insert_after. In
+        a JSON, YAML or TOML file it is refused for add_key (_refuse_config).
         """
+        self._refuse_config(
+            "insert_sibling",
+            target,
+            f"add_key to add a key next to '{target}', its parent's path being the parent_target",
+        )
         if position == "before":
             return self._insert_before(target, content)
         if position == "after":
@@ -4569,40 +5509,128 @@ class Applier:
             and parent.child_by_field_name("parameter") == params
         )
 
-    def _parameter_name(self, param_node) -> str:
-        """Extract the identifier name from a parameter node across languages."""
+    def _parameter_name(self, param_node, src: bytes | None = None) -> str:
+        """Extract the identifier name from a parameter node across languages,
+        reading it from `src` (the file's source when None)."""
         # Python: identifier, typed_parameter, default_parameter, typed_default_parameter
         # JS/TS: identifier, required_parameter, optional_parameter
         # C/C++: parameter_declaration
         if param_node.type == "identifier":
-            return self.parser.node_text(param_node)
+            return self._text(param_node, src)
+        pattern = param_node.child_by_field_name("pattern")
+        if pattern is not None and pattern.type == "this":
+            # A TS `this` parameter (`this: Window`).
+            return "this"
         # Try field name first
         name_field = param_node.child_by_field_name("name")
         if name_field is not None:
             if name_field.type == "identifier":
-                return self.parser.node_text(name_field)
+                return self._text(name_field, src)
             # Could be typed_parameter wrapper; recurse
-            return self._parameter_name(name_field)
+            return self._parameter_name(name_field, src)
         # Fallback: search for first identifier in descendants
         queue = list(param_node.named_children)
         while queue:
             c = queue.pop(0)
             if c.type == "identifier":
-                return self.parser.node_text(c)
+                return self._text(c, src)
             queue.extend(c.named_children)
         return ""
 
-    def _parameter_names(self, param_node) -> list[str]:
-        """The names a parameter node declares: every name of a Go
-        parameter declaration that lists several for one type (`a, b int`)
-        and none of one that gives only a type (`int`, `func(x int)`);
-        elsewhere the one _parameter_name finds, if any."""
+    def _parameter_names(self, param_node, src: bytes | None = None) -> list[str]:
+        """The names a parameter node declares, read from `src` (the file's
+        source when None): every name of a Go parameter declaration that
+        lists several for one type (`a, b int`) and none of one that gives
+        only a type (`int`, `func(x int)`); those a JS/TS or Ruby
+        destructuring pattern binds (`{a: x, b}` binds x and b, see
+        _bound_names); elsewhere the one _parameter_name finds, if any."""
+        pattern = self._parameter_pattern(param_node)
+        if pattern is not None:
+            return [self._text(n, src) for n in self._bound_names(pattern, src)]
         if param_node.type in ("parameter_declaration", "variadic_parameter_declaration") and (
             self.parser.ext == ".go"
         ):
-            return [self.parser.node_text(n) for n in param_node.children_by_field_name("name")]
-        name = self._parameter_name(param_node)
+            return [self._text(n, src) for n in param_node.children_by_field_name("name")]
+        name = self._parameter_name(param_node, src)
         return [name] if name else []
+
+    def _text(self, node, src: bytes | None = None) -> str:
+        """The text of `node` in `src`, the file's source when None (an
+        edited version of it parsed apart, as add_parameter checks)."""
+        if src is None:
+            return self.parser.node_text(node)
+        return src[node.start_byte : node.end_byte].decode("utf-8")
+
+    @staticmethod
+    def _parameter_pattern(param_node):
+        """The destructuring pattern a parameter is, or None: a JS/TS object
+        or array pattern (`{a, b}`, `[a, b]`, also with a type or a default,
+        `{a}: P = {}`) or a Ruby destructured parameter (`(a, b)`)."""
+        node = param_node
+        if node.type in ("required_parameter", "optional_parameter"):
+            node = node.child_by_field_name("pattern")
+        if node is not None and node.type == "assignment_pattern":
+            node = node.child_by_field_name("left")
+        if node is not None and node.type in ("object_pattern", "array_pattern", "destructured_parameter"):
+            return node
+        return None
+
+    def _bound_names(self, node, src: bytes | None = None) -> list:
+        """
+        The name nodes that a destructuring pattern, or an element of one,
+        binds, in order: through renamed keys (`{a: x}` binds x), defaults
+        (`{a = 1}`, `[a = 1]`), rest elements (`...rest`, Ruby `*rest`) and
+        nested patterns. A Ruby `_` holds a position and binds no name.
+        """
+        if node is None:
+            return []
+        if node.type in ("identifier", "shorthand_property_identifier_pattern"):
+            return [] if self.parser.ext == ".rb" and self._text(node, src) == "_" else [node]
+        if node.type == "pair_pattern":
+            return self._bound_names(node.child_by_field_name("value"), src)
+        if node.type in ("object_assignment_pattern", "assignment_pattern"):
+            return self._bound_names(node.child_by_field_name("left"), src)
+        if node.type == "splat_parameter":
+            name = node.child_by_field_name("name")
+            return [name] if name is not None else []
+        if node.type in ("rest_pattern", "object_pattern", "array_pattern", "destructured_parameter"):
+            return [n for c in node.named_children if "comment" not in c.type for n in self._bound_names(c, src)]
+        return []
+
+    def _remove_bound_name(self, pattern, name: str) -> None:
+        """
+        Remove `name` from the destructuring pattern `pattern`, which binds
+        other names too, and write the file. The element that binds it goes,
+        in an object pattern with its comma as _delete_entry deletes an
+        entry, and one that binds others too (a nested pattern) loses the
+        name inside. The elements of an array pattern and of a Ruby one bind
+        by position, so one before others keeps its place, as a hole (`[,
+        b]`) or a `_` (`(_, b)`); the last one goes with the comma, and the
+        holes, before it.
+        """
+        elements = [c for c in pattern.named_children if "comment" not in c.type]
+        idx = next(i for i, e in enumerate(elements) if name in [self._text(n) for n in self._bound_names(e)])
+        element = elements[idx]
+        if [self._text(n) for n in self._bound_names(element)] != [name]:
+            nested = element
+            while nested.type not in ("object_pattern", "array_pattern", "destructured_parameter"):
+                field = {"pair_pattern": "value", "object_assignment_pattern": "left", "assignment_pattern": "left"}
+                if nested.type in field:
+                    nested = nested.child_by_field_name(field[nested.type])
+                else:
+                    nested = nested.named_children[0]
+            self._remove_bound_name(nested, name)
+            return
+        if pattern.type == "object_pattern":
+            self._delete_entry(pattern, elements, idx)
+            return
+        src = self.parser.source_bytes
+        if idx == len(elements) - 1:
+            new_bytes = src[: elements[idx - 1].end_byte] + src[element.end_byte :]
+        else:
+            hole = b"_" if pattern.type == "destructured_parameter" else b""
+            new_bytes = src[: element.start_byte] + hole + src[element.end_byte :]
+        self._write_bytes(new_bytes)
 
     def add_parameter(self, target: str, parameter: str, position: str = "end") -> str:
         """
@@ -4612,7 +5640,10 @@ class Applier:
         'const int* buf'). A JS/TS arrow function's one unparenthesized
         parameter gets parentheses: `x => x` becomes `(x, y) => x`. A list
         written one parameter per line gets the new one on a line of its own
-        (_add_parameter_line); comments are no parameters.
+        (_add_parameter_line), and so does an empty one whose `)` is on a
+        line below its `(` (_add_parameter_below); comments are no
+        parameters. A name the function already has is refused
+        (_refuse_repeated_parameter).
         """
         if position not in ("start", "end"):
             raise ApplierError(
@@ -4622,7 +5653,7 @@ class Applier:
         existing = [c for c in params.named_children if "comment" not in c.type]
 
         source_bytes = self.parser.source_bytes
-
+        new_bytes = None
         if self._is_bare_arrow_parameter(params):
             # `x => ...` takes a second parameter only in parentheses.
             old = self.parser.node_text(params)
@@ -4632,33 +5663,30 @@ class Applier:
                 + f"({pair})".encode("utf-8")
                 + source_bytes[params.end_byte :]
             )
-            self._write_bytes(new_bytes)
-            return "Update successful"
-
-        if existing:
+        elif existing:
             new_bytes = self._add_parameter_line(params, existing, parameter, position)
-            if new_bytes is not None:
-                self._write_bytes(new_bytes)
-                return "Update successful"
+        else:
+            new_bytes = self._add_parameter_below(params, parameter)
 
-        if not existing:
-            # Empty parameter list: insert between ( and )
-            insert_byte = params.start_byte + 1
-            insertion = parameter
-        elif position == "start":
-            first = existing[0]
-            insert_byte = first.start_byte
-            insertion = f"{parameter}, "
-        else:  # end
-            last = existing[-1]
-            insert_byte = last.end_byte
-            insertion = f", {parameter}"
-
-        new_bytes = (
-            source_bytes[:insert_byte]
-            + insertion.encode("utf-8")
-            + source_bytes[insert_byte:]
-        )
+        if new_bytes is None:
+            if not existing:
+                # Empty parameter list: insert between ( and )
+                insert_byte = params.start_byte + 1
+                insertion = parameter
+            elif position == "start":
+                first = existing[0]
+                insert_byte = first.start_byte
+                insertion = f"{parameter}, "
+            else:  # end
+                last = existing[-1]
+                insert_byte = last.end_byte
+                insertion = f", {parameter}"
+            new_bytes = (
+                source_bytes[:insert_byte]
+                + insertion.encode("utf-8")
+                + source_bytes[insert_byte:]
+            )
+        self._refuse_repeated_parameter(target, params, new_bytes)
         self._write_bytes(new_bytes)
         return "Update successful"
 
@@ -4730,6 +5758,86 @@ class Applier:
             new_bytes = new_bytes[: last.end_byte] + b"," + new_bytes[last.end_byte :]
         return new_bytes
 
+    def _add_parameter_below(self, params, parameter: str) -> bytes | None:
+        """
+        The source with `parameter` added to an empty parameter list whose
+        `)` is on a line below its `(` (`def f(\\n):`), on a line of its own
+        one indentation level deeper than the line of the `(`, after the
+        comments that end before the `)` line; the `)` keeps its line. It
+        gets a trailing comma where the language takes one and the file
+        writes them (_trailing_parameter_comma). None for a list on one
+        line, which gets the parameter inline.
+        """
+        open_paren, close_paren = params.children[0], params.children[-1]
+        if open_paren.type != "(" or close_paren.type != ")" or close_paren.start_point[0] == open_paren.end_point[0]:
+            return None
+        src = self.parser.source_bytes
+        after = open_paren
+        for child in params.children[1:-1]:
+            if "comment" in child.type and child.end_point[0] < close_paren.start_point[0]:
+                after = child
+        opener_line = src[src.rfind(b"\n", 0, open_paren.start_byte) + 1 : open_paren.start_byte].decode("utf-8")
+        ext = self.parser.ext
+        unit = self._indent_unit({".py": "    ", ".java": "    ", ".go": "\t"}.get(ext, "  "))
+        indent = opener_line[: len(opener_line) - len(opener_line.lstrip(" \t"))] + unit
+        comma = "," if self._trailing_parameter_comma(params) else ""
+        close_line = src.rfind(b"\n", 0, close_paren.start_byte) + 1
+        line = f"\n{indent}{parameter}{comma}\n".encode("utf-8")
+        return src[: after.end_byte] + line + src[close_line:]
+
+    def _trailing_parameter_comma(self, params) -> bool:
+        """
+        Whether a parameter on a line of its own, last in a list like
+        `params`, takes a comma after it: always in Go, which needs one
+        before a line break; never in C, C++, Java and Ruby, which take
+        none; in Python, JS and TS as the file's other lists of that kind
+        written one parameter per line mostly do (with one when none does).
+        """
+        ext = self.parser.ext
+        if ext == ".go":
+            return True
+        if ext != ".py" and ext not in _JS_EXTS:
+            return False
+        counts = {True: 0, False: 0}
+        stack = [self.parser.tree.root_node]
+        while stack:
+            node = stack.pop()
+            stack.extend(node.named_children)
+            if node.type != params.type or node.children[-1].type != ")":
+                continue
+            items = [c for c in node.named_children if "comment" not in c.type]
+            if not items or node.children[-1].start_point[0] == items[-1].end_point[0]:
+                continue
+            following = items[-1].next_sibling
+            counts[following is not None and following.type == ","] += 1
+        return counts[True] >= counts[False]
+
+    def _refuse_repeated_parameter(self, target: str, params, new_bytes: bytes) -> None:
+        """
+        Refuse add_parameter's `new_bytes` when the new parameter declares a
+        name that the function already has, or declares one twice: the
+        parameter list at the old one's place in the edited source, parsed
+        apart, is compared with the old one by the names their parameters
+        declare (_parameter_names). Go, Java and Ruby take several `_`.
+        """
+        tree = self.parser.parse(new_bytes)
+        bare = self._is_bare_arrow_parameter(params)
+        wanted = "formal_parameters" if bare else params.type
+        node = tree.root_node.descendant_for_byte_range(params.start_byte, params.start_byte)
+        while node is not None and not (node.type == wanted and node.start_byte == params.start_byte):
+            node = node.parent
+        if node is None:
+            return
+        if bare:
+            before = [self.parser.node_text(params)]
+        else:
+            before = [n for c in params.named_children if "comment" not in c.type for n in self._parameter_names(c)]
+        after = [n for c in node.named_children if "comment" not in c.type for n in self._parameter_names(c, new_bytes)]
+        blank = ("_",) if self.parser.ext in (".go", ".java", ".rb") else ()
+        for name in after:
+            if name not in blank and after.count(name) > max(1, before.count(name)):
+                raise ApplierError(f"Parameter '{name}' already exists in '{target}'")
+
     def remove_parameter(self, target: str, parameter_name: str) -> str:
         """
         Remove a parameter by name from a function signature. A JS/TS arrow
@@ -4742,7 +5850,11 @@ class Applier:
         of several (`a, b int`) goes alone with its comments, the others
         keep the type and theirs (_remove_grouped_name); a Go
         parameter given only as a type (`int`) has no name, and a method's
-        receiver and named results are not parameters.
+        receiver and named results are not parameters. A name that a JS/TS
+        or Ruby destructuring pattern binds with others goes alone
+        (_remove_bound_name: `{a: x, b}` without x is `{b}`, `[a, b]`
+        without a is `[, b]`, `(a, b)` without a is `(_, b)`); the
+        pattern's last name takes the whole parameter.
         """
         params = self._find_parameter_list(target)
         if self._is_bare_arrow_parameter(params):
@@ -4762,8 +5874,14 @@ class Applier:
         if idx is None:
             raise ApplierError(f"Parameter '{parameter_name}' not found in '{target}'")
 
+        pattern = self._parameter_pattern(existing[idx])
+        if pattern is not None and [self.parser.node_text(n) for n in self._bound_names(pattern)] != [parameter_name]:
+            # One name of a destructured parameter that binds others.
+            self._remove_bound_name(pattern, parameter_name)
+            return "Update successful"
+
         names = self._parameter_names(existing[idx])
-        if len(names) > 1:
+        if pattern is None and len(names) > 1:
             self._remove_grouped_name(existing[idx], names.index(parameter_name))
             return "Update successful"
 
@@ -4794,7 +5912,12 @@ class Applier:
         that comma staying (`a /* x */ int`); one that starts a line that
         holds only it, its type and their comma and comments, written one
         per line, takes that line, and its type moves up to the name before
-        it, ahead of that name's comma and comments (`b int, // b`).
+        it, ahead of that name's comma and comments (`b int, // b`). The
+        comments after that comma stay too: on the name's line the type
+        follows them (`a, /* x */ b int` gives `a /* x */ int`), and when
+        they end that line the type moves up before the comma, which stays
+        there, and the next parameter or the `)` takes the removed name's
+        place (`a, // x` over `b int) {}` gives `a int, // x` over `) {}`).
         """
         src = self.parser.source_bytes
         nodes = declaration.children_by_field_name("name")
@@ -4835,6 +5958,34 @@ class Applier:
         comma = next(
             (c for c in declaration.children if c.type == "," and prev.end_byte <= c.start_byte < own.start_byte), None
         )
+        if comma is not None and any(
+            "comment" in c.type and comma.end_byte <= c.start_byte < own.start_byte for c in declaration.children
+        ):
+            # Comments after the comma stay, the type joining the name before.
+            kind_text = src[own.end_byte : declaration.end_byte]
+            if own.start_point[0] == prev.end_point[0]:
+                # `a, /* x */ b int` gives `a /* x */ int`.
+                comments = src[comma.end_byte : own.start_byte]
+                self._write_bytes(
+                    src[: comma.start_byte] + comments + kind_text.lstrip() + src[declaration.end_byte :]
+                )
+                return
+            # `a, // x` over `b int)` gives `a int, // x` over `)`: the comma
+            # stays before the line break, as Go needs, and the next
+            # parameter or the `)` takes the name's place.
+            rest = declaration.end_byte
+            after = declaration.next_sibling
+            if after is not None and after.type == ",":
+                rest = after.end_byte
+                while src[rest : rest + 1] in (b" ", b"\t"):
+                    rest += 1
+            between = src[prev.end_byte : own.start_byte]
+            if src[rest : rest + 1] == b")":
+                params = declaration.parent
+                opener = src[src.rfind(b"\n", 0, params.start_byte) + 1 : params.start_byte]
+                between = between.rstrip(b" \t") + opener[: len(opener) - len(opener.lstrip(b" \t"))]
+            self._write_bytes(src[: prev.end_byte] + kind_text + between + src[rest:])
+            return
         start = comma.start_byte if comma is not None and comma.start_point[0] == prev.end_point[0] else prev.end_byte
         self._write_bytes(src[:start] + src[own.end_byte :])
 
@@ -5054,7 +6205,8 @@ class Applier:
     def find_references(self, target: str) -> str:
         """
         Return all occurrences of an identifier named `target` in the file, as a
-        formatted multi-line string: 'line N: <source line>'. Read-only, syntactic
+        formatted multi-line string: 'line N: <source line>', in the order
+        they come in the file (by line, then column). Read-only, syntactic
         only (no scope awareness). In C++, destructor and operator names
         count as identifiers, named as the targets name them (`~A`,
         `operator==`, `operator bool`, see TreeSitterParser.symbol_name).
@@ -5079,12 +6231,14 @@ class Applier:
             ) or (curr.type in names and self.parser.symbol_name(curr) == target):
                 line_num = curr.start_point[0]
                 context = self.lines[line_num] if line_num < len(self.lines) else ""
-                results.append((line_num + 1, context.strip()))
+                results.append((curr.start_point, context.strip()))
             queue.extend(curr.named_children)
 
         if not results:
             return f"(no references to '{target}' found in {self.filepath})"
-        return "\n".join(f"line {ln}: {ctx}" for ln, ctx in results)
+        # The walk is breadth first; the file reads top to bottom.
+        results.sort(key=lambda result: result[0])
+        return "\n".join(f"line {point[0] + 1}: {ctx}" for point, ctx in results)
 
     # ──────────────────────────────────────────────
     # AST Reader tools (read-only, token-efficient)
@@ -5097,18 +6251,23 @@ class Applier:
           - "full" (default): entire source of the symbol (function body,
             class body, etc.): the code replace_function and delete_symbol
             take (_symbol_unit), from its first byte, with the `;` that ends
-            it when one follows it (a TS abstract method's) and without the
-            line break a C/C++ macro ends with. Given back to
-            replace_function as it is, it leaves the file unchanged (see
-            _read_shape_indent). Equivalent to the old `read_symbol`.
+            it when one follows it (a TS abstract method's, a JS/TS class
+            field's) and without the line break a C/C++ macro ends with or a
+            comment after it that the JS/TS grammar puts inside it
+            (_code_end). Given back to replace_function as it is, it leaves
+            the file unchanged (see _read_shape_indent). Equivalent to the
+            old `read_symbol`.
           - "interface": for a class -> header + field declarations + method
-            signatures with bodies replaced by ' ...'. For a function ->
-            just the signature. Equivalent to the old `read_interface`.
+            signatures with bodies replaced by ' ...'. For a function (a
+            closure in an object or composite literal too) -> just the
+            signature. Equivalent to the old `read_interface`.
           - "signature": signature-only. For a function -> the line(s)
             before the body. For a class -> the class header. Equivalent to
             the old `get_signature`.
-        "interface" and "signature" refuse a symbol that is neither a
-        function nor a class, saying what it is (_depth_refusal).
+        "interface" and "signature" start where "full" does, after a JS/TS
+        `export` and Python decorators for a function's or class's signature
+        (_signature_head), and refuse a symbol that is neither a function
+        nor a class, saying what it is (_depth_refusal).
 
         For config files (JSON/YAML/TOML), "full" returns the value node's
         source ('' for a YAML key with no value) and the other depths raise.
@@ -5122,13 +6281,15 @@ class Applier:
             if not node:
                 raise ApplierError(f"Target '{target}' not found in {self.filepath}")
             # What replace_function and delete_symbol take, and the `;` that
-            # ends a TS abstract method.
+            # ends a TS abstract method or a JS/TS class field, without a
+            # comment after it (_code_end).
             src = self.parser.source_bytes
             first, last = self._symbol_unit(node)
-            end = last.end_byte
+            end = self._code_end(last)
             semi = last.next_sibling
             if (
                 self.parser.ext not in _CONFIG_EXTS
+                and end == last.end_byte
                 and semi is not None
                 and semi.type == ";"
                 and not semi.is_named
@@ -5174,8 +6335,13 @@ class Applier:
         signatures (with bodies replaced by ' ...'), each member at its
         indentation relative to the class's header (see _interface_line) and
         ending as written (_member_text), and its closing (a C/C++ class's
-        `};`). For a function target, returns just its signature, and for a
-        Go type its declaration with its methods' signatures. Any other
+        `};`), from where read_symbol's full text starts to where it ends (a
+        TS `declare`, the C typedef or declaration a struct is the type of,
+        `} N;`, included; a typedef of a struct, union or enum without a tag
+        shows that type's members). For a function target (a closure in an
+        object or composite literal too), returns just its signature, and
+        for a Go type its declaration as read_symbol reads it (a type in a
+        `type (...)` group alone) with its methods' signatures. Any other
         symbol (a variable, a constant, a type alias) is refused
         (_depth_refusal). Read-only.
         """
@@ -5196,11 +6362,14 @@ class Applier:
                     inner = c
                     break
 
-        # Function target (a bodiless method, a C/C++ prototype, or a JS/TS
-        # function bound to a name, too) -- return signature only
+        # Function target (a bodiless method, a C/C++ prototype, a JS/TS
+        # function bound to a name or a closure in an object or composite
+        # literal, too) -- return signature only
         if (
             inner.type in func_types
             or inner.type in _BODILESS_FUNCTIONS
+            or (ext in _JS_EXTS and inner.type in JS_FUNCTION_VALUES)
+            or inner.type == "func_literal"
             or self._callable(node, target) is not node
             or self._declares_c_function(node, target)
         ):
@@ -5211,6 +6380,9 @@ class Applier:
         if ext in (".go",) and inner.type == "type_spec":
             return self._read_interface_go(node, inner)
 
+        # A C/C++ typedef of a struct, union or enum without a tag has the
+        # members of that type.
+        inner = self._typedef_struct(inner, enums=True)
         body = inner.child_by_field_name("body")
         if body is None:
             # A Ruby class or module with nothing in it is its whole text.
@@ -5220,10 +6392,11 @@ class Applier:
 
         source = self.parser.source_bytes
 
-        # Header: everything from the symbol's start (decorators and a JS/TS
-        # `export` included) up to body content. `base`, the indentation of
-        # the class's own line, comes off every line shown.
-        first = self._symbol_span(node)[0]
+        # Header: everything from the symbol's start (decorators, a JS/TS
+        # `export` and `declare` and a C typedef included, where read_symbol
+        # starts it, see _symbol_unit) up to body content. `base`, the
+        # indentation of the class's own line, comes off every line shown.
+        first, last = self._symbol_unit(node)
         head = first.start_byte
         base = self._get_indent(self.lines[first.start_point[0]])
         if ext in (".py", ".rb"):
@@ -5245,10 +6418,13 @@ class Applier:
                 tail_start = node.end_byte - len(tail.encode("utf-8"))
                 parts.append(self._interface_line(tail_start, tail, base, base))
         elif ext not in (".py",):
-            # Brace-delimited: closing } (or }; for C/C++, see _symbol_span)
-            end = self._symbol_span(node)[1].end_byte
-            closing = source[body.end_byte - 1:end].decode("utf-8").rstrip()
-            parts.append(self._interface_line(body.end_byte - 1, closing, base, base))
+            # Brace-delimited: closing } (or }; for C/C++, see _symbol_span,
+            # and `} N;` for a typedef), without a comment after it, which
+            # the JS/TS grammar puts inside a namespace's body (_code_end).
+            brace = self._code_end(body) - 1
+            end = max(self._code_end(last), brace + 1)
+            closing = source[brace:end].decode("utf-8").rstrip()
+            parts.append(self._interface_line(brace, closing, base, base))
 
         return "\n".join(parts)
 
@@ -5269,8 +6445,23 @@ class Applier:
             return {"method_declaration", "constructor_declaration"}
         return set()
 
+    @staticmethod
+    def _ruby_wrapped_method(call):
+        """The method that a Ruby `call` node takes as its one argument
+        (`private def m`, `private_class_method def self.f`), or None."""
+        arguments = call.child_by_field_name("arguments")
+        methods = [c for c in arguments.named_children if "comment" not in c.type] if arguments is not None else []
+        if len(methods) != 1 or methods[0].type not in ("method", "singleton_method"):
+            return None
+        return methods[0]
+
     def _extract_method_sig(self, child, func_types) -> str | None:
-        """Extract the signature of a method node with ' ...' appended, or None if not a method."""
+        """Extract the signature of a method node with ' ...' appended, or
+        None if not a method. It starts at the member's start: decorators, a
+        C++ member template's header, a TS namespace's `export` and a Ruby
+        `private` included. A Ruby method with nothing in it shows its header
+        (_header_span), an endless one what comes before its `=`
+        (_signature_end)."""
         c_inner = child
         if child.type == "decorated_definition":
             for cc in child.named_children:
@@ -5283,6 +6474,9 @@ class Applier:
         elif child.type == "export_statement":
             # A function a TS namespace exports: from its `export`.
             c_inner = child.child_by_field_name("declaration") or child
+        elif child.type == "call" and self.parser.ext == ".rb":
+            # `private def m`: from its `private`.
+            c_inner = self._ruby_wrapped_method(child) or child
 
         if c_inner.type not in func_types:
             return None
@@ -5296,14 +6490,15 @@ class Applier:
                     break
 
         if c_body is None:
-            # Abstract/interface method with no body -- include full text
-            return self.parser.node_text(child)
-
-        sig_end = c_inner.start_byte
-        for fc in c_inner.children:
-            if fc == c_body:
-                break
-            sig_end = fc.end_byte
+            header = self._header_span(c_inner)
+            if header is not None:
+                # An empty Ruby method (`def f; end`).
+                sig_end = header[1]
+            else:
+                # Abstract/interface method with no body -- include full text
+                return self.parser.node_text(child)
+        else:
+            sig_end = self._signature_end(c_inner, c_body)
 
         sig = self.parser.source_bytes[child.start_byte:sig_end].decode("utf-8").rstrip()
         return sig + " ..."
@@ -5312,8 +6507,13 @@ class Applier:
         """Walk a class body, appending signatures for methods and full text
         for fields, at their indentation relative to the class (see
         _interface_line; `indent` for a member that follows other code on
-        its line)."""
+        its line). A Ruby `class << self` shows its header, its members and
+        its `end`. A comment after the body's `}`, which the JS/TS grammar
+        puts inside it (_code_end), is none of its members."""
+        close = self._code_end(container)
         for child in container.named_children:
+            if child.start_byte >= close:
+                break
             sig = self._extract_method_sig(child, func_types)
             if sig is not None:
                 parts.append(self._interface_line(child.start_byte, sig, base, indent))
@@ -5328,6 +6528,17 @@ class Applier:
                     else:
                         parts.append(self._interface_line(semi.start_byte, ";", base, indent))
                 self._collect_interface_members(child, func_types, parts, base, indent)
+            elif child.type == "singleton_class":
+                # Ruby's `class << self`, a block of the class's own methods:
+                # its header, their signatures and its `end`.
+                body, end = child.child_by_field_name("body"), child.children[-1]
+                header_end = body.start_byte if body is not None else end.start_byte
+                header = self.parser.source_bytes[child.start_byte : header_end].decode("utf-8").rstrip()
+                parts.append(self._interface_line(child.start_byte, header, base, indent))
+                if body is not None:
+                    self._collect_interface_members(body, func_types, parts, base, indent)
+                if end.type == "end":
+                    parts.append(self._interface_line(end.start_byte, "end", base, indent))
             else:
                 text = self._member_text(child)
                 if child.type == "access_specifier":
@@ -5375,9 +6586,10 @@ class Applier:
 
     def _read_interface_go(self, node, inner) -> str:
         """Go-specific: struct/interface definition + all receiver method signatures."""
-        # Use parent type_declaration for full text including 'type' keyword
-        decl = node.parent if node.parent and node.parent.type == "type_declaration" else node
-        parts = [self.parser.node_text(decl)]
+        # The type as read_symbol shows it: with its `type` when that declares
+        # only it, a type in a `type (...)` group alone.
+        first, last = self._symbol_unit(node)
+        parts = [self.parser.source_bytes[first.start_byte : last.end_byte].decode("utf-8")]
         name_node = inner.child_by_field_name("name")
         if name_node is None:
             return parts[0]
@@ -5409,14 +6621,22 @@ class Applier:
     def add_top_level(self, content: str, position: str = "bottom") -> str:
         """
         Insert top-level content into the file. Position controls placement:
-          - "bottom" (default): append to end of file.
+          - "bottom" (default): append to end of file, or in a C/C++ header
+                   whose code is all inside an include guard
+                   (_include_guard), before its `#endif`, which keeps the
+                   blank lines it had above it.
           - "top": insert after the preamble (package/imports/includes/leading
                    comments and, for Python, the module docstring) and before
                    the first non-preamble declaration. For files with no
                    preamble, inserts at line 0.
-        The content goes in as written, except that read_symbol's text of a
-        nested symbol, whose later lines keep the indentation they have in
-        its class, is moved to column 0 with them (_from_read_shape).
+        The content is separated from the code on each side as siblings are
+        (_sibling_gap): by two blank lines in a Python module when it or that
+        code is a def or class (PEP 8), else by one; at the top, the blank
+        lines the file had after its preamble stay below the content when
+        they are more. The content goes in as written, except that
+        read_symbol's text of a nested symbol, whose later lines keep the
+        indentation they have in its class, is moved to column 0 with them
+        (_from_read_shape).
         """
         if position not in ("bottom", "top"):
             raise ApplierError(f"position must be 'bottom' or 'top', got: {position}")
@@ -5427,61 +6647,248 @@ class Applier:
             # read_symbol's text of a nested symbol, moved to the top level.
             content_lines = self._reindent(read, "")
 
+        root = self.parser.tree.root_node
+        guard = self._include_guard() if position == "bottom" else None
+        if guard is not None:
+            # A header's code is inside its include guard: the content goes
+            # before its `#endif`, as far from it as the code above was.
+            node, define = guard
+            endif = node.children[-1]
+            inside = [
+                c for c in node.named_children if c.start_byte >= define.start_byte and c.end_byte <= endif.start_byte
+            ]
+            row = endif.start_point[0]
+            before = self.lines[:row]
+            blank = 0
+            while before and not before[-1].strip():
+                before.pop()
+                blank += 1
+            gap = self._sibling_gap(node, inside[-1] if inside else define, content_lines)
+            self.lines = before + [""] * gap + content_lines + [""] * blank + self.lines[row:]
+            return self._save()
         if position == "bottom":
             while self.lines and not self.lines[-1].strip():
                 self.lines.pop()
             if self.lines:
-                self.lines.append("")
+                last = root.named_children[-1] if root.named_children else None
+                self.lines += [""] * self._sibling_gap(root, last, content_lines)
             self.lines.extend(content_lines)
             return self._save()
 
-        # position == "top": find preamble end and insert there
-        insert_line = self._find_preamble_end()
-        if insert_line == 0:
-            # Prepend at file start; add a trailing blank so downstream code is separated
-            self.lines = content_lines + [""] + self.lines
-        else:
-            # Insert after preamble with a blank separator before the new content
-            self.lines = self.lines[:insert_line] + [""] + content_lines + self.lines[insert_line:]
+        # position == "top": after the preamble, separated from it and from
+        # the code below it as siblings are (_sibling_gap), or by the blank
+        # lines the file had there when they are more.
+        at = self._find_preamble_end()
+        before, after = self.lines[:at], self.lines[at:]
+        blank = 0
+        while blank < len(after) and not after[blank].strip():
+            blank += 1
+        rest = after[blank:]
+        following = next((c for c in root.named_children if c.start_point[0] >= at and "comment" not in c.type), None)
+        gap_above = self._sibling_gap(root, None, content_lines) if before else 0
+        gap_below = max(blank, self._sibling_gap(root, content_lines, following)) if rest else 0
+        self.lines = before + [""] * gap_above + content_lines + [""] * gap_below + rest
         return self._save()
 
     def _find_preamble_end(self) -> int:
-        """Return the line number at which non-preamble code starts.
-        Preamble includes: package declarations (Go/Java), import/include
-        statements, leading comments, and (Python only) the module docstring.
-        Returns 0 if there is no preamble."""
+        """
+        The line at which the code after the file's preamble starts, 0 when
+        it has none (add_top_level's position "top", add_import's first
+        import). The preamble is what comes first in a file: the directives
+        that only work there (a `#!` line, a Python or Ruby encoding or Ruby
+        magic comment, a JS/TS hash-bang line and directive prologue such
+        as 'use strict', a TS `///` directive or `// @ts-nocheck`, C/C++
+        `#pragma once` and the `#ifndef`/`#define` of an include guard that
+        holds all the code), a Go package clause or Java package
+        declaration, the Python module docstring, imports and includes
+        (_is_import), and the comments before the last of them. Before the
+        first of them, the file's first block of comments is its header and
+        part of the preamble too, unless it is the leading comment of the
+        code right below it (no blank line between); other comments after
+        the preamble belong to the code after it.
+        """
         ext = self.parser.ext
-        preamble_types = set(self._import_node_types())
-        if ext == ".go":
-            preamble_types.add("package_clause")
-        if ext == ".java":
-            preamble_types.add("package_declaration")
-
-        last_preamble_end = -1
-        seen_docstring = False
-
-        for child in self.parser.tree.root_node.named_children:
-            if child.type == "comment":
-                last_preamble_end = child.end_point[0]
+        guard = self._include_guard()
+        directive_lines = self._file_directive_lines()
+        last = directive_lines - 1
+        pending: list = []
+        stop = None
+        # Still where a Python docstring or a JS/TS directive can be.
+        prologue = True
+        # Whether a preamble node other than a directive line came yet.
+        seen = False
+        for child in self._top_level_nodes():
+            if "comment" in child.type:
+                if child.start_point[0] < directive_lines:
+                    last = max(last, self._last_row(child))
+                else:
+                    pending.append(child)
                 continue
-            if child.type in preamble_types:
-                # Ruby: only `require`-like calls count as imports
-                if ext == ".rb" and child.type == "call":
-                    if not self._is_ruby_require_call(child):
-                        break
-                last_preamble_end = child.end_point[0]
-                continue
-            # Python module docstring: first expression_statement with a string
-            if ext == ".py" and child.type == "expression_statement" and not seen_docstring:
-                inner = child.named_children[0] if child.named_children else None
-                if inner is not None and inner.type == "string":
-                    last_preamble_end = child.end_point[0]
-                    seen_docstring = True
+            preamble = (
+                self._is_import(child)
+                or child.type in ("package_clause", "package_declaration", "hash_bang_line")
+                or self._pragma_once(child)
+                or (guard is not None and child == guard[1])
+            )
+            if not preamble and prologue and ext in (".py",) + _JS_EXTS and self._string_statement(child):
+                preamble = True
+                prologue = ext != ".py"
+            elif child.type != "hash_bang_line":
+                prologue = False
+            if not preamble:
+                stop = child
+                break
+            last = max(last, self._last_row(child))
+            pending = []
+            seen = seen or child.type != "hash_bang_line"
+        keep = len(pending)
+        if stop is not None:
+            # The comments right above the code are its own.
+            attached = len(pending)
+            row = stop.start_point[0]
+            while attached and self._last_row(pending[attached - 1]) >= row - 1:
+                attached -= 1
+                row = pending[attached].start_point[0]
+            keep = 0
+            if not seen and attached:
+                # The file's header: its first block of comments.
+                keep = 1
+                while keep < attached and pending[keep].start_point[0] <= self._last_row(pending[keep - 1]) + 1:
+                    keep += 1
+            keep = max([keep] + [i + 1 for i, c in enumerate(pending) if self._directive_comment(c)])
+        if keep:
+            last = max(last, self._last_row(pending[keep - 1]))
+        return last + 1
+
+    def _include_guard(self):
+        """
+        The include guard of a C/C++ header that holds all of its code, as
+        (the `#ifndef X_H` node, its `#define X_H` node): nothing but
+        comments is outside it, and the first directive inside defines the
+        name it tests, with no value. None for any other file.
+        """
+        if self.parser.ext not in C_EXTS + CPP_EXTS:
+            return None
+        code = [c for c in self.parser.tree.root_node.named_children if "comment" not in c.type]
+        if len(code) != 1 or code[0].type != "preproc_ifdef" or code[0].children[0].type != "#ifndef":
+            return None
+        guard = code[0]
+        name = guard.child_by_field_name("name")
+        define = next((c for c in guard.named_children if c != name and "comment" not in c.type), None)
+        if (
+            name is None
+            or define is None
+            or define.type != "preproc_def"
+            or define.child_by_field_name("value") is not None
+            or self.parser.node_text(define.child_by_field_name("name")) != self.parser.node_text(name)
+        ):
+            return None
+        return guard, define
+
+    def _top_level_nodes(self) -> list:
+        """The nodes among which the file's preamble and imports are: the
+        root's named children, the include guard of a C/C++ header that
+        holds all of its code (_include_guard) giving way to its `#define`
+        and the nodes after it."""
+        nodes = list(self.parser.tree.root_node.named_children)
+        guard = self._include_guard()
+        if guard is None:
+            return nodes
+        node, define = guard
+        inside = [c for c in node.named_children if c.start_byte >= define.start_byte]
+        return [c for c in nodes if c.end_byte <= node.start_byte] + inside + [
+            c for c in nodes if c.start_byte >= node.end_byte
+        ]
+
+    def _is_import(self, node) -> bool:
+        """Whether a top-level node is an import (_import_node_types): a
+        Ruby `call` only when it is a `require`, in JS/TS also a CommonJS
+        `require` (_is_js_require), and in C/C++ also a preprocessor
+        conditional that holds includes and no code (_include_block)."""
+        ext = self.parser.ext
+        if ext == ".rb" and node.type == "call":
+            return self._is_ruby_require_call(node)
+        if node.type in self._import_node_types():
+            return True
+        if ext in _JS_EXTS:
+            return self._is_js_require(node)
+        return ext in C_EXTS + CPP_EXTS and node.type in _PREPROC_CONDITIONALS and self._include_block(node)
+
+    def _is_js_require(self, node) -> bool:
+        """Whether a JS/TS statement only loads modules with CommonJS
+        `require`: `require('x');`, or a `const`/`let`/`var` each of whose
+        names is given one (`const fs = require('fs');`, `const { a } =
+        require('b').c;`)."""
+
+        def required(value) -> bool:
+            while value is not None and value.type == "member_expression":
+                value = value.child_by_field_name("object")
+            if value is None or value.type != "call_expression":
+                return False
+            function, arguments = value.child_by_field_name("function"), value.child_by_field_name("arguments")
+            strings = [c for c in arguments.named_children if "comment" not in c.type] if arguments is not None else []
+            return (
+                function is not None
+                and self.parser.node_text(function) == "require"
+                and len(strings) == 1
+                and strings[0].type in ("string", "template_string")
+            )
+
+        if node.type == "expression_statement":
+            return len(node.named_children) == 1 and required(node.named_children[0])
+        if node.type not in ("lexical_declaration", "variable_declaration"):
+            return False
+        declarators = [c for c in node.named_children if c.type == "variable_declarator"]
+        return bool(declarators) and all(required(d.child_by_field_name("value")) for d in declarators)
+
+    def _include_block(self, node) -> bool:
+        """Whether a C/C++ preprocessor conditional holds includes and
+        nothing but them, other directives and comments, in all of its
+        branches (`#ifdef _WIN32` / `#include <windows.h>` / `#endif`)."""
+        directives = ("preproc_include", "preproc_def", "preproc_function_def", "preproc_call") + _PREPROC_CONDITIONALS
+        found = False
+        stack = [node]
+        while stack:
+            block = stack.pop()
+            for i, child in enumerate(block.children):
+                if not child.is_named or "comment" in child.type:
                     continue
-            # Non-preamble node reached
-            break
+                if block.field_name_for_child(i) in ("name", "condition"):
+                    continue
+                if child.type not in directives:
+                    return False
+                if child.type == "preproc_include":
+                    found = True
+                elif child.type in _PREPROC_CONDITIONALS:
+                    stack.append(child)
+        return found
 
-        return last_preamble_end + 1 if last_preamble_end >= 0 else 0
+    def _pragma_once(self, node) -> bool:
+        """Whether a node is a C/C++ `#pragma once`."""
+        if node.type != "preproc_call":
+            return False
+        directive, argument = node.child_by_field_name("directive"), node.child_by_field_name("argument")
+        return (
+            directive is not None
+            and self.parser.node_text(directive) == "#pragma"
+            and argument is not None
+            and self.parser.node_text(argument).strip() == "once"
+        )
+
+    @staticmethod
+    def _string_statement(node) -> bool:
+        """Whether a node is a statement that is only a string: a Python
+        docstring, a JS/TS directive such as 'use strict'."""
+        return node.type == "expression_statement" and [c.type for c in node.named_children] == ["string"]
+
+    def _directive_comment(self, node) -> bool:
+        """Whether a comment is a JS/TS directive that must come before the
+        code: a `///` directive (`/// <reference types="node" />`) or a
+        pragma of TypeScript, Flow or JSX (`// @ts-nocheck`, `// @flow`,
+        `/** @jsx h */`)."""
+        if self.parser.ext not in _JS_EXTS:
+            return False
+        return bool(re.match(r"///|(//|/\*)\*?\s*@(ts-|flow\b|jsx)", self.parser.node_text(node)))
 
     def _supports_block_comments(self) -> bool:
         """Languages that support C-style /* ... */ block comments."""
@@ -5499,6 +6906,8 @@ class Applier:
         None if no leading comment exists. Handles:
           - Line comments: `#` (Python/YAML/TOML), `//` (JS/TS/C/C++)
           - C-style block comments: /* ... */ (single-line and multi-line)
+          - Ruby embedded documents (`=begin` ... `=end`, at column 0
+            whatever the symbol's indentation)
         Stops at the first blank line or non-comment code line, and at the
         lines that only look like a comment on the symbol: a line with code
         before or between block comments (`int x = 1; /* n */`), a line
@@ -5548,6 +6957,15 @@ class Applier:
             if not stripped:
                 # Blank line separator -- stop walking
                 break
+
+            if self.parser.ext == ".rb" and line.startswith("=end"):
+                # The end of a Ruby embedded document (`=begin` ... `=end`,
+                # both at column 0), which is one comment.
+                node = self.parser.tree.root_node.descendant_for_point_range((i, 0), (i, 0))
+                if node is None or not self._is_embedded_document(node) or node.end_point[0] != i:
+                    break
+                i = node.start_point[0] - 1
+                continue
 
             # Line comment (#, //, etc.)
             if any(stripped.startswith(p) for p in prefixes):
