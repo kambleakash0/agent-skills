@@ -17,30 +17,31 @@ logger = logging.getLogger("ast-editor")
 # Condensed form of AST-EDITOR.md, sent to clients as MCP server instructions.
 _INSTRUCTIONS = (
     "AST-targeted edits for .py .js .ts .c .cpp .rb .go .java .json .yaml "
-    ".toml files: prefer these tools over text edits there. file_path must "
+    ".toml files: prefer these over text edits there. file_path must "
     "be absolute.\n\n"
     "Source files: call list_symbols first for exact, case-sensitive names "
     "(Class.method), read_symbol to read one symbol (replace_function takes "
     "its text back as is), find_references before a rename. Overloads take "
     "parameter types (A.m(int)); a struct or TS type sharing its name takes "
-    "its keyword (struct stat, type User). Config files: a target is the key "
-    "path from the top level (project.version); quote a key that contains "
-    "dots (\"editor.fontSize\").\n\n"
+    "its keyword (struct stat, type User). Config targets are key paths "
+    "from the top level (project.version); quote a key with dots "
+    "(\"editor.fontSize\").\n\n"
     "Use the narrowest tool: replace_in_body, insert_in_body or "
-    "delete_in_body for a few lines (exact, unique snippets) rather than "
-    "replace_function or replace_function_body; add_parameter/remove_parameter "
-    "rather than replace_signature for one parameter; add_key for a new key, "
-    "replace_value for an existing one; add_import_name to extend an existing "
-    "import. Decorators, an export and a C++ template header belong to their "
-    "symbol.\n\n"
+    "delete_in_body for a few lines (a snippet must match once: exact text "
+    "at token boundaries, or whole lines with indentation shifted) "
+    "rather than replace_function or replace_function_body; "
+    "add_parameter/remove_parameter rather than replace_signature for one "
+    "parameter; add_key for a new key, replace_value for an existing one; "
+    "add_import_name to extend an import. Decorators, an export and a C++ "
+    "template header belong to their symbol.\n\n"
     "Every edit is parse-checked: one that would add a syntax error is "
-    "refused with its line and column, the file unchanged. Fix the content, "
-    "or if the code is valid but the parser does not support it, use your "
-    "normal edit tool. Line endings, a BOM and a missing final newline are "
-    "kept; write \\n.\n\n"
-    "Escape hatches: call delete_symbol once per symbol; use your normal "
-    "edit tool for arbitrary sub-expression changes and your write tool for "
-    "whole-file rewrites."
+    "refused with its line and column, the file unchanged; fix the content, "
+    "or for valid code the parser does not support, use your normal edit "
+    "tool. Each line's ending, a BOM and a missing final newline are kept; "
+    "write \\n.\n\n"
+    "Escape hatches: delete_symbol once per symbol; your edit tool "
+    "for arbitrary sub-expression changes, your write tool for whole-file "
+    "rewrites."
 )
 
 
@@ -102,9 +103,12 @@ ClassTarget = Annotated[
 BodySnippet = Annotated[
     str,
     Field(
-        description="Exact text to match, byte-identical including indentation "
-        "and newlines (\\n also matches CRLF line breaks); it must occur "
-        "exactly once in the target's body."
+        description="Text to match in the target's body (\\n also matches CRLF "
+        "line breaks): its exact text, starting and ending at token boundaries "
+        "(in comments and strings, between words), or else whole lines with "
+        "the same indentation added to or removed from each (the lines of a "
+        "multi-line string as they are in the file); it must match exactly "
+        "one place."
     ),
 ]
 LiteralValue = Annotated[
@@ -177,7 +181,11 @@ def replace_function(
     Content written as read_symbol shows the symbol (its first line without
     indentation, the later lines at their indentation in the file) goes in
     as it is, so read_symbol's text can be edited and given back, and given
-    back unchanged it leaves the file byte for byte as it was. Content
+    back unchanged it leaves the file byte for byte as it was. It may hold
+    several members (a method replaced by two, a field by two fields): the
+    line that starts each later one sits at the symbol's own indentation,
+    after the one before it ended (its `}`, `end` or `;`, in Python its
+    last statement). Content
     whose first line is at column 0 and the others indented from it, or
     with every line at its file indentation, is re-indented to the
     original's level as before. When no line sits at the symbol's own
@@ -199,12 +207,22 @@ def replace_function(
     A symbol that shares a line with other code (`function a() {} function
     b() {}`) has only its own text replaced; the code around it on the line
     stays (content ending with a `#` or `//` comment is refused when code
-    follows). When `content` is
+    follows), and so does a comment before it on its first line, which is
+    no part of it (`/** @type {X} */ let x;` keeps the comment, and
+    read_symbol starts at `let`); the content's later lines are indented
+    as that line is, or, after a block comment begun on a line above (`
+    */ void f() {`), as the line the comment starts on. When `content` is
     re-indented, the lines that start inside one of its multi-line string
     literals (a triple-quoted string, template literal, heredoc, raw
     string) and Ruby embedded documents (`=begin` ... `=end`, kept at
     column 0) keep their text; those of a Python docstring, Ruby `<<~`
-    heredoc or Java text block move with the code.
+    heredoc or Java text block move with the code. Where the file indents
+    with tabs (most of the symbol's indented lines start with one, the
+    text of its strings and the lines that spaces align under a bracket
+    aside, or its class's members do; any Go file), the content's
+    indentation steps written in spaces become tabs; the spaces that align
+    the lines of a block comment, or a line continued inside a `(` or `[`
+    that code follows on its line, stay after the tabs.
 
     Use this when: You're rewriting a function top-to-bottom (e.g., renaming it,
     changing parameters AND implementation together).
@@ -245,15 +263,21 @@ def replace_function_body(
     """
     Replace only the body of a function, preserving its signature and decorators.
     A body written on one line with its signature or braces (`function f() {
-    return 1; }`, `def f(): return 1`) is rebuilt over lines of its own,
-    and content for an empty body (`{` and `}` on lines of their own) goes
-    one indentation level deeper than the function. A Ruby endless method
+    return 1; }`, `def f(): return 1`) is rebuilt over lines of its own; a
+    comment after a one-line Python body stays at the end of the def's line
+    (`def b(): pass  # old` becomes `def b():  # old` over the new body).
+    Content for an empty body (`{` and `}` on lines of their own, a Ruby
+    method with nothing but comments between its signature and its `end`,
+    which it replaces) goes one indentation level deeper than the
+    function, and an empty Ruby method on one line (`def h; end`) is
+    opened up over lines of its own. A Ruby endless method
     (`def f = x`) has no body and is refused. The lines that start inside a
     multi-line string literal of `content` (a triple-quoted string, template
     literal, heredoc, raw string) or a Ruby embedded document (`=begin` ...
     `=end`, kept at column 0) keep their text when the rest is re-indented;
     those of a Python docstring, Ruby `<<~` heredoc or Java text block move
-    with the code.
+    with the code. In a body indented with tabs (any Go function), the
+    content's indentation steps written in spaces become tabs.
 
     Use this when: You're changing the implementation while keeping the interface stable.
     Don't use this when: You're also changing parameters or return type -> use
@@ -285,18 +309,62 @@ def replace_in_body(
     new_snippet: Annotated[
         str,
         Field(
-            description="Replacement text, written exactly as given (include the "
-            "indentation and newlines you need)."
+            description="Replacement text, with the indentation and newlines you "
+            "need: written as given after an exact match, moved with the "
+            "snippet's lines after one with its indentation shifted, and after "
+            "an exact one-line snippet written without its line's indentation, "
+            "its later lines given that indentation (text already at the file's "
+            "indentation there goes in as written; in Python the reading that "
+            "parses wins); lines inside a string keep their text. '' deletes "
+            "the snippet."
         ),
     ],
 ) -> str:
     """
-    Replace a byte-identical snippet inside a named function/method body,
-    without touching the surrounding code. The match is scoped to the target's
-    body so accidental matches elsewhere in the file cannot happen.
+    Replace a snippet inside a named function/method body, without touching
+    the surrounding code. The match is scoped to the target's body so
+    accidental matches elsewhere in the file cannot happen.
 
-    Raises if the snippet is not found, or if it appears more than once in the
-    body (include more surrounding context to disambiguate).
+    The snippet matches its exact text where that neither starts nor ends
+    inside an identifier, number, keyword or operator: `x = 1` is not found
+    in `max = 10`, nor `= 1` in `a == 1` or `el` in `$el`. In a comment or
+    string literal (not in an interpolation's code) it may start and end
+    between any two words, and it may end at a Python backslash
+    continuation. An exact match wins. Without one, its lines match whole
+    lines of the body with the same indentation added to or removed from
+    each of them, so a block copied without (some of) its indentation is
+    found: blank lines match blank lines, spaces and tabs at the ends of
+    lines do not count, tabs and spaces differ, and a snippet that starts
+    or ends in the middle of a line must match exactly. The text of a
+    multi-line string is never shifted: a line that starts inside one must
+    be written as it is in the file (but in a Python docstring, Ruby `<<~`
+    heredoc or Java text block, which move with the code). When the exact
+    matches are all inside strings or comments, the shifted matches in
+    other places count too, so a snippet found as written in the text of a
+    string and shifted in code is refused as matching both.
+
+    new_snippet is written like the snippet: after a match with shifted
+    indentation, its lines move the same way, keeping their relative
+    indentation; after an exact one-line snippet that left out (some of)
+    its line's indentation, or that starts in the middle of a line, its
+    later lines get that indentation (the line's own for one in the middle),
+    unless they are all that deep already, as in read_symbol's shape. New
+    text already at the file's indentation there goes in as written, as
+    does new_snippet after an exact snippet of several lines. In Python,
+    when the lines read one way would not parse and read the other way
+    would, the other is taken: `return 2` replaced by `return 2\\n    y = 3`
+    in an `if` block 8 spaces deep ends the block with `y = 3` at 4. The
+    lines that start inside a multi-line string literal, one of new_snippet
+    or one of the file that new_snippet goes into, keep their text; those
+    of a Python docstring, Ruby `<<~` heredoc or Java text block move with
+    the code, and a Ruby `=begin` document stays at column 0. In a body
+    indented with tabs (any Go function), new_snippet's indentation steps
+    written in spaces become tabs. An empty new_snippet deletes the snippet
+    as delete_in_body does.
+
+    Raises if the snippet is not found (saying so when it occurs only inside
+    longer tokens), or if it matches more than one place (naming their
+    lines; include more surrounding context to disambiguate).
 
     Use this when: You need to change a specific statement or block inside a
     large function body without rewriting the whole body. The single biggest
@@ -311,6 +379,11 @@ def replace_in_body(
         target="init"
         old_snippet="viper.BindPFlag(\\"port\\", cmd.Flags().Lookup(\\"port\\"))"
         new_snippet="viper.BindPFlag(\\"port\\", cmd.PersistentFlags().Lookup(\\"port\\"))"
+
+    Example (a block written without its indentation):
+        target="handle"
+        old_snippet="if retry:\\n    wait()"
+        new_snippet="if retry:\\n    backoff()\\n    wait()"
     """
     if err := _validate_file(file_path):
         return err
@@ -332,11 +405,21 @@ def delete_in_body(
     file_path: FilePath, target: FunctionTarget, snippet: BodySnippet
 ) -> str:
     """
-    Delete a byte-identical snippet inside a named function/method body. Scoped
-    to the target's body so global file matches don't apply.
+    Delete a snippet inside a named function/method body, matched as
+    replace_in_body matches one: its exact text at token boundaries, else
+    whole lines with their indentation shifted. Scoped to the target's body
+    so global file matches don't apply.
 
-    Raises if the snippet is not found, or if it appears more than once in the
-    body (include more surrounding context to make the match unique).
+    When the deletion leaves its lines without code (only indentation before
+    the snippet on its first line, only spaces and tabs after it on its last,
+    or it ends with that line's break), the whole lines go, with their
+    indentation and line break; a comment after the snippet on its last line
+    stays, at the line's indentation. A deletion that would leave a Python
+    body without a statement is refused (replace the snippet with `pass`
+    instead).
+
+    Raises if the snippet is not found, or if it matches more than one place
+    (include more surrounding context to make the match unique).
 
     Use this when: You want to remove a specific statement, block, or line
     inside a function body without rewriting the whole body. Also useful for
@@ -347,7 +430,7 @@ def delete_in_body(
 
     Example (remove a mount call inside a function):
         target="RegisterRoutes"
-        snippet='\\tr.Mount("/kb", kbHandler)\\n'
+        snippet='r.Mount("/kb", kbHandler)'
 
     Example (remove a key from an inline object arg):
         target="main"
@@ -375,23 +458,29 @@ def insert_in_body(
     new_snippet: Annotated[
         str,
         Field(
-            description="Text to insert: placed byte for byte with after/before "
-            "(include your own newlines and indentation), or re-indented as a "
-            "block (relative indentation kept) to the body's indentation with at."
+            description="Text to insert: with after/before, on lines of its own "
+            "next to an anchor that ends (after) or starts (before) its line, "
+            "indented as the anchor was matched (as written when already at the "
+            "file's indentation there or in read_symbol's shape, at the anchor's "
+            "indentation from column 0, inside the block an after anchor's line "
+            "opens), else byte for byte; with at, re-indented as a block "
+            "(relative indentation kept) to the body's indentation."
         ),
     ],
     after: Annotated[
         str,
         Field(
-            description="Unique, byte-identical anchor in the target's body to "
-            "insert after; '' (default) leaves this mode unused."
+            description="Unique anchor in the target's body to insert after, "
+            "matched as replace_in_body matches a snippet; '' (default) leaves "
+            "this mode unused."
         ),
     ] = "",
     before: Annotated[
         str,
         Field(
-            description="Unique, byte-identical anchor in the target's body to "
-            "insert before; '' (default) leaves this mode unused."
+            description="Unique anchor in the target's body to insert before, "
+            "matched as replace_in_body matches a snippet; '' (default) leaves "
+            "this mode unused."
         ),
     ] = "",
     at: Annotated[
@@ -414,19 +503,51 @@ def insert_in_body(
         the last statement is a nested block.
     `at` needs the body on its own lines: a one-line body such as
     `def f(): return 1` or `function f() { return 1; }` is refused; rewrite
-    it with `replace_function_body` instead. With `at`, the lines that start
+    it with `replace_function_body` instead. An empty body (`{` over `}`, a
+    Ruby `def f` over `end`) takes new_snippet one indentation level deeper
+    than the function; `after` and `before` find no anchor there and are
+    refused. With `at`, the lines that start
     inside a multi-line string literal of new_snippet (a triple-quoted
     string, template literal, heredoc, raw string) or a Ruby embedded
     document (`=begin` ... `=end`, kept at column 0) keep their text when
     the rest is re-indented; those of a Python docstring, Ruby `<<~` heredoc
-    or Java text block move with the code.
-      - after=<snippet>:  insert immediately after a byte-identical anchor.
-      - before=<snippet>: insert immediately before a byte-identical anchor.
+    or Java text block move with the code. In a body indented with tabs
+    (any Go function), new_snippet's indentation steps written in spaces
+    become tabs, with `after` and `before` too.
+      - after=<snippet>:  insert after an anchor.
+      - before=<snippet>: insert before an anchor.
 
-    The anchor match (for `after`/`before`) is scoped to the target's body
-    and must be unique -- multiple matches raise an error telling you to
-    include more surrounding context. Caller is responsible for any
-    leading/trailing newlines and indentation in new_snippet.
+    The anchor (for `after`/`before`) is matched as replace_in_body matches
+    a snippet (its exact text at token boundaries, else whole lines with
+    their indentation shifted), scoped to the target's body, and must be
+    unique -- multiple matches raise an error naming their lines; include
+    more surrounding context. An anchor that ends its line (after: only
+    spaces, tabs or a comment follow it, or it ends with its line break) or
+    starts it (before: only indentation precedes it) gets new_snippet on
+    lines of its own, below or above its lines, indented as the anchor
+    was matched: moved like a shifted anchor's lines, or given the
+    indentation an exact anchor left out of its first line (the line's own
+    for one that starts in the middle of the line, and all of it for
+    new_snippet at column 0 beside an anchor written with its
+    indentation), unless new_snippet is at the file's indentation there
+    already, or in read_symbol's shape beside an exact anchor (its first
+    line without indentation, the others at their file indentation: it
+    goes in as written, the first line at the anchor's indentation). In
+    Python, when new_snippet read one way would not parse and read the
+    other way would, the other is taken. After a line that opens a block
+    (`if (x) {`, `if x:`, `do`; the line below it is indented deeper),
+    new lines that would be at the anchor line's indentation go in at that
+    of the line below, inside the block. Multi-line strings and Ruby
+    `=begin` documents keep their text as with `at`. A line break at the
+    start of new_snippet after an anchor without its own, and spaces after
+    its last line break, are taken for the anchor line's own, and a final
+    line break is added. An anchor in the middle of a line gets new_snippet
+    byte for byte at its end or start, and so does one whose new line
+    would start in the text of a multi-line string or heredoc (after the
+    line that opens a heredoc, too; the lines of a Python docstring, Ruby
+    `<<~` heredoc or Java text block are indented like code and get lines
+    of their own) and one on a body that shares its signature's line;
+    `after` an anchor that ends with the body's closing brace is refused.
 
     Use this when: You're inserting new lines into a function body. Use
     `at="top"`/`at="bottom"` for simple prepend/append, or `after`/`before`
@@ -451,10 +572,10 @@ def insert_in_body(
         new_snippet='    metrics.incr("calls")\\n'
         after='    validate(request)\\n'
 
-    Example (before anchor):
+    Example (before anchor, both written without indentation):
         target="handle"
-        new_snippet='    auth_check(request)\\n'
-        before='    validate(request)\\n'
+        new_snippet='auth_check(request)'
+        before='validate(request)'
     """
     if err := _validate_file(file_path):
         return err
@@ -492,7 +613,7 @@ def add_method(
             description="Complete method source, added after the class's last "
             "member and re-indented like its existing members, keeping its own "
             "relative indentation (Go: a receiver func placed after the type "
-            "declaration)."
+            "declaration, indented with tabs)."
         ),
     ],
 ) -> str:
@@ -504,7 +625,10 @@ def add_method(
     keeping the content's relative indentation (in tabs when the members are
     tab-indented), and follows the last member after one blank line, or none
     if the class's methods have no blank lines between them or the last
-    member is a C++ access label. No blank line is added before the closing
+    member is a C++ access label; one-line content (a field) after one-line
+    fields stacked without a blank line between them is stacked too. In Go
+    the method goes after the type declaration, its indentation in tabs,
+    with a blank line on each side. No blank line is added before the closing
     brace; a braced body on one line (`class K {}`, `class K { a() {} }`) is
     opened up over several lines. A Java enum gets the method after its
     constants, with the `;` they need. A one-line Python or Ruby class is
@@ -1326,6 +1450,14 @@ def add_import_name(
       - Python (.py): `from <module> import a, b`
       - JS/TS:        `import { a, b } from "<module>"`
 
+    The name follows the list's layout: names in braces or parentheses
+    written one per line get the new one on a line of its own at their
+    indentation (after the last name's line and a comment at its end),
+    with a comma after it when the last name has one, else the last name
+    gets the comma; names aligned under the `(` or `{` get it aligned too;
+    an inline list stays inline (`a, b` becomes `a, b, c`), and so does a
+    Python list without parentheses.
+
     Use this when: The module is already imported via a named-import form and
     you want to add another name to that existing statement.
     Don't use this when: The import statement doesn't exist yet -> use
@@ -1369,7 +1501,11 @@ def remove_import_name(
     If the name removed is the only remaining one AND there are no other
     bindings (default / namespace) in the same statement, the entire import
     line is removed. Raises an error if removing the last name would leave
-    an invalid `import Default, {} from "mod"` fragment.
+    an invalid `import Default, {} from "mod"` fragment. In braces or
+    parentheses, a name on a line of its own goes with that whole line, a
+    comment at its end included (comments on other lines stay), and a
+    last name with no comma after it takes the comma before it; an inline
+    name goes with one comma next to it.
 
     Use this when: You want to remove a single name from a multi-name import.
     Don't use this when: You want to remove the entire import line -> use
@@ -1439,7 +1575,11 @@ def add_parameter(
     a line of its own, one indentation unit deeper than the `(` line, with
     a trailing comma in Go, none in C, C++, Java and Ruby, and in Python,
     JS and TS one when most of the file's lists written one per line have
-    one (or it has none). A name the function already has is refused
+    one (or it has none). In Python, 'end' is before a `**kwargs`, which
+    must stay last (`def f(a, **kw)` plus `b` is `def f(a, b, **kw)`; after
+    `*args` or a bare `*`, the new parameter is keyword-only). A C or C++
+    `(void)` takes the parameter in place of its `void`: `int f(void)` plus
+    `int c` is `int f(int c)`. A name the function already has is refused
     (`Parameter 'a' already exists in 'f'`), compared by the names the
     parameters declare (`*args`, `{a, b}`, Go `a, b int`); several `_` are
     fine in Go, Java and Ruby.
@@ -1494,7 +1634,12 @@ def remove_parameter(
     on other lines stay (one after the parameter before it too), and a last
     parameter with no comma after it takes the comma before it (except in
     Go, which needs it before a line break). Removing the only parameter
-    leaves `()`. In Go, one name of several that share a type goes alone:
+    leaves `()`, except in C (.c, .h), where `()` declares unspecified
+    parameters before C23: there it leaves `(void)` (C++ keeps `()`). In
+    Python, a bare `*` or a `/` left without the parameter it needs goes
+    too: `def f(a, *, b)` minus b is `def f(a)`, `def f(a, /, b)` minus a
+    is `def f(b)`, `def f(a, *, b, **kw)` minus b is `def f(a, **kw)`. In
+    Go, one name of several that share a type goes alone:
     removing `a` from `func f(a, b int)` gives `func f(b int)`, removing `b`
     gives `func f(a int)`; the comments of the other names stay with them,
     the type moving up to the name before a last one that had a line of its
@@ -1543,7 +1688,8 @@ def replace_docstring(
         str,
         Field(
             description="Case-sensitive name of the Python function, method, or "
-            "class, dotted for nested symbols (e.g. 'LRUCache.get')."
+            "class, dotted for nested symbols (e.g. 'LRUCache.get'), or '' for "
+            "the module docstring."
         ),
     ],
     new_docstring: Annotated[
@@ -1551,15 +1697,27 @@ def replace_docstring(
         Field(
             description="Python string literal including its quotes, normally "
             "triple-quoted; replaces the existing docstring or becomes the first "
-            "body statement."
+            "body statement (of the module, for target '')."
         ),
     ],
 ) -> str:
     """
-    Replace or insert a Python docstring on a function or class. Python-only. The
+    Replace or insert a Python docstring on a function, class or module. Python-only. The
     new_docstring should be a valid Python string literal including its surrounding
     triple quotes. A new docstring for a body on its signature's line (`def
     f(): return 1`) is refused: rewrite the body with `replace_function_body`.
+
+    target="" is the module (as add_key's "" is a config file's root): the
+    string the module starts with is replaced (not an f-string or bytes
+    literal, which is no docstring and stays), or a new docstring goes
+    before the first statement (a `from __future__` import stays after
+    it), below a `#!` line and an encoding comment, with no blank line
+    after them, and below a header comment set off by a blank line, which
+    keeps its blank lines; a comment right above the first statement stays
+    with it, below the docstring. One blank line follows the docstring,
+    two before a def or class; in a file with no statement it goes last.
+    A new_docstring for the module that is not a string literal with its
+    quotes (bare text, an f-string) is refused.
 
     Use this when: You want to add or update a Python docstring without touching
     the function body.
@@ -1636,8 +1794,12 @@ def add_top_level(
             description="Top-level source inserted as-is (function, class, "
             "constant, or any statement), separated from existing code by a "
             "blank line (two in a Python module when it or that code is a def "
-            "or class); read_symbol's text of a nested symbol (recognised by "
-            "its closing line or a decorator) is moved to column 0 as a whole."
+            "or class), or stacked at the bottom after one-line code stacked "
+            "with the code above it when it is one line too (not after imports, "
+            "unless it is one); its indentation steps become tabs in a Go file "
+            "or one indented with tabs; read_symbol's text of a nested symbol "
+            "(recognised by its closing line or a decorator) is moved to column "
+            "0 as a whole."
         ),
     ],
     position: Annotated[
@@ -1667,7 +1829,15 @@ def add_top_level(
 
     The content is separated from the code on each side by one blank line,
     or two in a Python module when it or that code is a def or class (PEP
-    8); at the top, more blank lines the file had there stay below it.
+    8); at the top, more blank lines the file had there stay below it. At
+    the bottom, one-line content after one-line code (a constant, a
+    prototype) that is stacked with the one-line code above it, without a
+    blank line, is stacked too, as insert_sibling stacks it; after imports,
+    includes or a package clause it gets the blank line, unless it is an
+    import or include itself. In a Go file,
+    or one indented with tabs, the content's indentation steps written in
+    spaces become tabs (multi-line string text, Ruby embedded documents
+    and the spaces that align a block comment's lines stay).
 
     Use this when: You're adding any kind of top-level code. Use position="top"
     when inserting multiple declarations at the top of a file without the
@@ -1988,9 +2158,11 @@ def insert_sibling(
     content: Annotated[
         str,
         Field(
-            description="Source to insert, re-indented to the target's level and "
-            "separated from its neighbours by a blank line (two around a "
-            "top-level Python def or class)."
+            description="Source to insert, re-indented to the target's level (in "
+            "tabs where the file indents with them) and spaced as the target was "
+            "from its neighbour: one-line code stacked without blank lines stays "
+            "stacked, and a function, class or other code over several lines gets "
+            "at least a blank line (two around a top-level Python def or class)."
         ),
     ],
     position: Annotated[
@@ -2009,11 +2181,25 @@ def insert_sibling(
     header is part of the symbol, too, and "after" a C/C++ class, struct,
     union or enum goes after the `;` that ends it.
 
-    The new code is separated from the target and from the symbol on its
-    other side (that symbol's leading comment, decorators and `export`
-    included) by one blank line, or two at the top level of a Python module
-    when either is a def or class (PEP 8). The end of a body or file, a C++
-    access label, and a comment above the new code get no added blank lines,
+    The new code goes into the gap between the target and the symbol on
+    that side (that symbol's leading comment, decorators and `export`
+    included), and is spaced as that gap was. Next to a block (a function,
+    class or method, also one written on one line, or other code over
+    several lines) the gap is that one, or the usual one when that is
+    wider: one blank line, two at the top level of a Python module around a
+    def or class (PEP 8). Between one-line code (fields, constants,
+    prototypes) the gap toward the symbol on that side stays as it was, and
+    the new code goes against the target with the smallest gap the target
+    had to a one-line neighbour, the one on its other side counted up to
+    the usual gap; so code written without blank lines between stays
+    stacked (`int f(void);` and `int g(void);` with `int h(void);` between
+    them), and after the last field of a class or before its first, the
+    new field is stacked when the fields are. Next to a block target,
+    one-line code goes against the one-line symbol on its other side as
+    that symbol is spaced from its own one-line neighbour (a field before
+    the first method, below stacked fields, is stacked under them). The
+    end of a body or file, a C++ access label, and a comment above the new
+    code get no added blank lines,
     except a comment indented deeper than the target: it ends the code above
     it, is not the target's leading comment, and "before" goes below it
     with the usual blank lines; "after" goes below such comment lines right
@@ -2029,8 +2215,10 @@ def insert_sibling(
     of a Python docstring, Ruby `<<~` heredoc or Java text block move with
     the code. A symbol's read_symbol text (its first line without
     indentation, the later lines at the indentation they had where it was
-    read) is indented as a whole. Next to a target indented with tabs, the
-    content's deeper indentation is written in tabs, as add_method does.
+    read) is indented as a whole, also when it holds several members (see
+    replace_function). Next to a target indented with tabs, and at the top
+    level of a Go file or one indented with tabs, the content's deeper
+    indentation is written in tabs, as add_method does.
     Refused in JSON, YAML and TOML files (use add_key).
 
     Use this when: You need precise placement relative to another top-level

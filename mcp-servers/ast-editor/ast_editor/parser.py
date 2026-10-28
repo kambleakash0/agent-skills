@@ -561,6 +561,13 @@ class TreeSitterParser:
         # snippets, inserted code); the Applier writes the file back with
         # its own `newline` style.
         self.newline = detect_newline(raw)
+        # The line break of each line when the file mixes CRLF and LF ones
+        # (None when it has one kind): the lines an edit leaves alone keep
+        # theirs (Applier._write_text).
+        crlf = raw.count(b"\r\n")
+        self.line_breaks = None
+        if crlf and crlf != raw.count(b"\n"):
+            self.line_breaks = ["\r\n" if line.endswith(b"\r") else "\n" for line in raw.split(b"\n")[:-1]]
         self.source_bytes = raw.replace(b"\r\n", b"\n")
         # A last line without a line break is read as if it had one, so that
         # code added after it starts a line of its own; the Applier leaves

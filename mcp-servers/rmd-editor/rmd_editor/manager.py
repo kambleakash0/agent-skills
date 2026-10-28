@@ -13,8 +13,8 @@ from typing import NamedTuple, Optional
 
 from rmd_editor.parser import (
     Cell, Frontmatter, FrontmatterError, dump_yaml, parse, serialize, yaml_string,
-    _KNITR_CHUNK_BEGIN, _KNITR_CHUNK_END, _OptionBlock, _OptionEntry, _R_SPACE, _chunk_body, _chunk_source, _chunk_stop,
-    _closed, _fence_close, _fence_indent, _indented, _join, _layout, _lines, _option_block, _option_extent,
+    _KNITR_CHUNK_BEGIN, _KNITR_CHUNK_END, _OptionBlock, _R_SPACE, _YAML_BREAKS, _chunk_body, _chunk_source,
+    _chunk_stop, _closed, _fence_close, _fence_indent, _indented, _join, _layout, _lines, _option_block, _option_extent,
     _option_text, _pipe_labels, _r_string_value, _r_to_yaml, _r_trouble, _read_chunk_opening, _read_header,
     _render_chunk_header, _with_newline,
 )
@@ -22,6 +22,24 @@ from rmd_editor.parser import (
 
 class RmdManagerError(Exception):
     pass
+
+
+def _write_utf8(file_path: str, text: str) -> None:
+    """
+    Write `text` to `file_path` as UTF-8 bytes, verbatim (no newline
+    translation). It is encoded before the file is opened: a lone surrogate
+    (JSON lets a client send half of a pair as an escape) has no UTF-8 form,
+    and opening first would already have emptied the file.
+    """
+    try:
+        data = text.encode("utf-8")
+    except UnicodeEncodeError as e:
+        raise RmdManagerError(
+            f"The text holds a lone surrogate, U+{ord(text[e.start]):04X}, which is not a "
+            f"character and can't be written as UTF-8, so {file_path} was left unchanged"
+        ) from e
+    with open(file_path, "wb") as f:
+        f.write(data)
 
 
 def create_rmd(
@@ -53,9 +71,8 @@ def create_rmd(
     if output_format:
         fm_lines.append(f"output: {yaml_string(output_format)}\n")
     fm_lines.append("---\n\n")
-    # newline="": LF line breaks on every platform.
-    with open(file_path, "w", encoding="utf-8", newline="") as f:
-        f.write("".join(fm_lines))
+    # Written verbatim: LF line breaks on every platform.
+    _write_utf8(file_path, "".join(fm_lines))
     return "Created"
 
 
@@ -72,6 +89,20 @@ def _check_timeout(timeout: float) -> None:
     """Reject a timeout that is not a positive number of seconds; 0 does not mean "no limit"."""
     if not timeout > 0:
         raise RmdManagerError(f"timeout must be a positive number of seconds, got {timeout}")
+
+
+def _frontmatter_key(key: str) -> str:
+    """
+    key as the frontmatter tools take it: without the whitespace around it,
+    but for line breaks (see parser._YAML_BREAKS), which stay, so that a new
+    key holding one is refused rather than "title\\n" setting title.
+    """
+    start, end = 0, len(key)
+    while start < end and key[start].isspace() and key[start] not in _YAML_BREAKS:
+        start += 1
+    while end > start and key[end - 1].isspace() and key[end - 1] not in _YAML_BREAKS:
+        end -= 1
+    return key[start:end]
 
 
 def _check_header_text(what: str, text: str) -> None:
@@ -93,7 +124,7 @@ def _check_header_text(what: str, text: str) -> None:
         raise RmdManagerError(
             f"{what} {text!r} has a # outside a quoted string, which R reads as a comment running to the end of the chunk header"
         )
-    # In a key, any = makes the header read back as other options, which _set_header reports.
+    # A key holding any = isn't a syntactic R name, which set_chunk_option refuses in the header (see _syntactic).
     if trouble == "=" and what == "Chunk option value":
         raise RmdManagerError(
             f"{what} {text!r} has an = outside a quoted string or brackets, which knitr can't read after key=: "
@@ -211,6 +242,44 @@ def _option_name(key: str) -> str:
     return dotted if dotted in _KNITR_DOTTED_OPTIONS else key
 
 
+# A syntactic R name, the only key R reads before = in the arguments of alist(...), as knitr reads a chunk header's
+# options: a letter, or a dot not followed by a digit, then letters, digits, dots and underscores. A reserved word
+# isn't one, and nor are ... and ..1, ..2 and so on.
+_R_SYNTACTIC = re.compile(r"(?:[^\W\d_]|\.(?![0-9]))[\w.]*")
+_R_DOTS = re.compile(r"\.\.(?:\.|[0-9]+)")
+
+
+def _syntactic(key: str) -> bool:
+    """Whether key is a syntactic R name (see _R_SYNTACTIC), which a chunk header can hold before = as written."""
+    return bool(_R_SYNTACTIC.fullmatch(key)) and key not in _R_RESERVED and not _R_DOTS.fullmatch(key)
+
+
+# A name in backticks, as R writes one that isn't syntactic (`my key`), with backslash escapes.
+_R_BACKTICKED = re.compile(r"`((?:\\.|[^\\`])*)`", re.S)
+
+
+def _key_name(key: str) -> str:
+    """
+    The name R reads a chunk header's key as, written before = in the
+    arguments of alist(...): the text of a string ("fig-width") or of a name in
+    backticks (`my key`), its escapes undone, which knitr's alist() takes too;
+    else key as written.
+    """
+    backticked = _R_BACKTICKED.fullmatch(key)
+    text = re.sub(r"\\(.)", r"\1", backticked.group(1), flags=re.S) if backticked else _r_string_value(key)
+    return key if text is None else text
+
+
+def _header_key(key: str) -> str:
+    """
+    A header key as set_chunk_option writes it back with a new value: a dashed
+    name of one of knitr's options, bare or in quotes or backticks, as the
+    dotted one it reads it as (see _option_name), else key as written.
+    """
+    name = _key_name(key)
+    return _option_name(name) if _option_name(name) != name else key
+
+
 def _first_named(cell: Cell) -> int:
     """The index into cell.options of the header's first key=value (or lone =); len(cell.options) if it has none."""
     return next((i for i, (key, value) in enumerate(cell.options) if value or not key), len(cell.options))
@@ -224,20 +293,42 @@ def _bare_names(cell: Cell) -> list[list[int]]:
     names written before the first key=value as one string, so they are one
     element, commas and all, unless the first is a quoted string already or one
     character, which it quotes alone; each later one is an element of its own.
-    knitr takes the one unnamed element for the label, and fails on a header
-    with more than one.
+    It quotes no text with an = in it, even in quotes or brackets (its [^=]*),
+    so a name holding one ("a=b", list(a=1)) ends the names it quotes, and is R
+    code of its own. knitr takes the one unnamed element for the label, and
+    fails on a header with more than one.
     """
     names = ([-1] if cell.label else []) + [i for i, (key, value) in enumerate(cell.options) if key and not value]
     named = _first_named(cell)
-    first = [i for i in names if i < named]
+    first = []
+    for i in names:
+        if i >= named or "=" in _bare_text(cell, [i]):
+            break
+        first.append(i)
     if not first or _bare_text(cell, first[:1])[0] in "'\"" or len(_bare_text(cell, first[:1])) == 1:
         return [[i] for i in names]
-    return [first] + [[i] for i in names if i >= named]
+    return [first] + [[i] for i in names if i not in first]
 
 
 def _bare_text(cell: Cell, names: list[int]) -> str:
     """The names of an unnamed element of a chunk's header (see _bare_names) as written, joined by commas."""
     return ", ".join(cell.label if i == -1 else cell.options[i][0] for i in names)
+
+
+def _quote_cut(cell: Cell) -> Optional[str]:
+    """
+    The part of a chunk's header, as written, inside which the quotes that
+    knitr's quote_label adds end, or None. Unless the header starts with a
+    quote or a name of one character, it quotes the text before the header's
+    first = (any =, in quotes or brackets too) up to the last comma there, which
+    is inside the part holding that = when the part has a comma before it, as
+    cd(x, y=1) has: R can't parse what that leaves, so knitr fails on the header.
+    """
+    parts = ([cell.label] if cell.label else []) + [f"{k}={v}" if v or not k else k for k, v in cell.options]
+    if not parts or parts[0][0] in "'\"" or len(parts[0]) == 1:
+        return None
+    part = next((part for part in parts if "=" in part), "")
+    return part if "," in part.partition("=")[0] else None
 
 
 def _unread_names(cell: Cell, names: list[list[int]]) -> str:
@@ -261,15 +352,16 @@ def _label_spellings(cell: Cell, block: Optional[_OptionBlock]) -> list[tuple[st
         spellings.append(("pipe", label, block.entries[entry].text))
     for key, value in cell.options:
         # Without a value it is a bare name, not a label= option
-        if key == "label" and value:
+        if _key_name(key) == "label" and value:
             # Not a string: knitr deparses the R expression and drops its spaces
             label = _r_string_value(value)
             spellings.append(("option", value.replace(" ", "") if label is None else label, f"label={value}"))
     names = _bare_names(cell)
-    if len(names) == 1:
+    # A header whose quote_label quotes end inside a name is one knitr fails on (see _quote_cut)
+    if len(names) == 1 and _quote_cut(cell) is None:
         text = _bare_text(cell, names[0])
-        if names[0][0] < _first_named(cell) and text[0] not in "'\"":
-            # Written before any key=value: knitr quotes the text as it is
+        if names[0][0] < _first_named(cell) and text[0] not in "'\"" and "=" not in text:
+            # Written before any key=value, and without an = (see _bare_names): knitr quotes the text as it is
             label = text
         else:
             # R code: a string's text, or else the code as knitr deparses it, without its spaces
@@ -289,25 +381,27 @@ class _Spelling(NamedTuple):
 def _option_spellings(cell: Cell, block: Optional[_OptionBlock]) -> list[tuple[str, list[_Spelling]]]:
     """
     A chunk's options, its label aside, merged as knitr merges them: (name,
-    spellings) for each option knitr reads (see _option_name), in the order
+    spellings) for each option knitr reads (see _option_name; a header key in
+    quotes or backticks by the name R reads, see _key_name), in the order
     first written, header first. The spelling knitr uses comes first: an option
     line's over the header's (parse_block's merge_list), a dashed name's over
-    the dotted one (dot_names), and else the header's last copy (opts_chunk$merge
-    assigns the copies in turn), which a key the header has twice also keeps
-    over an option line, as merge_list puts that line's value in the first copy.
-    The others follow in the order written. A name without a value is an option
-    here only in a header knitr fails on (see _bare_names); label= options, and
+    the dotted one (dot_names; a header holds one in quotes or backticks), and
+    else the header's last copy (opts_chunk$merge assigns the copies in turn),
+    which a key the header has twice also keeps over an option line, as
+    merge_list puts that line's value in the first copy. The others follow in
+    the order written. A name without a value is an option here only in a
+    header knitr fails on (see _bare_names and _quote_cut); label= options, and
     label: and id: keys in the option lines, are the label (see _label_spellings).
     """
     names = _bare_names(cell)
-    label = {i for element in names for i in element} if len(names) == 1 else set()
+    label = {i for element in names for i in element} if len(names) == 1 and _quote_cut(cell) is None else set()
     parts = ([(-1, (cell.label, ""))] if cell.label else []) + list(enumerate(cell.options))
     options: dict[str, list[_Spelling]] = {}
     for i, (key, value) in parts:
-        if (key == "label" and value) or i in label:
+        if (_key_name(key) == "label" and value) or i in label:
             continue
         text = f"{key}={value}" if value or not key else key
-        options.setdefault(_option_name(key), []).append(_Spelling("header", i, key, text))
+        options.setdefault(_option_name(_key_name(key)), []).append(_Spelling("header", i, key, text))
     for i, entry in enumerate(block.entries if block else []):
         if entry.key is not None and entry.key not in ("label", "id"):
             options.setdefault(_option_name(entry.key), []).append(_Spelling("pipe", i, entry.key, entry.text))
@@ -315,11 +409,11 @@ def _option_spellings(cell: Cell, block: Optional[_OptionBlock]) -> list[tuple[s
     for name, spellings in options.items():
         header = [s for s in spellings if s.where == "header"]
         pipe = [s for s in spellings if s.where == "pipe"]
-        dashed = [s for s in pipe if s.key != name]
+        dashed = [s for s in pipe if s.key != name] or [s for s in header if _key_name(s.key) not in (s.key, name)][-1:]
         exact = [s for s in pipe if s.key == name]
         if dashed:
             used = dashed[0]
-        elif exact and sum(s.key == name for s in header) < 2:
+        elif exact and sum(_key_name(s.key) == name for s in header) < 2:
             used = exact[0]
         else:
             used = header[-1]
@@ -353,22 +447,24 @@ def _r_name(text: str) -> str:
     return text if _R_NAME.fullmatch(text) and text not in _R_RESERVED else _r_string(text)
 
 
-def _pipe_line(block: _OptionBlock, entry: _OptionEntry, value: str) -> str:
-    """entry of block written anew on one option line holding value, YAML text, under its key as written."""
-    return f"{block.start}{entry.prefix} {value}" + (f" {block.end}" if block.end else "") + "\n"
+def _pipe_line(block: _OptionBlock, prefix: str, value: str) -> str:
+    """One option line of block holding value, YAML text, under prefix, a key and its ":" (an entry's, as written)."""
+    return f"{block.start}{prefix} {value}" + (f" {block.end}" if block.end else "") + "\n"
 
 
 def _pipe_edits(
-    cell: Cell, block: _OptionBlock, removed: set[int], rewritten: dict[int, str]
+    cell: Cell, block: _OptionBlock, removed: set[int], rewritten: dict[int, str],
+    added: Optional[tuple[str, str]] = None,
 ) -> list[tuple[int, int, str]]:
     """
     Edits for RmdManager._set_body_lines that remove the lines of the entries of
-    block, the option lines of chunk cell, in removed and write those in
-    rewritten (entry to new lines, ending in "\\n") anew. knitr reads the
-    option lines as YAML only when the first is a "key:" line, so comment and
-    blank lines that would be left at the top move to just after the first key
-    left, or go too when no key is left. Raises for lines that are one comment
-    over several ("/*| a: 1", then "b: 2 */"): they aren't edited line by line.
+    block, the option lines of chunk cell, in removed, write those in
+    rewritten (entry to new lines, ending in "\\n") anew, and add added, a new
+    key and its line, after the last entry. knitr reads the option lines as
+    YAML only when the first is a "key:" line, so comment and blank lines that
+    would be left at the top move to just after the first key left, or go too
+    when no key is left. Raises for lines that are one comment over several
+    ("/*| a: 1", then "b: 2 */"): they aren't edited line by line.
     """
     language = cell.language
     one_per_line = all(line.startswith(block.start) and line.rstrip(_R_SPACE).endswith(block.end)
@@ -382,6 +478,9 @@ def _pipe_edits(
     edits = {entries[i].start: (entries[i].start, entries[i].end, "") for i in removed}
     for i, text in rewritten.items():
         edits[entries[i].start] = (entries[i].start, entries[i].end, text)
+    if added is not None:
+        # After the last key's lines, before the comment and blank lines that end the block
+        edits[entries[-1].end] = (entries[-1].end, entries[-1].end, added[1])
     kept = [i for i in range(len(entries)) if i not in removed]
     top = entries[kept[0]].start if kept else len(block.lines)
     gone = {line for i in removed for line in range(entries[i].start, entries[i].end)}
@@ -406,7 +505,8 @@ def _pipe_edits(
     after = _option_block(language, "".join(lines + code))
     keys = [entry.key for entry in after.entries] if after else []
     broken = after is not None and _read_header("".join(after.meta))[1] is not None
-    if ((extent[2] if extent else 0) != len(lines) or keys != [entries[i].key for i in kept]
+    want = [entries[i].key for i in kept] + ([added[0]] if added else [])
+    if ((extent[2] if extent else 0) != len(lines) or keys != want
             or (broken and _read_header("".join(block.meta))[1] is None)):
         raise RmdManagerError(
             "Editing the option lines of this chunk would change how the rest of them read (for example an alias "
@@ -433,16 +533,119 @@ def _one_line(text: str) -> str:
     return text.replace("\r", "\\r").replace("\n", "\\n")
 
 
+def _is_option_line(language: str, line: str) -> bool:
+    """
+    Whether line starts as the option lines of a chunk of this engine do (see
+    parser._option_extent): with its comment characters and "| ", or "#| ".
+    """
+    return _option_extent(language, [line]) is not None
+
+
+def _code_start(language: str, lines: list[str]) -> int:
+    """
+    Where a chunk's code starts among lines, its lines without their line
+    breaks: after the option lines knitr reads at its top (see
+    parser._option_extent) and the blank line after them, which knitr's
+    divide_chunk takes with them; 0 for a chunk without option lines.
+    """
+    extent = _option_extent(language, lines)
+    if extent is None:
+        return 0
+    count = extent[2]
+    return count + 1 if count < len(lines) and not lines[count].strip() else count
+
+
+def _stray_option_lines(language: str, source: str) -> list[tuple[int, str]]:
+    """
+    The lines of a chunk's source, as (number from 1, text), that start as
+    option lines do (see _is_option_line) but come after the option lines at
+    its top, where knitr reads them as code.
+    """
+    # The body's lines: a blank line before the fence, which doesn't end with */, can end the option lines of a c chunk
+    lines = [line.rstrip("\n") for line in _lines(_chunk_body(source))]
+    extent = _option_extent(language, lines)
+    top = extent[2] if extent else 0
+    return [(number, line) for number, line in enumerate(lines[top:], start=top + 1) if _is_option_line(language, line)]
+
+
+def _check_stray_option_lines(cell: Cell, source: str, start: int = 1) -> None:
+    """
+    Raise if source, chunk cell's new source, has a line that starts as option
+    lines do after other lines (see _stray_option_lines), where knitr reads it
+    as code, unless cell's source has that line there too. The new text starts
+    at line start of source, so the error gives the line's number in the text.
+    A line right after the option lines is one they don't run on to: in a c,
+    css or sas chunk whose every line ends with the comment's closing
+    characters, knitr reads the first line alone as an option line.
+    """
+    had = {line for _, line in _stray_option_lines(cell.language, cell.source)}
+    lines = [line.rstrip("\n") for line in _lines(_chunk_body(source))]
+    extent = _option_extent(cell.language, lines)
+    for number, line in _stray_option_lines(cell.language, source):
+        if line in had:
+            continue
+        shown = f"Line {number - start + 1} of the new text, {line!r},"
+        if extent and extent[1] and all(text.rstrip(_R_SPACE).endswith(extent[1]) for text in lines):
+            raise RmdManagerError(
+                f"{shown} starts as a chunk option line does, but knitr reads only the first line of a chunk whose "
+                f"every line ends with {extent[1]!r} as an option line, the others as code, so the file was left "
+                "unchanged: put code below the option lines, or set the option with set_chunk_option"
+            )
+        if extent and number == extent[2] + 1:
+            raise RmdManagerError(
+                f"{shown} starts as a chunk option line does, but knitr reads it as code, as the option lines it reads "
+                "at the top of the chunk end above it, so the file was left unchanged: write it as they are written, "
+                "or set the option with set_chunk_option"
+            )
+        raise RmdManagerError(
+            f"{shown} is a chunk option line after other lines, where knitr reads it as code (it reads option lines "
+            "only at the top of a chunk), so the file was left unchanged: move it up with the option lines at the "
+            "top, or set the option with set_chunk_option"
+        )
+
+
+def _check_prepended(cell: Cell, source: str, text: str) -> None:
+    """
+    Raise unless source, chunk cell's source with text prepended (see
+    _with_added), starts with the option lines knitr reads at the top of cell,
+    or, if it has none, with none but lines of text: text that goes below the
+    cell's option lines can't start with one, which would be code there, and
+    no text can make knitr read lines below it as option lines too (as a line
+    ending in */ does under the /*| ... */ lines of a c chunk). An option line
+    after other lines of text is refused too (see _check_stray_option_lines).
+    """
+    old = [line.rstrip("\n") for line in _lines(_chunk_body(cell.source))]
+    new = [line.rstrip("\n") for line in _lines(_chunk_body(source))]
+    added = [line.rstrip("\n") for line in _lines(text)]
+    before, after = _option_extent(cell.language, old), _option_extent(cell.language, new)
+    count, now = (before[2] if before else 0), (after[2] if after else 0)
+    if count and added and _is_option_line(cell.language, added[0]):
+        raise RmdManagerError(
+            f"Line 1 of the new text, {added[0]!r}, is a chunk option line, but the chunk starts with option lines "
+            "already and the text goes below them, where knitr reads it as code, so the file was left unchanged: set "
+            "an option with set_chunk_option, or rewrite the option lines with replace_cell_source"
+        )
+    if (new[:now] != old[:count]) if count else now > len(added):
+        raise RmdManagerError(
+            "Prepending this text would change which lines of the chunk knitr reads as its option lines (as a line "
+            "ending in */ does under the /*| ... */ lines of a c chunk), so the file was left unchanged"
+        )
+    # An option line in the text after another of its lines is code, as it is in replace_cell_source's text
+    _check_stray_option_lines(cell, source, _code_start(cell.language, old) + 1)
+
+
 def _with_added(cell: Cell, text: str, *, before: bool) -> str:
     """
-    cell's source with text, "\\n" text, added before or after it. The two are
-    separated by exactly one line break, which text may end with (before) or
-    start with (after) itself; none of the cell's own line breaks is taken for
-    it, so its blank lines all stay. A chunk's source is its lines joined by
-    "\\n", a last "\\n" being a blank line before the fence (see
-    parser._chunk_source), and text added after it keeps that rule: "y\\n"
-    leaves a blank line before the fence. A prose cell's last line ends with its
-    line break already, unless it is the file's last line without one.
+    cell's source with text, "\\n" text, added before or after it; before a
+    chunk's code, text goes below the option lines knitr reads at its top and
+    the blank line after them (see _code_start). The two are separated by
+    exactly one line break, which text may end with (before) or start with
+    (after) itself; none of the cell's own line breaks is taken for it, so its
+    blank lines all stay. A chunk's source is its lines joined by "\\n", a last
+    "\\n" being a blank line before the fence (see parser._chunk_source), and
+    text added after it keeps that rule: "y\\n" leaves a blank line before the
+    fence. A prose cell's last line ends with its line break already, unless it
+    is the file's last line without one.
     """
     if not text or not cell.source:
         return text + cell.source if before else cell.source + text
@@ -452,7 +655,9 @@ def _with_added(cell: Cell, text: str, *, before: bool) -> str:
         return cell.source + ("" if cell.source.endswith("\n") or text.startswith("\n") else "\n") + text
     lines = [line.rstrip("\n") for line in _lines(_chunk_body(cell.source))]
     if before:
-        lines = (text[:-1] if text.endswith("\n") else text).split("\n") + lines
+        # Below the option lines knitr reads at the top of the chunk, and the blank line after them (see _code_start)
+        top = _code_start(cell.language, lines)
+        lines[top:top] = (text[:-1] if text.endswith("\n") else text).split("\n")
     else:
         lines += (text[1:] if text.startswith("\n") else text).split("\n")
     return _chunk_source("".join(line + "\n" for line in lines))
@@ -502,8 +707,11 @@ class RmdManager:
             self.frontmatter, self.cells = parse(self._text)
             raise RmdManagerError(problem)
         # Written as serialized: edited parts already use the document's line break.
-        with open(self.filepath, "w", encoding="utf-8", newline="") as f:
-            f.write(text)
+        try:
+            _write_utf8(self.filepath, text)
+        except RmdManagerError:
+            self.frontmatter, self.cells = parse(self._text)
+            raise
         self._text = text
         return "Saved"
 
@@ -569,7 +777,8 @@ class RmdManager:
         where knitr reads it from (see _label_spellings): a "#| label:" (or id:)
         line, a label= option (an R string, in the quotes it had), or else the bare
         name or names of the header, in their place (after other options, as an R
-        name or string); a chunk without a label gets it first in the header. The
+        name or string); a chunk without a label gets it first in the header, as
+        an R string if it holds an =, which R would read there as code. The
         spellings knitr reads it over go, so one is left. Raises, leaving the chunk
         as it was, for a label that place can't hold, or a header knitr fails on
         for its names without a value.
@@ -588,6 +797,9 @@ class RmdManager:
         bare = names[0] if names else []
         # Written first in the header: in the place of the bare name there, or as a new label
         first = where == "header" and (not bare or -1 in bare)
+        # quote_label quotes no text holding an = (see _bare_names), which R would read there as code (x == 1 as the
+        # label x==1): such a label goes first as an R string, which knitr reads as it is
+        written = _r_string(value) if first and "=" in value else value
         if first:
             _check_header_text("Chunk label", value)
         elif "\n" in value or "\r" in value:
@@ -595,7 +807,7 @@ class RmdManager:
             raise RmdManagerError(f"Chunk label {value!r} contains a line break, but {place} is a single line")
         options = []
         for i, (key, text) in enumerate(cell.options):
-            if key == "label" and text:
+            if _key_name(key) == "label" and text:
                 # The first label= option gets the value, in the quotes it had; the others go
                 if where == "option" and not any(k == "label" and v for k, v in options):
                     options.append(("label", _r_string(value, text[0] if _r_string_value(text) is not None else '"')))
@@ -613,9 +825,9 @@ class RmdManager:
         if where == "pipe":
             entry = pipe[0][0]
             removed.discard(entry)
-            rewritten[entry] = _pipe_line(block, block.entries[entry], _option_text(value))
+            rewritten[entry] = _pipe_line(block, block.entries[entry].prefix, _option_text(value))
         edits = _pipe_edits(cell, block, removed, rewritten) if pipe else []
-        self._set_header(cell, value if first else None, options,
+        self._set_header(cell, written if first else None, options,
                          f"Can't set the chunk label to {value!r}" if value else "Can't remove the chunk label")
         if edits:
             self._set_body_lines(cell, edits)
@@ -723,6 +935,32 @@ class RmdManager:
             )
         first_src = "".join(lines[:line_offset])
         if cell.cell_type == "code":
+            # knitr reads option lines at the top of a chunk only: the new chunk can't start with any
+            body = [line.rstrip("\n") for line in _lines(_chunk_body(cell.source))]
+            options = _option_extent(cell.language, body)
+            count = options[2] if options else 0
+            if line_offset < count:
+                raise RmdManagerError(
+                    f"Can't split cell {index} at line_offset {line_offset}: the chunk's first {count} lines are its "
+                    f"option lines, and the ones after line {line_offset} would start the new chunk, where knitr would "
+                    "read them as its options instead of this one's, so the file was left unchanged"
+                )
+            second = lines[line_offset].rstrip("\n")
+            if _is_option_line(cell.language, second):
+                raise RmdManagerError(
+                    f"Can't split cell {index} at line_offset {line_offset}: line {line_offset + 1}, {second!r}, would "
+                    "start the new chunk, where knitr would read it as an option line instead of code, so the file was "
+                    "left unchanged"
+                )
+            # Nor can the first chunk lose any: knitr reads only the first line of a c, css or sas chunk whose every
+            # line ends with the comment's closing characters as an option line (divide_chunk's which.min())
+            kept = _option_extent(cell.language, body[:line_offset])
+            if count and kept[2] != count:
+                raise RmdManagerError(
+                    f"Can't split cell {index} at line_offset {line_offset}: the first chunk would hold its {count} "
+                    "option lines alone, and knitr reads only the first line of a chunk whose every line ends with "
+                    f"{options[1]!r} as an option line, the others as code, so the file was left unchanged"
+                )
             # Split the chunk's body, then take each half's source: every body line keeps its place.
             second_src = _chunk_source(_chunk_body(cell.source)[len(first_src):])
             first_src = _chunk_source(first_src)
@@ -786,8 +1024,13 @@ class RmdManager:
 
     def replace_cell_source(self, index: int, new_source: str) -> str:
         idx = self._validate_index(index)
+        cell = self.cells[idx]
         new_source = _with_newline(new_source, "\n")
-        self._set_source(self.cells[idx], new_source, new_source)
+        if cell.cell_type == "code" and new_source != cell.source:
+            # knitr reads option lines only at the top of a chunk: one after other lines, as when the text puts a line
+            # above them, would be code there
+            _check_stray_option_lines(cell, new_source)
+        self._set_source(cell, new_source, new_source)
         return self._save()
 
     def prepend_to_cell(self, index: int, source: str) -> str:
@@ -795,7 +1038,10 @@ class RmdManager:
         cell = self.cells[idx]
         # As "\n" text, so the separator check sees "\r\n" and "\r" breaks too.
         source = _with_newline(source, "\n")
-        self._set_source(cell, _with_added(cell, source, before=True), source)
+        new_source = _with_added(cell, source, before=True)
+        if cell.cell_type == "code":
+            _check_prepended(cell, new_source, source)
+        self._set_source(cell, new_source, source)
         return self._save()
 
     def append_to_cell(self, index: int, source: str) -> str:
@@ -817,8 +1063,12 @@ class RmdManager:
         # The label knitr uses; one not written as the bare name or names in the header says where it is.
         # Line breaks are escaped, so the label stays on its line.
         names = _bare_names(cell)
+        cut = _quote_cut(cell)
         spellings = _label_spellings(cell, block)
-        if len(names) > 1:
+        if cut is not None:
+            lines.append(f"label: (none: knitr fails on this chunk header, whose quote_label quotes the text before "
+                         f"its first = up to the comma inside '{cut}', which leaves R code that doesn't parse)")
+        elif len(names) > 1:
             lines.append("label: (none: knitr fails on this chunk header, which has more than one name without a "
                          f"value: {_unread_names(cell, names)})")
         elif not spellings:
@@ -877,24 +1127,52 @@ class RmdManager:
                 "so give a value such as TRUE, or remove the option with remove_chunk_option"
             )
         # The spelling knitr uses gets the value where it is written (an option line's as YAML), and the others go,
-        # so one is left; a key not written yet goes at the end of the header.
+        # so one is left. A key not written yet goes at the end of the header, which knitr reads as R code, so as a
+        # syntactic R name, a dashed one of knitr's (fig-width, as Quarto writes them) as the dotted one (knitr's
+        # dot_names); in a chunk with YAML option lines, a dashed name or another key R can't read goes there instead,
+        # but for a dashed name of knitr's when they can't take a new line. A header copy R can't read counts as none.
         block = _option_block(cell.language, cell.source)
         spellings = next((option for name, option in _option_spellings(cell, block) if name == _option_name(key)), [])
         used = spellings[0] if spellings else None
         dropped = {s.index for s in spellings[1:] if s.where == "header"}
         removed = {s.index for s in spellings[1:] if s.where == "pipe"}
+        unquoted = used is not None and used.where == "header" and _key_name(used.key) == used.key
+        if unquoted and not _syntactic(_header_key(used.key)):
+            # A header copy knitr can't read (code-fold=TRUE, as 1.4.0 wrote it) goes: the key is written as a new one
+            dropped.add(used.index)
+            used = None
         rewritten = {}
+        added = None
         if used is not None and used.where == "pipe":
-            rewritten[used.index] = _pipe_line(block, block.entries[used.index], _r_to_yaml(value))
-        edits = _pipe_edits(cell, block, removed, rewritten) if removed or rewritten else []
+            rewritten[used.index] = _pipe_line(block, block.entries[used.index].prefix, _r_to_yaml(value))
+        elif used is None and block is not None and block.entries and not _syntactic(key):
+            # A dashed name isn't syntactic either
+            added = (key, _pipe_line(block, _option_text(key) + ":", _r_to_yaml(value)))
+        elif used is None and not _syntactic(_option_name(key)):
+            raise RmdManagerError(
+                f"Option key {key!r} isn't a syntactic R name (letters, digits, dots and underscores, starting with a "
+                "letter or with a dot not followed by a digit, and not a reserved word such as if), which a chunk "
+                "header needs, as knitr reads it as R code, so the file was left unchanged: in a chunk that starts "
+                "with #| option lines, which knitr reads as YAML, set_chunk_option writes the key there"
+            )
+        edits = []
+        if removed or rewritten or added:
+            try:
+                edits = _pipe_edits(cell, block, removed, rewritten, added)
+            except RmdManagerError:
+                # Option lines that can't take a new line: a dashed name of knitr's goes in the header, dotted
+                if added is None or removed or not _syntactic(_option_name(key)):
+                    raise
+                added = None
         in_header = used is not None and used.where == "header"
-        # The bare name first in the header, in a header knitr fails on (see _option_spellings), becomes the option
-        options = [(used.key, value)] if in_header and used.index == -1 else []
+        # The bare name first in the header, in a header knitr fails on (see _option_spellings), becomes the option. A
+        # header copy written as a dashed name, which knitr can't read there bare, is written as the dotted one.
+        options = [(_header_key(used.key), value)] if in_header and used.index == -1 else []
         for i, (k, v) in enumerate(cell.options):
             if i not in dropped:
-                options.append((k, value) if in_header and i == used.index else (k, v))
-        if used is None:
-            options.append((key, value))
+                options.append((_header_key(k), value) if in_header and i == used.index else (k, v))
+        if used is None and added is None:
+            options.append((_option_name(key), value))
         label = None if (in_header and used.index == -1) or -1 in dropped else cell.label
         self._set_header(cell, label, options, f"Can't set chunk option {key!r} to {value!r}")
         if edits:
@@ -939,7 +1217,7 @@ class RmdManager:
         return dump_yaml(fm.data).rstrip("\n")
 
     def set_frontmatter_key(self, key: str, value: str) -> str:
-        key = key.strip()
+        key = _frontmatter_key(key)
         if not key:
             raise RmdManagerError("Frontmatter key must not be empty")
         had_header = self.frontmatter.present
@@ -958,7 +1236,7 @@ class RmdManager:
 
     def remove_frontmatter_key(self, key: str) -> str:
         try:
-            self.frontmatter.remove_key(key.strip())
+            self.frontmatter.remove_key(_frontmatter_key(key))
         except FrontmatterError as e:
             raise RmdManagerError(str(e)) from e
         return self._save()

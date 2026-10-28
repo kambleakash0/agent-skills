@@ -260,6 +260,15 @@ def split_cell(
 ) -> str:
     """Split a cell into two at the given line offset (1-indexed, exclusive upper).
 
+    knitr reads a chunk's option lines (#| for r, --| for sql) only at its
+    top, so a split inside them, which would give some of them to the new
+    chunk, is refused, and so is one that would start the new chunk with a
+    line that starts as an option line does, which knitr reads as code where
+    it is now. In a c, css or sas chunk whose every line ends with the
+    comment's closing characters (*/, or ; for sas), knitr reads the first
+    line alone as an option line, so a split that would leave the first chunk
+    its option lines alone is refused too.
+
     Args:
         file_path: Absolute path to a .rmd file.
         index: Zero-based cell index.
@@ -324,9 +333,15 @@ def replace_cell_source(
     (backticks alone on a line, after nothing but spaces, tabs or >) or as a
     chunk header (such backticks, then {engine} or {engine options}) would end
     the chunk there, so it is refused; the error gives its line in the text
-    passed. In a markdown cell's text, a line that would open a chunk is
-    refused the same way (prepend_to_cell and append_to_cell check the text
-    they add).
+    passed. So is an option line (#| for r, --| for sql) after other lines,
+    as when a line is put above the chunk's option lines: knitr reads them
+    only at the top of a chunk, so it would be code there; one the chunk
+    already had there is fine. That holds for one right below them that
+    knitr reads as code too: in a c, css or sas chunk whose every line ends
+    with */ (or ; for sas), it reads the first line alone as an option line.
+    In a markdown cell's text, a line that would
+    open a chunk is refused the same way (prepend_to_cell and append_to_cell
+    check the text they add).
 
     Args:
         file_path: Absolute path to a .rmd file.
@@ -345,7 +360,7 @@ def prepend_to_cell(
     index: CellIndex,
     source: Annotated[
         str,
-        Field(description="Text to insert at the top of the cell body. One line break separates it from the cell's text, added unless the text ends with one; the cell's own blank lines stay."),
+        Field(description="Text to insert at the top of the cell body; in a chunk that starts with #| option lines, at the top of its code, below them. One line break separates it from the cell's text, added unless the text ends with one; the cell's own blank lines stay."),
     ],
 ) -> str:
     """Prepend text to an existing cell's source.
@@ -353,6 +368,15 @@ def prepend_to_cell(
     The text goes on lines of its own above the cell's text: one line break
     separates them, added unless the text ends with one, and a blank line the
     cell starts with stays. On prose "\\nMore\\n", "Top" gives "Top\\n\\nMore\\n".
+
+    knitr reads a chunk's option lines (#| for r, --| for sql, /*| ... */ for
+    c) only at its top, so in a chunk that starts with them the text goes
+    below them, and below the blank line after them: "library(x)" on
+    "#| echo: false\\nx" gives "#| echo: false\\nlibrary(x)\\nx". Text that
+    starts with an option line is refused there (set options with
+    set_chunk_option), and so is an option line after other lines of the
+    text, which knitr would read as code; in a chunk without option lines,
+    the text's own option lines at its top become the chunk's.
 
     Args:
         file_path: Absolute path to a .rmd file.
@@ -407,14 +431,20 @@ def get_chunk_options(file_path: FilePath, index: ChunkIndex) -> str:
     without a value, wherever it is (```{r echo=FALSE, foo} is labelled foo).
     The names written before the first key=value are one label to knitr,
     commas and all, which is noted, unless the first is one character, which
-    knitr quotes alone. A header with any other name without a value, which
-    knitr fails on, shows label: (none: ...) saying so. A name after other
-    options is R code, which knitr writes without its spaces. A label not
-    written as a bare name is shown with where it is written, and label= is
-    not listed among the options. A line break in a label shows as \\n.
+    knitr quotes alone. A part of the header is key=value at its first =
+    outside quotes and brackets, as R reads it, so "a=b" and list(a=1) are
+    names without a value; knitr quotes none with an = in it, so such a name
+    ends the ones before it and is R code (```{r "a=b"} is labelled a=b). A
+    header with any other name without a value, which knitr fails on, shows
+    label: (none: ...) saying so, and so does one whose first = has a comma
+    before it in the same name (```{r cd(x, y=1)}), which knitr's quote_label
+    cuts in two. A name after other options is R code, which knitr writes
+    without its spaces. A label not written as a bare name is shown with where
+    it is written, and label= is not listed among the options. A line break in a label shows as \\n.
 
     Each option knitr reads is listed once, as the spelling it uses: key=value
-    in the header, or the option line as written (#| for r and python, --| for
+    in the header (a key in backticks or quotes, `my key`=1, under the name it
+    stands for), or the option line as written (#| for r and python, --| for
     sql, //| for Rcpp and js, /*| ... */ for c, as knitr reads each engine's
     comment). knitr reads a #| line over the header, a dashed name such as
     fig-width over the dotted fig.width, and the last copy of a key the header
@@ -437,7 +467,7 @@ def set_chunk_option(
     index: ChunkIndex,
     key: Annotated[
         str,
-        Field(description='Chunk option name such as echo, warning, or fig.width; the special key "label" sets the chunk label.'),
+        Field(description='Chunk option name such as echo, warning, or fig.width; the special key "label" sets the chunk label. A dashed name such as fig-width (as Quarto writes them) goes in the header as fig.width; a key that is not a syntactic R name (code-fold, my key) goes only in the #| lines of a chunk that has them.'),
     ],
     value: Annotated[
         str,
@@ -455,10 +485,24 @@ def set_chunk_option(
     left. A key not written yet goes at the end of the header. Only those lines
     are rewritten: the body's other lines and the closing fence keep their bytes.
 
+    knitr reads the header as R code (the arguments of alist()), where a key
+    must be a syntactic R name: letters, digits, dots and underscores, starting
+    with a letter or a dot not followed by a digit, and not a reserved word. A
+    dashed name of one of knitr's options, as Quarto writes them (fig-width,
+    out-width), goes in the header as the dotted name knitr reads it as
+    (fig.width), or as written in a new #| line after the others when the
+    chunk has YAML #| lines (or in the header after all, when those lines
+    can't take a new one); a header copy written dashed is rewritten dotted.
+    Another key that isn't a syntactic name (code-fold, my key) goes in a new
+    #| line too, and is refused in a chunk without #| lines. A header key in
+    backticks or quotes (`my key`=1), which R reads too, is found by the name
+    it stands for, and a header copy R can't read (code-fold=TRUE) counts as
+    none.
+
     knitr reads keys and values as R code, and the header must read back with
     exactly the new label and options, so the edit is refused, leaving the file
     unchanged, for a line break, an unmatched bracket or quote, a comma outside
-    a quoted string, an "=" in a key or label, or, in a key or value, a
+    a quoted string, an "=" in a key, or, in a key or value, a
     backtick left open or a # or "=" outside quotes and brackets (x == 1 is
     fine). So is an empty value for any key but "label".
 
@@ -466,7 +510,9 @@ def set_chunk_option(
     the top of the chunk, whose lines alone are rewritten, else a label= option
     (kept as an R string, any text allowed but a line break), else the bare name
     or names in the header, in their place (after other options as an R name or
-    a quoted string); a chunk without a label gets it first in the header.
+    a quoted string); a chunk without a label gets it first in the header, as
+    a quoted R string if it holds an = (```{r "x == 1"}), as knitr quotes no
+    bare name with an = in it.
     Spellings knitr reads it over are removed, so one is left. A header with
     more than one name without a value, which knitr fails on, is refused: give
     those names values, or remove them, first. When the first #| key goes, the
@@ -558,11 +604,14 @@ def set_frontmatter_key(
     Only that key's lines change (the key line and its indented lines): comments,
     quoting, tags such as !r, and key order elsewhere in the header are kept. A
     new key goes just before the closing ---; a document without a header gets
-    one. A new key longer than 1024 characters as written (quotes included) is
-    refused: YAML reads no longer key on a key: value line. A header that is
-    not valid YAML is still edited line by line. A value
-    that can't be built (such as !!bool maybe, or nested too deep to sit under
-    a key) is written as a quoted string, like other text that isn't YAML.
+    one. The whitespace around the key is dropped, but not a line break: a new
+    key holding one ("short\\n", or NEL or U+2028) is refused, as is one with a
+    lone UTF-16 surrogate, which R's yaml package can't read, and one longer
+    than 1024 characters as written (quotes included), as YAML reads no longer
+    key on a key: value line. A header that is not valid YAML is still edited
+    line by line. A value that can't be built (such as !!bool maybe, or nested
+    too deep to sit under a key) is written as a quoted string, like other text
+    that isn't YAML.
 
     Args:
         file_path: Absolute path to a .rmd file.

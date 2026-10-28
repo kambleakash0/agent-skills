@@ -1,4 +1,6 @@
 import ast
+import difflib
+import functools
 import json
 import os
 import re
@@ -152,6 +154,46 @@ _MULTILINE_STRINGS = {
     **{ext: ("string_literal", "raw_string_literal") for ext in CPP_EXTS},
 }
 
+# The nodes whose text is words rather than tokens of code, where a body
+# snippet may start or end between any two words (see
+# Applier._splits_token): comments (every node type with "comment" in its
+# name), string literals and their parts, regular expressions, character
+# literals and a C/C++ macro's body. The code of an interpolation in a
+# string (`f"{x}"`, `${x}`, `#{x}`) is tokens again, and so are the tokens
+# that open and close a string.
+_TEXT_NODES = (
+    "string",
+    "string_content",
+    "string_fragment",
+    "escape_sequence",
+    "concatenated_string",
+    "template_string",
+    "regex",
+    "regex_pattern",
+    "jsx_text",
+    "interpreted_string_literal",
+    "interpreted_string_literal_content",
+    "raw_string_literal",
+    "raw_string_literal_content",
+    "rune_literal",
+    "heredoc_body",
+    "heredoc_content",
+    "bare_string",
+    "subshell",
+    "character",
+    "string_literal",
+    "multiline_string_fragment",
+    "character_literal",
+    "raw_string_content",
+    "char_literal",
+    "system_lib_string",
+    "preproc_arg",
+)
+_INTERPOLATIONS = ("interpolation", "template_substitution")
+_STRING_DELIMITERS = ("string_start", "string_end", "raw_string_delimiter", "heredoc_end")
+# A character that continues an identifier, number or keyword.
+_WORD_CHARACTER = re.compile(r"\w")
+
 # YAML keys that may stay plain scalars (see Applier._yaml_key_source),
 # and the plain scalars YAML 1.1 (PyYAML) or 1.2 reads as booleans or null.
 _YAML_PLAIN_KEY = re.compile(r"[^\W\d][\w\-./ ]*")
@@ -245,6 +287,51 @@ def _config_path(parent: str, name: str) -> str:
     return f"{parent}.{name}" if parent else name
 
 
+class _Span:
+    """Consecutive entries of a list that _entry_deleted deletes as one (a
+    Python parameter with the `*` or `/` it leaves without a parameter): the
+    range from the first one's start to the last one's end."""
+
+    type = "span"
+
+    def __init__(self, first, last):
+        self.start_byte, self.start_point = first.start_byte, first.start_point
+        self.end_byte, self.end_point = last.end_byte, last.end_point
+
+
+def _refusing_lone_surrogates(cls):
+    """
+    Class decorator for Applier: each public method first refuses a string
+    argument that holds a lone surrogate. JSON lets a client send half of a
+    surrogate pair as an escape; it is not a character and has no UTF-8
+    form, so no edit holding one can be written. Checking the arguments up
+    front gives one clear refusal, whichever step would encode them first.
+    """
+
+    def checking(method):
+        @functools.wraps(method)
+        def wrapper(self, *args, **kwargs):
+            for value in (*args, *kwargs.values()):
+                if isinstance(value, str):
+                    try:
+                        value.encode("utf-8")
+                    except UnicodeEncodeError as e:
+                        raise ApplierError(
+                            f"Refused: the text holds a lone surrogate, U+{ord(value[e.start]):04X}, "
+                            f"which is not a character and can't be written as UTF-8. "
+                            f"{self.filepath} was not modified."
+                        ) from e
+            return method(self, *args, **kwargs)
+
+        return wrapper
+
+    for name, attr in list(vars(cls).items()):
+        if not name.startswith("_") and callable(attr) and not isinstance(attr, (staticmethod, classmethod)):
+            setattr(cls, name, checking(attr))
+    return cls
+
+
+@_refusing_lone_surrogates
 class Applier:
     def __init__(self, filepath: str):
         self.filepath = filepath
@@ -256,8 +343,11 @@ class Applier:
             # can distinguish user errors from internal ones.
             raise ApplierError(str(e)) from e
 
-        # LF-normalised text, so line indices match the tree's rows.
+        # LF-normalised text, so line indices match the tree's rows. The
+        # lines as read stay apart, for the lines an edit leaves alone
+        # (_save).
         self.lines = _split_lines(self.parser.source_code)
+        self._read_lines = tuple(self.lines)
 
     def _get_indent(self, line: str) -> str:
         """The spaces and tabs a line starts with. A form feed, U+2028 or
@@ -437,26 +527,32 @@ class Applier:
         `in`, or, when the first line is a decorator, annotation or template
         header, one of the symbol's other headers and the line they introduce
         (the `def` below `@property`, a method below the `)` that ends its
-        decorator's arguments). Relative content has those lines at column 0,
-        and a line of code at P that is none of them (a def's body, an
-        expression continued on the next line, the `@property` of a nested
-        method, a statement below a Whitesmiths `{`) makes it relative content
-        indented by as much as P. The lines that start inside a multi-line
-        string or a Ruby embedded document (_literal_rows), comment lines,
-        C/C++ preprocessor lines, the lines a macro continues on, and labels
-        may be at any column, so they do not count.
+        decorator's arguments). Content for several members (two methods, a
+        method and a decorated one) has more lines at P: each line that
+        starts another member after the one before it ended (_next_member),
+        with its headers and the line they introduce. Relative content has
+        those lines at column 0, and a line of code at P that is none of
+        them (a def's body, an expression continued on the next line, the
+        `@property` of a nested method, a statement below a Whitesmiths `{`)
+        makes it relative content indented by as much as P. The lines that
+        start inside a multi-line string or a Ruby embedded document
+        (_literal_rows), comment lines, C/C++ preprocessor lines, the lines
+        a macro continues on, and labels may be at any column, so they do
+        not count.
 
         P is tried first as the indentation of the last line when it closes
         the symbol (`}`, `end`), then as that of the line after a first line
-        that is a decorator, annotation or template header: content read at
-        another depth (copied from another class) is recognised by that
-        line, which must then be a line of code at P. Last, P is `indent`,
-        the indentation of the place the content goes, for content read
-        there or at the same depth; this reading needs no line at P, so a
-        Python def or class whose later lines are all deeper than `indent`
-        is taken as read_symbol shows it, also when it was written relative
-        with a deeper indentation than the file's (a 4-space method for a
-        2-space class keeps its body 4 spaces in).
+        that is a decorator, annotation or template header, and in Python as
+        that of the shallowest later line of code: content read at another
+        depth (copied from another class) is recognised by that line, which
+        must then be a line of code at P (in Python, a def, class or
+        decorator that starts another member). Last, P is `indent`, the
+        indentation of the place the content goes, for content read there
+        or at the same depth; this reading needs no line at P, so a Python
+        def or class whose later lines are all deeper than `indent` is taken
+        as read_symbol shows it, also when it was written relative with a
+        deeper indentation than the file's (a 4-space method for a 2-space
+        class keeps its body 4 spaces in).
         """
         if (
             self.parser.ext in _CONFIG_EXTS
@@ -476,6 +572,15 @@ class Applier:
             tried.append((self._get_indent(lines[later[-1]]), later[-1]))
         if self._is_header_line(lines[0]):
             tried.append((self._get_indent(lines[later[0]]), later[0]))
+        if self.parser.ext == ".py":
+            # Several members read at another depth: the shallowest line of
+            # code starts one of them, a def, class or decorator.
+            free = {i for rows, _ in self._literal_rows(lines) for i in rows}
+            code = [i for i in later if i not in free and not lines[i].lstrip(" \t").startswith("#")]
+            if code:
+                shallowest = min(code, key=lambda i: len(self._get_indent(lines[i])))
+                if re.match(r"(@|class\b|def\b|async\s+def\b)", lines[shallowest].lstrip(" \t")):
+                    tried.append((self._get_indent(lines[shallowest]), shallowest))
         tried.append((indent, None))
         for read_at, anchor in tried:
             if read_at and self._fits_read_shape(lines, read_at, anchor):
@@ -487,7 +592,9 @@ class Applier:
         read at the indentation `read_at` (see _read_shape_indent), with the
         line `anchor`, if given, one of its lines of code at `read_at`. The
         later members of an overload group start at `read_at` too
-        (_overload_member)."""
+        (_overload_member), and so do the other members that content for
+        several of them holds, each after the one before it ended
+        (_next_member)."""
         absolute = [read_at + lines[0]] + lines[1:]
         free = {i for rows, _ in self._literal_rows(absolute) for i in rows}
         root = None
@@ -500,8 +607,9 @@ class Applier:
         # `@property` of a method, relative content).
         header = self._is_header_line(lines[0])
         anchored = anchor is None
-        # The last line at `read_at` and the lines of code below it.
-        group, previous, below = self._overload_name(lines), lines[0].strip(" \t"), []
+        # The last line at `read_at` and the lines of code below it, and the
+        # line the last member starts on.
+        group, previous, below, start = self._overload_name(lines), lines[0].strip(" \t"), [], 0
         for i in range(1, len(lines)):
             line = lines[i]
             if not line.strip(" \t") or i in free or self._free_line(root, absolute, i):
@@ -512,9 +620,12 @@ class Applier:
             if at_level and header:
                 header = self._is_header_line(line) or self._symbol_level_line(line, closing=True)
             elif at_level and (self._is_header_line(line) or not self._symbol_level_line(line, closing=False)):
-                if not self._overload_member(line, previous, below, group):
+                if not (
+                    self._overload_member(line, previous, below, group)
+                    or self._next_member(lines, start, i, read_at, previous)
+                ):
                     return False
-                header = self._is_header_line(line)
+                header, start = self._is_header_line(line), i
             if at_level:
                 previous, below = line.strip(" \t"), []
             else:
@@ -572,6 +683,38 @@ class Applier:
         if not (inline or empty):
             return False
         return code.startswith("@") or re.match(definition, code) is not None
+
+    def _next_member(self, lines: list[str], start: int, row: int, read_at: str, previous: str) -> bool:
+        """
+        Whether the line `row` of the content `lines`, at `read_at`, the
+        indentation of the symbol it is part of, starts another member
+        after the one before it ended, in content that holds several
+        (two methods, a method and the decorated one below it, two
+        fields). In Python the lines of the member before it, from the line
+        `start`, read at `read_at`, must be whole statements: Python parses
+        them moved back by `read_at` (but the content's first line, which
+        has no indentation). Elsewhere `previous`, the last line before it
+        at `read_at`, must end a member: a `}`, `)`, `]` or Ruby `end`
+        (_symbol_level_line), or a line that ends with `;` or `}` (in Go,
+        one that does not end with a bracket that opens, a comma or an
+        operator). A relative content's body line never follows one, as
+        its first one comes right after the content's first line, which
+        opens the body.
+        """
+        if self.parser.ext == ".py":
+            moved = [
+                line[len(read_at) :] if i and line.startswith(read_at) else line
+                for i, line in enumerate(lines[start:row], start)
+            ]
+            return _python_syntax_error("\n".join(moved).encode("utf-8")) is None
+        if self._symbol_level_line(previous, closing=True):
+            return True
+        code = re.sub(r"\s*(//.*|/\*.*\*/)$", "", previous)
+        if self.parser.ext == ".go":
+            # Go has no `;`, opens its blocks with a `{` at the end of the
+            # line and continues a line only after an operator or a comma.
+            return re.search(r"[{(\[,.=+\-*/%&|^<>!:]$", code) is None
+        return code.endswith((";", "}"))
 
     def _symbol_level_line(self, line: str, closing: bool) -> bool:
         """Whether `line` is one that sits at the indentation of the symbol it
@@ -989,9 +1132,10 @@ class Applier:
         re-indented to its own (a `;` or `,` after it on its last line kept,
         and a comment after it there, unless the content ends with one), or,
         when it shares a line with other code (`function a() {} function
-        b() {}`), only its own text (_replace_inline). Content in the shape
-        read_symbol shows the symbol in, the later lines at their file
-        indentation, goes in as it is (_from_read_shape), so
+        b() {}`) or a comment comes before it on its first line (`/**
+        @type {X} */ let x;`), only its own text (_replace_inline). Content
+        in the shape read_symbol shows the symbol in, the later lines at
+        their file indentation, goes in as it is (_from_read_shape), so
         replace_function(t, read_symbol(t)) leaves the file as it was. A
         name declared together with others (`int a = 1, b = 2;`) has their
         declaration replaced, and content that drops them is refused
@@ -1017,7 +1161,9 @@ class Applier:
         others = self._declared_with(node, target)
         # A JS/TS class field's `;` goes when the content is a method.
         drop = self._field_separator_goes(node, separator, content)
-        if before or after:
+        # A comment before the symbol on its first line (`/** @type {X} */
+        # let x;`) is no part of it, and stays there as code would.
+        if before or after or not self._starts_line(first.start_byte):
             return self._replace_inline(target, first, last, separator, content, others, drop)
         start_line = first.start_point[0]
         end_line = self._last_row(last) + 1
@@ -1028,6 +1174,7 @@ class Applier:
             # At column 0 read_symbol's shape is the relative and the absolute
             # one too, so the content goes in as written.
             content_lines = self._from_read_shape(content_lines, original_indent)
+        content_lines = self._tabbed(content_lines, original_indent, range(start_line, end_line))
         if content_lines and self._get_indent(content_lines[0]) != original_indent:
             content_lines = self._reindent(content_lines, original_indent)
         # The `;` or `,` after the symbol on its last line (JS's `class A {};`)
@@ -1144,8 +1291,10 @@ class Applier:
         lines stays. The content goes in where the symbol started, without
         blank lines around it or a final line break, its first line's
         indentation dropped and the lines after it re-indented with it to
-        the indentation of the symbol's line (content in read_symbol's shape
-        and absolute content keep theirs, as in replace_function). The `;`
+        the indentation of the symbol's line, or of the line where a block
+        comment that ends before the symbol on its line starts (content in
+        read_symbol's shape and absolute content keep theirs, as in
+        replace_function). The `;`
         or `,` after the symbol (`separator`, or None) is replaced too when
         the content ends with it, as read_symbol shows a `;`, and stays
         otherwise, unless `drop` (_field_separator_goes). Content that ends
@@ -1159,9 +1308,12 @@ class Applier:
             lines.pop(0)
         while lines and not lines[-1].strip():
             lines.pop()
-        indent = self._get_indent(self.lines[first.start_point[0]])
+        # The indentation of the symbol's line, or of the line a block
+        # comment that ends before it there starts on (_indent_row).
+        indent = self._get_indent(self.lines[self._indent_row(first)])
         if indent:
             lines = self._from_read_shape(lines, indent)
+        lines = self._tabbed(lines, indent, range(first.start_point[0], last.end_point[0] + 1))
         if lines:
             if self._get_indent(lines[0]) != indent:
                 lines = self._reindent(lines, indent)
@@ -1196,7 +1348,7 @@ class Applier:
                     )
                 break
         self._check_declared_with(target, others, new)
-        self._write_bytes(new)
+        self._write_bytes(new, (first.start_byte, end))
         return "Update successful"
 
     def replace_value(self, target: str, content: str) -> str:
@@ -1557,17 +1709,24 @@ class Applier:
         between its `{` and `}` lines, or the lines of a Python or Ruby body,
         with content re-indented to the body's indentation, that of its first
         line of code or comment; an empty body (`{` and `}` on lines of their
-        own) is one indentation unit deeper than the line the function starts
-        on. A body that shares a line with its signature or braces
+        own, a Ruby method with nothing between its signature and its `end`)
+        is one indentation unit deeper than the line the function starts on.
+        A body that shares a line with its signature or braces
         (`function f() { return 1; }`, `def f(): return 1`) is rebuilt over
         lines of its own (_rebuild_body).
         """
-        func_node, block_node = self._get_function_body_node(target)
-        if self._body_shares_line(func_node, block_node):
+        func_node, block_node = self._get_function_body_node(target, empty_ok=True)
+        if block_node is None:
+            # An empty Ruby method: the lines between its signature and its
+            # `end`, or, on one line (`def h; end`), rebuilt.
+            open_row, end_row = self._empty_method_rows(func_node)
+            if open_row == end_row:
+                return self._rebuild_body(func_node, None, content)
+            start_line, end_line = open_row + 1, end_row
+        elif self._body_shares_line(func_node, block_node):
             return self._rebuild_body(func_node, block_node, content)
-
-        # Python and Ruby use indented body lines between def/class and end markers.
-        if self.parser.ext == ".py" or self.parser.ext in (".rb",):
+        elif self.parser.ext == ".py" or self.parser.ext in (".rb",):
+            # Python and Ruby use indented body lines between def/class and end markers.
             start_line = block_node.start_point[0]
             end_line = block_node.end_point[0] + 1
         else:
@@ -1586,7 +1745,7 @@ class Applier:
             unit = self._indent_unit({".py": "    ", ".java": "    ", ".go": "\t"}.get(self.parser.ext, "  "))
             target_indent = self._get_indent(self.lines[func_node.start_point[0]]) + unit
 
-        content_lines = self._reindent(_content_lines(content), target_indent)
+        content_lines = self._reindent(self._tabbed(_content_lines(content), target_indent), target_indent)
 
         self.lines = self.lines[:start_line] + content_lines + self.lines[end_line:]
         return self._save()
@@ -1594,17 +1753,19 @@ class Applier:
     def _body_opening(self, func_node, body) -> int:
         """The byte where the body of func_node opens: after its `{`, after
         the `:` of a Python def or class, or after the name and parameters of
-        a Ruby method (not a `;` after them)."""
+        a Ruby method (not a `;` after them), also of an empty one, whose
+        body is None (_empty_method)."""
         ext = self.parser.ext
         if ext not in (".py", ".rb"):
             return body.start_byte + 1
+        limit = body.start_byte if body is not None else func_node.children[-1].start_byte
         head = [
             c for c in func_node.children
-            if c.end_byte <= body.start_byte and c.type != ";" and "comment" not in c.type
+            if c.end_byte <= limit and c.type != ";" and "comment" not in c.type
         ]
         if ext == ".py":
             head = [c for c in head if c.type == ":"]
-        return head[-1].end_byte if head else body.start_byte
+        return head[-1].end_byte if head else limit
 
     def _body_shares_line(self, func_node, body) -> bool:
         """
@@ -1636,7 +1797,9 @@ class Applier:
         indentation level deeper than the line the function starts on, and
         the `}` or `end` goes on a line of its own at that line's indentation.
         Comments that follow the opening on its line, before any statement,
-        stay there. A Python body ends with its last statement.
+        stay there. A Python body ends with its last statement, and the
+        comments after it on its line stay on the def's line, after the `:`
+        (`def b():  # old`).
         """
         ext = self.parser.ext
         src = self.parser.source_bytes
@@ -1647,14 +1810,29 @@ class Applier:
             lines.pop(0)
         while lines and not lines[-1].strip():
             lines.pop()
-        text = "\n".join(self._reindent(lines, base + unit)).encode("utf-8")
+        text = "\n".join(self._reindent(self._tabbed(lines, base + unit), base + unit)).encode("utf-8")
         opening = self._body_opening(func_node, body)
         if ext == ".py":
-            self._write_bytes(src[:opening] + b"\n" + text + src[body.end_byte :])
+            # The comments after the last statement on its line (`def b():
+            # pass  # old`) stay on the def's line, after the `:`.
+            last = [c for c in body.children if "comment" not in c.type][-1]
+            tail = [
+                c
+                for c in body.children
+                if "comment" in c.type and c.start_byte >= last.end_byte and c.start_point[0] == last.end_point[0]
+            ]
+            end, comment = last.end_byte, b""
+            if tail:
+                start, end = tail[0].start_byte, tail[-1].end_byte
+                while start > last.end_byte and src[start - 1 : start] in (b" ", b"\t"):
+                    start -= 1
+                comment = src[start:end]
+            self._write_bytes(src[:opening] + comment + b"\n" + text + src[end:])
             return "Update successful"
         close = func_node.children[-1].start_byte if ext == ".rb" else self._code_end(body) - 1
         line_end = src.find(b"\n", opening)
-        code = next((c for c in body.named_children if "comment" not in c.type), None)
+        # An empty Ruby method on one line has no body node (_empty_method).
+        code = next((c for c in body.named_children if "comment" not in c.type), None) if body is not None else None
         if 0 <= line_end < close and (code is None or code.start_byte > line_end):
             opening = line_end
         self._write_bytes(src[:opening] + b"\n" + text + b"\n" + base.encode("utf-8") + src[close:])
@@ -1683,10 +1861,12 @@ class Applier:
                 target_node = parent
 
             insert_line = target_node.end_point[0] + 1
-            content_lines = _content_lines(content)
-            # Add a blank separator before and the method content (and a trailing blank for readability)
+            # gofmt indents with tabs.
+            content_lines = self._tabbed(_content_lines(content), "", range(target_node.start_point[0], insert_line))
+            # A blank line between the method and the code on each side.
             sep_before = [""] if insert_line - 1 >= 0 and insert_line - 1 < len(self.lines) and self.lines[insert_line - 1].strip() else []
-            self.lines = self.lines[:insert_line] + sep_before + content_lines + self.lines[insert_line:]
+            sep_after = [""] if insert_line < len(self.lines) and self.lines[insert_line].strip() else []
+            self.lines = self.lines[:insert_line] + sep_before + content_lines + sep_after + self.lines[insert_line:]
             return self._save()
 
         body = node.child_by_field_name("body")
@@ -1982,7 +2162,9 @@ class Applier:
         lines at the end of the file included. An edit never leaves more of
         those than the file had, though: deleting the last symbol would
         otherwise strand the blank lines that separated it from the one
-        before.
+        before. The lines at either end that are still those read from the
+        file (the same objects, which slicing self.lines keeps) are those
+        the edit left alone, for _mixed_line_breaks.
         """
         lines = self.lines
         excess = _trailing_blank_lines(lines) - _trailing_blank_lines(
@@ -1990,15 +2172,28 @@ class Applier:
         )
         if excess > 0:
             lines = lines[: len(lines) - excess]
-        self._write_text("\n".join(lines) + "\n")
+        read = self._read_lines
+        head = 0
+        while head < min(len(lines), len(read)) and lines[head] is read[head]:
+            head += 1
+        tail = 0
+        while tail < min(len(lines), len(read)) - head and lines[-1 - tail] is read[-1 - tail]:
+            tail += 1
+        # Only lines with a line break count: not a last one without.
+        if tail and not self.parser.final_newline:
+            tail -= 1
+        self._write_text("\n".join(lines) + "\n", (head, tail))
         return "Update successful"
 
-    def _write_text(self, new_source: str) -> None:
+    def _write_text(self, new_source: str, kept: tuple[int, int] | None = None) -> None:
         """
         Single exit point for every edit (_save and _write_bytes both end
         here): normalise line endings, refuse a result that would not parse,
-        then write the file in its own newline style, its last line without
-        a line break when the file's had none, and refresh the parser.
+        then write the file in its own newline style (in a file that mixes
+        CRLF and LF, each line's own, see _mixed_line_breaks, `kept` being
+        what _save or _write_bytes know of the lines the edit left alone),
+        its last line without a line break when the file's had none, and
+        refresh the parser.
         """
         # Internal text is LF (see TreeSitterParser); caller-provided content
         # may still carry CRLF.
@@ -2010,17 +2205,29 @@ class Applier:
         if not new_source.endswith("\n"):
             new_source += "\n"
         try:
-            self._check_syntax(new_source.encode("utf-8"))
+            try:
+                data = new_source.encode("utf-8")
+            except UnicodeEncodeError as e:
+                # A lone surrogate (JSON lets a client send half of a pair
+                # as an escape) is not a character and has no UTF-8 form.
+                raise ApplierError(
+                    f"Edit refused: the new text holds a lone surrogate, "
+                    f"U+{ord(new_source[e.start]):04X}, which is not a character and "
+                    f"can't be written as UTF-8. {self.filepath} was not modified."
+                ) from e
+            self._check_syntax(data)
         except ApplierError:
             # Line-based edits change self.lines before saving; undo that so
             # this instance still mirrors the untouched file.
-            self.lines = _split_lines(self.parser.source_code)
+            self.lines = list(self._read_lines)
             raise
         if not self.parser.final_newline:
             # The file's last line had no line break (see TreeSitterParser),
             # and the new last line gets none either.
             new_source = new_source[:-1]
-        if self.parser.newline != "\n":
+        if self.parser.line_breaks is not None:
+            new_source = self._mixed_line_breaks(new_source, kept)
+        elif self.parser.newline != "\n":
             new_source = new_source.replace("\n", self.parser.newline)
         if bom:
             # The file's UTF-8 byte order mark, which the text does not
@@ -2030,6 +2237,48 @@ class Applier:
         with open(self.filepath, "w", encoding="utf-8", newline="") as f:
             f.write(new_source)
         self._refresh_parser_state()
+
+    def _mixed_line_breaks(self, text: str, kept: tuple[int, int] | None = None) -> str:
+        """
+        The LF text of an edit's result for a file that mixes CRLF and LF
+        line breaks (TreeSitterParser.line_breaks), with a break for each of
+        its lines: a line the edit left as it was (matched to the file's
+        lines as difflib matches them) keeps its own, and a line it wrote
+        takes the one the lines it replaces have, when they all have the
+        same one, else the one the lines around it have, when the two agree
+        (at the start or end of the file, the one line beside it), else the
+        file's most common one (TreeSitterParser.newline). `kept`, when
+        known, is how many of the file's lines with a break, at its start
+        and at its end, the edit left alone: no more of them are taken for
+        lines alike at both ends, so a line next to the edit that reads
+        like one it removed or added keeps its own break.
+        """
+        breaks = self.parser.line_breaks
+        old = self.parser.source_code.split("\n")[: len(breaks)]
+        new = text.split("\n")
+        rest = new.pop()
+        heads, tails = kept if kept is not None else (len(old), len(old))
+        # Only the lines between those alike at both ends are matched.
+        head = 0
+        while head < min(len(old), len(new), heads) and old[head] == new[head]:
+            head += 1
+        tail = 0
+        while tail < min(min(len(old), len(new)) - head, tails) and old[-1 - tail] == new[-1 - tail]:
+            tail += 1
+        result = breaks[:head] + [self.parser.newline] * (len(new) - head - tail) + breaks[len(old) - tail :]
+        matcher = difflib.SequenceMatcher(None, old[head : len(old) - tail], new[head : len(new) - tail], autojunk=False)
+        for tag, i1, i2, j1, j2 in matcher.get_opcodes():
+            i1, i2, j1, j2 = i1 + head, i2 + head, j1 + head, j2 + head
+            if tag == "equal":
+                result[j1:j2] = breaks[i1:i2]
+                continue
+            replaced = set(breaks[i1:i2])
+            around = {breaks[k] for k in (i1 - 1, i2) if 0 <= k < len(breaks)}
+            if len(replaced) == 1:
+                result[j1:j2] = [replaced.pop()] * (j2 - j1)
+            elif len(around) == 1:
+                result[j1:j2] = [around.pop()] * (j2 - j1)
+        return "".join(line + line_break for line, line_break in zip(new, result)) + rest
 
     def _check_syntax(self, new_bytes: bytes) -> None:
         """
@@ -2272,10 +2521,26 @@ class Applier:
 
         self.parser = TreeSitterParser(self.filepath)
         self.lines = _split_lines(self.parser.source_code)
+        self._read_lines = tuple(self.lines)
 
-    def _write_bytes(self, new_bytes: bytes) -> None:
-        """Write new LF source bytes to disk (via _write_text) and refresh parser state."""
-        self._write_text(new_bytes.decode("utf-8"))
+    def _write_bytes(self, new_bytes: bytes, span: tuple[int, int] | None = None) -> None:
+        """Write new LF source bytes to disk (via _write_text) and refresh
+        parser state. `span`, when given, is the bytes [start, end) of the
+        file that the edit replaced, all else being as it was: the lines
+        before the one `start` is on, and those after the one `end` is on
+        (from that one when it starts at `end` and stays whole), are left
+        alone (_mixed_line_breaks)."""
+        kept = None
+        if span is not None:
+            src = self.parser.source_bytes
+            start, end = span
+            suffix = len(src) - end
+            tail = src.count(b"\n", end)
+            whole = (end == 0 or src[end - 1 : end] == b"\n") and (
+                len(new_bytes) == suffix or new_bytes[len(new_bytes) - suffix - 1 : len(new_bytes) - suffix] == b"\n"
+            )
+            kept = (src.count(b"\n", 0, start), tail if whole else max(tail - 1, 0))
+        self._write_text(new_bytes.decode("utf-8"), kept)
 
     def _indent_unit(self, default: str) -> str:
         """
@@ -2331,14 +2596,15 @@ class Applier:
         Write `entry` (e.g. '"key": value') after the last of `entries` in a
         brace- or bracket-delimited container (JSON object or array, Python
         dict, JS/TS object literal, YAML flow mapping or sequence, TOML
-        inline table or array), following the container's layout: entries
-        one per line get a new line at the last entry's indentation (also
-        when the bracket closes the last entry's line, as in a list aligned
-        under its `[`, see _one_per_line), an inline container stays inline,
-        and a trailing comma after the last entry is kept (the new entry
-        gets one too). A comment on the last entry's line stays there, and
-        an entry that ends with a comment of its own gets its comma before
-        it (_with_separator). An empty container becomes `{ entry }`
+        inline table or array, the names of a JS/TS named import or of a
+        Python `from m import (...)`), following the container's layout:
+        entries one per line get a new line at the last entry's indentation
+        (also when the bracket closes the last entry's line, as in a list
+        aligned under its `[`, see _one_per_line), an inline container stays
+        inline, and a trailing comma after the last entry is kept (the new
+        entry gets one too). A comment on the last entry's line stays there,
+        and an entry that ends with a comment of its own gets its comma
+        before it (_with_separator). An empty container becomes `{ entry }`
         (`[entry]` without `pad_empty`), or with `expand_empty` is opened
         onto separate lines (`empty_trailing_comma` adds a comma).
         """
@@ -2454,25 +2720,34 @@ class Applier:
         )
 
     def _delete_entry(self, container, entries: list, idx: int) -> None:
+        """Delete entries[idx] from a delimited container, as _entry_deleted
+        says, and write the file."""
+        self._write_bytes(self._entry_deleted(container, entries, idx))
+
+    def _entry_deleted(self, container, entries: list, idx: int, count: int = 1) -> bytes:
         """
-        Delete entries[idx] from a brace-, bracket- or parenthesis-delimited
-        container (JSON object or array, Python dict or list, JS/TS object
-        literal, YAML flow sequence, TOML array, a parameter list) along with
-        one adjacent comma, and write the file. An entry on lines of its own
-        goes with those whole lines, a comment on its last line included; if
-        it was the last entry and had no trailing comma, the comma after the
-        entry before it goes too (JSON rejects a trailing comma). An entry
-        sharing a line with another one is cut up to the next entry when it
-        starts its line (or is the first entry), else from the end of the one
-        before it, so one separating comma goes with it; a comment between
-        the two stays, with the closing bracket moved below it when it ends
-        its line. Deleting the only entry leaves `{}` (when nothing but
-        whitespace, a trailing comma and comments on the entry's line
-        surround it) rather than a stray comma, which JS would reject.
-        Comments are no entries: they are left out of `entries`, and those on
-        lines other than the entry's stay.
+        The source with entries[idx] deleted from a brace-, bracket- or
+        parenthesis-delimited container (JSON object or array, Python dict
+        or list, JS/TS object literal, YAML flow sequence, TOML array, a
+        parameter list, import names) along with one adjacent comma; with
+        `count`, the entries from there to entries[idx + count - 1] go as
+        one (_Span). An entry on lines of its own goes with those whole
+        lines, a comment on its last line included; if it was the last entry
+        and had no trailing comma, the comma after the entry before it goes
+        too (JSON rejects a trailing comma). An entry sharing a line with
+        another one is cut up to the next entry when it starts its line (or
+        is the first entry), else from the end of the one before it, so one
+        separating comma goes with it; a comment between the two stays, with
+        the closing bracket moved below it when it ends its line. Deleting
+        the only entry leaves `{}` (when nothing but whitespace, a trailing
+        comma and comments on the entry's line surround it) rather than a
+        stray comma, which JS would reject. Comments are no entries: they
+        are left out of `entries`, and those on lines other than the
+        entry's stay.
         """
         src = self.parser.source_bytes
+        if count > 1:
+            entries = entries[:idx] + [_Span(entries[idx], entries[idx + count - 1])] + entries[idx + count :]
         entry = entries[idx]
         open_brace, close_brace = container.children[0], container.children[-1]
         inner = container.children[1:-1]
@@ -2490,6 +2765,7 @@ class Applier:
             c
             for c in inner
             if c != entry
+            and not entry.start_byte <= c.start_byte < entry.end_byte
             and not (c.type == "," and c.start_byte >= entry.end_byte)
             and not (entry.end_byte <= c.start_byte and c.end_byte <= end)
         ]
@@ -2561,7 +2837,7 @@ class Applier:
         new_bytes = src
         for start, stop, *text in sorted(cuts, reverse=True):
             new_bytes = new_bytes[:start] + b"".join(text) + new_bytes[stop:]
-        self._write_bytes(new_bytes)
+        return new_bytes
 
     def _find_json_object_at_path(self, dotted_path: str):
         """Return the JSON object node at the dotted path, or the root object if path is empty."""
@@ -3522,6 +3798,13 @@ class Applier:
         lines = self._reindent(lines, member_indent)
         method_types = self._interface_func_types() | {"method_signature", "abstract_method_signature"}
         gap_before = self._method_gap(body, members, method_types) if at_end and members else 0
+        # A one-line field after stacked one-line fields is stacked too.
+        code = [m for m in members if not self._is_aside(m)]
+        if at_end and code and not self._is_block(lines) and not self._is_block(code[-1]):
+            comment_range = self._find_leading_comment_range(code[-1].start_point[0])
+            far = self._sibling_above(code[-1], comment_range[0] if comment_range is not None else code[-1].start_point[0])
+            if far is not None and far[0] is not None and not self._is_block(far[0]):
+                gap_before = self._sibling_gaps(body, (code[-1], code[-1]), lines, None, far)[0]
         compact = ApplierError(
             f"The body of '{class_target}' shares a line with its header or its "
             "end, so there is no line of its own to add a member on. Rewrite the "
@@ -3702,7 +3985,7 @@ class Applier:
         constants = [c for c in body.children if c.type in ("enum_constant", ",")]
         return (constants[-1].end_byte if constants else body.start_byte + 1), b";", []
 
-    def _tab_indent(self, lines: list[str]) -> list[str]:
+    def _tab_indent(self, lines: list[str], extra=None) -> list[str]:
         """
         `lines` with the indentation they have beyond their first line's
         written in tabs: one per indentation step of the content (the
@@ -3711,24 +3994,32 @@ class Applier:
         multi-line string literal (_literal_rows), and content that already
         uses tabs for it, are left as they are; the lines of a literal that
         moves with the code (a docstring) get tabs only for as far as the
-        line it starts on is indented, so they stay in line with it.
+        line it starts on is indented, so they stay in line with it, and so
+        do the lines that spaces align with a line above (_aligned_rows): the
+        later lines of a block comment, and a line continued inside a
+        bracket that code follows on its line. `extra` adds the lines that
+        start inside a string of the file (_context_literals).
         """
         first = lines[0]
         base = first[: len(first) - len(first.lstrip(" \t"))]
-        literals = self._literal_rows(lines)
+        literals = self._literal_rows(lines) + (extra or [])
         literal = {i for rows, _ in literals for i in rows}
         extra = []
         for i, line in enumerate(lines):
             rest = line[len(base) :] if line.strip() and line.startswith(base) else ""
             extra.append(rest[: len(rest) - len(rest.lstrip(" \t"))])
+        aligned = {i: row for i, row in self._aligned_rows(lines).items() if i not in literal}
         # How much of a line's indentation may become tabs: all of a code
-        # line's, as much of a moving literal's lines as its first line has.
-        limit = {i: len(ws) for i, ws in enumerate(extra) if i not in literal}
+        # line's, as much of a moving literal's lines as its first line has,
+        # and of an aligned line as much as the line it aligns with has.
+        limit = {i: len(ws) for i, ws in enumerate(extra) if i not in literal and i not in aligned}
         for rows, shifts in literals:
             for i in rows:
                 if shifts and rows.start - 1 in limit:
                     limit[i] = min(len(extra[i]), limit[rows.start - 1])
-        widths = [len(ws) for i, ws in enumerate(extra) if ws and i not in literal]
+        for i in sorted(aligned):
+            limit[i] = min(len(extra[i]), limit.get(aligned[i], 0))
+        widths = [len(ws) for i, ws in enumerate(extra) if ws and i not in literal and i not in aligned]
         if not widths or any("\t" in extra[i] for i in limit):
             return lines
         step = min(widths)
@@ -3739,6 +4030,100 @@ class Applier:
                 line = base + "\t" * tabs + " " * spaces + line[len(base) + limit[i] :]
             result.append(line)
         return result
+
+    def _aligned_rows(self, lines: list[str]) -> dict[int, int]:
+        """
+        The lines of the caller content `lines` that spaces align with a
+        line above rather than indent, for _tab_indent, each with the row of
+        the line it aligns with: the later lines of a block comment, which
+        align with its first, and a line continued inside a `(` or `[` that
+        code follows on its own line (`def f(a,` above `      b):`), which
+        aligns with that line; inside a `{` (a block, an object) lines are
+        indented. The content is parsed with the file's grammar, Python's
+        dedented by its first line's indentation first.
+        """
+        ext = self.parser.ext
+        if ext in _CONFIG_EXTS or len(lines) < 2:
+            return {}
+        if ext == ".py":
+            old = self._get_indent(lines[0])
+            lines = [line[len(old) :] if line.startswith(old) else line for line in lines]
+        root = self.parser.parse("\n".join(lines).encode("utf-8")).root_node
+        # One walk down the tree (a node's parent is slow to get): the
+        # comments over several lines, and the brackets as (the byte after
+        # the bracket, the end of what it opens, its row, whether code
+        # follows it on that row and it is a `(` or `[`).
+        aligned, brackets, stack = {}, [], [root]
+        while stack:
+            node = stack.pop()
+            if "comment" in node.type:
+                for row in range(node.start_point[0] + 1, node.end_point[0] + 1):
+                    aligned.setdefault(row, node.start_point[0])
+                continue
+            children = node.children
+            if children and children[0].type in ("(", "[", "{"):
+                bracket = children[0]
+                after = children[1] if len(children) > 1 else None
+                aligns = (
+                    bracket.type != "{"
+                    and after is not None
+                    and after.start_point[0] == bracket.start_point[0]
+                    and "comment" not in after.type
+                )
+                brackets.append((bracket.end_byte, node.end_byte, bracket.start_point[0], aligns))
+            stack.extend(reversed(children))
+        brackets.sort()
+        # The brackets around the start of each line, innermost last.
+        around, k, offset = [], 0, 0
+        for row, line in enumerate(lines):
+            start, offset = offset, offset + len(line.encode("utf-8")) + 1
+            code = line.lstrip(" \t")
+            if not code:
+                continue
+            at = start + len(line[: len(line) - len(code)].encode("utf-8"))
+            while k < len(brackets) and brackets[k][0] <= at:
+                while around and around[-1][1] <= brackets[k][0]:
+                    around.pop()
+                around.append(brackets[k])
+                k += 1
+            while around and around[-1][1] <= at:
+                around.pop()
+            if row and row not in aligned and around and around[-1][2] < row and around[-1][3]:
+                aligned[row] = around[-1][2]
+        return aligned
+
+    def _tabs_at(self, indent: str, rows: range | None = None) -> bool:
+        """
+        Whether content that goes in at `indent` is written in tabs
+        (_tab_indent): when `indent` has one, or, at column 0, when most of
+        the indented lines of the file's lines `rows` (the code it replaces
+        or goes beside) start with a tab, the lines that start inside a
+        multi-line string (_literal_rows) and those that spaces align with
+        a line above (_aligned_rows) aside, or, when none of them is
+        indented, in a Go file (gofmt indents with tabs) or one whose
+        indentation unit is a tab (_indent_unit). Never in a JSON, YAML or
+        TOML file.
+        """
+        if self.parser.ext in _CONFIG_EXTS:
+            return False
+        if indent:
+            return "\t" in indent
+        lines = [self.lines[row] for row in (rows or ()) if row < len(self.lines)]
+        aside = {i for found, _ in self._literal_rows(lines) for i in found} | set(self._aligned_rows(lines))
+        indents = [self._get_indent(line) for i, line in enumerate(lines) if i not in aside and line.strip(" \t")]
+        indents = [ws for ws in indents if ws]
+        if indents:
+            return sum(ws.startswith("\t") for ws in indents) * 2 > len(indents)
+        return self.parser.ext == ".go" or self._indent_unit(" ") == "\t"
+
+    def _tabbed(self, lines: list[str], indent: str, rows: range | None = None, extra=None) -> list[str]:
+        """The lines of caller content that goes in at `indent` (beside or
+        in place of the file's lines `rows`), in tabs when the file indents
+        with them there (_tabs_at, _tab_indent; `extra` the lines that go
+        into a string of the file, see _context_literals)."""
+        if len(lines) < 2 or not self._tabs_at(indent, rows):
+            return lines
+        return self._tab_indent(lines, extra)
 
     def _starts_line(self, byte: int) -> bool:
         """Whether only whitespace precedes `byte` on its line."""
@@ -4645,12 +5030,14 @@ class Applier:
             hint += f", and the {keyword} it names with '{keyword} {path}'"
         return ApplierError(f"'{target}' is {self._symbol_kind(node, target)}, {reason}; read it with {hint}")
 
-    def _get_function_body_node(self, target: str):
+    def _get_function_body_node(self, target: str, empty_ok: bool = False):
         """Resolve target to (function node, body block node): the
         block/statement_block/compound_statement/body_statement/constructor_body
         of the function (see _callable). An arrow function whose body is an
         expression (`() => x`) has no block, and is refused, as is a Ruby
-        endless method (`def f = x`)."""
+        endless method (`def f = x`). An empty Ruby method (_empty_method)
+        has no body node either: with `empty_ok` the body is None, else it
+        is refused, as there is nothing in it to match."""
         node = self.parser.find_node_by_name(target)
         if not node:
             raise ApplierError(f"Target '{target}' not found in {self.filepath}")
@@ -4672,6 +5059,13 @@ class Applier:
                 if child.type in ("block", "statement_block", "compound_statement", "body_statement", "constructor_body"):
                     body = child
                     break
+        if body is None and self._empty_method(func_node):
+            if empty_ok:
+                return func_node, None
+            raise ApplierError(
+                f"The body of '{target}' is empty, so no snippet or anchor can match in it. "
+                "Add code with insert_in_body(at='top') or replace_function_body."
+            )
         if body is None:
             raise ApplierError(f"Could not find body block for target '{target}'")
         if func_node.type == "arrow_function" and body.type != "statement_block":
@@ -4683,23 +5077,45 @@ class Applier:
             )
         return func_node, body
 
+    def _empty_method(self, func_node) -> bool:
+        """Whether func_node is a Ruby method with an empty body (`def f`
+        over `end`, `def h; end`), which tree-sitter gives no body node: no
+        code between its signature and its `end`, maybe comments."""
+        return (
+            self.parser.ext == ".rb"
+            and func_node.type in ("method", "singleton_method")
+            and func_node.children[-1].type == "end"
+            and func_node.child_by_field_name("body") is None
+            and not any(c.type == "body_statement" for c in func_node.children)
+        )
+
+    def _empty_method_rows(self, func_node) -> tuple[int, int]:
+        """The row where the signature of an empty Ruby method
+        (_empty_method) ends (_body_opening) and the row of its `end`, the
+        same for a method on one line (`def h; end`)."""
+        opening = self._body_opening(func_node, None)
+        return self.parser.source_bytes.count(b"\n", 0, opening), func_node.children[-1].start_point[0]
+
     def replace_in_body(self, target: str, old_snippet: str, new_snippet: str) -> str:
         """
-        Replace a byte-identical snippet inside a function body with new_snippet.
-        The match is scoped to the target's body so accidental matches elsewhere
-        in the file are impossible.
+        Replace a snippet inside a function body with new_snippet
+        (_replace_in_body_bytes). The match is scoped to the target's body
+        so accidental matches elsewhere in the file are impossible, and is
+        found as _find_snippet finds it: the snippet's exact text at token
+        boundaries, else its whole lines with their indentation shifted.
 
-        Raises if the snippet is not found, or if it appears more than once
-        (include more surrounding context to disambiguate).
+        Raises if the snippet is not found, or if it matches more than one
+        place (include more context to disambiguate).
         """
         func_node, body = self._get_function_body_node(target)
         return self._replace_in_body_bytes(body, old_snippet, new_snippet, target)
 
     def delete_in_body(self, target: str, snippet: str) -> str:
         """
-        Delete a byte-identical snippet inside a function body. Scoped to the
-        target's body. Raises if not found or if the snippet appears more than
-        once -- include more context to disambiguate.
+        Delete a snippet inside a function body, matched as replace_in_body
+        matches one, with the lines it leaves without code (_deleted_span).
+        Scoped to the target's body. Raises if not found or if the snippet
+        matches more than one place -- include more context to disambiguate.
         """
         func_node, body = self._get_function_body_node(target)
         return self._replace_in_body_bytes(body, snippet, "", target)
@@ -4716,12 +5132,13 @@ class Applier:
         Insert new_snippet inside a function/method body. Pass exactly ONE of:
           - at="top":    insert at the top of the body (was: prepend_to_body).
           - at="bottom": insert at the bottom of the body (was: append_to_body).
-          - after=<snippet>:  insert immediately after a byte-identical anchor.
-          - before=<snippet>: insert immediately before a byte-identical anchor.
+          - after=<snippet>:  insert after an anchor.
+          - before=<snippet>: insert before an anchor.
 
-        The anchor match (for `after`/`before`) is scoped to the target's body
-        and must be unique; multiple matches raise. Caller is responsible for
-        any leading/trailing newlines and indentation in new_snippet.
+        The anchor (for `after`/`before`) is matched as replace_in_body
+        matches a snippet, scoped to the target's body, and must be unique;
+        multiple matches raise. Where new_snippet goes, and how it is
+        indented, is _insert_in_body_bytes's.
         """
         at_val = at or None
         after_val = after or None
@@ -4747,72 +5164,694 @@ class Applier:
         return self._insert_in_body_bytes(body, anchor, new_snippet, place, target)
 
     def _replace_in_body_bytes(self, body_node, old_snippet, new_snippet, target):
-        """Byte-level replace within a body. Empty new_snippet = delete."""
-        body_start, body_end = self._body_search_range(body_node)
+        """
+        Replace the one place old_snippet matches in a body (_find_snippet)
+        with new_snippet, indented as the snippet was matched
+        (_matched_content): moved with a shifted match's lines, and, after
+        an exact one-line snippet that left out (some of) the indentation of
+        its line, its later lines given that indentation too, unless they
+        have it already; in Python the reading of its indentation that
+        parses wins (_parsing_choice). After an exact snippet of several
+        lines, which matched them at their file indentation, it goes in as
+        written, but for indentation steps in spaces where the file indents
+        with tabs, which become tabs (_tabbed). The lines of new_snippet
+        that go into a string of the file keep their text
+        (_context_literals). An empty new_snippet deletes the match, with
+        the lines it leaves without code (_deleted_span), and is refused
+        when that would leave a Python body without a statement.
+        """
+        start, end, shift = self._find_snippet(body_node, old_snippet, target)
         source_bytes = self.parser.source_bytes
-        body_bytes = source_bytes[body_start:body_end]
-        # Source text is LF internally, so a snippet copied with CRLF still matches.
-        old_bytes = old_snippet.replace("\r\n", "\n").encode("utf-8")
-        if not old_bytes:
-            raise ApplierError("Empty snippet cannot be matched")
-
-        count = body_bytes.count(old_bytes)
-        if count == 0:
-            raise ApplierError(
-                f"Snippet not found in body of '{target}'. Check whitespace and indentation."
+        if not new_snippet:
+            start, end = self._deleted_span(start, end)
+            self._keep_a_statement(body_node, start, end, target)
+            text = ""
+        else:
+            given = new_snippet.replace("\r\n", "\n")
+            extra = self._context_literals(start, end, given)
+            if shift is not None:
+                text, other = self._matched_content(given, shift, lead=True, extra=extra)
+            elif sum(1 for line in _content_lines(old_snippet) if line.strip(" \t")) == 1:
+                text, other = self._matched_content(given, self._snippet_frame(start, end), lead=False, extra=extra)
+            else:
+                depth = self._snippet_frame(start, end)[2]
+                text, other = "\n".join(self._tabbed(given.split("\n"), depth, extra=extra)), None
+            text = self._parsing_choice(
+                lambda t: source_bytes[:start] + t.encode("utf-8") + source_bytes[end:], text, other
             )
-        if count > 1:
-            raise ApplierError(
-                f"Snippet matches {count} places in body of '{target}'. Include more "
-                "surrounding context to make the match unique."
-            )
-
-        idx = body_bytes.index(old_bytes)
-        abs_start = body_start + idx
-        abs_end = abs_start + len(old_bytes)
-
-        new_bytes_data = new_snippet.encode("utf-8")
-        new_bytes = source_bytes[:abs_start] + new_bytes_data + source_bytes[abs_end:]
-        self._write_bytes(new_bytes)
+        self._write_bytes(source_bytes[:start] + text.encode("utf-8") + source_bytes[end:], (start, end))
         return "Update successful"
 
     def _insert_in_body_bytes(self, body_node, anchor_snippet, new_snippet, place, target):
-        """Byte-level insert anchored to a snippet within a body."""
+        """
+        Insert new_snippet after or before the one place anchor_snippet
+        matches in a body (_find_snippet). An anchor that ends its line
+        (after: it ends with its line break, or only spaces, tabs and a
+        comment follow it there) or starts it (before: only indentation
+        precedes it), on a line of the body and not in the text of a
+        string, has new_snippet go in as lines of their own, below or above
+        the anchor's lines, indented as the anchor was matched
+        (_matched_content, with _snippet_frame for an exact match; content
+        at column 0 beside an anchor that left out no indentation as if it
+        had left out all of it), and moved into the block that the anchor's
+        last line opens (_into_block); in Python the reading of its
+        indentation that parses wins (_parsing_choice). A line break that
+        starts new_snippet after an anchor without its own stands for the
+        anchor line's break, and spaces and tabs after its last line break
+        for the indentation of the anchor's line, so content written to be
+        placed byte for byte goes in as before. In the middle of a line, in
+        the text of a string, or on the line of a signature that the body
+        shares (`def f(): return 1`), new_snippet is placed byte for byte.
+        After an anchor that ends with the closing brace of the body is
+        refused, as that is outside it.
+        """
+        start, end, shift = self._find_snippet(body_node, anchor_snippet, target, anchor=True)
+        body_start, body_end = self._body_search_range(body_node)
+        if place == "after" and self.parser.ext not in (".py", ".rb") and end >= body_end:
+            raise ApplierError(
+                f"The anchor ends with the closing brace of '{target}', so code after it would be "
+                "outside the body. Anchor on the code before the brace, or insert with at='bottom'."
+            )
+        source_bytes = self.parser.source_bytes
+        text = new_snippet.replace("\r\n", "\n")
+        # Lines of their own go between lines of the body only, not after
+        # a signature the body shares its line with (`def f(): return 1`),
+        # nor into the text of a string.
+        point = line_end = None
+        if place == "after":
+            breaks = source_bytes[end - 1 : end] == b"\n"
+            line_end = end - 1 if breaks else self._rest_of_line_free(end)
+            # The line below starts outside the text of a string (not in a
+            # heredoc that the anchor's line opens); a docstring's lines are
+            # indented like code.
+            if (
+                line_end is not None
+                and source_bytes.rfind(b"\n", 0, line_end) + 1 >= body_start
+                and not self._in_fixed_literal(min(line_end + 1, len(source_bytes)))
+            ):
+                point = min(line_end + 1, len(source_bytes))
+                if not breaks and text.startswith("\n"):
+                    text = text[1:]
+        else:
+            line_start = source_bytes.rfind(b"\n", 0, start) + 1
+            if (
+                line_start >= body_start
+                and not source_bytes[line_start:start].strip(b" \t")
+                and not self._in_fixed_literal(line_start)
+            ):
+                point = line_start
+        if point is None or not new_snippet:
+            point = end if place == "after" else start
+            text = new_snippet
+        else:
+            lines = text.split("\n")
+            if len(lines) > 1 and not lines[-1].strip(" \t"):
+                lines.pop()
+            frame = shift if shift is not None else self._snippet_frame(start, end)
+            first = next((line for line in lines if line.strip(" \t")), "")
+            if frame[0] == frame[1] == "" and frame[2] and not self._get_indent(first):
+                # Content at column 0 beside an anchor written with all of
+                # its indentation goes at the anchor's.
+                frame = ("", frame[2], frame[2])
+            content = "\n".join(lines)
+            extra = self._context_literals(point, point, content + "\n")
+            text, other = self._matched_content(content, frame, lead=True, extra=extra, read=shift is None)
+            if place == "after":
+                text = self._into_block(point, line_end, body_end, text, extra)
+                other = other if other is None else self._into_block(point, line_end, body_end, other, extra)
+            text = self._parsing_choice(
+                lambda t: source_bytes[:point] + (t + "\n").encode("utf-8") + source_bytes[point:], text, other
+            ) + "\n"
+        self._write_bytes(source_bytes[:point] + text.encode("utf-8") + source_bytes[point:], (point, point))
+        return "Update successful"
+
+    def _find_snippet(self, body_node, snippet: str, target: str, anchor: bool = False):
+        """
+        Where snippet (CRLF read as LF) is in the body of `target` (see
+        _body_search_range), as (start, end, shift): the bytes [start, end)
+        it covers, and None for an exact match, or else the (old, new,
+        depth) of a match with its indentation shifted, whose lines are the
+        snippet's lines with an indentation `old` turned into `new`
+        (_shift_line), the first of them of code indented `depth` in the
+        file.
+
+        An exact match wins: the snippet's own bytes, where they neither
+        start nor end inside a token (_splits_match), so `x = 1` is not
+        found in `max = 10`. Without one, the snippet's lines may match
+        whole lines of the body with one indentation shift
+        (_shifted_matches); when every exact match is inside a string or a
+        comment (_within_text), the shifted ones elsewhere count too, so
+        that the text of a string is not taken for the code the snippet
+        was written for at another indentation. Either way the match must
+        be unique: none, or several, is refused, naming the lines they are
+        on. `anchor` words the refusals for insert_in_body's after and
+        before.
+        """
+        what = "Anchor" if anchor else "Snippet"
+        needle = snippet.replace("\r\n", "\n").encode("utf-8")
+        if not needle:
+            raise ApplierError(f"Empty {what.lower()} cannot be matched")
         body_start, body_end = self._body_search_range(body_node)
         source_bytes = self.parser.source_bytes
-        body_bytes = source_bytes[body_start:body_end]
-        # Source text is LF internally, so an anchor copied with CRLF still matches.
-        anchor_bytes = anchor_snippet.replace("\r\n", "\n").encode("utf-8")
-        if not anchor_bytes:
-            raise ApplierError("Empty anchor cannot be matched")
-
-        count = body_bytes.count(anchor_bytes)
-        if count == 0:
+        exact, inside = [], []
+        at = source_bytes.find(needle, body_start, body_end)
+        while at != -1:
+            span = (at, at + len(needle))
+            (inside if self._splits_match(*span) else exact).append(span)
+            at = source_bytes.find(needle, at + 1, body_end)
+        textual = bool(exact) and all(self._within_text(*span) for span in exact)
+        shifted = []
+        if not exact or textual:
+            shifted = [
+                match
+                for match in self._shifted_matches(needle, body_start, body_end)
+                if not self._splits_match(match[0], match[1])
+            ]
+        if textual:
+            # The shifted matches at other places than the exact ones.
+            starts = {self._first_code(*span) for span in exact}
+            shifted = [match for match in shifted if self._first_code(match[0], match[1]) not in starts]
+            if shifted:
+                places = sorted(exact + [match[:2] for match in shifted])
+                raise ApplierError(
+                    f"{what} matches {len(places)} places in body of '{target}' ({self._match_lines(places)}): "
+                    "as written inside a string or comment, and with its indentation shifted. Include more "
+                    "surrounding context to make the match unique."
+                )
+        if len(exact) == 1:
+            return exact[0][0], exact[0][1], None
+        if exact:
             raise ApplierError(
-                f"Anchor snippet not found in body of '{target}'. Check whitespace and indentation."
+                f"{what} matches {len(exact)} places in body of '{target}' ({self._match_lines(exact)}). "
+                "Include more surrounding context to make the match unique."
             )
-        if count > 1:
+        if len(shifted) == 1:
+            return shifted[0]
+        if shifted:
             raise ApplierError(
-                f"Anchor matches {count} places in body of '{target}'. Include more "
-                "surrounding context to make the match unique."
+                f"{what} matches {len(shifted)} places in body of '{target}' with its indentation "
+                f"shifted ({self._match_lines(shifted)}). Include more surrounding context to make "
+                "the match unique."
             )
+        noun = "Anchor snippet" if anchor else "Snippet"
+        if inside:
+            raise ApplierError(
+                f"{noun} not found in body of '{target}' as whole tokens: it occurs only inside "
+                f"longer tokens, on {self._match_lines(inside)}. A match must start and end at the "
+                "edges of identifiers, numbers, keywords and operators (in strings and comments, "
+                "of words); include the whole token."
+            )
+        raise ApplierError(
+            f"{noun} not found in body of '{target}'. Check whitespace and indentation: the text "
+            "must match the body exactly, or as whole lines with the same indentation added to or "
+            "removed from each of them (tabs and spaces differ)."
+        )
 
-        idx = body_bytes.index(anchor_bytes)
-        abs_start = body_start + idx
-        abs_end = abs_start + len(anchor_bytes)
-        insert_point = abs_end if place == "after" else abs_start
+    def _shifted_matches(self, needle: bytes, body_start: int, body_end: int) -> list:
+        """
+        The places in the bytes [body_start, body_end) of a body where the
+        snippet `needle` matches whole lines with its indentation shifted,
+        as (start, end, (old, new, depth)) for _find_snippet: each of its
+        lines of code is a line there with the same spaces and tabs put in
+        front of it (old is '' and new what is put there) or taken from it
+        (old what is taken, new ''), spaces and tabs at the ends of the
+        lines aside, and each of its blank lines a blank line, whatever its
+        whitespace. A line that starts inside a multi-line string whose
+        text does not move with the code (_literal_moves) must be as the
+        snippet writes it, as its indentation is part of the string. A line
+        break that ends the snippet ends the match too. depth is the
+        indentation of its first line of code there. A snippet that starts
+        or ends in the middle of a line matches exactly or not at all.
+        """
+        source_bytes = self.parser.source_bytes
+        want = needle.split(b"\n")
+        breaks = not want[-1]
+        if breaks:
+            want.pop()
+        code = [i for i, line in enumerate(want) if line.strip(b" \t")]
+        if not code:
+            return []
+        first = body_start
+        if first and source_bytes[first - 1 : first] != b"\n":
+            first = source_bytes.find(b"\n", first, body_end) + 1
+            if not first:
+                return []
+        rows = []
+        while first <= body_end:
+            stop = source_bytes.find(b"\n", first)
+            if stop == -1:
+                stop = len(source_bytes)
+            if stop > body_end:
+                break
+            rows.append((first, stop))
+            first = stop + 1
+        lines = [source_bytes[a:b] for a, b in rows]
+        fixed = {}
 
-        new_bytes_data = new_snippet.encode("utf-8")
-        new_bytes = source_bytes[:insert_point] + new_bytes_data + source_bytes[insert_point:]
-        self._write_bytes(new_bytes)
-        return "Update successful"
+        def kept(i: int) -> bool:
+            # Whether line i starts inside a string whose text stays put.
+            if i not in fixed:
+                fixed[i] = self._in_fixed_literal(rows[i][0])
+            return fixed[i]
+
+        matches = []
+        for k in range(len(rows) - len(want) + 1):
+            line, mine = lines[k + code[0]].rstrip(b" \t"), want[code[0]].rstrip(b" \t")
+            if line.lstrip(b" \t") != mine.lstrip(b" \t"):
+                continue
+            have = line[: len(line) - len(line.lstrip(b" \t"))]
+            given = mine[: len(mine) - len(mine.lstrip(b" \t"))]
+            if have.endswith(given):
+                old, new = b"", have[: len(have) - len(given)]
+            elif given.endswith(have):
+                old, new = given[: len(given) - len(have)], b""
+            else:
+                continue
+            if all(
+                got == wanted
+                if kept(k + j)
+                else (wanted.startswith(old) and got.rstrip(b" \t") == new + wanted[len(old) :].rstrip(b" \t"))
+                if wanted.strip(b" \t")
+                else not got.strip(b" \t")
+                for j, (got, wanted) in enumerate(zip(lines[k : k + len(want)], want))
+            ):
+                end = rows[k + len(want) - 1][1] + (1 if breaks else 0)
+                if end <= body_end:
+                    shift = (old.decode("utf-8"), new.decode("utf-8"), have.decode("utf-8"))
+                    matches.append((rows[k][0], end, shift))
+        return matches
+
+    def _match_lines(self, spans) -> str:
+        """'line N' or 'lines N, M' for matches of a snippet, tuples that
+        start with their start and end bytes: the lines their first code is
+        on (_first_code), at most ten of them."""
+        source_bytes = self.parser.source_bytes
+        rows = []
+        for span in spans:
+            row = source_bytes.count(b"\n", 0, self._first_code(span[0], span[1])) + 1
+            if row not in rows:
+                rows.append(row)
+            if len(rows) > 10:
+                break
+        shown = ", ".join(str(row) for row in rows[:10]) + (", ..." if len(rows) > 10 else "")
+        return f"line {shown}" if len(rows) == 1 else f"lines {shown}"
+
+    def _first_code(self, start: int, end: int) -> int:
+        """The first byte in [start, end) that is not a space, tab or line
+        break, or `start` when they all are."""
+        source_bytes = self.parser.source_bytes
+        for at in range(start, end):
+            if source_bytes[at] not in b" \t\n":
+                return at
+        return start
+
+    def _splits_match(self, start: int, end: int) -> bool:
+        """Whether a match of a snippet, the bytes [start, end), starts or
+        ends inside a token (_splits_token)."""
+        source_bytes = self.parser.source_bytes
+        # A match starts and ends between characters, and the character on
+        # either side of a boundary is in the four bytes there.
+        before = source_bytes[max(start - 4, 0) : start].decode("utf-8", "ignore")[-1:]
+        first = source_bytes[start : start + 4].decode("utf-8", "ignore")[:1]
+        last = source_bytes[max(end - 4, start) : end].decode("utf-8", "ignore")[-1:]
+        after = source_bytes[end : end + 4].decode("utf-8", "ignore")[:1]
+        return self._splits_token(start, first, before) or self._splits_token(end, last, after)
+
+    def _splits_token(self, at: int, inner: str, outer: str) -> bool:
+        """
+        Whether a match boundary at byte `at`, with the character `inner`
+        inside the match and `outer` outside it, splits a token: when both
+        continue an identifier, number or keyword (letters, digits, `_`),
+        or when `at` is inside a token of code (_node_around), such as an
+        operator (the `=` of `==`), a Ruby `foo?` or a JS `$el`. In comments
+        and strings (_in_text), whose text is words, only the first holds.
+        A Python backslash continuation, which tree-sitter reads as one
+        token with its line break, may be split there, so a snippet may end
+        with the backslash.
+        """
+        if _WORD_CHARACTER.match(inner) and _WORD_CHARACTER.match(outer):
+            return True
+        node = self._node_around(at)
+        return (
+            node is not None
+            and not node.child_count
+            and node.type != "line_continuation"
+            and not self._in_text(node)
+        )
+
+    def _node_around(self, at: int):
+        """The smallest node of the file that starts before byte `at` and
+        ends after it, or None at the ends of the file."""
+        if not 0 < at < len(self.parser.source_bytes):
+            return None
+        # The smallest node that holds the bytes on both sides of `at`.
+        node = self.parser.tree.root_node.descendant_for_byte_range(at - 1, at + 1)
+        while node is not None and not node.start_byte < at < node.end_byte:
+            node = node.parent
+        return node
+
+    def _in_text(self, node) -> bool:
+        """Whether `node` (from _node_around) is text, the words of a comment
+        or string literal (_TEXT_NODES), rather than code: no token that
+        opens or closes a string, and not in an interpolation's code."""
+        if not node.child_count and (not node.is_named or node.type in _STRING_DELIMITERS):
+            return False
+        while node is not None:
+            if "comment" in node.type or node.type in _TEXT_NODES:
+                return True
+            if node.type in _INTERPOLATIONS:
+                return False
+            node = node.parent
+        return False
+
+    def _comment_from(self, at: int):
+        """The comment that starts at byte `at`, or None."""
+        node = self.parser.tree.root_node.descendant_for_byte_range(at, at + 1)
+        if node is None or node.start_byte != at or "comment" not in node.type:
+            return None
+        return node
+
+    def _rest_of_line_free(self, at: int) -> int | None:
+        """The end of the line byte `at` is on (its line break) when nothing
+        but spaces, tabs and a comment that ends on it follow `at` there,
+        else None."""
+        source_bytes = self.parser.source_bytes
+        line_end = source_bytes.find(b"\n", at)
+        if line_end == -1:
+            line_end = len(source_bytes)
+        code = source_bytes[at:line_end].lstrip(b" \t")
+        if code:
+            comment = self._comment_from(line_end - len(code))
+            if (
+                comment is None
+                or comment.end_byte > line_end
+                or source_bytes[comment.end_byte : line_end].strip(b" \t")
+            ):
+                return None
+        return line_end
+
+    def _literal_around(self, at: int):
+        """The multi-line string literal of the file (_MULTILINE_STRINGS)
+        that byte `at` is inside, after its first byte and before its last,
+        or None: a line that starts there is text of the literal, its
+        indentation included."""
+        types = _MULTILINE_STRINGS.get(self.parser.ext)
+        if not types or not 0 < at < len(self.parser.source_bytes):
+            return None
+        node = self.parser.tree.root_node.descendant_for_byte_range(at, at)
+        while node is not None:
+            if node.type in types and node.start_byte < at < node.end_byte:
+                return node
+            node = node.parent
+        return None
+
+    def _literal_moves(self, node, source: bytes) -> bool:
+        """Whether the lines of the multi-line string literal `node`, of
+        the source `source`, move with the code (see _literal_rows): a
+        Python docstring, a Ruby `<<~` heredoc or a Java text block, whose
+        languages strip their common indentation from the value."""
+        ext = self.parser.ext
+        if ext == ".py":
+            return self._is_docstring(node)
+        if ext == ".java":
+            return source[node.start_byte : node.start_byte + 3] == b'"""'
+        if node.type != "heredoc_body":
+            return False
+        # The body starts at the line break of the line its `<<~EOS` is on.
+        end = next((c for c in node.children if c.type == "heredoc_end"), None)
+        if end is None:
+            return False
+        name = re.escape(source[end.start_byte : end.end_byte].strip())
+        opener = source[source.rfind(b"\n", 0, node.start_byte) + 1 : node.start_byte]
+        return re.search(rb"<<~[\"'`]?" + name + rb"\b", opener) is not None
+
+    def _in_fixed_literal(self, at: int) -> bool:
+        """Whether byte `at` is inside a multi-line string literal of the
+        file (_literal_around) whose lines do not move with the code
+        (_literal_moves): text whose indentation is part of its value, and
+        that a new line of code must not go into. A docstring's lines are
+        indented like code."""
+        literal = self._literal_around(at)
+        return literal is not None and not self._literal_moves(literal, self.parser.source_bytes)
+
+    def _within_text(self, start: int, end: int) -> bool:
+        """Whether the bytes [start, end) of the file are all in one comment
+        or string literal (_in_text): its text, not code."""
+        node = self.parser.tree.root_node.descendant_for_byte_range(start, max(start, end - 1))
+        return node is not None and self._in_text(node)
+
+    def _context_literals(self, start: int, end: int, text: str) -> list[tuple[range, bool]]:
+        """
+        The lines of the content `text`, written in place of the file's
+        bytes [start, end), that start inside a multi-line string literal
+        it holds only part of, one that the code before or after it opens
+        or closes (as when the content goes into the text of a string), in
+        the form _literal_rows gives them: their indices in `text`, and
+        whether the literal's lines move with the code (_literal_moves).
+        The result is parsed to find them; the literals the content holds
+        all of are _literal_rows's.
+        """
+        types = _MULTILINE_STRINGS.get(self.parser.ext)
+        if not types or "\n" not in text:
+            return []
+        src = self.parser.source_bytes
+        data = text.replace("\r\n", "\n").encode("utf-8")
+        new = src[:start] + data + src[end:]
+        stop = start + len(data)
+        # Where the lines of the content after its first start in `new`.
+        offsets, at = [], data.find(b"\n")
+        while at != -1:
+            offsets.append(start + at + 1)
+            at = data.find(b"\n", at + 1)
+        result, stack = [], [self.parser.parse(new).root_node]
+        while stack:
+            node = stack.pop()
+            if node.end_byte <= start or node.start_byte >= stop:
+                continue
+            if node.type in types:
+                if node.start_byte < start or node.end_byte > stop:
+                    rows = [i for i, at in enumerate(offsets, 1) if node.start_byte < at < node.end_byte]
+                    if rows:
+                        moves = self._context_literal_moves(node, new, start, stop - end)
+                        result.append((range(rows[0], rows[-1] + 1), moves))
+                continue
+            stack.extend(node.children)
+        return result
+
+    def _context_literal_moves(self, node, new: bytes, start: int, delta: int) -> bool:
+        """_literal_moves for the literal `node` of an edit's result `new`
+        (_context_literals), whose content starts at byte `start` and made
+        the file `delta` bytes longer: told from the file's own literal
+        that starts where `node` does before the content, or ends where it
+        does after it, as the content, not yet indented as it will be, may
+        have taken a docstring out of its function in `new`."""
+        at = node.start_byte + 1 if node.start_byte < start else node.end_byte - delta - 1
+        origin = self._literal_around(at)
+        if origin is None:
+            return self._literal_moves(node, new)
+        return self._literal_moves(origin, self.parser.source_bytes)
+
+    def _parsing_choice(self, make, text: str, other: str | None) -> str:
+        """The content `text` for an edit, or `other`, the other reading of
+        its indentation (_matched_content), when the file is Python and the
+        result `make(text)` would not parse while `make(other)` would."""
+        if other is None or other == text or self.parser.ext != ".py":
+            return text
+        if _python_syntax_error(make(text)) is None or _python_syntax_error(make(other)) is not None:
+            return text
+        return other
+
+    def _into_block(self, point: int, line_end: int, body_end: int, text: str, extra) -> str:
+        """
+        The lines `text` that insert_in_body puts at `point`, below an
+        anchor whose line ends at `line_end`, moved into the block that
+        line opens (`if (x) {`, `if x:`): when the next line of the body
+        that is not blank, before `body_end`, is indented deeper than the
+        anchor's line, and the first line of code of `text` is at the
+        anchor line's indentation, the lines move as far as that next line
+        is (_shift_content, `extra` the lines that start inside a string of
+        the file, see _context_literals). In the text of a docstring or a
+        block comment, the lines are text: a deeper line below is aligned
+        text, no block.
+        """
+        around = self.parser.tree.root_node.descendant_for_byte_range(line_end, line_end)
+        if self._literal_around(point) is not None or (
+            around is not None and "comment" in around.type and around.end_byte > line_end
+        ):
+            return text
+        src = self.parser.source_bytes
+        own = self._get_indent(self.lines[src.count(b"\n", 0, line_end)])
+        pos = point
+        while pos < body_end:
+            stop = src.find(b"\n", pos)
+            stop = len(src) if stop == -1 else stop
+            if src[pos:stop].strip(b" \t"):
+                break
+            pos = stop + 1
+        else:
+            return text
+        below = self._get_indent(src[pos:stop].decode("utf-8"))
+        lines = text.split("\n")
+        first = next((line for line in lines if line.strip(" \t")), None)
+        if first is None or self._get_indent(first) != own or len(below) <= len(own) or not below.startswith(own):
+            return text
+        return "\n".join(self._shift_content(lines, own, below, extra))
+
+    def _indent_row(self, node) -> int:
+        """The row whose indentation is that of the code of `node`: the one
+        it starts on, or, when that line starts inside a block comment
+        begun on a line above (the ` */` of a doc comment before `node` on
+        its line), the row that comment starts on."""
+        src = self.parser.source_bytes
+        line_start = src.rfind(b"\n", 0, node.start_byte) + 1
+        line = src[line_start : node.start_byte]
+        at = line_start + len(line) - len(line.lstrip(b" \t"))
+        comment = self.parser.tree.root_node.descendant_for_byte_range(at, at + 1)
+        if comment is not None and "comment" in comment.type and comment.start_byte < line_start:
+            return comment.start_point[0]
+        return node.start_point[0]
+
+    def _snippet_frame(self, start: int, end: int) -> tuple[str, str, str]:
+        """
+        The shift, as _find_snippet gives one, for the content that goes
+        with an exact match [start, end): the indentation that its first
+        line of code left out, as ('', that, the indentation of the line in
+        the file). That is what precedes the match on the line when it is
+        only indentation, nothing when the match starts on a line before
+        (that line's break and the indentation after it are in the snippet),
+        and the line's whole indentation when code precedes it there, as if
+        the snippet started at column 0.
+        """
+        source_bytes = self.parser.source_bytes
+        code = self._first_code(start, end)
+        line_start = source_bytes.rfind(b"\n", 0, code) + 1
+        depth = self._get_indent(self.lines[source_bytes.count(b"\n", 0, code)])
+        if line_start > start:
+            return "", "", depth
+        before = source_bytes[line_start:start].decode("utf-8")
+        return "", before if not before.strip(" \t") else depth, depth
+
+    def _matched_content(
+        self, content: str, shift: tuple[str, str, str], lead: bool, extra=None, read: bool = False
+    ) -> tuple[str, str | None]:
+        """
+        content (CRLF read as LF) indented as the snippet it goes with was
+        matched, for `shift` = (old, new, depth) from _find_snippet or
+        _snippet_frame: its lines moved as a line indented `old` moves to
+        `new`, keeping their indentation relative to each other
+        (_shift_content). Only the lines that begin a line in the file move:
+        all of them when `lead`, else those after the first, which goes
+        where the match starts. When the shift adds indentation and each of
+        those lines of code is indented `depth` already, the file's
+        indentation there, the content goes in as written; so it does in
+        read_symbol's shape, when `lead` and `read` (beside an exact
+        anchor, whose frame is the file's), its first line has no
+        indentation and the others are that deep, the first line then
+        indented `depth`.
+        Where the file indents with tabs, its indentation steps are tabs
+        first (_tabbed). `extra` are the lines that start inside a string
+        of the file (_context_literals), which keep their text as those of
+        the content's own strings do.
+
+        Returns the text and the other reading of the content's indentation
+        (moved where it goes in as written, and the reverse), or None when
+        there is none: in Python, a text that would not parse gives way to
+        the other (_parsing_choice).
+        """
+        old, new, depth = shift
+        given = content.replace("\r\n", "\n").split("\n")
+        lines = self._tabbed(given, depth, extra=extra)
+        text = "\n".join(lines)
+        if old == new:
+            return text, None
+        # The lines of the file's strings that move with the code (a
+        # docstring's) count as code here.
+        literal = {row for rows, _ in self._literal_rows(given) for row in rows} | {
+            row for rows, moves in extra or [] if not moves for row in rows
+        }
+        # The shape is told from the lines as given, before tabs.
+        begins = [i for i, line in enumerate(given) if (lead or i) and line.strip(" \t") and i not in literal]
+        moved = self._shift_content(lines, old, new, extra)
+        if not lead:
+            moved[0] = lines[0]
+        moved = "\n".join(moved)
+        if old:
+            return moved, None
+        later = [i for i in begins if i]
+        if all(given[i].startswith(depth) for i in begins):
+            return text, moved
+        if read and lead and later and not self._get_indent(given[0]) and all(given[i].startswith(depth) for i in later):
+            return "\n".join([depth + lines[0]] + lines[1:]), moved
+        return moved, None if lead else text
+
+    def _shift_content(self, lines: list[str], old: str, new: str, extra=None) -> list[str]:
+        """
+        Caller content `lines` moved as a line of code indented `old` moves
+        to `new` (_shift_line), each line keeping its indentation relative
+        to the others; a line indented less than what the move takes away
+        loses all of its indentation. Blank lines stay as they are, and so
+        do the lines that start inside a multi-line string literal or a Ruby
+        embedded document of the content, except those of a literal whose
+        language strips their common indentation, which move with the code
+        unless one of them cannot (as in _reindent); `extra` adds the lines
+        that start inside a string of the file (_context_literals).
+        """
+        result = []
+        for line in lines:
+            moved = self._shift_line(line, old, new)
+            result.append(moved if moved is not None else new + line.lstrip(" \t"))
+        for rows, shifts in self._literal_rows(lines) + (extra or []):
+            kept = lines[rows.start : rows.stop]
+            moved = [self._shift_line(line, old, new) for line in kept] if shifts else [None]
+            result[rows.start : rows.stop] = kept if None in moved else moved
+        return result
+
+    def _deleted_span(self, start: int, end: int) -> tuple[int, int]:
+        """
+        The bytes that deleting the match [start, end) of a snippet removes:
+        the match, or the whole lines it takes all the code of, with their
+        indentation and line break, when only indentation precedes it on its
+        first line and only spaces and tabs follow it on its last (or it
+        ends with that line's break). When a comment follows it there, the
+        code goes up to the comment, which stays at the line's indentation.
+        """
+        source_bytes = self.parser.source_bytes
+        line_start = source_bytes.rfind(b"\n", 0, start) + 1
+        if not source_bytes[start:end].strip() or source_bytes[line_start:start].strip(b" \t"):
+            return start, end
+        if source_bytes[end - 1 : end] == b"\n":
+            return line_start, end
+        line_end = self._rest_of_line_free(end)
+        if line_end is None:
+            return start, end
+        rest = source_bytes[end:line_end]
+        if not rest.strip(b" \t"):
+            return line_start, min(line_end + 1, len(source_bytes))
+        first_line = source_bytes[line_start : source_bytes.find(b"\n", line_start)]
+        code = line_start + len(first_line) - len(first_line.lstrip(b" \t"))
+        return code, line_end - len(rest.lstrip(b" \t"))
+
+    def _keep_a_statement(self, body_node, start: int, end: int, target: str) -> None:
+        """Refuse to delete the bytes [start, end) of a Python body when they
+        hold all of its statements: Python needs one."""
+        if self.parser.ext != ".py":
+            return
+        statements = [c for c in body_node.named_children if c.type != "comment"]
+        if statements and all(start <= c.start_byte and c.end_byte <= end for c in statements):
+            raise ApplierError(
+                f"Deleting the snippet would leave the body of '{target}' without a statement, "
+                "which Python does not allow. Replace it with `pass` (replace_in_body), or delete "
+                "the whole function (delete_symbol)."
+            )
 
     def _body_search_range(self, body_node) -> tuple[int, int]:
         """Return (start_byte, end_byte) byte range within which to search for
         a snippet inside a function body. For Python/Ruby, extends the start
         back to the beginning of the first body line so leading indentation is
         part of the searchable text, when only that indentation comes before
-        it there (not the signature of a one-line function, or other code).
+        it there (not the signature of a one-line function, or other code),
+        and the end over the line break after the last statement, so that a
+        snippet may end with its line's break there too.
         For brace-delimited languages, returns
         the body node's native byte range (which includes `{` and `}`), up
         to its `}`: a comment after that, which the JS/TS grammar puts in
@@ -4824,6 +5863,8 @@ class Applier:
             line_start = source_bytes.rfind(b"\n", 0, start_byte) + 1
             if not source_bytes[line_start:start_byte].strip(b" \t"):
                 start_byte = line_start
+            if source_bytes[end_byte : end_byte + 1] == b"\n":
+                end_byte += 1
         return start_byte, end_byte
 
     def _body_insert_point(self, target: str, at: str) -> tuple[int, str]:
@@ -4833,15 +5874,16 @@ class Applier:
         from whichever line happens to be first or last, so a body that ends in a
         nested block still gets the new lines at body level. In Python the new
         lines go after a leading docstring so it stays the docstring; in Ruby a
-        bottom insert goes before any rescue/else/ensure clause. A body that
-        shares a line with its signature or braces has no line to insert on and
-        is refused.
+        bottom insert goes before any rescue/else/ensure clause, and an empty
+        method (_empty_method) takes the lines between its signature and its
+        `end`. A body that shares a line with its signature or braces has no
+        line to insert on and is refused.
         """
-        func_node, body = self._get_function_body_node(target)
+        func_node, body = self._get_function_body_node(target, empty_ok=True)
         ext = self.parser.ext
         # Not a comment after the `}` that the JS/TS grammar puts in the body.
-        end = self._code_end(body)
-        stmts = [c for c in body.named_children if c.end_byte <= end]
+        # An empty Ruby method has no body node (_empty_method).
+        stmts = [] if body is None else [c for c in body.named_children if c.end_byte <= self._code_end(body)]
         if len(stmts) == 1 and stmts[0].type == "statement_list":
             # Go wraps a block's statements in a statement_list that ends on the `}` line
             stmts = list(stmts[0].named_children)
@@ -4865,7 +5907,8 @@ class Applier:
             open_row = self.parser.source_bytes.count(b"\n", 0, self._body_opening(func_node, body))
             compact = bool(stmts) and stmts[0].start_point[0] == open_row
             if ext == ".rb" and func_node.children[-1].type == "end":
-                compact = compact or body.end_point[0] == func_node.children[-1].start_point[0]
+                last_row = body.end_point[0] if body is not None else open_row
+                compact = compact or last_row == func_node.children[-1].start_point[0]
         if compact:
             raise ApplierError(
                 f"The body of '{target}' shares a line with its signature or braces, so "
@@ -4883,26 +5926,36 @@ class Applier:
                 return body.start_point[0] + 1, indent
             if ext == ".py" and stmts and self._is_docstring_node(stmts[0]):
                 return stmts[0].end_point[0] + 1, indent
+            if body is None:
+                return open_row + 1, indent
             return (stmts[0].start_point[0] if stmts else body.start_point[0]), indent
         if braced:
             return body.end_point[0], indent
         if clause is not None:
             return clause.start_point[0], indent
+        if body is None:
+            return func_node.children[-1].start_point[0], indent
         return (stmts[-1].end_point[0] + 1 if stmts else body.end_point[0] + 1), indent
 
     @staticmethod
     def _is_docstring_node(node) -> bool:
-        """True for a Python statement that is just a string literal (a docstring)."""
+        """True for a Python statement that is just a string literal (a
+        docstring), but not an f-string, t-string or bytes literal, which
+        Python never takes for one (its prefix may only be r or u)."""
         if node.type != "expression_statement" or node.named_child_count != 1:
             return False
-        return node.named_children[0].type in ("string", "concatenated_string")
+        string = node.named_children[0]
+        if string.type not in ("string", "concatenated_string"):
+            return False
+        parts = [c for c in string.named_children if c.type == "string"] if string.type == "concatenated_string" else [string]
+        return all(not re.match(rb"[a-zA-Z]*", part.text).group().lower().strip(b"ru") for part in parts)
 
     def _prepend_to_body(self, target: str, content: str) -> str:
         """
         Insert content at the top of a function body, preserving existing statements.
         """
         insert_line, target_indent = self._body_insert_point(target, "top")
-        content_lines = self._reindent(_content_lines(content), target_indent)
+        content_lines = self._reindent(self._tabbed(_content_lines(content), target_indent), target_indent)
         self.lines = self.lines[:insert_line] + content_lines + self.lines[insert_line:]
         return self._save()
 
@@ -4911,7 +5964,7 @@ class Applier:
         Insert content at the bottom of a function body, preserving existing statements.
         """
         insert_line, target_indent = self._body_insert_point(target, "bottom")
-        content_lines = self._reindent(_content_lines(content), target_indent)
+        content_lines = self._reindent(self._tabbed(_content_lines(content), target_indent), target_indent)
         self.lines = self.lines[:insert_line] + content_lines + self.lines[insert_line:]
         return self._save()
 
@@ -4920,7 +5973,7 @@ class Applier:
         Insert content as a sibling immediately before a named symbol (function, class,
         method, or top-level assignment): above its leading comment block,
         decorators, JS/TS `export` and C++ `template <...>`, separated from it
-        and from the sibling above it as _sibling_gap says. Blank lines below
+        and from the sibling above it as _sibling_gaps says. Blank lines below
         a comment above it, or below the `{` or access label that opens its
         body, are left as they are. A symbol that shares its first line with
         other code is refused: lines above that line would land before that
@@ -4934,7 +5987,8 @@ class Applier:
         # _symbol_span), and above its leading comment, which documents the
         # symbol and must stay on top of it.
         first, last = self._symbol_unit(node)
-        if self._line_sharing(first, last)[0]:
+        before, separator, _ = self._line_sharing(first, last)
+        if before:
             raise ApplierError(
                 f"'{target}' shares its first line with other code, so new lines above "
                 "that line would not land right before it. Make this edit with your "
@@ -4947,26 +6001,19 @@ class Applier:
         # The symbol's indentation, which a comment above it need not have
         # (a Ruby `=begin` is at column 0).
         target_indent = self._get_indent(self.lines[first.start_point[0]])
-        content_lines = self._sibling_content(content, target_indent)
+        content_lines = self._sibling_content(content, target_indent, range(first.start_point[0], last.end_point[0] + 1))
 
         # The sibling above, a comment at the end of its line not counted.
-        siblings = first.parent.named_children if first.parent is not None else []
-        above = [
-            s for s in siblings
-            if self._last_row(s) < insert_line
-            and ("comment" not in s.type or self._starts_line(s.start_byte))
-        ]
         # A comment above keeps the blank lines below it, unless it is
         # indented deeper, as the end of the code above it.
-        top, gap_above = insert_line, []
-        if above and above[-1].type != "access_specifier" and (
-            "comment" not in above[-1].type
-            or self._indented_deeper(self.lines[above[-1].start_point[0]], target_indent)
-        ):
-            while top > 0 and not self.lines[top - 1].strip(" \t"):
-                top -= 1
-            gap_above = [""] * self._sibling_gap(first.parent, above[-1], content_lines)
-        gap_below = [""] * self._sibling_gap(first.parent, content_lines, first)
+        near = self._sibling_above(first, insert_line)
+        top = insert_line - near[1] if near is not None else insert_line
+        far = self._sibling_below(first, last, separator)
+        below, above = self._sibling_gaps(
+            first.parent, (first, last), content_lines, near, far, self._stacked_beyond(near, upward=True)
+        )
+        gap_above = [""] * above if near is not None else []
+        gap_below = [""] * below
 
         self.lines = (
             self.lines[:top]
@@ -4982,7 +6029,7 @@ class Applier:
         Insert content as a sibling immediately after a named symbol (function, class,
         method, or top-level assignment), separated from it and from the
         sibling below it (with that sibling's leading comment, decorators and
-        `export`) as _sibling_gap says. The comment lines right below the
+        `export`) as _sibling_gaps says. The comment lines right below the
         symbol that are indented deeper than it end its code, so the content
         goes below them (_rows_below). When nothing but the end of its body or
         file, or a C++ access label, follows the symbol, the blank lines after
@@ -5011,19 +6058,20 @@ class Applier:
         # Below the comment lines that end its code (_rows_below).
         insert_line = self._rows_below(first, last, separator)
         target_indent = self._get_indent(self.lines[first.start_point[0]])
-        content_lines = self._sibling_content(content, target_indent)
+        content_lines = self._sibling_content(content, target_indent, range(first.start_point[0], last.end_point[0] + 1))
 
-        siblings = last.parent.named_children if last.parent is not None else []
-        below = [s for s in siblings if s.start_point[0] >= insert_line]
-        gap_above = [""] * self._sibling_gap(last.parent, last, content_lines)
-        bottom, gap_below = insert_line, []
-        if below and below[0].type != "access_specifier":
-            # The next symbol's leading comment, decorators or `export` start
-            # it; the blank lines before it are replaced.
-            while bottom < len(self.lines) and not self.lines[bottom].strip(" \t"):
-                bottom += 1
-            following = next((s for s in below if "comment" not in s.type), None)
-            gap_below = [""] * self._sibling_gap(last.parent, content_lines, following)
+        # The next symbol's leading comment, decorators or `export` start
+        # it; the blank lines before it are replaced.
+        near = self._sibling_below(first, last, separator)
+        bottom = insert_line + near[1] if near is not None else insert_line
+        top = first.start_point[0]
+        comment_range = self._find_leading_comment_range(top)
+        far = self._sibling_above(first, comment_range[0] if comment_range is not None else top)
+        above, below = self._sibling_gaps(
+            last.parent, (first, last), content_lines, near, far, self._stacked_beyond(near, upward=False)
+        )
+        gap_above = [""] * above
+        gap_below = [""] * below if near is not None else []
 
         self.lines = (
             self.lines[:insert_line]
@@ -5034,11 +6082,12 @@ class Applier:
         )
         return self._save()
 
-    def _sibling_content(self, content: str, indent: str) -> list[str]:
+    def _sibling_content(self, content: str, indent: str, rows: range) -> list[str]:
         """The lines of insert_sibling's content, without blank lines around
         them, re-indented to `indent` (content in read_symbol's shape from
-        the indentation it was read at, see _from_read_shape), in tabs when
-        `indent` has one, as add_method writes them (_tab_indent)."""
+        the indentation it was read at, see _from_read_shape), in tabs where
+        the file indents with them beside the target's lines `rows`, as
+        add_method writes them (_tabbed)."""
         lines = _content_lines(content)
         while lines and not lines[0].strip():
             lines.pop(0)
@@ -5047,9 +6096,7 @@ class Applier:
         if not lines:
             raise ApplierError("content is empty: pass the source of the code to insert")
         lines = self._from_read_shape(lines, indent)
-        if "\t" in indent:
-            lines = self._tab_indent(lines)
-        return self._reindent(lines, indent)
+        return self._reindent(self._tabbed(lines, indent, rows), indent)
 
     def _sibling_gap(self, parent, a, b) -> int:
         """
@@ -5072,6 +6119,190 @@ class Applier:
             )
 
         return 2 if definition(a) or definition(b) else 1
+
+    def _is_block(self, item) -> bool:
+        """
+        Whether `item`, a sibling (a node, or the first and last nodes of a
+        symbol) or the lines of new content, is a block for the spacing of
+        siblings (_sibling_gaps): code over several lines, comments aside,
+        or a definition with a body on one line (_block_line). None (no
+        sibling) is not.
+        """
+        if item is None:
+            return False
+        if isinstance(item, list):
+            lines = item
+            if self.parser.ext == ".py":
+                old = self._get_indent(lines[0])
+                lines = [line[len(old) :] if line.startswith(old) else line for line in lines]
+            rows, stack = set(), [self.parser.parse("\n".join(lines).encode("utf-8")).root_node]
+            while stack:
+                node = stack.pop()
+                if "comment" in node.type:
+                    continue
+                if node.child_count:
+                    stack.extend(node.children)
+                elif node.end_byte > node.start_byte:
+                    rows.update(range(node.start_point[0], node.end_point[0] + 1))
+            return len(rows) > 1 or any(self._block_line(item[row]) for row in rows if row < len(item))
+        first, last = item if isinstance(item, tuple) else (item, item)
+        if first.type in ("function_definition", "class_definition", "decorated_definition"):
+            return True
+        return self._last_row(last) > first.start_point[0] or self._block_line(self.lines[first.start_point[0]])
+
+    def _block_line(self, line: str) -> bool:
+        """Whether a line of code is a definition with a body, for
+        _is_block: a Python def or class (or a decorator), a Ruby def, class
+        or module, and elsewhere code that ends with a `}`, a `;` after it
+        and a comment aside (`function f() {}`, `struct S {};`)."""
+        code = line.strip(" \t")
+        if self.parser.ext == ".py":
+            return re.match(r"(@|class\b|def\b|async\s+def\b)", code) is not None
+        if self.parser.ext == ".rb":
+            return re.match(r"(def|class|module)\b", code) is not None
+        code = re.sub(r"\s*(//.*|/\*.*?\*/)$", "", code)
+        return code.rstrip("; \t").endswith("}")
+
+    def _sibling_gaps(self, parent, target, content: list[str], near, far, beyond=None) -> tuple[int, int]:
+        """
+        The blank lines that insert_sibling puts between `target` (the
+        first and last nodes of the symbol that the content goes beside)
+        and the lines `content`, and between them and `near`, the target's
+        sibling on that side, given as (its node, the blank lines that
+        separated it from the target), the node None when only comments
+        follow, or None when there is none (the start or end of the body or
+        file, a C++ access label); `far` is the sibling on the target's
+        other side, in the same form, and `beyond` the blank lines between
+        a one-line `near` and its own one-line neighbour on the side away
+        from the target, or None (_stacked_beyond).
+
+        Where a block (_is_block) is one of the two, the gap is the usual
+        one (_sibling_gap) or the wider one that separated the target from
+        `near`. Between one-line content and a one-line target it is the
+        smallest gap between the target and a one-line neighbour (that on
+        the far side counted up to the usual gap), and between one-line
+        content and a one-line `near` the gap that separated a one-line
+        target from it, or, beside a block target, the gap `beyond` (up to
+        the usual gap); else the usual one. So stacked declarations and
+        fields stay stacked, and the gap the content went into stays on
+        the side of `near`.
+        """
+        near_node, near_gap = near if near is not None else (None, 0)
+        target_block, content_block = self._is_block(target), self._is_block(content)
+        usual = self._sibling_gap(parent, target[0], content)
+        gaps = []
+        if not target_block:
+            if near is not None and not self._is_block(near_node):
+                gaps.append(near_gap)
+            if far is not None and far[0] is not None and not self._is_block(far[0]):
+                gaps.append(min(far[1], usual))
+        if target_block or content_block:
+            toward = max(usual, near_gap)
+        else:
+            toward = min(gaps) if gaps else usual
+        usual = self._sibling_gap(parent, content, near_node)
+        if content_block or self._is_block(near_node):
+            away = max(usual, near_gap)
+        elif near is not None and not target_block:
+            away = near_gap
+        elif beyond is not None:
+            # Beside a block, one-line content joins the stack of `near`.
+            away = min(beyond, usual)
+        else:
+            away = usual
+        return toward, away
+
+    def _stacked_beyond(self, near, upward: bool):
+        """
+        For `near`, the sibling of insert_sibling's target on the side the
+        content goes (as _sibling_above, `upward`, or _sibling_below give
+        it), when it is one-line code: the blank lines between it and its
+        own neighbour on the side away from the target, when that is
+        one-line code too, else None. One-line content that goes between a
+        block and `near` joins that stack (_sibling_gaps).
+        """
+        if near is None or near[0] is None or self._is_block(near[0]):
+            return None
+        node = near[0]
+        if upward:
+            comment_range = self._find_leading_comment_range(node.start_point[0])
+            other = self._sibling_above(node, comment_range[0] if comment_range is not None else node.start_point[0])
+        else:
+            other = self._sibling_below(node, node, self._line_sharing(node, node)[1])
+        if other is None or other[0] is None or self._is_block(other[0]):
+            return None
+        return other[1]
+
+    def _sibling_above(self, first, top: int):
+        """
+        The sibling above the symbol that starts with the node `first`, its
+        lines starting at row `top` (its leading comment's first), for the
+        spacing of insert_sibling: (the code above, and the blank lines
+        between them), or None when the start of its body or file, a C++
+        access label, or a comment that is not indented deeper than the
+        symbol comes first. A comment indented deeper ends the code above
+        it, which counts.
+        """
+        siblings = first.parent.named_children if first.parent is not None else []
+        above = [
+            s for s in siblings
+            if self._last_row(s) < top and ("comment" not in s.type or self._starts_line(s.start_byte))
+        ]
+        if not above or above[-1].type == "access_specifier":
+            return None
+        indent = self._get_indent(self.lines[first.start_point[0]])
+        if "comment" in above[-1].type and not self._indented_deeper(self.lines[above[-1].start_point[0]], indent):
+            return None
+        row = top
+        while row > 0 and not self.lines[row - 1].strip(" \t"):
+            row -= 1
+        return next((s for s in reversed(above) if "comment" not in s.type), None), top - row
+
+    def _sibling_below(self, first, last, separator):
+        """
+        The sibling below the symbol first..last (`separator` the `;` or
+        `,` that ends it, or None), for the spacing of insert_sibling: (the
+        first code below it, None when only comments follow, and the blank
+        lines between them), or None when the end of its body or file or a
+        C++ access label comes first. The comment lines that end its code
+        (_rows_below) are part of the symbol.
+        """
+        start = self._rows_below(first, last, separator)
+        siblings = last.parent.named_children if last.parent is not None else []
+        below = [s for s in siblings if s.start_point[0] >= start]
+        if not below or below[0].type == "access_specifier":
+            return None
+        row = start
+        while row < len(self.lines) and not self.lines[row].strip(" \t"):
+            row += 1
+        return next((s for s in below if "comment" not in s.type), None), row - start
+
+    def _gap_after(self, parent, last, content: list[str], start=None) -> int:
+        """The blank lines between `last`, the last code of `parent`, and
+        the lines `content` added after it (add_top_level, add_method), as
+        insert_sibling would put them after it (_sibling_gaps): one-line
+        content after stacked one-line code is stacked too. The code that
+        `start` (an include guard's `#define`) ends, and that node itself,
+        do not count. After a comment, or with no code, the usual gap
+        (_sibling_gap), and so after imports, includes or a package clause
+        for content that is none (_is_import_line)."""
+        if last is None or "comment" in last.type:
+            return self._sibling_gap(parent, last, content)
+        preamble = self._is_import(last) or last.type in ("package_clause", "package_declaration")
+        if preamble and not self._is_import_line(content):
+            return self._sibling_gap(parent, last, content)
+        comment_range = self._find_leading_comment_range(last.start_point[0])
+        far = self._sibling_above(last, comment_range[0] if comment_range is not None else last.start_point[0])
+        if far is not None and start is not None and (far[0] is None or far[0].start_byte <= start.start_byte):
+            far = None
+        return self._sibling_gaps(parent, (last, last), content, None, far)[0]
+
+    def _is_import_line(self, lines: list[str]) -> bool:
+        """Whether the first line of code of the content `lines` is an
+        import, an include or a `require` (for _gap_after, which stacks it
+        under the file's own)."""
+        code = next((line.strip() for line in lines if line.strip() and not self._is_comment_line(line)), "")
+        return re.match(r"(import|from|require|require_relative)\b|#\s*include\b", code) is not None
 
     def insert_sibling(self, target: str, content: str, position: str) -> str:
         """
@@ -5265,7 +6496,12 @@ class Applier:
           - Python:  `from <module> import a, b`  -> adds as a new name
           - JS/TS:   `import { a, b } from "module"`  -> adds as a new specifier
         Idempotent: if the name is already present, returns without changes.
-        Raises if no matching import statement exists.
+        Raises if no matching import statement exists. Names in braces or
+        parentheses follow their layout (_insert_entry): written one per
+        line, the new one gets a line of its own at their indentation, with
+        a comma after it when the last one has one (else the last one gets
+        the comma); an inline list stays inline, as does a Python list
+        without parentheses.
         """
         ext = self.parser.ext
         if ext == ".py":
@@ -5290,6 +6526,15 @@ class Applier:
         if not name_nodes:
             raise ApplierError("Cannot add to an empty import list")
 
+        if stmt.children[-1].type == ")":
+            # Names in parentheses follow their layout, one per line or
+            # inline (_insert_entry). The statement stands in for the
+            # parentheses: it ends with the `)`, and its `from` starts the
+            # line of the `(`.
+            self._insert_entry(
+                stmt, name_nodes, name, expand_empty=False, empty_trailing_comma=False, default_unit="    "
+            )
+            return "Update successful"
         last = name_nodes[-1]
         insertion = f", {name}"
         source_bytes = self.parser.source_bytes
@@ -5318,15 +6563,10 @@ class Applier:
             if name_node and self.parser.node_text(name_node) == name:
                 return "Name already present -- no change made"
 
-        last = specs[-1]
-        insertion = f", {name}"
-        source_bytes = self.parser.source_bytes
-        new_bytes = (
-            source_bytes[: last.end_byte]
-            + insertion.encode("utf-8")
-            + source_bytes[last.end_byte :]
+        # One name per line or inline, as the braces have them.
+        self._insert_entry(
+            named_imports, specs, name, expand_empty=False, empty_trailing_comma=False, default_unit="  "
         )
-        self._write_bytes(new_bytes)
         return "Update successful"
 
     def _find_js_named_import(self, module: str):
@@ -5372,7 +6612,10 @@ class Applier:
           - Python:  `from <module> import a, b, c`
           - JS/TS:   `import { a, b, c } from "module"`
         If removing the only remaining name, removes the entire import statement
-        (when the statement consists of only named imports).
+        (when the statement consists of only named imports). In braces or
+        parentheses the name goes as _delete_entry deletes an entry: on a
+        line of its own with that line and the comment at its end, else
+        with one comma next to it.
         """
         ext = self.parser.ext
         if ext == ".py":
@@ -5405,6 +6648,12 @@ class Applier:
             self.lines = self.lines[:start_line] + self.lines[end_line:]
             return self._save()
 
+        if stmt.children[-1].type == ")":
+            # A name on a line of its own goes with that line and its
+            # comment (_delete_entry; the statement stands in for the
+            # parentheses, as in _add_import_name_python).
+            self._delete_entry(stmt, name_nodes, idx)
+            return "Update successful"
         source_bytes = self.parser.source_bytes
         start = name_nodes[idx].start_byte
         end = name_nodes[idx].end_byte
@@ -5453,17 +6702,9 @@ class Applier:
                 "statement, then re-add the default binding with `add_import`."
             )
 
-        # Multiple specs: remove this one + adjacent comma
-        source_bytes = self.parser.source_bytes
-        start = specs[idx].start_byte
-        end = specs[idx].end_byte
-        if idx > 0:
-            start = specs[idx - 1].end_byte
-        elif idx + 1 < len(specs):
-            end = specs[idx + 1].start_byte
-
-        new_bytes = source_bytes[:start] + source_bytes[end:]
-        self._write_bytes(new_bytes)
+        # Multiple specs: remove this one with an adjacent comma, or with its
+        # line and the comment at its end when it has a line of its own.
+        self._delete_entry(named_imports, specs, idx)
         return "Update successful"
 
     def _find_parameter_list(self, target: str):
@@ -5642,8 +6883,10 @@ class Applier:
         written one parameter per line gets the new one on a line of its own
         (_add_parameter_line), and so does an empty one whose `)` is on a
         line below its `(` (_add_parameter_below); comments are no
-        parameters. A name the function already has is refused
-        (_refuse_repeated_parameter).
+        parameters. The end of a Python list is before its `**kwargs`
+        (_is_kwargs), which must stay last, and the `void` of a C or C++
+        `(void)` gives way to the parameter (_void_parameter). A name the
+        function already has is refused (_refuse_repeated_parameter).
         """
         if position not in ("start", "end"):
             raise ApplierError(
@@ -5651,10 +6894,20 @@ class Applier:
             )
         params = self._find_parameter_list(target)
         existing = [c for c in params.named_children if "comment" not in c.type]
+        # The index of the parameter the new one goes before, None for after
+        # the last: a Python `**kwargs` must stay last.
+        before = 0 if position == "start" else None
+        if before is None and existing and self._is_kwargs(existing[-1]):
+            before = len(existing) - 1
 
         source_bytes = self.parser.source_bytes
         new_bytes = None
-        if self._is_bare_arrow_parameter(params):
+        void = self._void_parameter(existing)
+        if void is not None:
+            # A C or C++ `(void)` lists no parameters: the new one takes the
+            # place of the `void`.
+            new_bytes = source_bytes[: void.start_byte] + parameter.encode("utf-8") + source_bytes[void.end_byte :]
+        elif self._is_bare_arrow_parameter(params):
             # `x => ...` takes a second parameter only in parentheses.
             old = self.parser.node_text(params)
             pair = f"{parameter}, {old}" if position == "start" else f"{old}, {parameter}"
@@ -5664,7 +6917,7 @@ class Applier:
                 + source_bytes[params.end_byte :]
             )
         elif existing:
-            new_bytes = self._add_parameter_line(params, existing, parameter, position)
+            new_bytes = self._add_parameter_line(params, existing, parameter, before)
         else:
             new_bytes = self._add_parameter_below(params, parameter)
 
@@ -5673,9 +6926,8 @@ class Applier:
                 # Empty parameter list: insert between ( and )
                 insert_byte = params.start_byte + 1
                 insertion = parameter
-            elif position == "start":
-                first = existing[0]
-                insert_byte = first.start_byte
+            elif before is not None:
+                insert_byte = existing[before].start_byte
                 insertion = f"{parameter}, "
             else:  # end
                 last = existing[-1]
@@ -5690,7 +6942,7 @@ class Applier:
         self._write_bytes(new_bytes)
         return "Update successful"
 
-    def _add_parameter_line(self, params, existing: list, parameter: str, position: str) -> bytes | None:
+    def _add_parameter_line(self, params, existing: list, parameter: str, before: int | None) -> bytes | None:
         """
         The source with `parameter` added to a parameter list written one
         parameter per line, on a line of its own at the indentation of the
@@ -5701,11 +6953,12 @@ class Applier:
         At the end it goes on the line after the last parameter's (after the
         comma and a comment there), with a comma of its own when the last
         one has one; else the last one gets the comma. A `)` on the last
-        parameter's line (`def f(a,\\n      b):`) stays after the new one. At
-        the start it goes where the first parameter is, above the comments
-        on lines of their own right before it, and the first parameter moves
-        to the next line, indented like the parameter after it when it
-        follows the `(` (aligned parameters).
+        parameter's line (`def f(a,\\n      b):`) stays after the new one.
+        Before the parameter existing[before] (the first, at the start; a
+        Python `**kwargs` at the end) it goes where that parameter is, above
+        the comments on lines of their own right before it, and that
+        parameter moves to the next line, indented like the parameter after
+        it when it follows the `(` (aligned parameters).
         """
         # Every parameter after the first starts its line (the first may
         # follow the `(`), and a lone one starts its own.
@@ -5714,11 +6967,11 @@ class Applier:
         ):
             return None
         src = self.parser.source_bytes
-        if position == "start":
-            first = existing[0]
+        if before is not None:
+            first = existing[before]
             if self._starts_line(first.start_byte):
                 indent = self._own_line_indent([first], "")
-            elif len(existing) > 1 and self._starts_line(existing[1].start_byte):
+            elif before == 0 and len(existing) > 1 and self._starts_line(existing[1].start_byte):
                 indent = self._own_line_indent([existing[1]], "")
             else:
                 return None
@@ -5838,6 +7091,27 @@ class Applier:
             if name not in blank and after.count(name) > max(1, before.count(name)):
                 raise ApplierError(f"Parameter '{name}' already exists in '{target}'")
 
+    def _void_parameter(self, existing: list):
+        """The `void` of a C or C++ parameter list that declares no
+        parameters (`f(void)`), or None: the list's one parameter is the
+        type `void` alone, with no declarator (`void *p` is a parameter)."""
+        if self.parser.ext not in C_EXTS + CPP_EXTS or len(existing) != 1:
+            return None
+        node = existing[0]
+        if node.type != "parameter_declaration" or node.child_by_field_name("declarator") is not None:
+            return None
+        return node if self.parser.node_text(node).strip() == "void" else None
+
+    def _is_kwargs(self, param_node) -> bool:
+        """Whether a parameter is a Python `**kwargs` (typed or not), which
+        must come last."""
+        if self.parser.ext != ".py":
+            return False
+        node = param_node
+        if node.type == "typed_parameter" and node.named_children:
+            node = node.named_children[0]
+        return node.type == "dictionary_splat_pattern"
+
     def remove_parameter(self, target: str, parameter_name: str) -> str:
         """
         Remove a parameter by name from a function signature. A JS/TS arrow
@@ -5854,7 +7128,9 @@ class Applier:
         or Ruby destructuring pattern binds with others goes alone
         (_remove_bound_name: `{a: x, b}` without x is `{b}`, `[a, b]`
         without a is `[, b]`, `(a, b)` without a is `(_, b)`); the
-        pattern's last name takes the whole parameter.
+        pattern's last name takes the whole parameter. A Python `*` or `/`
+        left without the parameter it needs goes with it (_marker_span),
+        and a C function left with none gets `(void)` (_void_filled).
         """
         params = self._find_parameter_list(target)
         if self._is_bare_arrow_parameter(params):
@@ -5886,7 +7162,11 @@ class Applier:
             return "Update successful"
 
         if params.children[0].type == "(" and params.children[-1].type == ")":
-            self._delete_entry(params, existing, idx)
+            first, count = self._marker_span(existing, idx)
+            new_bytes = self._entry_deleted(params, existing, first, count)
+            if count == len(existing) and self.parser.ext in C_EXTS:
+                new_bytes = self._void_filled(params, existing[idx], new_bytes)
+            self._write_bytes(new_bytes)
             return "Update successful"
 
         # A Ruby parameter list without parentheses (`def f a, b`).
@@ -5901,6 +7181,38 @@ class Applier:
         new_bytes = source_bytes[:start] + source_bytes[end:]
         self._write_bytes(new_bytes)
         return "Update successful"
+
+    def _marker_span(self, existing: list, idx: int) -> tuple[int, int]:
+        """
+        The parameters that remove_parameter deletes for existing[idx], as
+        (index of the first, count): in Python also a bare `*` right before
+        it when only `**kwargs` would follow the `*` (which must mark a
+        keyword-only parameter), and a `/` right after it when it is the
+        only parameter before the `/` (which must follow one).
+        """
+        if self.parser.ext != ".py":
+            return idx, 1
+        rest = existing[idx + 1 :]
+        if idx > 0 and existing[idx - 1].type == "keyword_separator" and all(self._is_kwargs(p) for p in rest):
+            return idx - 1, 2
+        if idx == 0 and rest and rest[0].type == "positional_separator":
+            return 0, 2
+        return idx, 1
+
+    def _void_filled(self, params, param, new_bytes: bytes) -> bytes:
+        """
+        `new_bytes`, the source with `param`, the last parameter of the C
+        parameter list `params`, deleted (_entry_deleted), with `void` in
+        the emptied list, since `()` declares unspecified parameters in C
+        before C23: `(void)`, or, when comments stay in the list, the
+        parameter's own text replaced by `void` (`(/* x */ void)`).
+        """
+        open_end = params.start_byte + 1
+        close = params.end_byte - 1 - (len(self.parser.source_bytes) - len(new_bytes))
+        if not new_bytes[open_end:close].strip():
+            return new_bytes[:open_end] + b"void" + new_bytes[close:]
+        src = self.parser.source_bytes
+        return src[: param.start_byte] + b"void" + src[param.end_byte :]
 
     def _remove_grouped_name(self, declaration, k: int) -> None:
         """
@@ -6135,16 +7447,20 @@ class Applier:
 
     def replace_docstring(self, target: str, new_docstring: str) -> str:
         """
-        Replace or insert a Python docstring on a function or class. The new_docstring
-        should be a valid Python string literal including its surrounding triple
-        quotes. Python-specific. A new docstring for a body that shares the
-        line of its signature (`def f(): return 1`) is refused.
+        Replace or insert a Python docstring on a function or class, or on
+        the module for the target "" (_replace_module_docstring). The
+        new_docstring should be a valid Python string literal including its
+        surrounding triple quotes. Python-specific. A new docstring for a
+        body that shares the line of its signature (`def f(): return 1`) is
+        refused.
         """
         if self.parser.ext != ".py":
             raise ApplierError(
                 f"replace_docstring only supports .py files (got {self.parser.ext})"
             )
 
+        if target == "":
+            return self._replace_module_docstring(new_docstring)
         node = self.parser.find_node_by_name(target)
         if not node:
             raise ApplierError(f"Target '{target}' not found in {self.filepath}")
@@ -6201,6 +7517,76 @@ class Applier:
         )
         self._write_bytes(new_bytes)
         return "Update successful (docstring inserted)"
+
+    def _replace_module_docstring(self, new_docstring: str) -> str:
+        """
+        replace_docstring for the target "", the module (as add_key's "" is
+        a config file's root). The string statement the module starts with
+        is replaced. Without one, the docstring goes in before the first
+        statement, so a `from __future__` import stays after it, and below
+        the comments before that statement but those right above it, which
+        are its own: a `#!` line and an encoding comment
+        (_file_directive_lines) with no blank line after them, a header
+        comment with the blank lines it has below it. One blank line follows
+        the docstring, two before a def or class (_sibling_gap). In a file
+        with no statement it goes last, a blank line below a comment. A
+        new_docstring that is no string literal is refused
+        (_refuse_non_literal).
+        """
+        self._refuse_non_literal(new_docstring)
+        nodes = self.parser.tree.root_node.named_children
+        first = next((c for c in nodes if "comment" not in c.type), None)
+        if first is not None and self._is_docstring_node(first):
+            string = first.named_children[0]
+            src = self.parser.source_bytes
+            self._write_bytes(src[: string.start_byte] + new_docstring.encode("utf-8") + src[string.end_byte :])
+            return "Update successful (docstring replaced)"
+
+        doc = _content_lines(new_docstring)
+        while doc and not doc[0].strip():
+            doc.pop(0)
+        while doc and not doc[-1].strip():
+            doc.pop()
+        directives = self._file_directive_lines()
+        comments = [
+            c
+            for c in nodes
+            if "comment" in c.type
+            and c.start_point[0] >= directives
+            and (first is None or c.end_byte <= first.start_byte)
+        ]
+        if first is None:
+            row = self._last_row(comments[-1]) + 1 if comments else min(directives, len(self.lines))
+            above = [""] if comments else []
+            self.lines = self.lines[:row] + above + doc + self.lines[row:]
+            return self._save() + " (docstring inserted)"
+        # The comments right above the first statement are its own.
+        row = first.start_point[0]
+        for comment in reversed(comments):
+            if self._last_row(comment) < row - 1:
+                break
+            row = comment.start_point[0]
+        below = [""] * self._sibling_gap(self.parser.tree.root_node, doc, first)
+        self.lines = self.lines[:row] + doc + below + self.lines[row:]
+        return self._save() + " (docstring inserted)"
+
+    @staticmethod
+    def _refuse_non_literal(new_docstring: str) -> None:
+        """Refuse a new_docstring that is not one Python string literal with
+        its quotes (`\"\"\"Summary.\"\"\"`), which a docstring must be: bare
+        text would go in as code, or be a syntax error. An f-string or bytes
+        literal is no docstring either."""
+        try:
+            with warnings.catch_warnings():
+                warnings.simplefilter("ignore")
+                value = ast.parse(new_docstring.strip(), mode="eval").body
+        except (SyntaxError, ValueError, RecursionError, MemoryError):
+            value = None
+        if not (isinstance(value, ast.Constant) and isinstance(value.value, str)):
+            raise ApplierError(
+                "new_docstring is not a Python string literal: write it with its quotes, "
+                "as in '\"\"\"Summary.\"\"\"'."
+            )
 
     def find_references(self, target: str) -> str:
         """
@@ -6631,12 +8017,15 @@ class Applier:
                    preamble, inserts at line 0.
         The content is separated from the code on each side as siblings are
         (_sibling_gap): by two blank lines in a Python module when it or that
-        code is a def or class (PEP 8), else by one; at the top, the blank
-        lines the file had after its preamble stay below the content when
-        they are more. The content goes in as written, except that
-        read_symbol's text of a nested symbol, whose later lines keep the
-        indentation they have in its class, is moved to column 0 with them
-        (_from_read_shape).
+        code is a def or class (PEP 8), else by one; at the bottom, one-line
+        content after one-line code stacked with the code above it is
+        stacked too (_gap_after); at the top, the blank lines the file had
+        after its preamble stay below the content when they are more. The
+        content goes in as written, except that read_symbol's text of a
+        nested symbol, whose later lines keep the indentation they have in
+        its class, is moved to column 0 with them (_from_read_shape), and
+        that its indentation steps are tabs in a Go file or one indented
+        with tabs (_tabbed).
         """
         if position not in ("bottom", "top"):
             raise ApplierError(f"position must be 'bottom' or 'top', got: {position}")
@@ -6646,6 +8035,7 @@ class Applier:
         if read is not content_lines:
             # read_symbol's text of a nested symbol, moved to the top level.
             content_lines = self._reindent(read, "")
+        content_lines = self._tabbed(content_lines, "")
 
         root = self.parser.tree.root_node
         guard = self._include_guard() if position == "bottom" else None
@@ -6663,7 +8053,8 @@ class Applier:
             while before and not before[-1].strip():
                 before.pop()
                 blank += 1
-            gap = self._sibling_gap(node, inside[-1] if inside else define, content_lines)
+            code = [c for c in inside if c.start_byte > define.start_byte]
+            gap = self._gap_after(node, code[-1], content_lines, define) if code else self._sibling_gap(node, define, content_lines)
             self.lines = before + [""] * gap + content_lines + [""] * blank + self.lines[row:]
             return self._save()
         if position == "bottom":
@@ -6671,7 +8062,7 @@ class Applier:
                 self.lines.pop()
             if self.lines:
                 last = root.named_children[-1] if root.named_children else None
-                self.lines += [""] * self._sibling_gap(root, last, content_lines)
+                self.lines += [""] * self._gap_after(root, last, content_lines)
             self.lines.extend(content_lines)
             return self._save()
 

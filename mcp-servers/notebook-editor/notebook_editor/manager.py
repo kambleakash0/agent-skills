@@ -29,6 +29,28 @@ class NotebookManagerError(Exception):
     pass
 
 
+def _write_notebook(nb, filepath: str) -> None:
+    """
+    Write `nb` to `filepath` as nbformat.write does, but check first that it
+    can be written as UTF-8: a lone surrogate in a cell (JSON lets a client
+    send half of a pair as an escape) has no UTF-8 form, and nbformat.write
+    would already have emptied the file when it fails. Such a notebook is
+    refused and the file is left as it was.
+    """
+    text = nbformat.writes(nb)
+    if not text.endswith("\n"):
+        text += "\n"
+    try:
+        text.encode("utf-8")
+    except UnicodeEncodeError as e:
+        raise NotebookManagerError(
+            f"The notebook holds a lone surrogate, U+{ord(text[e.start]):04X}, which is not a "
+            f"character and can't be written as UTF-8, so {filepath} was left unchanged"
+        ) from e
+    with open(filepath, "w", encoding="utf-8") as f:
+        f.write(text)
+
+
 def create_notebook(
     filepath: str,
     kernel_name: str = "python3",
@@ -60,7 +82,9 @@ def create_notebook(
     nb.metadata["language_info"] = {"name": language}
 
     try:
-        nbformat.write(nb, filepath)
+        _write_notebook(nb, filepath)
+    except NotebookManagerError:
+        raise
     except Exception as e:
         raise NotebookManagerError(f"Failed to write notebook: {e}") from e
 
@@ -89,7 +113,7 @@ class NotebookManager:
 
     def _save(self) -> str:
         with _write_lock:
-            nbformat.write(self.nb, self.filepath)
+            _write_notebook(self.nb, self.filepath)
         return "Update successful"
 
     def _save_outputs(self, indices: list[int]) -> str:
@@ -115,7 +139,7 @@ class NotebookManager:
                     if target is not None:
                         target.outputs = cell.outputs
                         target.execution_count = cell.execution_count
-            nbformat.write(fresh, self.filepath)
+            _write_notebook(fresh, self.filepath)
         return "Update successful"
 
     def _find_cell(self, nb, index: int, cell):

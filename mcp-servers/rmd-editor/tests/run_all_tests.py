@@ -264,6 +264,113 @@ def test_parser_complex_options():
     out = serialize(fm, cells)
     check("complex: round-trip", out, src)
 
+
+def test_chunk_header_parts():
+    print("\n═══ parser: header parts split as R reads them ═══")
+    from rmd_editor import server
+    # A part is key=value at its first = outside quotes, backticks and brackets that isn't part of ==, !=, <= or >= (or
+    # of a %...% operator), as R reads the arguments of alist(...); a part without one is a name without a value
+    for header, (label, options) in {
+        '{r echo=FALSE, "a=b"}': (None, [("echo", "FALSE"), ('"a=b"', "")]),
+        '{r "a=b", echo=FALSE}': ('"a=b"', [("echo", "FALSE")]),
+        "{r 'a=b'}": ("'a=b'", []),
+        "{r foo, list(a=1)}": ("foo", [("list(a=1)", "")]),
+        '{r foo, "fig.cap"="x"}': ("foo", [('"fig.cap"', '"x"')]),
+        "{r foo, `a=b`=5}": ("foo", [("`a=b`", "5")]),
+        "{r foo, eval=x==1}": ("foo", [("eval", "x==1")]),
+        "{r foo, a<=1}": ("foo", [("a<=1", "")]),
+        "{r foo, a %=% b}": ("foo", [("a %=% b", "")]),
+        '{r foo, fig.cap="a=b"}': ("foo", [("fig.cap", '"a=b"')]),
+        "{r =}": (None, [("", "")]),
+    }.items():
+        text = f"```{header}\nx\n```\n"
+        fm, cells = parse(text)
+        check(f"header {header}: label and options", (cells[0].label, cells[0].options), (label, options))
+        check_same(f"header {header}: round trip", serialize(fm, cells), text)
+    # knitr takes an unnamed string for the label, = and all, wherever it is
+    for header, (shown, listed) in {
+        '{r echo=FALSE, "a=b"}': ("language: r\nlabel: a=b\n  echo=FALSE", "[0] code (r label=a=b opts=1) 1L  x"),
+        '{r "a=b", echo=FALSE}': ("language: r\nlabel: a=b\n  echo=FALSE", "[0] code (r label=a=b opts=1) 1L  x"),
+        '{r "a=b"}': ("language: r\nlabel: a=b\noptions: (none)", "[0] code (r label=a=b) 1L  x"),
+    }.items():
+        path = write_raw("parts.rmd", f"```{header}\nx\n```\n")
+        check_same(f"header {header}: get_chunk_options", server.get_chunk_options(path, 0), shown)
+        check_same(f"header {header}: list_cells", server.list_cells(path), listed)
+    # knitr's quote_label quotes no text with an = in it, even in quotes or brackets (its [^=]*): such a name after
+    # others is an element of its own, so knitr fails on the header, and one alone is R code, written without spaces
+    fails = "knitr fails on this chunk header, which has more than one name without a value"
+    for header, (shown, listed) in {
+        '{r foo, "a=b"}': (f"language: r\nlabel: (none: {fails}: 'foo' and '\"a=b\"')\n  foo\n  \"a=b\"", "[0] code (r opts=2) 1L  x"),
+        "{r foo, list(a=1)}": (f"language: r\nlabel: (none: {fails}: 'foo' and 'list(a=1)')\n  foo\n  list(a=1)",
+                               "[0] code (r opts=2) 1L  x"),
+        "{r ab, cd, list(a=1)}": (f"language: r\nlabel: (none: {fails}: 'ab, cd' and 'list(a=1)')\n  ab\n  cd\n  list(a=1)",
+                                  "[0] code (r opts=3) 1L  x"),
+        "{r list(a = 1)}": ("language: r\nlabel: list(a=1)\noptions: (none)", "[0] code (r label=list(a=1)) 1L  x"),
+    }.items():
+        path = write_raw("parts.rmd", f"```{header}\nx\n```\n")
+        check_same(f"header {header}: get_chunk_options", server.get_chunk_options(path, 0), shown)
+        check_same(f"header {header}: list_cells", server.list_cells(path), listed)
+    # Edits keep a quoted label, or replace it
+    for name, (header, call, written) in {
+        "option set after a quoted label": ('{r echo=FALSE, "a=b"}', lambda p: server.set_chunk_option(p, 0, "echo", "TRUE"),
+                                            '{r echo=TRUE, "a=b"}'),
+        "option added after a quoted label": ('{r "a=b"}', lambda p: server.set_chunk_option(p, 0, "fig.width", "5"),
+                                              '{r "a=b", fig.width=5}'),
+        "quoted label set": ('{r "a=b", echo=FALSE}', lambda p: server.set_chunk_option(p, 0, "label", "c"), "{r c, echo=FALSE}"),
+        "quoted label removed": ('{r "a=b"}', lambda p: server.remove_chunk_option(p, 0, "label"), "{r}"),
+    }.items():
+        path = write_raw("parts.rmd", f"```{header}\nx\n```\n")
+        check(f"{name}: saved", call(path), "Saved")
+        check_same(f"{name}: file", read_raw(path), f"```{written}\nx\n```\n")
+    # A label holding an = goes first in the header as an R string: quote_label quotes no text with an = in it, so R would
+    # read it there as code (x == 1 as the label x==1, a b == c not at all)
+    for value in ("x == 1", "a b == c", "if==1", "f(a, b=1)", "a=b", "a<=1"):
+        path = write_raw("parts.rmd", "```{r}\nx\n```\n")
+        check(f"label {value!r}: saved", server.set_chunk_option(path, 0, "label", value), "Saved")
+        check_same(f"label {value!r}: written as an R string", read_raw(path), f'```{{r "{value}"}}\nx\n```\n')
+        check_same(f"label {value!r}: read back", server.get_chunk_options(path, 0), f"language: r\nlabel: {value}\noptions: (none)")
+    path = write_raw("parts.rmd", "```{r foo, echo=FALSE}\nx\n```\n")
+    check("label with an = in place of a bare label: saved", server.set_chunk_option(path, 0, "label", "x == 1"), "Saved")
+    check_same("label with an = in place of a bare label: file", read_raw(path), '```{r "x == 1", echo=FALSE}\nx\n```\n')
+    # A name holding an = in quotes or brackets that an edit leaves first in the header keeps the comma before it, so it
+    # reads back as it was; knitr takes it for the label either way
+    for name, (header, call, written, label) in {
+        "option added after a leading quoted name": ('{r, "a=b"}', lambda p: server.set_chunk_option(p, 0, "echo", "FALSE"),
+                                                     '{r, "a=b", echo=FALSE}', "a=b"),
+        "option removed before a quoted name": ('{r echo=FALSE, "c=d"}', lambda p: server.remove_chunk_option(p, 0, "echo"),
+                                                '{r, "c=d"}', "c=d"),
+        "option removed before a call": ("{r echo=FALSE, list(a=1)}", lambda p: server.remove_chunk_option(p, 0, "echo"),
+                                         "{r, list(a=1)}", "list(a=1)"),
+    }.items():
+        path = write_raw("parts.rmd", f"```{header}\nx\n```\n")
+        check(f"{name}: saved", call(path), "Saved")
+        check_same(f"{name}: file", read_raw(path), f"```{written}\nx\n```\n")
+        check_same(f"{name}: label", server.get_chunk_options(path, 0).split("\n")[1], f"label: {label}")
+    # quote_label quotes the text before the header's first = (any =) up to the last comma there: one inside a name, as in
+    # cd(x, y=1), leaves R code that doesn't parse, so knitr fails on the header. After a key=value, such a name is R code.
+    cut = ("knitr fails on this chunk header, whose quote_label quotes the text before its first = up to the comma inside "
+           "'{}', which leaves R code that doesn't parse")
+    call, pasted = "cd(x, y=1)", 'paste("a b", x==1)'
+    for header, (shown, listed) in {
+        "{r cd(x, y=1)}": (f"language: r\nlabel: (none: {cut.format(call)})\n  {call}", "[0] code (r opts=1) 1L  x"),
+        "{r, cd(x, y=1)}": (f"language: r\nlabel: (none: {cut.format(call)})\n  {call}", "[0] code (r opts=1) 1L  x"),
+        '{r paste("a b", x==1)}': (f"language: r\nlabel: (none: {cut.format(pasted)})\n  {pasted}", "[0] code (r opts=1) 1L  x"),
+        "{r cd(x, y=1), echo=TRUE}": (f"language: r\nlabel: (none: {cut.format(call)})\n  {call}\n  echo=TRUE",
+                                      "[0] code (r opts=2) 1L  x"),
+        "{r echo=TRUE, f(a, b=1)}": ("language: r\nlabel: f(a,b=1)\n  echo=TRUE", "[0] code (r label=f(a,b=1) opts=1) 1L  x"),
+    }.items():
+        path = write_raw("parts.rmd", f"```{header}\nx\n```\n")
+        check_same(f"header {header}: get_chunk_options", server.get_chunk_options(path, 0), shown)
+        check_same(f"header {header}: list_cells", server.list_cells(path), listed)
+    for name, (call, written) in {
+        "label set in place of a name quote_label cuts": (lambda p: server.set_chunk_option(p, 0, "label", "foo"), "{r foo}"),
+        "name quote_label cuts removed": (lambda p: server.remove_chunk_option(p, 0, "cd(x, y=1)"), "{r}"),
+    }.items():
+        path = write_raw("parts.rmd", "```{r cd(x, y=1)}\nx\n```\n")
+        check(f"{name}: saved", call(path), "Saved")
+        check_same(f"{name}: file", read_raw(path), f"```{written}\nx\n```\n")
+
+
 def test_no_trailing_newline():
     print("\n═══ documents without a trailing newline ═══")
 
@@ -659,6 +766,25 @@ def test_byte_order_mark():
     check("bom: create_rmd overwrite drops the mark", read_bytes(os.path.join(WORK_DIR, "bom.rmd")).startswith(b"---\n"), True)
 
 
+def test_lone_surrogate():
+    print("\n═══ a lone surrogate in new text: refused, the file kept ═══")
+    # JSON lets a client send half of a surrogate pair, which has no UTF-8 form;
+    # the save used to empty the file before failing to encode it.
+    lone = chr(0xD800)
+    text = "Intro\n\n```{r}\nx\n```\n"
+    for label, edit in [
+        ("replace_cell_source", lambda mgr: mgr.replace_cell_source(0, "a" + lone + "b\n")),
+        ("set_chunk_option", lambda mgr: mgr.set_chunk_option(1, "fig.cap", '"' + lone + '"')),
+    ]:
+        path = write_raw("surrogate.rmd", text)
+        try:
+            edit(RmdManager(path))
+            check(f"lone surrogate: {label} refused", "saved", "refused")
+        except RmdManagerError as e:
+            check(f"lone surrogate: {label} refused", str(e), "lone surrogate, U+D800")
+        check(f"lone surrogate: {label} leaves the file", read_bytes(path), text.encode("utf-8"))
+
+
 # ──────────────────────────────────────────────
 # create_rmd
 # ──────────────────────────────────────────────
@@ -936,6 +1062,152 @@ def test_prepend_append_to_cell():
         check_same(f"{name}: file", read_doc(path), written)
 
 
+def test_option_lines_stay_on_top():
+    print("\n═══ chunk text: option lines stay at the top ═══")
+    from rmd_editor import server
+    # knitr reads a chunk's option lines (#| for r, --| for sql, /*| ... */ for c) only at its top, so text prepended to a
+    # chunk goes below them, and below the blank line after them that knitr takes with them
+    for name, (doc, text, written) in {
+        "r": ("```{r}\n#| echo: false\nx\n```\n", "library(x)", "```{r}\n#| echo: false\nlibrary(x)\nx\n```\n"),
+        "two option lines": ("```{r}\n#| echo: false\n#| label: a\nx\n```\n", "y", "```{r}\n#| echo: false\n#| label: a\ny\nx\n```\n"),
+        "a blank line after them": ("```{r}\n#| echo: false\n\nx\n```\n", "y", "```{r}\n#| echo: false\n\ny\nx\n```\n"),
+        "R-style option lines": ("```{r}\n#| echo=FALSE\nx\n```\n", "y", "```{r}\n#| echo=FALSE\ny\nx\n```\n"),
+        "option lines only": ("```{r}\n#| echo: false\n```\n", "y", "```{r}\n#| echo: false\ny\n```\n"),
+        "option lines and a blank line only": ("```{r}\n#| echo: false\n\n```\n", "y", "```{r}\n#| echo: false\n\ny\n```\n"),
+        "text ending in a line break": ("```{r}\n#| echo: false\nx\n```\n", "y\n", "```{r}\n#| echo: false\ny\nx\n```\n"),
+        "sql": ("```{sql}\n--| echo: false\nSELECT 1\n```\n", "-- note", "```{sql}\n--| echo: false\n-- note\nSELECT 1\n```\n"),
+        "sql read by #|": ("```{sql}\n#| echo: false\nSELECT 1\n```\n", "-- note", "```{sql}\n#| echo: false\n-- note\nSELECT 1\n```\n"),
+        "js": ("```{js}\n//| echo: false\nx;\n```\n", "y;", "```{js}\n//| echo: false\ny;\nx;\n```\n"),
+        "c": ("```{c}\n/*| echo: false */\nint x;\n```\n", "int y;", "```{c}\n/*| echo: false */\nint y;\nint x;\n```\n"),
+        "indented chunk": ("  ```{r}\n  #| echo: false\n  x\n  ```\n", "y", "  ```{r}\n  #| echo: false\n  y\n  x\n  ```\n"),
+        "CRLF": ("```{r}\r\n#| echo: false\r\nx\r\n```\r\n", "y", "```{r}\r\n#| echo: false\r\ny\r\nx\r\n```\r\n"),
+        # A chunk without option lines gets the text at its top, where the text's own option lines are the chunk's
+        "no option lines": ("```{r}\nx\n```\n", "#| echo: false", "```{r}\n#| echo: false\nx\n```\n"),
+    }.items():
+        path = write_raw("top.rmd", doc)
+        check(f"prepend below option lines, {name}: saved", server.prepend_to_cell(path, 0, text), "Saved")
+        check_same(f"prepend below option lines, {name}: file", read_raw(path), written)
+    path = write_raw("top.rmd", "```{r}\n#| echo: false\nx\n```\n")
+    server.prepend_to_cell(path, 0, "y")
+    check_same("prepend below option lines: the option still read", server.get_chunk_options(path, 0),
+               "language: r\nlabel: (none)\n  #| echo: false")
+
+    def refused(label, doc, call, error):
+        """call(path) on a fresh file holding doc returns error and leaves the file as it was."""
+        path = write_raw("top.rmd", doc)
+        check_same(f"{label}: refused", call(path), error)
+        check_same(f"{label}: file unchanged", read_raw(path), doc)
+
+    opts = "```{r}\n#| echo: false\nx\n```\n"
+    # An option line prepended below the chunk's own would be code there, and text that would make knitr read lines
+    # below it as option lines too (a line ending in */ under /*| ... */ lines) changes them
+    below = ("is a chunk option line, but the chunk starts with option lines already and the text goes below them, where "
+             "knitr reads it as code, so the file was left unchanged: set an option with set_chunk_option, or rewrite the "
+             "option lines with replace_cell_source")
+    runs_on = ("Error: Prepending this text would change which lines of the chunk knitr reads as its option lines (as a line "
+               "ending in */ does under the /*| ... */ lines of a c chunk), so the file was left unchanged")
+    refused("prepend an option line", opts, lambda p: server.prepend_to_cell(p, 0, "#| warning: false\ny"),
+            f"Error: Line 1 of the new text, '#| warning: false', {below}")
+    refused("prepend an option line above a blank line", "```{r}\n#| echo: false\n\nx\n```\n",
+            lambda p: server.prepend_to_cell(p, 0, "#| warning: false"), f"Error: Line 1 of the new text, '#| warning: false', {below}")
+    refused("prepend an sql option line", "```{sql}\n--| echo: false\nSELECT 1\n```\n",
+            lambda p: server.prepend_to_cell(p, 0, "--| eval: false"), f"Error: Line 1 of the new text, '--| eval: false', {below}")
+    refused("prepend a #| line to sql option lines", "```{sql}\n--| echo: false\nSELECT 1\n```\n",
+            lambda p: server.prepend_to_cell(p, 0, "#| eval: false"), f"Error: Line 1 of the new text, '#| eval: false', {below}")
+    refused("prepend a line that runs c option lines on", "```{c}\n/*| echo: false */\nint x;\n```\n",
+            lambda p: server.prepend_to_cell(p, 0, "int y; */"), runs_on)
+    refused("prepend option lines that run on into the code", "```{c}\nint x; */\n```\n",
+            lambda p: server.prepend_to_cell(p, 0, "/*| echo: false"), runs_on)
+
+    # A line that starts as an option line does, after other lines, is code to knitr: in prepended text too
+    after = ("is a chunk option line after other lines, where knitr reads it as code (it reads option lines only at the "
+             "top of a chunk), so the file was left unchanged: move it up with the option lines at the top, or set the "
+             "option with set_chunk_option")
+    refused("prepend an option line after a blank line of the text", opts, lambda p: server.prepend_to_cell(p, 0, "\n#| warning: false"),
+            f"Error: Line 2 of the new text, '#| warning: false', {after}")
+    refused("prepend an option line after code", "```{r}\nx\n```\n", lambda p: server.prepend_to_cell(p, 0, "y\n#| echo: false"),
+            f"Error: Line 2 of the new text, '#| echo: false', {after}")
+    refused("prepend an option line after code, below option lines", "```{r}\n#| echo: false\n\nx\n```\n",
+            lambda p: server.prepend_to_cell(p, 0, "y\nz\n#| warning: false"), f"Error: Line 3 of the new text, '#| warning: false', {after}")
+    refused("replace moving the option lines down", opts, lambda p: server.replace_cell_source(p, 0, "library(x)\n#| echo: false\nx"),
+            f"Error: Line 2 of the new text, '#| echo: false', {after}")
+    refused("replace with an option line after a blank line", opts,
+            lambda p: server.replace_cell_source(p, 0, "#| echo: false\n\n#| warning: false\nx"),
+            f"Error: Line 3 of the new text, '#| warning: false', {after}")
+    refused("replace with an option line after code", "```{r}\nx\n```\n", lambda p: server.replace_cell_source(p, 0, "x\n#| echo: false"),
+            f"Error: Line 2 of the new text, '#| echo: false', {after}")
+    refused("replace with an sql option line after code", "```{sql}\n--| echo: false\nSELECT 1\n```\n",
+            lambda p: server.replace_cell_source(p, 0, "SELECT 2\n--| echo: false"), f"Error: Line 2 of the new text, '--| echo: false', {after}")
+    for name, (doc, text, written) in {
+        "option lines kept at the top": (opts, "#| echo: true\ny", "```{r}\n#| echo: true\ny\n```\n"),
+        "a line the chunk already had": ("```{r}\nx\n#| note\n```\n", "y\n#| note", "```{r}\ny\n#| note\n```\n"),
+        "prose": ("Intro\n", "Text\n#| not an option\n", "Text\n#| not an option\n"),
+    }.items():
+        path = write_raw("top.rmd", doc)
+        check(f"replace, {name}: saved", server.replace_cell_source(path, 0, text), "Saved")
+        check_same(f"replace, {name}: file", read_raw(path), written)
+
+    # split_cell: a split inside the option lines would give some of them to the new chunk, and one before a line that
+    # starts as an option line does would make it the new chunk's option
+    refused("split inside the option lines", "```{r}\n#| echo: false\n#| warning: false\nx\n```\n", lambda p: server.split_cell(p, 0, 1),
+            "Error: Can't split cell 0 at line_offset 1: the chunk's first 2 lines are its option lines, and the ones after "
+            "line 1 would start the new chunk, where knitr would read them as its options instead of this one's, so the file "
+            "was left unchanged")
+    refused("split before an option line in the code", "```{r}\nx\n#| echo: false\ny\n```\n", lambda p: server.split_cell(p, 0, 1),
+            "Error: Can't split cell 0 at line_offset 1: line 2, '#| echo: false', would start the new chunk, where knitr "
+            "would read it as an option line instead of code, so the file was left unchanged")
+    for name, (doc, offset, written) in {
+        "after the option lines": ("```{r}\n#| echo: false\n#| warning: false\nx\n```\n", 2,
+                                   "```{r}\n#| echo: false\n#| warning: false\n```\n```{r}\nx\n```\n"),
+        "prose": ("Intro\n#| not an option\n", 1, "Intro\n#| not an option\n"),
+    }.items():
+        path = write_raw("top.rmd", doc)
+        check(f"split, {name}: saved", server.split_cell(path, 0, offset), "Saved")
+        check_same(f"split, {name}: file", read_raw(path), written)
+    # In a c, css or sas chunk whose every line ends with its comment's closing characters, knitr reads the first line
+    # alone as an option line (divide_chunk's which.min()), so a split that leaves the first chunk only its option lines
+    # would make the others code
+    for language, doc in {
+        "css": "```{css}\n/*| label: x */\n/*| echo: false */\nbody {}\n```\n",
+        "c": "```{c}\n/*| a: 1 */\n/*| b: 2 */\nint x;\n```\n",
+    }.items():
+        refused(f"split leaving a {language} chunk its option lines alone", doc, lambda p: server.split_cell(p, 0, 2),
+                "Error: Can't split cell 0 at line_offset 2: the first chunk would hold its 2 option lines alone, and knitr "
+                "reads only the first line of a chunk whose every line ends with '*/' as an option line, the others as code, "
+                "so the file was left unchanged")
+    for name, (doc, offset, written) in {
+        # Every line ends with ; already, so knitr reads the second line as code before the split too
+        "sas lines that all end with ;": ("```{sas}\n*| a: 1 ;\n*| b: 2 ;\ndata x;\n```\n", 2,
+                                          "```{sas}\n*| a: 1 ;\n*| b: 2 ;\n```\n```{sas}\ndata x;\n```\n"),
+        "c, one option line": ("```{c}\n/*| a: 1 */\nint x;\nint y;\n```\n", 1, "```{c}\n/*| a: 1 */\n```\n```{c}\nint x;\nint y;\n```\n"),
+        # A blank line before the fence doesn't end with */, so knitr reads both lines above it as option lines
+        "c, then a blank line": ("```{c}\n/*| a: 1 */\n/*| b: 2 */\n\nint x;\n```\n", 3,
+                                 "```{c}\n/*| a: 1 */\n/*| b: 2 */\n\n```\n```{c}\nint x;\n```\n"),
+    }.items():
+        path = write_raw("top.rmd", doc)
+        check(f"split, {name}: saved", server.split_cell(path, 0, offset), "Saved")
+        check_same(f"split, {name}: file", read_raw(path), written)
+    # A line that starts as an option line does right after the option lines, but that knitr reads as code, gets an error
+    # that says why
+    refused("replace with css option lines only", "```{css}\nbody {}\n```\n",
+            lambda p: server.replace_cell_source(p, 0, "/*| label: x */\n/*| echo: false */"),
+            "Error: Line 2 of the new text, '/*| echo: false */', starts as a chunk option line does, but knitr reads only "
+            "the first line of a chunk whose every line ends with '*/' as an option line, the others as code, so the file "
+            "was left unchanged: put code below the option lines, or set the option with set_chunk_option")
+    refused("replace with a #| line after sql --| lines", "```{sql}\nSELECT 1\n```\n",
+            lambda p: server.replace_cell_source(p, 0, "--| echo: false\n#| eval: false\nSELECT 1"),
+            "Error: Line 2 of the new text, '#| eval: false', starts as a chunk option line does, but knitr reads it as code, "
+            "as the option lines it reads at the top of the chunk end above it, so the file was left unchanged: write it as "
+            "they are written, or set the option with set_chunk_option")
+    for name, (doc, text, written) in {
+        "css option lines, then a blank line": ("```{css}\nbody {}\n```\n", "/*| label: x */\n/*| echo: false */\n",
+                                                "```{css}\n/*| label: x */\n/*| echo: false */\n\n```\n"),
+    }.items():
+        path = write_raw("top.rmd", doc)
+        check(f"replace, {name}: saved", server.replace_cell_source(path, 0, text), "Saved")
+        check_same(f"replace, {name}: file", read_raw(path), written)
+
+
 # ──────────────────────────────────────────────
 # Chunk options
 # ──────────────────────────────────────────────
@@ -1004,8 +1276,7 @@ def test_chunk_header_values():
     refused("comma outside a string", lambda p: server.set_chunk_option(p, 0, "fig.cap", "a, b"),
             "the chunk header ```{r fig.cap=a, b} would read back as label None and options {'fig.cap': 'a', 'b': ''}")
     refused("comma in a label", lambda p: server.set_chunk_option(p, 0, "label", "a, b"), "would read back as label 'a'")
-    refused("= in a label", lambda p: server.set_chunk_option(p, 0, "label", "a=b"), "would read back as label None")
-    refused("= in a key", lambda p: server.set_chunk_option(p, 0, "a=b", "1"), "would read back as")
+    refused("= in a key", lambda p: server.set_chunk_option(p, 0, "a=b", "1"), "Option key 'a=b' isn't a syntactic R name")
     refused("unmatched quote", lambda p: server.set_chunk_option(p, 0, "fig.cap", '"a'),
             "Chunk option value '\"a' has an unmatched bracket or quote")
     refused("unmatched bracket", lambda p: server.set_chunk_option(p, 0, "eval", "c(1, 2"), "has an unmatched bracket or quote")
@@ -1525,6 +1796,112 @@ def test_chunk_option_semantics():
     path = write_raw("opts.rmd", labels)
     server.set_chunk_option(path, 0, "label", "L")
     check_same("repeated #| label: one left after a set", server.get_chunk_options(path, 0), "language: r\nlabel: L (from #| label: L)\noptions: (none)")
+
+
+def test_chunk_option_keys():
+    print("\n═══ chunk options: keys knitr can read ═══")
+    from rmd_editor import server
+    # knitr reads a header's options as R code, the arguments of alist(...), so a key written there must be a syntactic
+    # R name: a dashed spelling of one of knitr's options (fig-width, as Quarto writes them) goes in as its dotted name,
+    # or as written in the chunk's #| lines (YAML) when it has them, and so does any other key a header can't hold
+    plain, pipe = "```{r}\nx\n```\n", "```{r}\n#| echo: false\nx\n```\n"
+    for name, (doc, key, value, written) in {
+        "dashed knitr option": (plain, "fig-width", "5", "```{r fig.width=5}\nx\n```\n"),
+        "dashed knitr option after a label": ("```{r a}\nx\n```\n", "out-width", '"50%"', '```{r a, out.width="50%"}\nx\n```\n'),
+        "dashed knitr option knitr reads as another": (plain, "fig-dpi", "300", "```{r fig.dpi=300}\nx\n```\n"),
+        "dashed knitr option, #| lines": (pipe, "fig-width", "5", "```{r}\n#| echo: false\n#| fig-width: 5\nx\n```\n"),
+        "dashed knitr option, R-style #| lines": ("```{r}\n#| echo=FALSE\nx\n```\n", "fig-width", "5",
+                                                  "```{r fig.width=5}\n#| echo=FALSE\nx\n```\n"),
+        "dashed knitr option by its header copy": ("```{r fig.width=3}\nx\n```\n", "fig-width", "5", "```{r fig.width=5}\nx\n```\n"),
+        "dashed header copy written dotted": ("```{r fig-width=3}\nx\n```\n", "fig-width", "5", "```{r fig.width=5}\nx\n```\n"),
+        "other dashed key, #| lines": (pipe, "code-fold", "TRUE", "```{r}\n#| echo: false\n#| code-fold: true\nx\n```\n"),
+        "key with a space, #| lines": (pipe, "my key", '"a"', "```{r}\n#| echo: false\n#| my key: a\nx\n```\n"),
+        "key R's yaml reads as a number, #| lines": (pipe, "2", "TRUE", '```{r}\n#| echo: false\n#| "2": true\nx\n```\n'),
+        "#| lines ending in a comment": ("```{r}\n#| echo: false\n#| # note\nx\n```\n", "code-fold", "TRUE",
+                                         "```{r}\n#| echo: false\n#| code-fold: true\n#| # note\nx\n```\n"),
+        "sql --| lines": ("```{sql}\n--| echo: false\nSELECT 1\n```\n", "fig-cap", '"A"', "```{sql}\n--| echo: false\n--| fig-cap: A\nSELECT 1\n```\n"),
+        "c /*| */ lines": ("```{c}\n/*| echo: false */\nint x;\n```\n", "fig-width", "5",
+                           "```{c}\n/*| echo: false */\n/*| fig-width: 5 */\nint x;\n```\n"),
+        "CRLF #| lines": ("```{r}\r\n#| echo: false\r\nx\r\n```\r\n", "code-fold", "TRUE",
+                          "```{r}\r\n#| echo: false\r\n#| code-fold: true\r\nx\r\n```\r\n"),
+        # #| lines whose YAML doesn't read hold no key to add one after: the header, as without them
+        "dashed knitr option, #| lines that don't read": ("```{r}\n#| [a: 1\nx\n```\n", "fig-width", "5",
+                                                          "```{r fig.width=5}\n#| [a: 1\nx\n```\n"),
+        # Syntactic names go in the header, as before
+        "name starting with a dot": (plain, ".x", "1", "```{r .x=1}\nx\n```\n"),
+        "name with an underscore": (plain, "my_opt", "1", "```{r my_opt=1}\nx\n```\n"),
+        "name with a letter outside ASCII": (plain, "größe", "1", "```{r größe=1}\nx\n```\n"),
+    }.items():
+        path = write_raw("keys.rmd", doc)
+        check(f"key {key!r}, {name}: saved", server.set_chunk_option(path, 0, key, value), "Saved")
+        check_same(f"key {key!r}, {name}: file", read_raw(path), written)
+
+    # Any other key a header can't hold is refused there
+    syntactic = ("isn't a syntactic R name (letters, digits, dots and underscores, starting with a letter or with a dot not "
+                 "followed by a digit, and not a reserved word such as if), which a chunk header needs, as knitr reads it as "
+                 "R code, so the file was left unchanged: in a chunk that starts with #| option lines, which knitr reads as "
+                 "YAML, set_chunk_option writes the key there")
+    for key in ("my key", "code-fold", "if", "TRUE", "2x", ".2x", "_x", "a=b", "a$b", "...", "..1"):
+        path = write_raw("keys.rmd", plain)
+        check_same(f"key {key!r} in a header: refused", server.set_chunk_option(path, 0, key, "1"), f"Error: Option key {key!r} {syntactic}")
+        check_same(f"key {key!r} in a header: file unchanged", read_raw(path), plain)
+
+    path = write_raw("keys.rmd", "```{r}\n#| [a: 1\nx\n```\n")
+    check_same("key a header can't hold, #| lines that don't read: refused", server.set_chunk_option(path, 0, "code-fold", "TRUE"),
+               f"Error: Option key 'code-fold' {syntactic}")
+
+    # A key written in the #| lines is found there again: listed, set in its line, removed with it
+    path = write_raw("keys.rmd", pipe)
+    server.set_chunk_option(path, 0, "code-fold", "TRUE")
+    check_same("#| key: listed", server.get_chunk_options(path, 0), "language: r\nlabel: (none)\n  #| echo: false\n  #| code-fold: true")
+    check("#| key: set again", server.set_chunk_option(path, 0, "code-fold", "FALSE"), "Saved")
+    check_same("#| key: set in its line", read_raw(path), "```{r}\n#| echo: false\n#| code-fold: false\nx\n```\n")
+    check("#| key: removed", server.remove_chunk_option(path, 0, "code-fold"), "Saved")
+    check_same("#| key: its line gone", read_raw(path), pipe)
+    path = write_raw("keys.rmd", pipe)
+    server.set_chunk_option(path, 0, "fig-width", "5")
+    server.set_chunk_option(path, 0, "fig.width", "6")
+    check_same("#| fig-width set by its dotted name", read_raw(path), "```{r}\n#| echo: false\n#| fig-width: 6\nx\n```\n")
+    # A header key in backticks or quotes is the name R reads it as (knitr's alist() takes both): found by that name, and
+    # a dashed one of knitr's written dotted when it is set
+    for name, (doc, call, written) in {
+        "backticked dashed knitr option": ("```{r `fig-width`=3}\nx\n```\n", lambda p: server.set_chunk_option(p, 0, "fig-width", "5"),
+                                           "```{r fig.width=5}\nx\n```\n"),
+        "quoted dashed knitr option, by its dotted name": ('```{r "fig-width"=3}\nx\n```\n',
+                                                           lambda p: server.set_chunk_option(p, 0, "fig.width", "5"), "```{r fig.width=5}\nx\n```\n"),
+        "backticked dashed copy over the dotted one": ("```{r `fig-width`=3, fig.width=4}\nx\n```\n",
+                                                       lambda p: server.set_chunk_option(p, 0, "fig.width", "5"), "```{r fig.width=5}\nx\n```\n"),
+        "backticked key": ("```{r `my key`=1}\nx\n```\n", lambda p: server.set_chunk_option(p, 0, "my key", "2"), "```{r `my key`=2}\nx\n```\n"),
+        "backticked key removed": ("```{r `my key`=1, echo=TRUE}\nx\n```\n", lambda p: server.remove_chunk_option(p, 0, "my key"),
+                                   "```{r echo=TRUE}\nx\n```\n"),
+        # A header copy knitr can't read (code-fold=TRUE, as 1.4.0 wrote it) goes, and the key is written as a new one
+        "header copy knitr can't read, to the #| lines": ("```{r code-fold=TRUE}\n#| echo: false\nx\n```\n",
+                                                          lambda p: server.set_chunk_option(p, 0, "code-fold", "FALSE"),
+                                                          "```{r}\n#| echo: false\n#| code-fold: false\nx\n```\n"),
+        # Option lines that can't take a new line: a dashed name of knitr's goes in the header, as the dotted one
+        "dashed knitr option, one c comment over several lines": ("```{c}\n/*| a: 1\nb: 2 */\nint y;\n```\n",
+                                                                  lambda p: server.set_chunk_option(p, 0, "fig-width", "5"),
+                                                                  "```{c fig.width=5}\n/*| a: 1\nb: 2 */\nint y;\n```\n"),
+        "dashed knitr option, sas lines that would all end with ;": ("```{sas}\n*| echo: false ;\ndata x;\n```\n",
+                                                                     lambda p: server.set_chunk_option(p, 0, "fig-width", "5"),
+                                                                     "```{sas fig.width=5}\n*| echo: false ;\ndata x;\n```\n"),
+    }.items():
+        path = write_raw("keys.rmd", doc)
+        check(f"{name}: saved", call(path), "Saved")
+        check_same(f"{name}: file", read_raw(path), written)
+    path = write_raw("keys.rmd", "```{r `fig-width`=3, fig.width=4}\nx\n```\n")
+    check_same("backticked dashed copy over the dotted one: listed", server.get_chunk_options(path, 0),
+               "language: r\nlabel: (none)\n  `fig-width`=3 (knitr reads it over fig.width=4)")
+    doc = "```{r code-fold=TRUE}\nx\n```\n"
+    path = write_raw("keys.rmd", doc)
+    check_same("header copy knitr can't read, no #| lines: refused", server.set_chunk_option(path, 0, "code-fold", "FALSE"),
+               f"Error: Option key 'code-fold' {syntactic}")
+    check_same("header copy knitr can't read, no #| lines: file unchanged", read_raw(path), doc)
+    path = write_raw("keys.rmd", "```{c}\n/*| a: 1\nb: 2 */\nint y;\n```\n")
+    check_same("key a header can't hold, one c comment over several lines: refused",
+               server.set_chunk_option(path, 0, "code-fold", "TRUE"),
+               "Error: The option lines of this c chunk are one /*| ... */ comment over several lines, which can't be edited "
+               "line by line, so the file was left unchanged")
 
 
 def test_chunk_body_lines():
@@ -2371,6 +2748,28 @@ def test_frontmatter_limits():
     # A key written in quotes counts its quotes
     check("quoted key of 1025 characters: refused", server.set_frontmatter_key(path, "#" + "k" * 1022, "1"),
           "is 1025 characters long as written")
+    # A new key holding a line break (any that YAML reads as one) is refused, not cut short: the whitespace around a
+    # key goes, its line breaks don't, so "title\n" isn't title
+    breaks = "contains a line break, but a key is written on one line, as key: value, so the file was left unchanged"
+    for name, doc in {"header": "---\ntitle: t\n---\nBody\n", "no header": "Body\n"}.items():
+        for key in ("short\n", "title\n", "\ntitle", "a\nb", "a\r\nb", "a\rb", "a\x85b", "a" + chr(0x2028) + "b", "title" + chr(0x2029)):
+            path = write_raw("limits.rmd", doc)
+            check_same(f"key {key!r}, {name}: refused", server.set_frontmatter_key(path, key, "1"),
+                       f"Error: Frontmatter key {key!r} {breaks}")
+            check_same(f"key {key!r}, {name}: file unchanged", read_raw(path), doc)
+        # A lone UTF-16 surrogate can only be written as an escape, which R's yaml package rejects
+        path = write_raw("limits.rmd", doc)
+        check_same(f"key with a lone surrogate, {name}: refused", server.set_frontmatter_key(path, "a\ud800b", "1"),
+                   "Error: Frontmatter key 'a\\ud800b' holds U+D800, a lone UTF-16 surrogate, which YAML can only write as an "
+                   "escape that the libyaml in R's yaml package rejects, so the file was left unchanged")
+        check_same(f"key with a lone surrogate, {name}: file unchanged", read_raw(path), doc)
+    path = write_raw("limits.rmd", "---\ntitle: t\n---\nBody\n")
+    check("key with spaces and tabs around it: saved", server.set_frontmatter_key(path, " \ttitle ", "2"), "Saved")
+    check_same("key with spaces and tabs around it: the key set", read_raw(path), "---\ntitle: 2\n---\nBody\n")
+    check_same("remove a key with a line break: no such key", server.remove_frontmatter_key(path, "title\n"),
+               "Error: Frontmatter has no key 'title\\n'")
+    check_same("remove a key with a line break: file unchanged", read_raw(path), "---\ntitle: 2\n---\nBody\n")
+    check("remove a key with spaces around it: saved", server.remove_frontmatter_key(path, " title "), "Saved")
 
     # Big headers: an edit reads the header in time that grows with its size, not with its size squared (these took
     # 13 s and 8 s when it did, about 2 s and 1 s now)
@@ -3226,12 +3625,14 @@ if __name__ == "__main__":
         test_parser_round_trip()
         test_parser_edge_cases()
         test_parser_complex_options()
+        test_chunk_header_parts()
         test_no_trailing_newline()
         test_line_breaks()
         test_crlf_documents()
         test_mixed_line_endings()
         test_line_numbers_agree()
         test_byte_order_mark()
+        test_lone_surrogate()
         test_create_rmd()
         test_create_rmd_quoting()
         test_extension_case()
@@ -3245,10 +3646,12 @@ if __name__ == "__main__":
         test_empty_document_indexes()
         test_replace_cell_source()
         test_prepend_append_to_cell()
+        test_option_lines_stay_on_top()
         test_chunk_options()
         test_chunk_header_values()
         test_chunk_label_spellings()
         test_chunk_option_semantics()
+        test_chunk_option_keys()
         test_chunk_body_lines()
         test_prose_keeps_cells()
         test_chunk_fences()

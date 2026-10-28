@@ -3665,10 +3665,11 @@ def test_line_endings():
     endings = _line_endings(_read_bytes(path))
     check("lf js replace_in_body with CRLF content: LF only", "PASS" if endings == "lf" else f"FAIL: {endings}", "PASS")
 
-    # A mixed file is written back in its majority style.
+    # A mixed file keeps each line's own break; new lines take that of the
+    # line beside them (see test_content_layout).
     path = _write_temp("test_mixed.py", "a = 1\r\nb = 2\r\nc = 3\n")
     Applier(path).add_top_level("d = 4")
-    check("mixed endings: normalised to the majority (CRLF)", _read_bytes(path).decode("utf-8"), "a = 1\r\nb = 2\r\nc = 3\r\n\r\nd = 4\r\n")
+    check("mixed endings: each line keeps its own", _read_bytes(path).decode("utf-8"), "a = 1\r\nb = 2\r\nc = 3\nd = 4\n")
     os.remove(path)
 
     # str.splitlines() also splits on form feeds; the file must keep them and
@@ -7167,7 +7168,7 @@ def test_sibling_spacing():
         ("py a constant after a class", "s.py", "class A:\n    pass\n\n\nclass B:\n    pass\n", "A", "X = 1", "after",
          "class A:\n    pass\n\n\nX = 1\n\n\nclass B:\n    pass\n"),
         ("py a constant between constants", "s.py", "X = 1\nY = 2\n", "X", "Z = 3", "after",
-         "X = 1\n\nZ = 3\n\nY = 2\n"),
+         "X = 1\nZ = 3\nY = 2\n"),
         ("py before, below imports", "s.py", "import os\n\n\ndef f():\n    pass\n", "f", g, "before",
          "import os\n\n\ndef g():\n    pass\n\n\ndef f():\n    pass\n"),
         ("py before the first symbol of the file", "s.py", "def f():\n    pass\n", "f", "X = 1", "before",
@@ -7450,7 +7451,8 @@ def test_parameter_lines():
          "def f(\n    a,\n    /,\n    c=1,\n):\n    pass\n"),
         ("py, after *args", "p.py", "def f(\n    a,\n    *args,\n):\n    pass\n", "f", "b=1", "end",
          "def f(\n    a,\n    *args,\n    b=1,\n):\n    pass\n"),
-        ("py, after **kwargs: refused as before", "p.py", "def f(\n    a,\n    **kwargs,\n):\n    pass\n", "f", "*args", "end", None),
+        ("py, before **kwargs, which stays last", "p.py", "def f(\n    a,\n    **kwargs,\n):\n    pass\n", "f", "*args", "end",
+         "def f(\n    a,\n    *args,\n    **kwargs,\n):\n    pass\n"),
         ("py, a parameter over several lines", "p.py", "def f(\n    a,\n    b={\n        'x': 1,\n    },\n):\n    pass\n",
          "f", "c=1", "end", "def f(\n    a,\n    b={\n        'x': 1,\n    },\n    c=1,\n):\n    pass\n"),
         ("py, two parameters on the last line: inline", "p.py", "def f(\n    a, b,\n):\n    pass\n", "f", "c=1", "end",
@@ -7480,11 +7482,7 @@ def test_parameter_lines():
     ]
     for label, name, source, target, parameter, position, expected in adds:
         result = _edit_result(name, source, lambda a: a.add_parameter(target, parameter, position))
-        if expected is None:
-            # No reordering: what goes after **kwargs is refused as before.
-            _refused(f"add_parameter ({label})", result, "syntax error")
-        else:
-            _exact(f"add_parameter ({label})", result, expected)
+        _exact(f"add_parameter ({label})", result, expected)
     _exact("add_parameter (py, crlf)", _edit_result("p.py", py, lambda a: a.add_parameter("f", "c=1"), "\r\n"),
            "def f(\n    a,\n    b,\n    c=1,\n):\n    pass\n".replace("\n", "\r\n"))
     _exact("add_parameter (go, crlf, at the start)",
@@ -8632,11 +8630,11 @@ def test_symbol_discovery():
     # (label, file name, source, edit, expected file text)
     edits = [
         ("insert_sibling after a macro", "k.c", "#define M 1\nint g = 1;\n",
-         lambda a: a.insert_sibling("M", "#define N 2", "after"), "#define M 1\n\n#define N 2\n\nint g = 1;\n"),
+         lambda a: a.insert_sibling("M", "#define N 2", "after"), "#define M 1\n#define N 2\nint g = 1;\n"),
         ("insert_sibling after a macro over two lines", "k.c", "#define F(x) \\\n    ((x) + 1)\nint y;\n",
          lambda a: a.insert_sibling("F", "#define G 2", "after"), "#define F(x) \\\n    ((x) + 1)\n\n#define G 2\n\nint y;\n"),
         ("insert_sibling before a global", "k.c", "#define M 1\nint g = 1;\n",
-         lambda a: a.insert_sibling("g", "int h = 2;", "before"), "#define M 1\n\nint h = 2;\n\nint g = 1;\n"),
+         lambda a: a.insert_sibling("g", "int h = 2;", "before"), "#define M 1\nint h = 2;\nint g = 1;\n"),
         ("replace_function on a macro", "k.c", "#define M 1\nint g = 1;\n",
          lambda a: a.replace_function("M", "#define M 2"), "#define M 2\nint g = 1;\n"),
         ("edit_leading_comment add on a typedef", "k.c", "#define M 1\ntypedef int I;\n",
@@ -9010,6 +9008,33 @@ def test_byte_order_mark():
         check(f"bom: {label} refusal names UTF-8", result, "ast-editor reads and writes UTF-8 files only")
         check(f"bom: {label} file unchanged", "<unchanged>" if _read_bytes(path) == data else "CHANGED", "<unchanged>")
         os.remove(path)
+
+
+def test_lone_surrogate():
+    print("\n═══ a lone surrogate in new text: refused, the file kept ═══")
+    # JSON lets a client send half of a surrogate pair, which has no UTF-8 form.
+    lone = chr(0xD800)
+    reason = "lone surrogate, U+D800, which is not a character"
+    for label, name, src, action in [
+        ("py replace_function_body", "s.py", "def f():\n    return 1\n",
+         lambda a: a.replace_function_body("f", "return '" + lone + "'")),
+        ("py replace_function", "s.py", "def f():\n    return 1\n",
+         lambda a: a.replace_function("f", "def f():\n    return '" + lone + "'")),
+        ("js replace_in_body", "s.js", "function f() {\n  return 1;\n}\n",
+         lambda a: a.replace_in_body("f", "1", "'" + lone + "'")),
+        ("py insert_in_body", "s.py", "def f():\n    x = 1\n",
+         lambda a: a.insert_in_body("f", "y = '" + lone + "'", after="x = 1")),
+        ("py add_parameter", "s.py", "def f(a):\n    pass\n", lambda a: a.add_parameter("f", "b='" + lone + "'")),
+        ("py replace_docstring", "s.py", 'def f():\n    """D."""\n',
+         lambda a: a.replace_docstring("f", '"""' + lone + '"""')),
+        ("py edit_leading_comment", "s.py", "def f():\n    pass\n",
+         lambda a: a.edit_leading_comment("f", "add", "# " + lone)),
+        ("json replace_value", "s.json", '{\n  "a": 1\n}\n', lambda a: a.replace_value("a", '"' + lone + '"')),
+        ("yaml add_key", "s.yaml", "a: 1\n", lambda a: a.add_key("", "b", '"' + lone + '"')),
+        ("toml append_to_array", "s.toml", "a = [1]\n", lambda a: a.append_to_array("a", '"' + lone + '"')),
+        ("py read_symbol target", "s.py", "def f():\n    pass\n", lambda a: a.read_symbol("f" + lone)),
+    ]:
+        _refused(label, _edit_result(name, src, action), reason)
 
 
 def test_python_list_append():
@@ -10005,9 +10030,9 @@ def test_listed_data():
         ("delete_symbol with its decorator and comment", lambda a: a.delete_symbol("A.x"),
          "class A {\n  y = 1; // why\n  m() {}\n}\n"),
         ("insert_sibling after", lambda a: a.insert_sibling("A.y", "z = 3;", "after"),
-         "class A {\n  // The x.\n  @Input() x: number;\n  y = 1; // why\n\n  z = 3;\n\n  m() {}\n}\n"),
+         "class A {\n  // The x.\n  @Input() x: number;\n  y = 1; // why\n  z = 3;\n\n  m() {}\n}\n"),
         ("insert_sibling before, above its comment", lambda a: a.insert_sibling("A.x", "w = 0;", "before"),
-         "class A {\n  w = 0;\n\n  // The x.\n  @Input() x: number;\n  y = 1; // why\n  m() {}\n}\n"),
+         "class A {\n  w = 0;\n  // The x.\n  @Input() x: number;\n  y = 1; // why\n  m() {}\n}\n"),
         ("edit_leading_comment replace", lambda a: a.edit_leading_comment("A.x", "replace", "// X."),
          ts.replace("// The x.", "// X.")),
         ("edit_leading_comment add", lambda a: a.edit_leading_comment("A.y", "add", "// Y."),
@@ -10791,7 +10816,7 @@ def test_final_newline_state():
            _edit_result("n.py", "def f():\n    pass", lambda a: a.replace_function("f", "def f():\n    return 1"), "\r\n"),
            "def f():\r\n    return 1")
     _exact("no final line break (crlf add_top_level)",
-           _edit_result("n.py", "X = 1\nY = 2", lambda a: a.add_top_level("Z = 3"), "\r\n"), "X = 1\r\nY = 2\r\n\r\nZ = 3")
+           _edit_result("n.py", "X = 1\nY = 2", lambda a: a.add_top_level("Z = 3"), "\r\n"), "X = 1\r\nY = 2\r\nZ = 3")
     # The syntax check still guards such files, and a refused edit leaves
     # them as they were.
     _refused("no final line break (syntax error refused)",
@@ -10955,7 +10980,7 @@ def test_layout_followups():
         ("java", "T.java", "class A {\n\tvoid m() {\n\t}\n}\n", "A.m", "void k() {\n    x();\n}", "after",
          "class A {\n\tvoid m() {\n\t}\n\n\tvoid k() {\n\t\tx();\n\t}\n}\n"),
         ("go struct field", "t.go", "package main\n\ntype T struct {\n\tA int\n}\n", "T", "type U struct {\n    B int\n}", "after",
-         "package main\n\ntype T struct {\n\tA int\n}\n\ntype U struct {\n    B int\n}\n"),
+         "package main\n\ntype T struct {\n\tA int\n}\n\ntype U struct {\n\tB int\n}\n"),
         ("rb", "t.rb", "class A\n\tdef m\n\t\t1\n\tend\nend\n", "A.m", "def k\n  2\nend", "before",
          "class A\n\tdef k\n\t\t2\n\tend\n\n\tdef m\n\t\t1\n\tend\nend\n"),
         # Content already in tabs, and members indented with spaces, are
@@ -11203,7 +11228,7 @@ def test_comments_ending_code():
         ("blank line", "c.js", "class A {\n  m() {}\n\n    // deep\n  n() {}\n}\n",
          lambda a: a.insert_sibling("A.m", "k() {}", "after"), "class A {\n  m() {}\n\n  k() {}\n\n    // deep\n  n() {}\n}\n"),
         ("code after the comment", "c.c", "int f(void);\n    /* x */ int g(void);\n",
-         lambda a: a.insert_sibling("f", "int h(void);", "after"), "int f(void);\n\nint h(void);\n\n    /* x */ int g(void);\n"),
+         lambda a: a.insert_sibling("f", "int h(void);", "after"), "int f(void);\nint h(void);\n    /* x */ int g(void);\n"),
     ]
     for label, name, source, action, expected in cases:
         _exact(f"comments ending the code above ({label})", _edit_result(name, source, action), expected)
@@ -11233,7 +11258,7 @@ def test_comments_ending_code():
         ("delete_symbol of the first", shared, lambda a: a.delete_symbol("x"), "/* a\n b */ int y;\n"),
         ("delete_symbol of the second", shared, lambda a: a.delete_symbol("y"), "int x; /* a\n b */\n"),
         ("a line break after the comment", "int x; /* a\n b */\nint y;\n", lambda a: a.insert_sibling("x", "int z;", "after"),
-         "int x; /* a\n b */\n\nint z;\n\nint y;\n"),
+         "int x; /* a\n b */\nint z;\nint y;\n"),
         ("delete_symbol, a line break after the comment", "int x; /* a\n b */\nint y;\n", lambda a: a.delete_symbol("x"),
          "int y;\n"),
     ]
@@ -11614,6 +11639,1104 @@ def test_target_resolution_followups():
                _edit_result("k.h", source, lambda a: a.add_top_level("int g(void);"), "\r\n"), expected.replace("\n", "\r\n"))
 
 
+# ──────────────────────────────────────────────
+# Body snippets and anchors: token boundaries, whole lines, shifted indentation
+# ──────────────────────────────────────────────
+
+
+def test_body_snippets():
+    print("\n═══ body snippets and anchors: tokens, whole lines, shifted indentation ═══")
+
+    # A snippet or anchor matches where it neither starts nor ends inside a
+    # token (an identifier, number, keyword or operator). Inside a string or
+    # a comment the text is words, and a match may not split one of those.
+    maxed = "def f():\n    max = 10\n    return max\n"
+    dollar = "function f() {\n  const $el = 1;\n  return $el;\n}\n"
+    asks = "def f\n  foo?\nend\n"
+    equals = "function f() {\n  return a == 1;\n}\n"
+    # (label, file name, source, action, expected file text)
+    cases = [
+        ("one no longer ambiguous", "k.py", "def f():\n    max = 1\n    x = 1\n",
+         lambda a: a.replace_in_body("f", "x = 1", "x = 2"), "def f():\n    max = 1\n    x = 2\n"),
+        ("a word of a string", "k.py", 'def f():\n    print("hello world")\n',
+         lambda a: a.replace_in_body("f", "world", "there"), 'def f():\n    print("hello there")\n'),
+        ("a word of a comment", "k.js", "function f() {\n  // max retries\n  return 1;\n}\n",
+         lambda a: a.replace_in_body("f", "retries", "attempts"), "function f() {\n  // max attempts\n  return 1;\n}\n"),
+        ("a whole js identifier", "k.js", dollar, lambda a: a.replace_in_body("f", "$el = 1", "$el = 2"),
+         dollar.replace("$el = 1", "$el = 2")),
+        ("a whole ruby method name", "k.rb", asks, lambda a: a.replace_in_body("f", "foo?", "bar?"), "def f\n  bar?\nend\n"),
+        ("a whole operator", "k.js", equals, lambda a: a.replace_in_body("f", "== 1", "=== 1"),
+         equals.replace("==", "===")),
+        ("an anchor in the middle of a line", "k.py", "def f():\n    g(b)\n",
+         lambda a: a.insert_in_body("f", "a, ", after="g("), "def f():\n    g(a, b)\n"),
+    ]
+    for label, name, source, action, expected in cases:
+        _exact(f"token boundaries ({label})", _edit_result(name, source, action), expected)
+    # (label, file name, source, action, reason)
+    refusals = [
+        ("delete_in_body (reported)", "k.py", maxed, lambda a: a.delete_in_body("f", "x = 1"),
+         "Snippet not found in body of 'f' as whole tokens: it occurs only inside longer tokens, on line 2."),
+        ("replace_in_body (reported)", "k.py", maxed, lambda a: a.replace_in_body("f", "x = 1", "x = 2"),
+         "Snippet not found in body of 'f' as whole tokens: it occurs only inside longer tokens, on line 2."),
+        ("insert_in_body", "k.py", maxed, lambda a: a.insert_in_body("f", "y = 0", after="ax"),
+         "Anchor snippet not found in body of 'f' as whole tokens: it occurs only inside longer tokens, on lines 2, 3."),
+        ("a word of a string split", "k.py", 'def f():\n    print("max = 10")\n',
+         lambda a: a.replace_in_body("f", "x = 1", "y"), "Snippet not found in body of 'f' as whole tokens"),
+        ("part of a js identifier", "k.js", dollar, lambda a: a.replace_in_body("f", "el = 1", "el = 2"),
+         "Snippet not found in body of 'f' as whole tokens"),
+        ("part of a ruby method name", "k.rb", asks, lambda a: a.replace_in_body("f", "foo", "bar"),
+         "Snippet not found in body of 'f' as whole tokens"),
+        ("part of an operator", "k.js", equals, lambda a: a.replace_in_body("f", "= 1", "= 2"),
+         "Snippet not found in body of 'f' as whole tokens"),
+        ("part of a go number", "k.go", "package main\n\nfunc f() int {\n\treturn 100\n}\n",
+         lambda a: a.replace_in_body("f", "10", "20"), "Snippet not found in body of 'f' as whole tokens"),
+        ("part of a java identifier", "K.java", "class K {\n    void f() {\n        counter++;\n    }\n}\n",
+         lambda a: a.delete_in_body("K.f", "count"), "Snippet not found in body of 'K.f' as whole tokens"),
+        ("part of a word of a comment", "k.cpp", "int f() {\n    // retries\n    return 0;\n}\n",
+         lambda a: a.replace_in_body("f", "tries", "x"), "Snippet not found in body of 'f' as whole tokens"),
+        ("part of the code in an f-string", "k.py", 'def f(maxval):\n    return f"{maxval}"\n',
+         lambda a: a.replace_in_body("f", "val", "v"), "Snippet not found in body of 'f' as whole tokens"),
+        ("ambiguous, with the lines", "k.py", "def f():\n    a = 1\n    b = 1\n",
+         lambda a: a.replace_in_body("f", "1", "2"),
+         "Snippet matches 2 places in body of 'f' (lines 2, 3). Include more surrounding context"),
+    ]
+    for label, name, source, action, reason in refusals:
+        _refused(f"token boundaries ({label})", _edit_result(name, source, action), reason)
+
+    # A deletion that leaves its lines without code takes them whole, with
+    # their indentation and line break; a comment after it stays, at the
+    # line's indentation. A Python body keeps a statement.
+    body = "class A:\n    def f(self):\n        x = 1\n        if x:\n            return 2\n"
+    no_x = "class A:\n    def f(self):\n        if x:\n            return 2\n"
+    cases = [
+        ("a line without its indentation (reported)", "k.py", body, lambda a: a.delete_in_body("A.f", "x = 1"), no_x),
+        ("a line with its indentation", "k.py", body, lambda a: a.delete_in_body("A.f", "        x = 1"), no_x),
+        ("a line and its break", "k.py", body, lambda a: a.delete_in_body("A.f", "x = 1\n"), no_x),
+        ("a whole line", "k.py", body, lambda a: a.delete_in_body("A.f", "        x = 1\n"), no_x),
+        ("replace_in_body with nothing", "k.py", body, lambda a: a.replace_in_body("A.f", "x = 1", ""), no_x),
+        ("several lines", "k.py", body, lambda a: a.delete_in_body("A.f", "if x:\n            return 2"),
+         "class A:\n    def f(self):\n        x = 1\n"),
+        ("code before it on its line stays", "k.py", "def f():\n    x = 1; y = 2\n",
+         lambda a: a.delete_in_body("f", "; y = 2"), "def f():\n    x = 1\n"),
+        ("code after it on its line stays", "k.py", "def f():\n    x = 1; y = 2\n",
+         lambda a: a.delete_in_body("f", "x = 1; "), "def f():\n    y = 2\n"),
+        ("a comment after it stays", "k.py", "def f():\n    x = 1  # c\n    y = 2\n",
+         lambda a: a.delete_in_body("f", "x = 1"), "def f():\n    # c\n    y = 2\n"),
+        ("js", "k.js", "function f() {\n  a();\n  b();\n}\n", lambda a: a.delete_in_body("f", "a();"),
+         "function f() {\n  b();\n}\n"),
+        ("go, the only statement", "k.go", "package main\n\nfunc f() {\n\tx()\n}\n",
+         lambda a: a.delete_in_body("f", "x()"), "package main\n\nfunc f() {\n}\n"),
+        ("ruby, the body's last line and its break", "k.rb", "def f\n  x = 1\n  x\nend\n",
+         lambda a: a.delete_in_body("f", "  x\n"), "def f\n  x = 1\nend\n"),
+        ("python, the body's last line and its break", "k.py", "def f():\n    x = 1\n    return x\n\n\ndef g():\n    pass\n",
+         lambda a: a.delete_in_body("f", "    return x\n"), "def f():\n    x = 1\n\n\ndef g():\n    pass\n"),
+        ("the last line of a file without a final line break", "k.py", "def f():\n    x = 1\n    y = 2",
+         lambda a: a.delete_in_body("f", "y = 2"), "def f():\n    x = 1"),
+    ]
+    for label, name, source, action, expected in cases:
+        _exact(f"whole-line deletion ({label})", _edit_result(name, source, action), expected)
+    _exact("whole-line deletion (CRLF)", _edit_result("k.py", body, lambda a: a.delete_in_body("A.f", "x = 1"), "\r\n"),
+           no_x.replace("\n", "\r\n"))
+    empty = "would leave the body of 'f' without a statement, which Python does not allow"
+    for label, source, action in [
+        ("the only statement", "def f():\n    x = 1\n", lambda a: a.delete_in_body("f", "x = 1")),
+        ("all but a comment", "def f():\n    # note\n    x = 1\n", lambda a: a.delete_in_body("f", "x = 1")),
+        ("replace_in_body with nothing", "def f():\n    x = 1\n", lambda a: a.replace_in_body("f", "x = 1", "")),
+    ]:
+        _refused(f"whole-line deletion ({label})", _edit_result("k.py", source, action), empty)
+
+    # Without an exact match, a snippet or anchor matches whole lines of the
+    # body with one indentation added to or removed from each of its lines,
+    # and new_snippet moves the same way, keeping its relative indentation,
+    # unless it is at the file's indentation there already.
+    three = body.replace("return 2", "return 3")
+    go = "package main\n\nfunc f(x int) int {\n\tif x > 0 {\n\t\treturn 1\n\t}\n\treturn 0\n}\n"
+    js = "function f(x) {\n  if (x) {\n    return 1;\n  }\n  return 0;\n}\n"
+    rb = "class A\n  def f(x)\n    if x\n      1\n    end\n  end\nend\n"
+    java = "class K {\n    int f(int x) {\n        if (x > 0) {\n            return 1;\n        }\n        return 0;\n    }\n}\n"
+    cpp = "int f(int x) {\n    if (x > 0) {\n        return 1;\n    }\n    return 0;\n}\n"
+    sloppy = "function f() {\n  if (a) {\n    b();\n  }\n  if (a) {\n  b();\n  }\n}\n"
+    cases = [
+        ("4 columns short (reported)", "k.py", body,
+         lambda a: a.replace_in_body("A.f", "    if x:\n        return 2", "    if x:\n        return 3"), three),
+        ("at column 0 (reported)", "k.py", body,
+         lambda a: a.replace_in_body("A.f", "if x:\n    return 2", "if x:\n    return 3"), three),
+        ("indented too deep", "k.py", body, lambda a: a.replace_in_body("A.f", "            x = 1", "            x = 5"),
+         body.replace("x = 1", "x = 5")),
+        ("new lines keep their relative indentation", "k.py", body,
+         lambda a: a.replace_in_body("A.f", "if x:\n    return 2", "if x:\n    if x > 1:\n        return 3\n    return 2"),
+         body.replace("            return 2", "            if x > 1:\n                return 3\n            return 2")),
+        ("new content at the file's indentation goes in as written", "k.py", body,
+         lambda a: a.replace_in_body("A.f", "if x:\n    return 2", "        if x:\n            return 3"), three),
+        ("a multi-line string keeps its text", "k.py", body,
+         lambda a: a.replace_in_body("A.f", "if x:\n    return 2", 'if x:\n    return """a\nb"""'),
+         body.replace("return 2", 'return """a\nb"""')),
+        ("delete_in_body", "k.py", body, lambda a: a.delete_in_body("A.f", "if x:\n    return 2\n"),
+         "class A:\n    def f(self):\n        x = 1\n"),
+        ("blank lines match blank lines", "k.py", "def f():\n    x = 1\n\n    y = 2\n",
+         lambda a: a.replace_in_body("f", "x = 1\n\ny = 2", "x = 1\ny = 2"), "def f():\n    x = 1\n    y = 2\n"),
+        ("spaces at the end of a line aside", "k.py", "def f():\n    x = 1   \n    y = 2\n",
+         lambda a: a.replace_in_body("f", "x = 1\ny = 2", "z = 3"), "def f():\n    z = 3\n"),
+        ("go, tabs", "k.go", go, lambda a: a.replace_in_body("f", "if x > 0 {\n\treturn 1\n}", "if x > 1 {\n\treturn 2\n}"),
+         go.replace("x > 0", "x > 1").replace("return 1", "return 2")),
+        ("js", "k.js", js, lambda a: a.replace_in_body("f", "if (x) {\n  return 1;\n}", "if (x) {\n  return 2;\n}"),
+         js.replace("return 1", "return 2")),
+        ("ruby", "k.rb", rb, lambda a: a.replace_in_body("A.f", "if x\n  1\nend", "if x\n  2\nend"), rb.replace("1", "2")),
+        ("ruby, an embedded document stays at column 0", "k.rb", rb,
+         lambda a: a.replace_in_body("A.f", "if x\n  1\nend", "=begin\nx\n=end\nif x\n  2\nend"),
+         "class A\n  def f(x)\n=begin\nx\n=end\n    if x\n      2\n    end\n  end\nend\n"),
+        ("java, delete_in_body", "K.java", java, lambda a: a.delete_in_body("K.f", "if (x > 0) {\n    return 1;\n}\n"),
+         "class K {\n    int f(int x) {\n        return 0;\n    }\n}\n"),
+        ("cpp, insert_in_body after", "k.cpp", cpp, lambda a: a.insert_in_body("f", "x++;", after="if (x > 0) {\n    return 1;\n}"),
+         cpp.replace("    }\n", "    }\n    x++;\n")),
+        ("an exact match wins", "k.js", sloppy, lambda a: a.replace_in_body("f", "if (a) {\n  b();", "if (a) {\n  c();"),
+         sloppy.replace("  if (a) {\n  b();", "  if (a) {\n  c();")),
+    ]
+    for label, name, source, action, expected in cases:
+        _exact(f"shifted indentation ({label})", _edit_result(name, source, action), expected)
+    _exact("shifted indentation (js, a CRLF file)",
+           _edit_result("k.js", js, lambda a: a.replace_in_body("f", "if (x) {\r\n  return 1;\r\n}", "if (x) {\r\n  return 2;\r\n}"), "\r\n"),
+           js.replace("return 1", "return 2").replace("\n", "\r\n"))
+    refusals = [
+        ("ambiguous", "k.py", "def f(x):\n    if x:\n        y = 1\n    if x:\n        y = 1\n",
+         lambda a: a.replace_in_body("f", "if x:\n    y = 1", "z = 1"),
+         "Snippet matches 2 places in body of 'f' with its indentation shifted (lines 2, 4). Include more"),
+        ("not one shift", "k.py", body, lambda a: a.replace_in_body("A.f", "if x:\n   return 2", "pass"),
+         "Snippet not found in body of 'A.f'. Check whitespace and indentation: "),
+        ("tabs and spaces differ", "k.go", go, lambda a: a.replace_in_body("f", "if x > 0 {\n    return 1\n}", "x"),
+         "(tabs and spaces differ)"),
+        ("an anchor", "k.py", body, lambda a: a.insert_in_body("A.f", "y = 2", after="if x:\n   return 2"),
+         "Anchor snippet not found in body of 'A.f'. Check whitespace and indentation: "),
+    ]
+    for label, name, source, action, reason in refusals:
+        _refused(f"shifted indentation ({label})", _edit_result(name, source, action), reason)
+
+    # An anchor that starts its line (before) or ends it (after, also before
+    # a comment) has new_snippet go on lines of its own, indented as the
+    # anchor is; one in the middle of a line has it placed byte for byte.
+    with_y = body.replace("        x = 1\n", "        x = 1\n        y = 2\n")
+    validate = "def f(x):\n    validate(x)\n"
+    cases = [
+        ("after a line at column 0 (reported)", "k.py", body, lambda a: a.insert_in_body("A.f", "y = 2", after="x = 1"), with_y),
+        ("before a line at column 0", "k.py", body, lambda a: a.insert_in_body("A.f", "y = 2", before="x = 1"),
+         body.replace("        x = 1\n", "        y = 2\n        x = 1\n")),
+        ("content at the file's indentation", "k.py", body,
+         lambda a: a.insert_in_body("A.f", "        y = 2\n", after="x = 1"), with_y),
+        ("the anchor's line break given", "k.py", body, lambda a: a.insert_in_body("A.f", "y = 2\n", after="x = 1\n"), with_y),
+        ("a leading line break", "k.py", body, lambda a: a.insert_in_body("A.f", "\n        y = 2", after="x = 1"), with_y),
+        ("a blank line", "k.py", body, lambda a: a.insert_in_body("A.f", "\n\ny = 2", after="x = 1"),
+         body.replace("        x = 1\n", "        x = 1\n\n        y = 2\n")),
+        ("before, with the anchor's indentation after it", "k.py", validate,
+         lambda a: a.insert_in_body("f", "auth(x)\n    ", before="validate(x)"), "def f(x):\n    auth(x)\n    validate(x)\n"),
+        ("after a block at column 0", "k.py", body, lambda a: a.insert_in_body("A.f", "y = 3", after="if x:\n    return 2"),
+         body + "        y = 3\n"),
+        ("after a line that ends with a comment", "k.py", "def f():\n    x = 1  # c\n",
+         lambda a: a.insert_in_body("f", "y = 2", after="x = 1"), "def f():\n    x = 1  # c\n    y = 2\n"),
+        ("after the last line of a file without a final line break", "k.py", "def f():\n    x = 1",
+         lambda a: a.insert_in_body("f", "y = 2", after="x = 1"), "def f():\n    x = 1\n    y = 2"),
+        ("ruby, an embedded document stays at column 0", "k.rb", "class A\n  def f\n    1\n  end\nend\n",
+         lambda a: a.insert_in_body("A.f", "=begin\nx\n=end\n2", after="1"),
+         "class A\n  def f\n    1\n=begin\nx\n=end\n    2\n  end\nend\n"),
+        ("go, tabs", "k.go", go, lambda a: a.insert_in_body("f", "x--", before="return 0"),
+         go.replace("\treturn 0\n", "\tx--\n\treturn 0\n")),
+        ("before the closing brace", "k.js", "function f() {\n  a();\n}\n",
+         lambda a: a.insert_in_body("f", "  b();", before="}"), "function f() {\n  a();\n  b();\n}\n"),
+        ("after a body on its signature's line, byte for byte", "k.py", "def f(): return 1\n",
+         lambda a: a.insert_in_body("f", "; y = 2", after="return 1"), "def f(): return 1; y = 2\n"),
+        ("java, a text block moves with the code", "K.java",
+         'class K {\n    String f() {\n        String s = "x";\n        return s;\n    }\n}\n',
+         lambda a: a.insert_in_body("K.f", 'String t = """\n    yo\n    """;', before="return s;"),
+         'class K {\n    String f() {\n        String s = "x";\n        String t = """\n            yo\n'
+         '            """;\n        return s;\n    }\n}\n'),
+    ]
+    for label, name, source, action, expected in cases:
+        _exact(f"anchored lines ({label})", _edit_result(name, source, action), expected)
+    _exact("anchored lines (CRLF)", _edit_result("k.py", body, lambda a: a.insert_in_body("A.f", "y = 2", after="x = 1"), "\r\n"),
+           with_y.replace("\n", "\r\n"))
+    # Code after the closing brace of the body would be outside it.
+    _refused("anchored lines (after the closing brace)",
+             _edit_result("k.js", "function f() {\n  a();\n}\n", lambda a: a.insert_in_body("f", "b();", after="a();\n}")),
+             "The anchor ends with the closing brace of 'f', so code after it would be outside the body.")
+
+    # An exact one-line snippet written without (all of) its indentation
+    # gives the later lines of new_snippet that indentation too, unless they
+    # are at the file's indentation already.
+    cases = [
+        ("relative lines", body, lambda a: a.replace_in_body("A.f", "x = 1", "x = 1\nif x > 1:\n    x = 0"),
+         body.replace("        x = 1\n", "        x = 1\n        if x > 1:\n            x = 0\n")),
+        ("lines at the file's indentation", body, lambda a: a.replace_in_body("A.f", "x = 1", "x = 1\n        y = 2"), with_y),
+        ("a snippet in the middle of a line", "def f():\n    x = g(a)\n",
+         lambda a: a.replace_in_body("f", "g(a)", "g(\n    a,\n)"), "def f():\n    x = g(\n        a,\n    )\n"),
+    ]
+    for label, source, action, expected in cases:
+        _exact(f"one-line snippets ({label})", _edit_result("k.py", source, action), expected)
+
+
+# ──────────────────────────────────────────────
+# Content layout: several members in read_symbol's shape, tabs, mixed line
+# endings, stacked siblings
+# ──────────────────────────────────────────────
+
+
+def test_content_layout():
+    print("\n═══ content layout: several members, tabs, mixed line endings, stacked siblings ═══")
+
+    # Content in read_symbol's shape (its first line at column 0, the later
+    # lines at their file indentation) may hold several members: a line at
+    # the symbol's own indentation that starts another member after the one
+    # before it ended counts as one of the symbol's own lines.
+    cls = "class A:\n    def f(self):\n        return 1\n\n    def z(self):\n        return 9\n"
+    two = "class A:\n    def f(self):\n        return 1\n\n    def g(self):\n        return 2\n\n    def z(self):\n        return 9\n"
+    js = "class A {\n  f() {\n    return 1;\n  }\n}\n"
+    cases = [
+        ("python replace_function (reported)", "k.py", cls,
+         lambda a: a.replace_function("A.f", "def f(self):\n        return 1\n\n    def g(self):\n        return 2"), two),
+        ("python insert_sibling before (reported)", "k.py", cls,
+         lambda a: a.insert_sibling("A.z", "def g(self):\n        return 2\n\n    def h(self):\n        return 3", "before"),
+         cls.replace("    def z", "    def g(self):\n        return 2\n\n    def h(self):\n        return 3\n\n    def z")),
+        ("python, the second member decorated (reported)", "k.py", cls,
+         lambda a: a.replace_function("A.f", "def f(self):\n        return 1\n\n    @property\n    def g(self):\n        return 2"),
+         two.replace("    def g", "    @property\n    def g")),
+        ("js replace_function (reported)", "k.js", js,
+         lambda a: a.replace_function("A.f", "f() {\n    return 1;\n  }\n\n  g() {\n    return 2;\n  }"),
+         "class A {\n  f() {\n    return 1;\n  }\n\n  g() {\n    return 2;\n  }\n}\n"),
+        ("python add_method", "k.py", cls,
+         lambda a: a.add_method("A", "def g(self):\n        return 2\n\n    def h(self):\n        return 3"),
+         cls + "\n    def g(self):\n        return 2\n\n    def h(self):\n        return 3\n"),
+        ("python fields", "k.py", "class C:\n    kind: str\n",
+         lambda a: a.replace_function("C.kind", 'kind: str\n    label: str = ""'), 'class C:\n    kind: str\n    label: str = ""\n'),
+        ("java, the second member annotated", "K.java", "class K {\n    void f() {\n    }\n}\n",
+         lambda a: a.replace_function("K.f", 'void f() {\n    }\n\n    @Override\n    public String toString() {\n        return "K";\n    }'),
+         'class K {\n    void f() {\n    }\n\n    @Override\n    public String toString() {\n        return "K";\n    }\n}\n'),
+        ("ruby", "k.rb", "class A\n  def f\n    1\n  end\nend\n",
+         lambda a: a.replace_function("A.f", "def f\n    1\n  end\n\n  def g\n    2\n  end"),
+         "class A\n  def f\n    1\n  end\n\n  def g\n    2\n  end\nend\n"),
+        ("cpp fields", "k.cpp", "struct S {\n    int a;\n};\n",
+         lambda a: a.replace_function("S.a", "int a;\n    int b;"), "struct S {\n    int a;\n    int b;\n};\n"),
+        ("go, a var group", "k.go", "package main\n\nvar (\n\ta = 1\n\tb = 2\n)\n",
+         lambda a: a.replace_function("a", "a = 1\n\tc = 3"), "package main\n\nvar (\n\ta = 1\n\tc = 3\n\tb = 2\n)\n"),
+        ("python, read at another depth", "k.py", cls,
+         lambda a: a.replace_function("A.f", "def f(self):\n            return 1\n\n        def g(self):\n            return 2"), two),
+        # Relative and absolute content is re-indented as before.
+        ("python relative, a nested def", "k.py", cls,
+         lambda a: a.replace_function("A.f", "def f(self):\n    def g():\n        return 1\n    return g"),
+         cls.replace("        return 1\n", "        def g():\n            return 1\n        return g\n")),
+        ("python relative, a class of methods", "k.py", cls,
+         lambda a: a.insert_sibling("A.z", "class B:\n    def m(self):\n        pass\n\n    def n(self):\n        pass", "before"),
+         cls.replace("    def z", "    class B:\n        def m(self):\n            pass\n\n        def n(self):\n            pass\n\n    def z")),
+        ("python relative, two methods", "k.py", cls,
+         lambda a: a.replace_function("A.f", "def f(self):\n    return 1\n\ndef g(self):\n    return 2"), two),
+        ("python absolute, two methods", "k.py", cls,
+         lambda a: a.replace_function("A.f", "    def f(self):\n        return 1\n\n    def g(self):\n        return 2"), two),
+        ("python relative, a call continued at the member level", "k.py", "class A:\n    x = 1\n",
+         lambda a: a.replace_function("A.x", "x = f(\n    1,\n    2)"), "class A:\n    x = f(\n        1,\n        2)\n"),
+        ("js relative", "k.js", js,
+         lambda a: a.replace_function("A.f", "f() {\n  if (a) {\n    b();\n  }\n  return 1;\n}"),
+         "class A {\n  f() {\n    if (a) {\n      b();\n    }\n    return 1;\n  }\n}\n"),
+    ]
+    for label, name, source, action, expected in cases:
+        _exact(f"several members ({label})", _edit_result(name, source, action), expected)
+
+    # Content for a file or block indented with tabs gets its indentation
+    # steps in tabs, and Go content always does. The text of multi-line
+    # strings, a Ruby embedded document, and the spaces that align a block
+    # comment or a continued line stay as written.
+    go_type = "package main\n\ntype T struct {\n\ta int\n}\n"
+    go_f = "package main\n\nfunc f() {\n\tx := 1\n\t_ = x\n}\n"
+    go_if = "package main\n\nfunc f(x int) int {\n\tif x > 0 {\n\t\treturn 1\n\t}\n\treturn 0\n}\n"
+    tab_cls = "class A:\n\tdef a(self):\n\t\tpass\n"
+    cases = [
+        ("go add_method (reported)", "k.go", go_type, lambda a: a.add_method("T", "func (t T) f() {\n    return\n}"),
+         go_type + "\nfunc (t T) f() {\n\treturn\n}\n"),
+        ("go add_method, code right after the type", "k.go", go_type + "func g() {}\n",
+         lambda a: a.add_method("T", "func (t T) f() {\n    return\n}"),
+         go_type + "\nfunc (t T) f() {\n\treturn\n}\n\nfunc g() {}\n"),
+        ("python replace_function (reported)", "k.py", tab_cls, lambda a: a.replace_function("A.a", "def a(self):\n    return 1"),
+         "class A:\n\tdef a(self):\n\t\treturn 1\n"),
+        ("go insert_in_body at the bottom (reported)", "k.go", go_f,
+         lambda a: a.insert_in_body("f", "if x > 0 {\n    x = 2\n}", at="bottom"),
+         go_f.replace("\t_ = x\n", "\t_ = x\n\tif x > 0 {\n\t\tx = 2\n\t}\n")),
+        ("go insert_in_body at the top", "k.go", go_f,
+         lambda a: a.insert_in_body("f", "if true {\n    return\n}", at="top"),
+         go_f.replace("{\n\tx := 1", "{\n\tif true {\n\t\treturn\n\t}\n\tx := 1")),
+        ("go replace_function_body", "k.go", go_f, lambda a: a.replace_function_body("f", "if true {\n    return\n}"),
+         "package main\n\nfunc f() {\n\tif true {\n\t\treturn\n\t}\n}\n"),
+        ("go replace_function_body of a one-line body", "k.go", "package main\n\nfunc f() { return }\n",
+         lambda a: a.replace_function_body("f", "if true {\n    return\n}"),
+         "package main\n\nfunc f() {\n\tif true {\n\t\treturn\n\t}\n}\n"),
+        ("go replace_function at the top level", "k.go", go_f,
+         lambda a: a.replace_function("f", "func f() {\n    if true {\n        return\n    }\n}"),
+         "package main\n\nfunc f() {\n\tif true {\n\t\treturn\n\t}\n}\n"),
+        ("go add_top_level", "k.go", "package main\n", lambda a: a.add_top_level("func g() {\n    return\n}"),
+         "package main\n\nfunc g() {\n\treturn\n}\n"),
+        ("go insert_sibling", "k.go", go_f, lambda a: a.insert_sibling("f", "func g() {\n    return\n}", "after"),
+         go_f + "\nfunc g() {\n\treturn\n}\n"),
+        ("go replace_in_body", "k.go", go_if,
+         lambda a: a.replace_in_body("f", "return 0", "if x < 0 {\n    return -1\n}\nreturn 0"),
+         go_if.replace("\treturn 0\n", "\tif x < 0 {\n\t\treturn -1\n\t}\n\treturn 0\n")),
+        ("go insert_in_body before an anchor", "k.go", go_if,
+         lambda a: a.insert_in_body("f", "if x > 5 {\n    return 5\n}", before="return 0"),
+         go_if.replace("\treturn 0\n", "\tif x > 5 {\n\t\treturn 5\n\t}\n\treturn 0\n")),
+        ("python, a tab file's top level", "k.py", "def a():\n\tpass\n\n\ndef b():\n\tpass\n",
+         lambda a: a.replace_function("b", "def b():\n    if x:\n        return 1"),
+         "def a():\n\tpass\n\n\ndef b():\n\tif x:\n\t\treturn 1\n"),
+        ("python, a multi-line string keeps its text", "k.py", tab_cls,
+         lambda a: a.replace_function("A.a", 'def a(self):\n    s = """x\n    y"""\n    return s'),
+         'class A:\n\tdef a(self):\n\t\ts = """x\n    y"""\n\t\treturn s\n'),
+        ("python, a docstring moves with the code", "k.py", tab_cls,
+         lambda a: a.replace_function("A.a", 'def a(self):\n    """Doc.\n\n    More.\n    """\n    return 1'),
+         'class A:\n\tdef a(self):\n\t\t"""Doc.\n\n\t\tMore.\n\t\t"""\n\t\treturn 1\n'),
+        ("python, a continued line aligned with spaces", "k.py", tab_cls,
+         lambda a: a.replace_function("A.a", "def a(self, x,\n      y):\n    return x"),
+         "class A:\n\tdef a(self, x,\n\t      y):\n\t\treturn x\n"),
+        ("ruby, an embedded document stays at column 0", "k.rb", "class A\n\tdef f\n\t\t1\n\tend\nend\n",
+         lambda a: a.replace_function("A.f", "def f\n=begin\nx\n=end\n  2\nend"),
+         "class A\n\tdef f\n=begin\nx\n=end\n\t\t2\n\tend\nend\n"),
+        ("go, a block comment keeps its alignment", "k.go", "package main\n",
+         lambda a: a.add_top_level("func g() {\n    /*\n     * x\n     */\n    return\n}"),
+         "package main\n\nfunc g() {\n\t/*\n\t * x\n\t */\n\treturn\n}\n"),
+        ("java, a javadoc in a tab class", "K.java", "class K {\n\tint a;\n}\n",
+         lambda a: a.add_method("K", "/**\n * Doc.\n */\nvoid f() {\n    g();\n}"),
+         "class K {\n\tint a;\n\n\t/**\n\t * Doc.\n\t */\n\tvoid f() {\n\t\tg();\n\t}\n}\n"),
+        ("content in tabs goes in as written", "k.go", go_f,
+         lambda a: a.insert_in_body("f", "if x > 0 {\n\tx = 2\n}", at="bottom"),
+         go_f.replace("\t_ = x\n", "\t_ = x\n\tif x > 0 {\n\t\tx = 2\n\t}\n")),
+        ("a file indented with spaces keeps them", "k.py", cls,
+         lambda a: a.replace_function("A.z", "def z(self):\n  if x:\n    return 9"),
+         cls.replace("        return 9\n", "      if x:\n        return 9\n")),
+    ]
+    for label, name, source, action, expected in cases:
+        _exact(f"tabs ({label})", _edit_result(name, source, action), expected)
+    # read_symbol's text given back leaves a tab file as it was, also
+    # where spaces align a continued line.
+    for label, name, source, target in [
+        ("go", "k.go", go_if, "f"),
+        ("python", "k.py", tab_cls, "A.a"),
+        ("c, a prototype continued with spaces", "k.c", "int f(int a,\n      int b);\n\nint g(void)\n{\n\treturn 0;\n}\n", "f"),
+        ("c, a function continued with spaces", "k.c", "int f(int a,\n      int b)\n{\n\treturn a;\n}\n", "f"),
+    ]:
+        _exact(f"tabs round trip ({label})", _round_trip(name, source, target), "<unchanged>")
+
+    # A file that mixes CRLF and LF line breaks keeps them on the lines an
+    # edit leaves alone. The lines it writes take the break of the lines
+    # they replace, else of the lines around them, else the file's most
+    # common one.
+    mixed = "/*!\n x\n*/\nfunction f() {\r\n}\r\nfunction g() {\r\n}\r\n"
+    lf_f = "def f():\n    x = 1\n    y = 2\n\r\n\r\ndef g():\r\n    a = 1\r\n    b = 2\r\n    pass\r\n"
+    cases = [
+        ("replace_function (reported)", "k.js", mixed, lambda a: a.replace_function("g", "function g() {\n  return 1;\n}"),
+         "/*!\n x\n*/\nfunction f() {\r\n}\r\nfunction g() {\r\n  return 1;\r\n}\r\n"),
+        ("a changed line keeps its break", "k.py", "a = 1\nb = 2\r\nc = 3\r\n", lambda a: a.replace_value("a", "5"),
+         "a = 5\nb = 2\r\nc = 3\r\n"),
+        ("new lines between lines with LF", "k.py", lf_f, lambda a: a.insert_in_body("f", "z = 3", after="x = 1"),
+         lf_f.replace("    x = 1\n", "    x = 1\n    z = 3\n")),
+        ("lines around that differ, the most common", "k.py", lf_f, lambda a: a.insert_in_body("f", "z = 3", at="bottom"),
+         lf_f.replace("    y = 2\n", "    y = 2\n    z = 3\r\n")),
+        ("delete_symbol", "k.js", mixed, lambda a: a.delete_symbol("f", include_leading_comments=False),
+         "/*!\n x\n*/\nfunction g() {\r\n}\r\n"),
+        ("a file without a final line break", "k.py", "a = 1\r\nb = 2\r\nc = 3\nd = 4",
+         lambda a: a.replace_value("b", "5"), "a = 1\r\nb = 5\r\nc = 3\nd = 4"),
+        ("the end of the file", "k.py", "a = 1\r\nb = 2\r\nc = 3\n", lambda a: a.add_top_level("d = 4"),
+         "a = 1\r\nb = 2\r\nc = 3\nd = 4\n"),
+        ("a byte order mark", "k.py", "\ufeffa = 1\r\nb = 2\n", lambda a: a.replace_value("a", "3"), "\ufeffa = 3\r\nb = 2\n"),
+    ]
+    for label, name, source, action, expected in cases:
+        _exact(f"mixed line endings ({label})", _edit_result(name, source, action), expected)
+
+    # New code gets the gap that separates the target from its neighbour on
+    # that side, or, when there is none, at most the usual one from its
+    # other side; code over several lines, a Python def or class, keeps at
+    # least the usual blank line (two around a top-level Python def/class).
+    cell = 'from dataclasses import dataclass\n\n\n@dataclass\nclass Cell:\n    kind: str\n    label: str = ""\n    source: str = ""\n'
+    protos = "int f(void);\nint g(void);\n"
+    stacked = "int f(void);\nint h(void);\nint g(void);\n"
+    fields = "class A {\n  a = 1;\n  b = 2;\n}\n"
+    cases = [
+        ("after a stacked field (reported)", "k.py", cell,
+         lambda a: a.insert_sibling("Cell.label", 'fence: str = "```"', "after"),
+         cell.replace("    source", '    fence: str = "```"\n    source')),
+        ("after a stacked prototype (reported)", "k.c", protos, lambda a: a.insert_sibling("f", "int h(void);", "after"), stacked),
+        ("before a stacked prototype", "k.c", protos, lambda a: a.insert_sibling("g", "int h(void);", "before"), stacked),
+        ("after the last stacked field", "k.py", cell, lambda a: a.insert_sibling("Cell.source", "fence: str", "after"),
+         cell + "    fence: str\n"),
+        ("before the first stacked field", "k.py", cell, lambda a: a.insert_sibling("Cell.kind", "x: int", "before"),
+         cell.replace("    kind", "    x: int\n    kind")),
+        ("a commented prototype", "k.c", protos, lambda a: a.insert_sibling("f", "// h\nint h(void);", "after"),
+         "int f(void);\n// h\nint h(void);\nint g(void);\n"),
+        ("a wider gap", "k.c", "int f(void);\n\n\nint g(void);\n", lambda a: a.insert_sibling("f", "int h(void);", "after"),
+         "int f(void);\n\n\nint h(void);\n\n\nint g(void);\n"),
+        ("stacked with the target, apart from the code above", "k.c", "int a;\n\nint b;\nint c;\n",
+         lambda a: a.insert_sibling("b", "int n;", "before"), "int a;\n\nint n;\nint b;\nint c;\n"),
+        ("below imports, above stacked constants", "k.py", "import os\n\n\nX = 1\nY = 2\n",
+         lambda a: a.insert_sibling("X", "W = 0", "before"), "import os\n\n\nW = 0\nX = 1\nY = 2\n"),
+        ("a constant after a def", "k.py", "def f():\n    pass\n\n\nX = 1\n", lambda a: a.insert_sibling("f", "W = 0", "after"),
+         "def f():\n    pass\n\n\nW = 0\n\nX = 1\n"),
+        ("a function between prototypes", "k.c", protos,
+         lambda a: a.insert_sibling("f", "int h(void) {\n    return 0;\n}", "after"),
+         "int f(void);\n\nint h(void) {\n    return 0;\n}\n\nint g(void);\n"),
+        ("a constant after stacked constants, before a def", "k.py", "X = 1\nY = 2\n\n\ndef f():\n    pass\n",
+         lambda a: a.insert_sibling("Y", "Z = 3", "after"), "X = 1\nY = 2\nZ = 3\n\n\ndef f():\n    pass\n"),
+        ("a field before a method", "k.py", "class C:\n    a: int\n    b: int\n\n    def m(self):\n        pass\n",
+         lambda a: a.insert_sibling("C.b", "c: int", "after"),
+         "class C:\n    a: int\n    b: int\n    c: int\n\n    def m(self):\n        pass\n"),
+        ("a method between stacked fields", "k.py", "class C:\n    a: int\n    b: int\n",
+         lambda a: a.insert_sibling("C.a", "def m(self):\n    pass", "after"),
+         "class C:\n    a: int\n\n    def m(self):\n        pass\n\n    b: int\n"),
+        ("a lone field", "k.py", "class C:\n    a: int\n", lambda a: a.insert_sibling("C.a", "b: int", "after"),
+         "class C:\n    a: int\n\n    b: int\n"),
+        ("functions keep their blank line", "k.js", "function a() {\n}\n\nfunction b() {\n}\n",
+         lambda a: a.insert_sibling("a", "const x = 1;", "after"), "function a() {\n}\n\nconst x = 1;\n\nfunction b() {\n}\n"),
+        # add_top_level and add_method put data after stacked data the same way.
+        ("add_top_level after stacked prototypes", "k.c", protos, lambda a: a.add_top_level("int h(void);"),
+         protos + "int h(void);\n"),
+        ("add_top_level after a function", "k.c", "int f(void) {\n    return 0;\n}\n", lambda a: a.add_top_level("int h(void);"),
+         "int f(void) {\n    return 0;\n}\n\nint h(void);\n"),
+        ("add_top_level in an include guard", "k.h", "#ifndef K_H\n#define K_H\n\nint f(void);\nint g(void);\n\n#endif\n",
+         lambda a: a.add_top_level("int h(void);"), "#ifndef K_H\n#define K_H\n\nint f(void);\nint g(void);\nint h(void);\n\n#endif\n"),
+        ("add_method, a python field", "k.py", "class C:\n    a: int\n    b: int\n", lambda a: a.add_method("C", "c: int"),
+         "class C:\n    a: int\n    b: int\n    c: int\n"),
+        ("add_method, a js field", "k.js", fields, lambda a: a.add_method("A", "c = 3;"), fields.replace("  b = 2;\n", "  b = 2;\n  c = 3;\n")),
+        ("add_method, a method after fields", "k.js", fields, lambda a: a.add_method("A", "m() {\n  return 1;\n}"),
+         fields.replace("  b = 2;\n", "  b = 2;\n\n  m() {\n    return 1;\n  }\n")),
+    ]
+    for label, name, source, action, expected in cases:
+        _exact(f"stacked siblings ({label})", _edit_result(name, source, action), expected)
+
+
+# ──────────────────────────────────────────────
+# Import lists by line, module docstrings, C void lists, Python parameter
+# markers, comments before a symbol, one-line and empty bodies
+# ──────────────────────────────────────────────
+
+
+def test_lists_docstrings_bodies():
+    print("\n═══ import lists, module docstrings, (void), parameter markers, comments on a symbol's line, bodies ═══")
+
+    # add_import_name follows the layout of the name list, as add_key and
+    # append_to_array do: names one per line get a new line at their
+    # indentation, with the list's trailing-comma style, and an inline list
+    # stays inline. remove_import_name takes a name on a line of its own
+    # with that line, the comment at its end included.
+    # (label, file name, source, edit, expected file text)
+    one = 'import {\n  a,\n  b,\n} from "m";\n'
+    commented = "from m import (\n    a,  # A\n    b,  # B\n)\n"
+    cases = [
+        ("py add_import_name, one name per line (reported)", "m.py", "from .parser import (\n    _A,\n    _B,\n)\n\nx = 1\n",
+         lambda a: a.add_import_name(".parser", "_C"), "from .parser import (\n    _A,\n    _B,\n    _C,\n)\n\nx = 1\n"),
+        ("py add_import_name without a trailing comma", "m.py", "from m import (\n    a,\n    b\n)\n",
+         lambda a: a.add_import_name("m", "c"), "from m import (\n    a,\n    b,\n    c\n)\n"),
+        ("py add_import_name after a comment on the last line", "m.py", commented,
+         lambda a: a.add_import_name("m", "c"), "from m import (\n    a,  # A\n    b,  # B\n    c,\n)\n"),
+        ("py add_import_name to one name on its own line", "m.py", "from m import (\n    a,\n)\n",
+         lambda a: a.add_import_name("m", "c"), "from m import (\n    a,\n    c,\n)\n"),
+        ("py add_import_name with an alias", "m.py", "from m import (\n    a as x,\n    b,\n)\n",
+         lambda a: a.add_import_name("m", "c as d"), "from m import (\n    a as x,\n    b,\n    c as d,\n)\n"),
+        ("py add_import_name above a comment line before the )", "m.py", "from m import (\n    a,\n    b,\n    # c later\n)\n",
+         lambda a: a.add_import_name("m", "c"), "from m import (\n    a,\n    b,\n    c,\n    # c later\n)\n"),
+        ("py add_import_name to names aligned under the (", "m.py", "from m import (a,\n               b)\n",
+         lambda a: a.add_import_name("m", "c"), "from m import (a,\n               b,\n               c)\n"),
+        ("py add_import_name inline in parentheses", "m.py", "from m import (a, b)\n",
+         lambda a: a.add_import_name("m", "c"), "from m import (a, b, c)\n"),
+        ("py add_import_name inline", "m.py", "from m import a, b\n",
+         lambda a: a.add_import_name("m", "c"), "from m import a, b, c\n"),
+        ("py add_import_name after a backslash continuation", "m.py", "from m import a, \\\n    b\n",
+         lambda a: a.add_import_name("m", "c"), "from m import a, \\\n    b, c\n"),
+        ("js add_import_name, one name per line (reported)", "m.js", one,
+         lambda a: a.add_import_name("m", "c"), 'import {\n  a,\n  b,\n  c,\n} from "m";\n'),
+        ("js add_import_name without a trailing comma", "m.js", 'import {\n  a,\n  b\n} from "m";\n',
+         lambda a: a.add_import_name("m", "c"), 'import {\n  a,\n  b,\n  c\n} from "m";\n'),
+        ("js add_import_name with a default import", "m.js", 'import D, {\n  a,\n  b,\n} from "m";\n',
+         lambda a: a.add_import_name("m", "c"), 'import D, {\n  a,\n  b,\n  c,\n} from "m";\n'),
+        ("js add_import_name inline", "m.js", 'import { a, b } from "m";\n',
+         lambda a: a.add_import_name("m", "c"), 'import { a, b, c } from "m";\n'),
+        ("js add_import_name inline with a trailing comma", "m.js", 'import { a, b, } from "m";\n',
+         lambda a: a.add_import_name("m", "c"), 'import { a, b, c, } from "m";\n'),
+        ("ts add_import_name to a type import", "m.ts", 'import type {\n  A,\n  B,\n} from "m";\n',
+         lambda a: a.add_import_name("m", "C"), 'import type {\n  A,\n  B,\n  C,\n} from "m";\n'),
+        ("ts add_import_name of a type name", "m.ts", 'import {\n  type A,\n  b,\n} from "m";\n',
+         lambda a: a.add_import_name("m", "type C"), 'import {\n  type A,\n  b,\n  type C,\n} from "m";\n'),
+        ("py remove_import_name of the last name with its comment", "m.py", commented,
+         lambda a: a.remove_import_name("m", "b"), "from m import (\n    a,  # A\n)\n"),
+        ("py remove_import_name of a middle name with its comment", "m.py", "from m import (\n    a,  # A\n    b,  # B\n    c,\n)\n",
+         lambda a: a.remove_import_name("m", "b"), "from m import (\n    a,  # A\n    c,\n)\n"),
+        ("py remove_import_name of the first name", "m.py", commented,
+         lambda a: a.remove_import_name("m", "a"), "from m import (\n    b,  # B\n)\n"),
+        ("py remove_import_name without a trailing comma", "m.py", "from m import (\n    a,\n    b\n)\n",
+         lambda a: a.remove_import_name("m", "b"), "from m import (\n    a\n)\n"),
+        ("py remove_import_name inline in parentheses", "m.py", "from m import (a, b, c)\n",
+         lambda a: a.remove_import_name("m", "b"), "from m import (a, c)\n"),
+        ("py remove_import_name inline", "m.py", "from m import a, b, c\n",
+         lambda a: a.remove_import_name("m", "c"), "from m import a, b\n"),
+        ("js remove_import_name of the last name with its comment", "m.js", 'import {\n  a, // A\n  b, // B\n} from "m";\n',
+         lambda a: a.remove_import_name("m", "b"), 'import {\n  a, // A\n} from "m";\n'),
+        ("js remove_import_name of a middle name", "m.js", 'import {\n  a, // A\n  b, // B\n  c,\n} from "m";\n',
+         lambda a: a.remove_import_name("m", "b"), 'import {\n  a, // A\n  c,\n} from "m";\n'),
+        ("ts remove_import_name from a type import", "m.ts", 'import type {\n  A,\n  B,\n} from "m";\n',
+         lambda a: a.remove_import_name("m", "B"), 'import type {\n  A,\n} from "m";\n'),
+        ("ts remove_import_name of a type name inline", "m.ts", 'import { type A, b } from "m";\n',
+         lambda a: a.remove_import_name("m", "A"), 'import { b } from "m";\n'),
+    ]
+    for label, name, source, action, expected in cases:
+        _exact(label, _edit_result(name, source, action), expected)
+    _exact("js add_import_name, one name per line (CRLF)",
+           _edit_result("m.js", one, lambda a: a.add_import_name("m", "c"), "\r\n"),
+           'import {\r\n  a,\r\n  b,\r\n  c,\r\n} from "m";\r\n')
+
+    # replace_docstring with the target "" edits the module docstring: it
+    # replaces the one the module starts with, or inserts one before the
+    # first statement, below a `#!` line, an encoding line and a header
+    # comment set off by a blank line (a comment right above the first
+    # statement stays with it), followed by one blank line, two before a
+    # def or class.
+    new = '"""New."""'
+    cases = [
+        ("module docstring replaced", '"""Old."""\n\nimport os\n', new, '"""New."""\n\nimport os\n'),
+        ("module docstring replaced below a #! line and a comment", '#!/usr/bin/env python\n# tool\n"""Old."""\nimport os\n',
+         new, '#!/usr/bin/env python\n# tool\n"""New."""\nimport os\n'),
+        ("module docstring alone replaced", "'''Old.'''\n", new, '"""New."""\n'),
+        ("module docstring inserted below #!, above a __future__ import (reported)",
+         "#!/usr/bin/env python\nfrom __future__ import annotations\nimport os\n", new,
+         '#!/usr/bin/env python\n"""New."""\n\nfrom __future__ import annotations\nimport os\n'),
+        ("module docstring inserted below an encoding line", "# -*- coding: utf-8 -*-\nimport os\n", new,
+         '# -*- coding: utf-8 -*-\n"""New."""\n\nimport os\n'),
+        ("module docstring inserted below a header comment", "# Copyright A\n# License B\n\nimport os\n", new,
+         '# Copyright A\n# License B\n\n"""New."""\n\nimport os\n'),
+        ("module docstring inserted above the first statement's comment", "# needed for X\nimport os\n", new,
+         '"""New."""\n\n# needed for X\nimport os\n'),
+        ("module docstring inserted before a def", "def f():\n    pass\n", new, '"""New."""\n\n\ndef f():\n    pass\n'),
+        ("module docstring inserted before a decorated class", "@dataclass\nclass A:\n    pass\n", new,
+         '"""New."""\n\n\n@dataclass\nclass A:\n    pass\n'),
+        ("module docstring inserted after a blank line below #!", "#!/usr/bin/env python\n\nimport os\n", new,
+         '#!/usr/bin/env python\n\n"""New."""\n\nimport os\n'),
+        ("module docstring inserted below a #! line alone", "#!/usr/bin/env python\n", new,
+         '#!/usr/bin/env python\n"""New."""\n'),
+        ("module docstring inserted below comments alone", "# notes\n", new, '# notes\n\n"""New."""\n'),
+        ("module docstring inserted, a later string is no docstring", 'import os\n"""Notes."""\n', new,
+         '"""New."""\n\nimport os\n"""Notes."""\n'),
+        ("module docstring of several lines inserted", "import os\n", '"""Summary.\n\nMore.\n"""',
+         '"""Summary.\n\nMore.\n"""\n\nimport os\n'),
+    ]
+    for label, source, docstring, expected in cases:
+        _exact(label, _edit_result("d.py", source, lambda a: a.replace_docstring("", docstring)), expected)
+    _exact("module docstring inserted (CRLF)",
+           _edit_result("d.py", "import os\n", lambda a: a.replace_docstring("", new), "\r\n"),
+           '"""New."""\r\n\r\nimport os\r\n')
+    for label, docstring in [("text", "New."), ("a name", "New"), ("an f-string", 'f"""New."""')]:
+        _refused(f"module docstring that is no string literal ({label})",
+                 _edit_result("d.py", "import os\n", lambda a: a.replace_docstring("", docstring)),
+                 "new_docstring is not a Python string literal")
+
+    # C: `(void)` is an empty parameter list. add_parameter replaces the
+    # `void`, and removing the last parameter of a C function leaves
+    # `(void)`, since `()` declares unspecified parameters before C23; C++
+    # keeps `()`.
+    cases = [
+        ("c add_parameter to (void) (reported)", "f.c", "int f(void) { return 0; }\n",
+         lambda a: a.add_parameter("f", "int c"), "int f(int c) { return 0; }\n"),
+        ("c add_parameter at the start of (void)", "f.c", "int f(void) { return 0; }\n",
+         lambda a: a.add_parameter("f", "int c", "start"), "int f(int c) { return 0; }\n"),
+        ("c add_parameter to a prototype's (void)", "f.h", "int f(void);\n",
+         lambda a: a.add_parameter("f", "int c"), "int f(int c);\n"),
+        ("cpp add_parameter to (void)", "f.cpp", "int f(void) {}\n",
+         lambda a: a.add_parameter("f", "int c"), "int f(int c) {}\n"),
+        ("c add_parameter after a void pointer", "f.c", "int f(void *p) { return 0; }\n",
+         lambda a: a.add_parameter("f", "int c"), "int f(void *p, int c) { return 0; }\n"),
+        ("c remove_parameter of the last one (reported)", "f.c", "int f(int a) { return 0; }\n",
+         lambda a: a.remove_parameter("f", "a"), "int f(void) { return 0; }\n"),
+        ("c remove_parameter of a prototype's last one", "f.h", "int f(int a);\n",
+         lambda a: a.remove_parameter("f", "a"), "int f(void);\n"),
+        ("c remove_parameter of the last one, on its own line", "f.c", "int f(\n    int a\n) { return 0; }\n",
+         lambda a: a.remove_parameter("f", "a"), "int f(void) { return 0; }\n"),
+        ("c remove_parameter of the last one with the comment after it", "f.c", "int f(int a /* the a */) { return 0; }\n",
+         lambda a: a.remove_parameter("f", "a"), "int f(void) { return 0; }\n"),
+        ("c remove_parameter of the last one, a comment before it kept", "f.c", "int f(/* x */ int a) { return 0; }\n",
+         lambda a: a.remove_parameter("f", "a"), "int f(/* x */ void) { return 0; }\n"),
+        ("c remove_parameter of the last one, a comment line kept", "f.c", "int f(\n    // the a\n    int a\n) { return 0; }\n",
+         lambda a: a.remove_parameter("f", "a"), "int f(\n    // the a\n    void\n) { return 0; }\n"),
+        ("c remove_parameter of one of two", "f.c", "int f(int a, int b) { return b; }\n",
+         lambda a: a.remove_parameter("f", "a"), "int f(int b) { return b; }\n"),
+        ("cpp remove_parameter of the last one", "f.cpp", "int f(int a) { return 0; }\n",
+         lambda a: a.remove_parameter("f", "a"), "int f() { return 0; }\n"),
+    ]
+    for label, name, source, action, expected in cases:
+        _exact(label, _edit_result(name, source, action), expected)
+
+    # Python: a bare `*` needs a keyword-only parameter after it and a `/`
+    # a parameter before it, so removing the last of them takes the marker
+    # too. add_parameter at the end goes before `**kwargs`, which must come
+    # last.
+    cases = [
+        ("remove the only keyword-only parameter (reported)", "def f(a, *, b):\n", "b", "def f(a):\n"),
+        ("remove the only positional-only parameter (reported)", "def f(a, /, b):\n", "a", "def f(b):\n"),
+        ("remove a keyword-only parameter of two", "def f(a, *, b, c):\n", "b", "def f(a, *, c):\n"),
+        ("remove the keyword-only parameter before **kwargs", "def f(a, *, b, **kw):\n", "b", "def f(a, **kw):\n"),
+        ("remove the only parameter after *", "def f(*, b):\n", "b", "def f():\n"),
+        ("remove the only parameter before /", "def f(a, /):\n", "a", "def f():\n"),
+        ("remove a positional-only parameter of two", "def f(a, b, /, c):\n", "a", "def f(b, /, c):\n"),
+        ("remove a typed keyword-only parameter", 'def f(a: int, *, b: str = "") -> None:\n', "b",
+         "def f(a: int) -> None:\n"),
+        ("remove one per line", "def f(\n    a,\n    *,\n    b,\n):\n", "b", "def f(\n    a,\n):\n"),
+        ("remove one per line without a trailing comma", "def f(\n    a,\n    *,\n    b\n):\n", "b", "def f(\n    a\n):\n"),
+        ("remove one per line before /", "def f(\n    a,\n    /,\n    b,\n):\n", "a", "def f(\n    b,\n):\n"),
+    ]
+    for label, head, name, expected in cases:
+        _exact(f"py {label}", _edit_result("p.py", head + "    pass\n", lambda a: a.remove_parameter("f", name)),
+               expected + "    pass\n")
+    _exact("py remove the only keyword-only parameter of a method",
+           _edit_result("p.py", "class A:\n    def f(self, *, b):\n        pass\n", lambda a: a.remove_parameter("A.f", "b")),
+           "class A:\n    def f(self):\n        pass\n")
+    cases = [
+        ("add before **kwargs", "def f(a, **kw):\n", "b", "end", "def f(a, b, **kw):\n"),
+        ("add a keyword-only parameter before **kwargs", "def f(self, *args, **kwargs):\n", "timeout=None", "end",
+         "def f(self, *args, timeout=None, **kwargs):\n"),
+        ("add before a typed **kwargs", "def f(a, **kw: int):\n", "b", "end", "def f(a, b, **kw: int):\n"),
+        ("add before a lone **kwargs", "def f(**kw):\n", "b", "end", "def f(b, **kw):\n"),
+        ("add one per line before **kwargs", "def f(\n    a,\n    **kw,\n):\n", "b", "end",
+         "def f(\n    a,\n    b,\n    **kw,\n):\n"),
+        ("add one per line before **kwargs without a trailing comma", "def f(\n    a,\n    **kw\n):\n", "b", "end",
+         "def f(\n    a,\n    b,\n    **kw\n):\n"),
+        ("add above the comment over **kwargs", "def f(\n    a,\n    # options\n    **kw,\n):\n", "b", "end",
+         "def f(\n    a,\n    b,\n    # options\n    **kw,\n):\n"),
+        ("add after a keyword-only parameter", "def f(a, *, b):\n", "c", "end", "def f(a, *, b, c):\n"),
+        ("add at the start before /", "def f(a, /, b):\n", "c", "start", "def f(c, a, /, b):\n"),
+        ("add **kwargs after *args", "def f(a, *args):\n", "**kw", "end", "def f(a, *args, **kw):\n"),
+    ]
+    for label, head, parameter, position, expected in cases:
+        _exact(f"py {label}",
+               _edit_result("p.py", head + "    pass\n", lambda a: a.add_parameter("f", parameter, position)),
+               expected + "    pass\n")
+
+    # A comment before a symbol on its first line (`/** @type {X} */ let
+    # x;`) is not part of it, and replace_function keeps it there, as it
+    # keeps code before the symbol.
+    # (label, file name, source, target)
+    cases = [
+        ("js (reported)", "x.js", "/** @type {X} */ let x;\nlet y;\n", "x"),
+        ("ts", "x.ts", "/* a */ function f(): void {}\nlet y = 1;\n", "f"),
+        ("ts over several lines", "x.ts", "/* a */ function f(): void {\n  g();\n}\n", "f"),
+        ("two comments", "x.js", "/* a */ /* b */ let x;\n", "x"),
+        ("c", "x.c", "/* a */ int f(void) { return 0; }\nint g;\n", "f"),
+        ("cpp", "x.cpp", "/* a */ int f() { return 0; }\n", "f"),
+        ("java", "K.java", "class K {\n    /* a */ int f() { return 0; }\n}\n", "K.f"),
+        ("java over several lines", "K.java", "class K {\n    /** a */ int f() {\n        return 0;\n    }\n}\n", "K.f"),
+        ("go", "x.go", "package main\n\n/* a */ func f() {}\n", "f"),
+    ]
+    for label, name, source, target in cases:
+        check(f"comment before the symbol on its line, {label}: round trip", _round_trip(name, source, target), "<unchanged>")
+    cases = [
+        ("js", "x.js", "/** @type {X} */ let x;\nlet y;\n", lambda a: a.replace_function("x", "let x = 1;"),
+         "/** @type {X} */ let x = 1;\nlet y;\n"),
+        ("js, with a comment after it", "x.js", "/* a */ let x; // x\n", lambda a: a.replace_function("x", "let x = 2;"),
+         "/* a */ let x = 2; // x\n"),
+        ("ts, content over several lines", "x.ts", "/* a */ function f(): void {}\nlet y = 1;\n",
+         lambda a: a.replace_function("f", "function f(): void {\n  g();\n}"),
+         "/* a */ function f(): void {\n  g();\n}\nlet y = 1;\n"),
+        ("c", "x.c", "/* a */ int f(void) { return 0; }\nint g;\n",
+         lambda a: a.replace_function("f", "int f(void) { return 1; }"), "/* a */ int f(void) { return 1; }\nint g;\n"),
+        ("java, read_symbol's shape", "K.java", "class K {\n    /* a */ int f() { return 0; }\n}\n",
+         lambda a: a.replace_function("K.f", "int f() {\n        return 1;\n    }"),
+         "class K {\n    /* a */ int f() {\n        return 1;\n    }\n}\n"),
+        ("java, relative content", "K.java", "class K {\n    /* a */ int f() { return 0; }\n}\n",
+         lambda a: a.replace_function("K.f", "int f() {\n    return 1;\n}"),
+         "class K {\n    /* a */ int f() {\n        return 1;\n    }\n}\n"),
+        ("go", "x.go", "package main\n\n/* a */ func f() {}\n",
+         lambda a: a.replace_function("f", "func f() {\n\treturn\n}"), "package main\n\n/* a */ func f() {\n\treturn\n}\n"),
+    ]
+    for label, name, source, action, expected in cases:
+        _exact(f"comment before the symbol on its line, {label}: replace_function", _edit_result(name, source, action), expected)
+
+    # A comment after a Python body written on its signature's line stays
+    # on that line when replace_function_body puts the body on lines of
+    # its own; read_symbol shows it as part of the function.
+    one_line = "def b(): pass  # old\n"
+    cases = [
+        ("replace_function_body (reported)", one_line, lambda a: a.replace_function_body("b", "x()"),
+         "def b():  # old\n    x()\n"),
+        ("replace_function_body with several lines", one_line, lambda a: a.replace_function_body("b", "x()\ny()"),
+         "def b():  # old\n    x()\n    y()\n"),
+        ("replace_function_body of a method", "class A:\n    def b(self): pass  # old\n",
+         lambda a: a.replace_function_body("A.b", "x()"), "class A:\n    def b(self):  # old\n        x()\n"),
+        ("replace_function_body of several statements", "def c(): return 1; x = 2  # c\n",
+         lambda a: a.replace_function_body("c", "y()"), "def c():  # c\n    y()\n"),
+        ("replace_function_body of a class", "class A: pass  # k\n",
+         lambda a: a.replace_function_body("A", "x = 1"), "class A:  # k\n    x = 1\n"),
+        ("replace_function_body of a decorated function", "@d\ndef b(): pass  # old\n",
+         lambda a: a.replace_function_body("b", "x()"), "@d\ndef b():  # old\n    x()\n"),
+        ("replace_function_body, the next def kept", "def b(): pass  # old\ndef c(): pass\n",
+         lambda a: a.replace_function_body("b", "x()"), "def b():  # old\n    x()\ndef c(): pass\n"),
+        ("replace_function_body without a comment", "def b(): pass\n",
+         lambda a: a.replace_function_body("b", "x()"), "def b():\n    x()\n"),
+        ("replace_in_body", one_line, lambda a: a.replace_in_body("b", "pass", "x()"), "def b(): x()  # old\n"),
+    ]
+    for label, source, action, expected in cases:
+        _exact(f"py one-line body with a comment: {label}", _edit_result("b.py", source, action), expected)
+    _exact("py one-line body with a comment: read_symbol",
+           _read_result("b.py", one_line, lambda a: a.read_symbol("b")), "def b(): pass  # old")
+    check("py one-line body with a comment: round trip", _round_trip("b.py", one_line, "b"), "<unchanged>")
+    _refused("py one-line body with a comment: insert_in_body at the top",
+             _edit_result("b.py", one_line, lambda a: a.insert_in_body("b", "x()", at="top")), "shares a line")
+
+    # An empty Ruby method (`def f` over `end`) has no body node; content
+    # goes one level deeper than its `def`, between the signature and the
+    # `end`, and a method on one line (`def h; end`) is opened up.
+    cls = "class A\n  def f\n  end\nend\n"
+    filled = "class A\n  def f\n    1\n  end\nend\n"
+    cases = [
+        ("replace_function_body (reported)", cls, lambda a: a.replace_function_body("A.f", "1"), filled),
+        ("insert_in_body at the top", cls, lambda a: a.insert_in_body("A.f", "1", at="top"), filled),
+        ("insert_in_body at the bottom", cls, lambda a: a.insert_in_body("A.f", "1", at="bottom"), filled),
+        ("with parameters", "def f(a)\nend\n", lambda a: a.replace_function_body("f", "a"), "def f(a)\n  a\nend\n"),
+        ("with a signature over two lines", "class A\n  def g\n    1\n  end\n\n  def f(a,\n        b)\n  end\nend\n",
+         lambda a: a.replace_function_body("A.f", "a"), "class A\n  def g\n    1\n  end\n\n  def f(a,\n        b)\n    a\n  end\nend\n"),
+        ("with a comment on the def line", "class A\n  def g # c\n  end\nend\n",
+         lambda a: a.replace_function_body("A.g", "1"), "class A\n  def g # c\n    1\n  end\nend\n"),
+        ("with a comment inside", "def f\n  # todo\nend\n", lambda a: a.replace_function_body("f", "1"), "def f\n  1\nend\n"),
+        ("insert_in_body at the top, above a comment", "def f\n  # todo\nend\n",
+         lambda a: a.insert_in_body("f", "1", at="top"), "def f\n  1\n  # todo\nend\n"),
+        ("insert_in_body at the bottom, below a comment", "def f\n  # todo\nend\n",
+         lambda a: a.insert_in_body("f", "1", at="bottom"), "def f\n  # todo\n  1\nend\n"),
+        ("with a blank line inside", "def f\n\nend\n", lambda a: a.replace_function_body("f", "1"), "def f\n  1\nend\n"),
+        ("with content over several lines", "def f\nend\n", lambda a: a.replace_function_body("f", "if x\n  1\nend"),
+         "def f\n  if x\n    1\n  end\nend\n"),
+        ("on one line", "def h; end\n", lambda a: a.replace_function_body("h", "1"), "def h\n  1\nend\n"),
+        ("on one line, in a class", "class A\n  def h; end\nend\n", lambda a: a.replace_function_body("A.h", "1"),
+         "class A\n  def h\n    1\n  end\nend\n"),
+        ("on one line with parameters", "def h(a); end\n", lambda a: a.replace_function_body("h", "a"),
+         "def h(a)\n  a\nend\n"),
+        ("a singleton method", "class A\n  def self.f\n  end\nend\n", lambda a: a.replace_function_body("A.f", "1"),
+         "class A\n  def self.f\n    1\n  end\nend\n"),
+    ]
+    for label, source, action, expected in cases:
+        _exact(f"rb empty method: {label}", _edit_result("e.rb", source, action), expected)
+    _refused("rb empty method on one line: insert_in_body at the top",
+             _edit_result("e.rb", "def h; end\n", lambda a: a.insert_in_body("h", "1", at="top")), "shares a line")
+    _refused("rb empty method: replace_in_body",
+             _edit_result("e.rb", "def f\nend\n", lambda a: a.replace_in_body("f", "1", "2")),
+             "The body of 'f' is empty")
+    _refused("rb empty method: insert_in_body after an anchor",
+             _edit_result("e.rb", "def f\nend\n", lambda a: a.insert_in_body("f", "2", after="1")),
+             "The body of 'f' is empty")
+    # Empty braced bodies already take content one level deeper.
+    cases = [
+        ("js insert_in_body at the top", "e.js", "function f() {\n}\n", lambda a: a.insert_in_body("f", "x();", at="top"),
+         "function f() {\n  x();\n}\n"),
+        ("go insert_in_body at the bottom", "e.go", "package main\n\nfunc f() {\n}\n",
+         lambda a: a.insert_in_body("f", "x()", at="bottom"), "package main\n\nfunc f() {\n\tx()\n}\n"),
+        ("c replace_function_body", "e.c", "void f(void) {\n}\n", lambda a: a.replace_function_body("f", "x();"),
+         "void f(void) {\n  x();\n}\n"),
+        ("java insert_in_body at the top", "K.java", "class K {\n    void f() {\n    }\n}\n",
+         lambda a: a.insert_in_body("K.f", "x();", at="top"), "class K {\n    void f() {\n        x();\n    }\n}\n"),
+    ]
+    for label, name, source, action, expected in cases:
+        _exact(f"empty body: {label}", _edit_result(name, source, action), expected)
+
+
+# ──────────────────────────────────────────────
+# Review follow-ups: string literals, block openers, read_symbol-shaped
+# insertions, sibling and import spacing, mixed line breaks
+# ──────────────────────────────────────────────
+
+
+def test_snippet_layout_followups():
+    print("\n═══ follow-ups: snippets and strings, insertion indentation, spacing, line breaks ═══")
+
+    # The text of a multi-line string is never shifted: a snippet matches
+    # the lines that start inside one only as they are written in the
+    # file, and new lines that go into one, or replace lines of one, keep
+    # the text they are given, in tabs files too. A docstring moves with
+    # the code, as it does elsewhere.
+    query = 'def f():\n    q = """\n    a\n    b\n    """\n    return q\n'
+    refusals = [
+        ("py string lines shifted (reported)", "k.py", query,
+         lambda a: a.replace_in_body("f", 'q = """\na\nb\n"""', 'q = """\na\nc\n"""'), "Snippet not found in body of 'f'"),
+        ("js template lines shifted", "k.js", "function f() {\n  if (a) {\n    const t = `\n    line\n    `;\n  }\n}\n",
+         lambda a: a.replace_in_body("f", "const t = `\nline\n`;", "const t = `\nline2\n`;"),
+         "Snippet not found in body of 'f'"),
+        ("go raw string lines shifted", "k.go",
+         "package main\n\nfunc f() {\n\tif a {\n\t\ts := `\n\t\tline\n\t\t`\n\t\t_ = s\n\t}\n}\n",
+         lambda a: a.replace_in_body("f", "s := `\nline\n`\n_ = s", "s := `\nline2\n`\n_ = s"),
+         "Snippet not found in body of 'f'"),
+    ]
+    for label, name, source, action, reason in refusals:
+        _refused(f"string text ({label})", _edit_result(name, source, action), reason)
+    tabbed = 'def f():\n\tsql = """\nSELECT a\n    FROM t\n"""\n\treturn sql\n'
+    raw = "package main\n\nfunc f() string {\n\treturn `\nline one\n    indented two\n`\n}\n"
+    docstring = 'def f():\n    """One.\n\n    Two.\n    """\n    return 1\n'
+    cases = [
+        ("py string written as in the file", "k.py", query,
+         lambda a: a.replace_in_body("f", 'q = """\n    a\n    b\n    """', 'q = """\n    a\n    c\n    """'),
+         query.replace("    b\n", "    c\n")),
+        ("py code shifted, string as in the file", "k.py", "def f():\n    if x:\n        q = '''\n    a\n'''\n    return 1\n",
+         lambda a: a.replace_in_body("f", "if x:\n    q = '''\n    a\n'''", "if x:\n    q = '''\n    b\n'''"),
+         "def f():\n    if x:\n        q = '''\n    b\n'''\n    return 1\n"),
+        ("go raw string at column 0 (reported)", "a.go", raw,
+         lambda a: a.replace_in_body("f", "line one\n    indented two", "line one\n    indented three"),
+         raw.replace("two", "three")),
+        ("py tab file, string at column 0 (reported)", "a.py", tabbed,
+         lambda a: a.replace_in_body("f", "SELECT a\n    FROM t", "SELECT b\n    FROM t"), tabbed.replace("SELECT a", "SELECT b")),
+        ("py tab file, one line of a string", "a.py", tabbed,
+         lambda a: a.replace_in_body("f", "SELECT a", "SELECT a,\n    b"), tabbed.replace("SELECT a\n", "SELECT a,\n    b\n")),
+        ("py tab file, code still in tabs", "a.py", tabbed,
+         lambda a: a.replace_in_body("f", "return sql", "if sql:\n    return sql"),
+         tabbed.replace("\treturn sql", "\tif sql:\n\t\treturn sql")),
+        ("py docstring shifted with the code", "k.py", docstring,
+         lambda a: a.replace_in_body("f", '"""One.\n\nTwo.\n"""', '"""One.\n\nThree.\n"""'), docstring.replace("Two", "Three")),
+    ]
+    for label, name, source, action, expected in cases:
+        _exact(f"string text ({label})", _edit_result(name, source, action), expected)
+
+    # A snippet found as written only inside a string or a comment, and in
+    # code with its indentation shifted, matches both places.
+    sql = 'def f():\n    sql = """\nx = 1\ny = 2\n"""\n    x = 1\n    y = 2\n    return sql\n'
+    template = "function f() {\n  const t = `\nif (a) {\n  b();\n}\n`;\n  if (a) {\n    b();\n  }\n}\n"
+    refusals = [
+        ("py replace_in_body (reported)", "k.py", sql, lambda a: a.replace_in_body("f", "x = 1\ny = 2", "x = 1\ny = 3"),
+         "Snippet matches 2 places in body of 'f' (lines 3, 6): as written inside a string or comment, and with its "
+         "indentation shifted. Include more surrounding context"),
+        ("py delete_in_body", "k.py", sql, lambda a: a.delete_in_body("f", "x = 1\ny = 2"),
+         "Snippet matches 2 places in body of 'f' (lines 3, 6)"),
+        ("js template", "k.js", template, lambda a: a.replace_in_body("f", "if (a) {\n  b();\n}", "if (a) {\n  c();\n}"),
+         "Snippet matches 2 places in body of 'f' (lines 3, 7)"),
+        ("anchor", "k.py", sql, lambda a: a.insert_in_body("f", "z = 3", after="x = 1\ny = 2"),
+         "Anchor matches 2 places in body of 'f' (lines 3, 6)"),
+    ]
+    for label, name, source, action, reason in refusals:
+        _refused(f"text and shifted code ({label})", _edit_result(name, source, action), reason)
+    _exact("text and shifted code (only in a string, still found)",
+           _edit_result("k.py", 'def f():\n    s = """\nx = 1\n"""\n    return s\n',
+                        lambda a: a.replace_in_body("f", "x = 1", "x = 2")),
+           'def f():\n    s = """\nx = 2\n"""\n    return s\n')
+
+    # A snippet may end at a Python backslash continuation.
+    continued = "def f(a, b):\n    x = a + \\\n        b\n    return x\n"
+    cases = [
+        ("the line (reported)", lambda a: a.replace_in_body("f", "x = a + \\", "x = a - \\"), continued.replace("+", "-")),
+        ("part of the line", lambda a: a.replace_in_body("f", "a + \\", "a * \\"), continued.replace("+", "*")),
+    ]
+    for label, action, expected in cases:
+        _exact(f"backslash continuation ({label})", _edit_result("k.py", continued, action), expected)
+
+    # insert_in_body after an anchor that opens a block puts the new lines
+    # inside it, at the indentation of the line below; an anchor whose line
+    # ends inside a string takes new_snippet byte for byte, in the string.
+    opened = "function f(x) {\n  if (x) {\n    a();\n  }\n}\n"
+    ruby = "def f(x)\n  y = x + 1\n  if y > 2\n    y = 2\n  end\nend\n"
+    cases = [
+        ("js (reported)", "k.js", opened, lambda a: a.insert_in_body("f", "b();", after="if (x) {"),
+         "function f(x) {\n  if (x) {\n    b();\n    a();\n  }\n}\n"),
+        ("js, new_snippet at the opener's indentation", "k.js", opened, lambda a: a.insert_in_body("f", "  b();", after="  if (x) {"),
+         "function f(x) {\n  if (x) {\n    b();\n    a();\n  }\n}\n"),
+        ("js, new_snippet already inside", "k.js", opened, lambda a: a.insert_in_body("f", "\n    b();", after="if (x) {"),
+         "function f(x) {\n  if (x) {\n    b();\n    a();\n  }\n}\n"),
+        ("ruby", "k.rb", ruby, lambda a: a.insert_in_body("f", "z = 0", after="if y > 2"),
+         "def f(x)\n  y = x + 1\n  if y > 2\n    z = 0\n    y = 2\n  end\nend\n"),
+        ("python", "k.py", "def f(x):\n    if x:\n        a()\n", lambda a: a.insert_in_body("f", "b()", after="if x:"),
+         "def f(x):\n    if x:\n        b()\n        a()\n"),
+        ("after the block it opens", "k.js", opened, lambda a: a.insert_in_body("f", "b();", after="if (x) {\n    a();\n  }"),
+         "function f(x) {\n  if (x) {\n    a();\n  }\n  b();\n}\n"),
+        ("an opener with a comment after it", "k.js", "function f(x) {\n  if (x) { // open\n    a();\n  }\n}\n",
+         lambda a: a.insert_in_body("f", "b();", after="if (x) {"),
+         "function f(x) {\n  if (x) { // open\n    b();\n    a();\n  }\n}\n"),
+        ("the opening line of a block comment", "k.js", "function f() {\n  /**\n   * Doc.\n   */\n  a();\n}\n",
+         lambda a: a.insert_in_body("f", " * More.", after="/**"),
+         "function f() {\n  /**\n   * More.\n   * Doc.\n   */\n  a();\n}\n"),
+        ("js template line", "k.js", "function f(k) {\n  const m = `a ${k}\nb`;\n  return m;\n}\n",
+         lambda a: a.insert_in_body("f", " c", after="const m = `a ${k}"),
+         "function f(k) {\n  const m = `a ${k} c\nb`;\n  return m;\n}\n"),
+        ("python string line", "k.py", 'def f(k):\n    m = """a\nb"""\n    return m\n',
+         lambda a: a.insert_in_body("f", " c", after='m = """a'), 'def f(k):\n    m = """a c\nb"""\n    return m\n'),
+        ("before a line inside a string", "k.py", 'def f(k):\n    m = """a\n    b"""\n    return m\n',
+         lambda a: a.insert_in_body("f", "c ", before='b"""'), 'def f(k):\n    m = """a\n    c b"""\n    return m\n'),
+    ]
+    for label, name, source, action, expected in cases:
+        _exact(f"anchored lines ({label})", _edit_result(name, source, action), expected)
+    _refused("anchored lines (after the line that opens a heredoc, in its text)",
+             _edit_result("k.rb", "def f\n  sql = <<-SQL\n    SELECT *\n  SQL\n  sql\nend\n",
+                          lambda a: a.insert_in_body("f", "puts 'x'", after="sql = <<-SQL")), "syntax error")
+    # The lines of a docstring, a `<<~` heredoc or a Java text block are
+    # indented like code, and new ones go on lines of their own.
+    doc = 'class A:\n    def f(self):\n        """One.\n\n        Two.\n        """\n        return 1\n'
+    three = doc.replace("        Two.\n", "        Two.\n        Three.\n")
+    aligned = ('class T:\n    def h(self, a):\n        """h(chunks : [string],\n             cur_line : [string])\n\n'
+               '        Text.\n        """\n        return 1\n')
+    cases = [
+        ("a line after a docstring line", "k.py", doc, lambda a: a.insert_in_body("A.f", "Three.", after="Two."), three),
+        ("a docstring line replaced by two", "k.py", doc, lambda a: a.replace_in_body("A.f", "Two.", "Two.\nThree."), three),
+        ("a docstring line and its end shifted", "k.py", doc,
+         lambda a: a.replace_in_body("A.f", 'Two.\n"""', 'Two.\nThree.\n"""'), three),
+        ("a docstring's opening lines shifted and given back", "k.py", aligned,
+         lambda a: a.replace_in_body("T.h", '"""h(chunks : [string],\n     cur_line : [string])',
+                                     '"""h(chunks : [string],\n     cur_line : [string])'), aligned),
+        ("a line after a docstring line, aligned text below", "k.py", aligned,
+         lambda a: a.insert_in_body("T.h", "x", after='"""h(chunks : [string],'),
+         aligned.replace("[string],\n", "[string],\n        x\n", 1)),
+        ("a line in a squiggly heredoc", "k.rb", "def f\n  sql = <<~SQL\n    SELECT *\n  SQL\n  sql\nend\n",
+         lambda a: a.insert_in_body("f", "FROM t", after="SELECT *"),
+         "def f\n  sql = <<~SQL\n    SELECT *\n    FROM t\n  SQL\n  sql\nend\n"),
+        ("a line in a java text block", "K.java",
+         'class K {\n    String f() {\n        return """\n            a\n            """;\n    }\n}\n',
+         lambda a: a.insert_in_body("K.f", "b", after="a"),
+         'class K {\n    String f() {\n        return """\n            a\n            b\n            """;\n    }\n}\n'),
+    ]
+    for label, name, source, action, expected in cases:
+        _exact(f"anchored lines ({label})", _edit_result(name, source, action), expected)
+
+    # Several lines in read_symbol's shape (the first without indentation,
+    # the others at their file indentation) go in as written, the first
+    # at the anchor line's indentation; new_snippet at column 0 after an
+    # anchor written with its indentation is indented like it. A Python
+    # new_snippet that would not parse in one shape is taken in the other.
+    small = "def f(x):\n    a = 1\n    return a\n"
+    nested = "def f(x):\n    a = 1\n    if x:\n        a = 2\n    return a\n"
+    assign = "function f(x) {\n  let a = 1;\n  return a;\n}\n"
+    js_nested = "function f(x) {\n  let a = 1;\n  if (x) {\n    a = 2;\n  }\n  return a;\n}\n"
+    cases = [
+        ("before, as placed byte for byte (reported)", "k.py", small,
+         lambda a: a.insert_in_body("f", "if x:\n        a = 2\n    ", before="return a"), nested),
+        ("js before, as placed byte for byte", "k.js", assign,
+         lambda a: a.insert_in_body("f", "if (x) {\n    a = 2;\n  }\n  ", before="return a;"), js_nested),
+        ("before, in read_symbol's shape", "k.py", small,
+         lambda a: a.insert_in_body("f", "if x:\n        a = 2", before="return a"), nested),
+        ("after, in read_symbol's shape", "k.py", small,
+         lambda a: a.insert_in_body("f", "if x:\n        a = 2", after="a = 1"), nested),
+        ("relative", "k.py", small, lambda a: a.insert_in_body("f", "if x:\n    a = 2", before="return a"), nested),
+        ("js relative", "k.js", assign, lambda a: a.insert_in_body("f", "if (x) {\n  a = 2;\n}", before="return a;"),
+         js_nested),
+        ("column 0 after an anchor with its indentation", "k.py", small,
+         lambda a: a.insert_in_body("f", "y = 2", after="    a = 1"), "def f(x):\n    a = 1\n    y = 2\n    return a\n"),
+        ("column 0 before an anchor with its indentation", "k.py", small,
+         lambda a: a.insert_in_body("f", "y = 2", before="    return a"), "def f(x):\n    a = 1\n    y = 2\n    return a\n"),
+        ("column 0 after two lines with their indentation", "k.py", small,
+         lambda a: a.insert_in_body("f", "y = 2", after="    a = 1\n    return a"),
+         "def f(x):\n    a = 1\n    return a\n    y = 2\n"),
+        ("shifted snippet given back as it was", "k.js", "class Legacy {\n  run() {\n    return 1;\n  }\n};\n",
+         lambda a: a.replace_in_body("Legacy", "run() {\n  return 1;", "run() {\n  return 1;"),
+         "class Legacy {\n  run() {\n    return 1;\n  }\n};\n"),
+        ("replace_in_body, later lines written out of the block", "k.py",
+         "def f(x):\n    if x:\n        return 2\n    return 3\n",
+         lambda a: a.replace_in_body("f", "return 2", "return 2\n    y = 3"),
+         "def f(x):\n    if x:\n        return 2\n    y = 3\n    return 3\n"),
+        ("replace_in_body, relative later lines", "k.py", "def f(x):\n    x = 1\n    return x\n",
+         lambda a: a.replace_in_body("f", "x = 1", "x = 1\nif x:\n    return 3"),
+         "def f(x):\n    x = 1\n    if x:\n        return 3\n    return x\n"),
+        ("replace_in_body, relative later lines at the body's depth", "k.py", "def f(x):\n    x = 1\n    return x\n",
+         lambda a: a.replace_in_body("f", "x = 1", "if x:\n    return 3"),
+         "def f(x):\n    if x:\n        return 3\n    return x\n"),
+    ]
+    for label, name, source, action, expected in cases:
+        _exact(f"read_symbol-shaped lines ({label})", _edit_result(name, source, action), expected)
+
+    # Tabs: the code of the symbol decides, not the text of its strings or
+    # the lines that align a continued call.
+    strings = 'def f():\n    return """\nall:\n\techo hi\n"""\n\n\ndef g():\n    pass\n'
+    tab_string = 'def f():\n    s = """\n\tindented with a tab\n"""\n    return s\n\n\ndef g():\n    return 1\n'
+    gnu = 'int\nf (char *arg)\n{\n  printf ("%s has %d\\n",\n\t  arg,\n\t  n);\n  return (0);\n}\n'
+    cases = [
+        ("py replace_function (reported)", "k.py", strings, lambda a: a.replace_function("f", "def f():\n    if x:\n        return 1"),
+         "def f():\n    if x:\n        return 1\n\n\ndef g():\n    pass\n"),
+        ("py insert_sibling", "k.py", strings, lambda a: a.insert_sibling("f", "def h():\n    if x:\n        return 1", "after"),
+         strings.replace("\n\n\ndef g", "\n\n\ndef h():\n    if x:\n        return 1\n\n\ndef g")),
+        ("js template", "k.js", "function f() {\n  return `\n\tx\n`;\n}\n",
+         lambda a: a.replace_function("f", "function f() {\n  if (a) {\n    return 1;\n  }\n}"),
+         "function f() {\n  if (a) {\n    return 1;\n  }\n}\n"),
+        ("py tab in a string", "k.py", tab_string,
+         lambda a: a.replace_function("f", "def f():\n    if x:\n        return 2\n    return 1"),
+         "def f():\n    if x:\n        return 2\n    return 1\n\n\ndef g():\n    return 1\n"),
+        ("c continuation aligned with a tab", "k.c", gnu,
+         lambda a: a.replace_function("f", "int\nf (char *arg)\n{\n  if (arg)\n    return (1);\n  return (0);\n}"),
+         "int\nf (char *arg)\n{\n  if (arg)\n    return (1);\n  return (0);\n}\n"),
+        ("py tab-indented function", "k.py", "def f():\n\tif x:\n\t\treturn 1\n",
+         lambda a: a.replace_function("f", "def f():\n    if x:\n        return 2"), "def f():\n\tif x:\n\t\treturn 2\n"),
+    ]
+    for label, name, source, action, expected in cases:
+        _exact(f"tabs beside ({label})", _edit_result(name, source, action), expected)
+
+    # A block comment that ends on the symbol's first line: its later lines
+    # keep the indentation they have below the comment's first line.
+    commented = [
+        ("java", "k.java", "class A {\n    /**\n     * Doc.\n     */ void f() {\n        g();\n    }\n}\n", "A.f",
+         "void f() {\n    h();\n}", "class A {\n    /**\n     * Doc.\n     */ void f() {\n        h();\n    }\n}\n"),
+        ("c", "k.c", "/*\n * c\n */ int f(void) {\n    return 0;\n}\n", "f", "int f(void) {\n    return 1;\n}",
+         "/*\n * c\n */ int f(void) {\n    return 1;\n}\n"),
+        ("ts", "k.ts", "/*\n * c\n */ class A {\n  m(): void {}\n}\n", "A", "class A {\n  n(): void {}\n}",
+         "/*\n * c\n */ class A {\n  n(): void {}\n}\n"),
+        ("js", "k.js", "/* a\n   b */ function f() {\n  return 1;\n}\n", "f", "function f() {\n  return 2;\n}",
+         "/* a\n   b */ function f() {\n  return 2;\n}\n"),
+    ]
+    for label, name, source, target, content, expected in commented:
+        _exact(f"comment ending on the first line ({label} round trip)", _round_trip(name, source, target), "<unchanged>")
+        _exact(f"comment ending on the first line ({label})",
+               _edit_result(name, source, lambda a, t=target, c=content: a.replace_function(t, c)), expected)
+
+    # An f-string or bytes literal is no docstring.
+    cases = [
+        ("an f-string first", 'f"{setup()}"\nimport os\n', '"""Doc."""\n\nf"{setup()}"\nimport os\n'),
+        ("a bytes literal first", 'b"x"\nimport os\n', '"""Doc."""\n\nb"x"\nimport os\n'),
+        ("a raw docstring", 'r"""Old."""\nimport os\n', '"""Doc."""\nimport os\n'),
+    ]
+    for label, source, expected in cases:
+        _exact(f"module docstring ({label})",
+               _edit_result("k.py", source, lambda a: a.replace_docstring("", '"""Doc."""')), expected)
+
+    # One-line code joins the stack of one-line siblings next to it; after
+    # imports, includes and a package clause new code is set apart.
+    fields = "class C:\n    a: int\n    b: int\n\n    def m(self):\n        pass\n"
+    cases = [
+        ("a field before a method (reported)", "k.py", fields, lambda a: a.insert_sibling("C.m", "c: int = 0", "before"),
+         "class C:\n    a: int\n    b: int\n    c: int = 0\n\n    def m(self):\n        pass\n"),
+        ("a field after a method", "k.py", "class C:\n    def m(self):\n        pass\n\n    a: int\n    b: int\n",
+         lambda a: a.insert_sibling("C.m", "c: int = 0", "after"),
+         "class C:\n    def m(self):\n        pass\n\n    c: int = 0\n    a: int\n    b: int\n"),
+        ("a constant before a def", "k.py", "X = 1\nY = 2\n\n\ndef m():\n    pass\n",
+         lambda a: a.insert_sibling("m", "Z = 3", "before"), "X = 1\nY = 2\nZ = 3\n\n\ndef m():\n    pass\n"),
+        ("a lone field before a method", "k.py", "class C:\n    a: int\n\n    def m(self):\n        pass\n",
+         lambda a: a.insert_sibling("C.m", "c: int = 0", "before"),
+         "class C:\n    a: int\n\n    c: int = 0\n\n    def m(self):\n        pass\n"),
+    ]
+    for label, name, source, action, expected in cases:
+        _exact(f"stacked siblings ({label})", _edit_result(name, source, action), expected)
+    cases = [
+        ("py imports (reported)", "k.py", "import os\nimport sys\n", "Z = 3", "import os\nimport sys\n\nZ = 3\n"),
+        ("py future import", "k.py", "from __future__ import annotations\nimport os\n", "LOG = os.getenv('LOG')",
+         "from __future__ import annotations\nimport os\n\nLOG = os.getenv('LOG')\n"),
+        ("js imports", "k.js", 'import a from "a";\nimport b from "b";\n', "const Z = 3;",
+         'import a from "a";\nimport b from "b";\n\nconst Z = 3;\n'),
+        ("c includes", "k.c", "#include <a.h>\n#include <b.h>\n", "int x = 1;", "#include <a.h>\n#include <b.h>\n\nint x = 1;\n"),
+        ("header includes", "k.h", "#ifndef A_H\n#define A_H\n\n#include <a.h>\n#include <b.h>\n\n#endif\n", "int f(void);",
+         "#ifndef A_H\n#define A_H\n\n#include <a.h>\n#include <b.h>\n\nint f(void);\n\n#endif\n"),
+        ("go package and import", "k.go", 'package main\nimport "fmt"\n', "var z = 3", 'package main\nimport "fmt"\n\nvar z = 3\n'),
+        ("an import after imports", "k.py", "import os\nimport sys\n", "import re", "import os\nimport sys\nimport re\n"),
+    ]
+    for label, name, source, content, expected in cases:
+        _exact(f"add_top_level after imports ({label})", _edit_result(name, source, lambda a, c=content: a.add_top_level(c)),
+               expected)
+
+    # Mixed line breaks: the lines next to the edit keep theirs although
+    # they read like the lines the edit removed or added.
+    cases = [
+        ("delete_symbol (reported)", "class A {\r\n    @Override\r\n    public void a() {}\r\n    @Override\n    public void b() {}\n}\n",
+         lambda a: a.delete_symbol("A.a"), "class A {\r\n    @Override\n    public void b() {}\n}\n"),
+        ("insert_sibling", "class A {\r\n    @Override\r\n    public void a() {}\r\n\r\n    @Override\n    public void b() {}\n}\n",
+         lambda a: a.insert_sibling("A.b", "@Override\npublic void c() {}", "before"),
+         "class A {\r\n    @Override\r\n    public void a() {}\r\n\r\n    @Override\r\n    public void c() {}\r\n\r\n"
+         "    @Override\n    public void b() {}\n}\n"),
+        ("insert_in_body", "class A {\r\n    int x;\r\n    void a() {\r\n        g();\r\n        g();\n    }\n}\n",
+         lambda a: a.insert_in_body("A.a", "g();", before="g();\n    }"),
+         "class A {\r\n    int x;\r\n    void a() {\r\n        g();\r\n        g();\r\n        g();\n    }\n}\n"),
+    ]
+    for label, source, action, expected in cases:
+        path = _write_temp("K.java", "")
+        with open(path, "wb") as f:
+            f.write(source.encode("utf-8"))
+        try:
+            action(Applier(path))
+            result = _read_bytes(path).decode("utf-8")
+        except ApplierError as e:
+            result = f"REFUSED: {e}"
+        os.remove(path)
+        _exact(f"mixed line breaks ({label})", result, expected)
+
+
 if __name__ == "__main__":
     test_python()
     test_python_decorated()
@@ -11703,6 +12826,7 @@ if __name__ == "__main__":
     test_deeper_comments()
     test_go_grouped_parameters()
     test_byte_order_mark()
+    test_lone_surrogate()
     test_python_list_append()
     test_final_review_followups()
     test_overloaded_targets()
@@ -11725,6 +12849,10 @@ if __name__ == "__main__":
     test_ruby_attached_lines()
     test_comments_ending_code()
     test_target_resolution_followups()
+    test_body_snippets()
+    test_content_layout()
+    test_lists_docstrings_bodies()
+    test_snippet_layout_followups()
 
     # Reset all fixtures to clean state after tests
     for lang in FIXTURES:

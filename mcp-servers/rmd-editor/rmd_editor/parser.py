@@ -405,9 +405,12 @@ def _read_chunk_opening(line: str) -> Optional[_ChunkOpening]:
 def _parse_label_and_options(inside: str) -> tuple[Optional[str], list[tuple[str, str]]]:
     """
     Given the text between `{r ` and `}` (e.g. `label, echo=FALSE, fig.width=7`),
-    return (label, options). Label is the first part when it is a bare token
-    without '='. Options are the other parts as (key, value) pairs in the order
-    written, a key written twice included twice; a bare token has the value "".
+    return (label, options). Label is the first part when it is a bare token,
+    one without the = of key=value. Options are the other parts as (key, value)
+    pairs in the order written, a key written twice included twice; a bare
+    token has the value "". A part is split at its = as R reads the arguments
+    of alist(...) (see _r_scan), so "a=b" and list(a=1) are bare tokens, and
+    "a=b" first in the header is a quoted label.
     """
     label: Optional[str] = None
     options: list[tuple[str, str]] = []
@@ -415,7 +418,9 @@ def _parse_label_and_options(inside: str) -> tuple[Optional[str], list[tuple[str
     for idx, part in enumerate(parts):
         if not part:
             continue
-        if "=" not in part:
+        # The = of key=value, as R reads it: not one inside quotes or brackets ("a=b", list(a=1)) or in == or <=
+        equals = _r_scan(part)[1]
+        if equals is None:
             # Bare token -- if this is the first part, it's the label
             if idx == 0:
                 label = part.strip()
@@ -423,8 +428,7 @@ def _parse_label_and_options(inside: str) -> tuple[Optional[str], list[tuple[str
             else:
                 options.append((part.strip(), ""))
         else:
-            k, _, v = part.partition("=")
-            options.append((k.strip(), v.strip()))
+            options.append((part[:equals].strip(), part[equals + 1:].strip()))
     return label, options
 
 
@@ -485,6 +489,27 @@ def _r_trouble(s: str) -> Optional[str]:
     !=, <= or >= (a second = in key=value), or None. Quotes and brackets left
     open are _closed's to find.
     """
+    comment, equals, quote = _r_scan(s)
+    if comment is not None and (equals is None or comment < equals):
+        return "#"
+    if equals is not None:
+        return "="
+    return "`" if quote == "`" else None
+
+
+def _r_scan(s: str) -> tuple[Optional[int], Optional[int], Optional[str]]:
+    """
+    s read as R code, as knitr reads a chunk header's parts (the arguments of
+    alist(...)): (comment, equals, quote). comment is where the first # outside
+    quotes is, equals where the first = outside quotes and brackets is that
+    isn't part of ==, !=, <= or >= (the = of name = value), each None if there
+    is none, and quote is the quote (', " or `) left open at the end, else
+    None. Inside quotes a backslash escapes the next character, and a %...%
+    operator such as %in% is skipped. The scan doesn't stop at a #, so equals
+    may come after comment.
+    """
+    comment: Optional[int] = None
+    equals: Optional[int] = None
     quote: Optional[str] = None
     escaped = False
     depth = 0
@@ -501,7 +526,8 @@ def _r_trouble(s: str) -> Optional[str]:
         elif c in "'\"`":
             quote = c
         elif c == "#":
-            return "#"
+            if comment is None:
+                comment = i
         elif c == "%":
             # An operator such as %in% or %=%: skip to its closing %
             i = max(i, s.find("%", i + 1))
@@ -512,10 +538,10 @@ def _r_trouble(s: str) -> Optional[str]:
         elif c == "=":
             if s.startswith("==", i):
                 i += 1
-            elif depth == 0 and not (i and s[i - 1] in "<>!"):
-                return "="
+            elif depth == 0 and not (i and s[i - 1] in "<>!") and equals is None:
+                equals = i
         i += 1
-    return "`" if quote == "`" else None
+    return comment, equals, quote
 
 
 # A quoted R string, as a whole: its quote, then its text with backslash escapes.
@@ -789,9 +815,9 @@ def _render_chunk_header(language: str, label: Optional[str], options: list[tupl
         parts.insert(0, label)
     if not parts:
         return fence + "{" + language + "}"
-    # A bare name first among the options came after a leading comma, as in ```{r, echo}: the comma is written back,
-    # so it reads back as it was (knitr reads it as the label either way).
-    lead = " " if label or "=" in parts[0] else ", "
+    # A bare name first among the options came after a leading comma, as in ```{r, echo} or ```{r, "a=b"}: the comma
+    # is written back, so it reads back as it was (knitr reads it as the label either way).
+    lead = " " if label or options[0][1] or not options[0][0] else ", "
     return fence + "{" + language + lead + ", ".join(parts) + "}"
 
 
@@ -1294,16 +1320,34 @@ def _parse_yaml_value(value: str):
         return value
 
 
+# Every character YAML reads as a line break: "\n", "\r", NEL, U+2028 and U+2029. A new key can't hold one.
+_YAML_BREAKS = "\n\r\x85\N{LINE SEPARATOR}\N{PARAGRAPH SEPARATOR}"
+
+
 def _new_key_prefix(key: str) -> str:
     """
     How a new top-level key is written: "key:", quoted when YAML needs it.
-    Raises FrontmatterError for a key longer as written than the 1024
-    characters YAML reads before the ":" of a key: value line (an implicit key:
-    PyYAML and the libyaml in R's yaml package both stop there).
+    Raises FrontmatterError for a key a key: value line can't hold: one with
+    a line break (see _YAML_BREAKS), one with a lone UTF-16 surrogate, which
+    YAML writes only as an escape (\\uD800) that the libyaml in R's yaml
+    package rejects, and one longer as written than the 1024 characters YAML
+    reads before the ":" of a key: value line (an implicit key: PyYAML and that
+    libyaml both stop there).
     """
+    shown = key if len(key) <= 40 else key[:37] + "..."
+    if any(c in _YAML_BREAKS for c in key):
+        raise FrontmatterError(
+            f"Frontmatter key {shown!r} contains a line break, but a key is written on one line, as key: value, so the "
+            "file was left unchanged"
+        )
+    surrogate = next((c for c in key if 0xD800 <= ord(c) <= 0xDFFF), None)
+    if surrogate is not None:
+        raise FrontmatterError(
+            f"Frontmatter key {shown!r} holds U+{ord(surrogate):04X}, a lone UTF-16 surrogate, which YAML can only "
+            "write as an escape that the libyaml in R's yaml package rejects, so the file was left unchanged"
+        )
     written = yaml_string(key)
     if len(written) > _MAX_IMPLICIT_KEY:
-        shown = key if len(key) <= 40 else key[:37] + "..."
         raise FrontmatterError(
             f"Frontmatter key {shown!r} is {len(written)} characters long as written, and YAML reads a key: value line "
             f"only for a key of up to {_MAX_IMPLICIT_KEY} characters, so the file was left unchanged"

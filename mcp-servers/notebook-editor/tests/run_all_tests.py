@@ -1058,6 +1058,35 @@ def test_find_in_notebook():
     check("find_in_notebook: markdown cell matched", out, "markdown")
 
 
+def test_lone_surrogate_refused():
+    print("\n═══ a lone surrogate is refused and the file kept ═══")
+    # JSON lets a client send half of a surrogate pair; nbformat.write used
+    # to empty the file before failing to encode it.
+    lone = chr(0xD800)
+    edits = [
+        ("replace_cell_source", lambda mgr: mgr.replace_cell_source(1, "x = '" + lone + "'")),
+        ("add_cell", lambda mgr: mgr.add_cell(0, lone, "markdown")),
+    ]
+    for label, edit in edits:
+        path = reset_fixture()
+        with open(path, "rb") as f:
+            before = f.read()
+        try:
+            edit(NotebookManager(path))
+            check(f"{label}: lone surrogate refused", "FAIL", "PASS")
+        except NotebookManagerError as e:
+            check(f"{label}: lone surrogate refused", str(e), "lone surrogate, U+D800")
+        with open(path, "rb") as f:
+            check(f"{label}: file unchanged", f.read() == before, True)
+    target = os.path.join(WORK_DIR, "surrogate_new.ipynb")
+    try:
+        create_notebook(target, kernel_display_name="K" + lone)
+        check("create_notebook: lone surrogate refused", "FAIL", "PASS")
+    except NotebookManagerError as e:
+        check("create_notebook: lone surrogate refused", str(e), "lone surrogate, U+D800")
+    check("create_notebook: no file left behind", os.path.exists(target), False)
+
+
 # ──────────────────────────────────────────────
 # create_notebook tests
 # ──────────────────────────────────────────────
@@ -1255,6 +1284,7 @@ if __name__ == "__main__":
         test_set_cell_metadata()
         test_list_notebook_symbols()
         test_find_in_notebook()
+        test_lone_surrogate_refused()
         test_execute_cell()
         test_execute_all_cells()
         test_execute_all_cells_stop_on_error()
