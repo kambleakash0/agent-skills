@@ -2464,13 +2464,14 @@ export function use() {
     check("ts add_import_name: duplicate detected", msg, "already present")
 
     # Add to the mixed-binding form `import Default, { named } from ...`
+    # (one name counts as sorted: the new one goes at its sorted place)
     app = Applier(ts_path)
     app.add_import_name("other", "extra")
     result = read_file(ts_path)
     check(
         "ts add_import_name: works with default+named import",
         result,
-        "{ named, extra }",
+        "{ extra, named }",
     )
     check(
         "ts add_import_name: default binding preserved",
@@ -5556,9 +5557,11 @@ def test_member_layout_followups():
         ("cpp add_method: class with only an access label", "c.cpp",
          "class K {\npublic:\n};\n", lambda a: a.add_method("K", "void b() {}"),
          "class K {\npublic:\n  void b() {}\n};\n"),
+        # One after a method that a label follows goes after that method, in
+        # its section.
         ("cpp add_method: after a trailing access label", "c.cpp",
          "class K {\n  void a() {}\npublic:\n};\n", lambda a: a.add_method("K", "void b() {}"),
-         "class K {\n  void a() {}\npublic:\n  void b() {}\n};\n"),
+         "class K {\n  void a() {}\n\n  void b() {}\npublic:\n};\n"),
         # Java enums: new members go after the constants, which get the `;`
         # Java needs before other members when they have none.
         ("java add_field: enum with methods", "E.java",
@@ -8942,7 +8945,7 @@ def test_byte_order_mark():
          bom + "import os\n\n\ndef f():\n    pass\n"),
         ("go add_import", "k.go", bom + 'package main\n\nimport "os"\n\nfunc f() {}\n',
          lambda a: a.add_import('import "fmt"'),
-         bom + 'package main\n\nimport "os"\nimport "fmt"\n\nfunc f() {}\n'),
+         bom + 'package main\n\nimport "fmt"\nimport "os"\n\nfunc f() {}\n'),
         ("json replace_value", "k.json", bom + '{\n  "a": 1\n}\n', lambda a: a.replace_value("a", "2"),
          bom + '{\n  "a": 2\n}\n'),
         ("json add_key", "k.json", bom + '{"a": 1}\n', lambda a: a.add_key("", "b", "2"), bom + '{"a": 1, "b": 2}\n'),
@@ -10960,10 +10963,10 @@ def test_layout_followups():
     _exact("add_field below an access label (crlf)",
            _edit_result("f.cpp", "class Box {\npublic:\n    int v;\n};\n", lambda a: a.add_field("Box", "int n;"), "\r\n"),
            "class Box {\r\npublic:\r\n    int n;\r\n    int v;\r\n};\r\n")
-    # add_method still goes after the last member.
+    # add_method goes after the last method, in its section.
     _exact("add_method after an access label section",
            _edit_result("f.cpp", box, lambda a: a.add_method("Box", "void f() {}")),
-           "class Box {\npublic:\n    int get() { return v; }\nprivate:\n    int v;\n\n    void f() {}\n};\n")
+           "class Box {\npublic:\n    int get() { return v; }\n\n    void f() {}\nprivate:\n    int v;\n};\n")
 
     # insert_sibling next to a member indented with tabs writes the content's
     # indentation in tabs, as add_method does.
@@ -11603,11 +11606,12 @@ def test_target_resolution_followups():
                                                                lambda a: a.add_parameter("f", "this: Foo")),
              "Parameter 'this' already exists in 'f'")
 
-    # CommonJS requires are imports: a new import goes after them.
+    # CommonJS requires are imports: a new import goes with them (a
+    # require at its sorted place among sorted requires).
     cjs = "const fs = require('fs');\nconst path = require('path');\n\nfunction f() {}\n"
     for label, text, expected in [
         ("require (reported)", "const os = require('os');",
-         "const fs = require('fs');\nconst path = require('path');\nconst os = require('os');\n\nfunction f() {}\n"),
+         "const fs = require('fs');\nconst os = require('os');\nconst path = require('path');\n\nfunction f() {}\n"),
         ("es import", "import os from 'os';",
          "const fs = require('fs');\nconst path = require('path');\nimport os from 'os';\n\nfunction f() {}\n"),
     ]:
@@ -12154,7 +12158,7 @@ def test_lists_docstrings_bodies():
         ("ts add_import_name to a type import", "m.ts", 'import type {\n  A,\n  B,\n} from "m";\n',
          lambda a: a.add_import_name("m", "C"), 'import type {\n  A,\n  B,\n  C,\n} from "m";\n'),
         ("ts add_import_name of a type name", "m.ts", 'import {\n  type A,\n  b,\n} from "m";\n',
-         lambda a: a.add_import_name("m", "type C"), 'import {\n  type A,\n  b,\n  type C,\n} from "m";\n'),
+         lambda a: a.add_import_name("m", "type C"), 'import {\n  type A,\n  type C,\n  b,\n} from "m";\n'),
         ("py remove_import_name of the last name with its comment", "m.py", commented,
          lambda a: a.remove_import_name("m", "b"), "from m import (\n    a,  # A\n)\n"),
         ("py remove_import_name of a middle name with its comment", "m.py", "from m import (\n    a,  # A\n    b,  # B\n    c,\n)\n",
@@ -12737,6 +12741,857 @@ def test_snippet_layout_followups():
         _exact(f"mixed line breaks ({label})", result, expected)
 
 
+def test_final_docstring_literals():
+    print("\n═══ replace_docstring takes a string literal for a function, method or class too ═══")
+
+    # Bare text would go in as a statement (`Summary` over `return 1`): it
+    # is refused, the file unchanged, as it is for the module (target "").
+    targets = [
+        ("a function without a docstring (reported)", "def f():\n    return 1\n", "f"),
+        ("a function's docstring", 'def f():\n    """Old."""\n    return 1\n', "f"),
+        ("a method", "class A:\n    def m(self):\n        return 1\n", "A.m"),
+        ("a class", 'class A:\n    """Old."""\n\n    x = 1\n', "A"),
+        ("a decorated function", "@cache\ndef f():\n    return 1\n", "f"),
+    ]
+    contents = [("a word", "Summary"), ("a sentence", "Return the sum."), ("an f-string", 'f"""Summary."""'),
+                ("a bytes literal", 'b"""Summary."""'), ("nothing", "")]
+    for label, source, target in targets:
+        for kind, docstring in contents:
+            _refused(f"docstring that is no string literal ({label}, {kind})",
+                     _edit_result("d.py", source, lambda a, t=target, d=docstring: a.replace_docstring(t, d)),
+                     "new_docstring is not a Python string literal: write it with its quotes, as in "
+                     "'\"\"\"Summary.\"\"\"'")
+
+    # A string literal goes in as before, whatever its quotes and prefix.
+    cases = [
+        ("inserted", "def f():\n    return 1\n", "f", '"""Summary."""', 'def f():\n    """Summary."""\n    return 1\n'),
+        ("replaced", 'def f():\n    """Old."""\n    return 1\n', "f", "'''Summary.'''",
+         "def f():\n    '''Summary.'''\n    return 1\n"),
+        ("a method's, raw", "class A:\n    def m(self):\n        return 1\n", "A.m", 'r"""Summary."""',
+         'class A:\n    def m(self):\n        r"""Summary."""\n        return 1\n'),
+        ("a class's, one quote", "class A:\n    x = 1\n", "A", '"Summary."', 'class A:\n    "Summary."\n    x = 1\n'),
+    ]
+    for label, source, target, docstring, expected in cases:
+        _exact(f"docstring literal ({label})",
+               _edit_result("d.py", source, lambda a, t=target, d=docstring: a.replace_docstring(t, d)), expected)
+
+
+def test_final_keyword_only_parameters():
+    print("\n═══ remove_parameter of *args keeps the parameters after it keyword-only ═══")
+
+    # The parameters after `*args`, but a `**kwargs`, are keyword-only: a
+    # bare `*` takes the place of `*args` to keep them so. Without them it
+    # goes alone.
+    cases = [
+        ("a keyword-only parameter after it (reported)", "def f(a, *args, b):\n    pass\n", "f",
+         "def f(a, *, b):\n    pass\n"),
+        ("a default and **kw after it", "def f(a, *args, b=1, **kw):\n    pass\n", "f",
+         "def f(a, *, b=1, **kw):\n    pass\n"),
+        ("nothing after it", "def f(a, *args):\n    pass\n", "f", "def f(a):\n    pass\n"),
+        ("only **kw after it", "def f(a, *args, **kw):\n    pass\n", "f", "def f(a, **kw):\n    pass\n"),
+        ("annotated", "def f(a, *args: int, b: str):\n    pass\n", "f", "def f(a, *, b: str):\n    pass\n"),
+        ("first", "def f(*args, b):\n    pass\n", "f", "def f(*, b):\n    pass\n"),
+        ("a method", "class K:\n    def m(self, *args, b):\n        pass\n", "K.m",
+         "class K:\n    def m(self, *, b):\n        pass\n"),
+        ("one per line", "def f(\n    a,\n    *args,\n    b,\n):\n    pass\n", "f",
+         "def f(\n    a,\n    *,\n    b,\n):\n    pass\n"),
+        ("one per line, **kw after it", "def f(\n    a,\n    *args,\n    **kw,\n):\n    pass\n", "f",
+         "def f(\n    a,\n    **kw,\n):\n    pass\n"),
+        ("after a /", "def f(a, /, *args, b):\n    pass\n", "f", "def f(a, /, *, b):\n    pass\n"),
+        ("an async def", "async def f(a, *args, b):\n    pass\n", "f", "async def f(a, *, b):\n    pass\n"),
+    ]
+    for label, source, target, expected in cases:
+        _exact(f"remove *args ({label})",
+               _edit_result("k.py", source, lambda a, t=target: a.remove_parameter(t, "args")), expected)
+
+
+def test_final_last_parameters():
+    print("\n═══ add_parameter keeps a parameter that must come last at the end ═══")
+
+    # 'end' goes before the parameters that must stay last: a JS/TS rest
+    # parameter, a Go or Java variadic one, the `...` of C and C++ and a C++
+    # parameter pack, a Ruby `**opts`, `**nil`, `&blk` or `...`, and a
+    # Python `**kwargs` (after `*args` a new parameter is keyword-only, so
+    # it goes last). 'start' goes after a TS `this` parameter or a Java
+    # receiver parameter, which must stay first.
+    cases = [
+        ("js rest (reported)", "k.js", "function f(a, ...rest) {}\n", "f", "b", "end", "function f(a, b, ...rest) {}\n"),
+        ("js rest alone", "k.js", "function f(...rest) {}\n", "f", "b", "end", "function f(b, ...rest) {}\n"),
+        ("js rest alone, start", "k.js", "function f(...rest) {}\n", "f", "b", "start", "function f(b, ...rest) {}\n"),
+        ("js rest, start", "k.js", "function f(a, ...rest) {}\n", "f", "b", "start", "function f(b, a, ...rest) {}\n"),
+        ("js arrow function", "k.js", "const g = (a, ...r) => {};\n", "g", "b", "end", "const g = (a, b, ...r) => {};\n"),
+        ("js method", "k.js", "class K {\n  m(a, ...r) {}\n}\n", "K.m", "b", "end", "class K {\n  m(a, b, ...r) {}\n}\n"),
+        ("js destructured rest", "k.js", "function f(a, ...[x, y]) {}\n", "f", "b", "end",
+         "function f(a, b, ...[x, y]) {}\n"),
+        ("js one per line", "k.js", "function f(\n  a,\n  ...rest\n) {}\n", "f", "b", "end",
+         "function f(\n  a,\n  b,\n  ...rest\n) {}\n"),
+        ("js one per line, a comment above the rest", "k.js", "function f(\n  a,\n  // the rest\n  ...rest\n) {}\n",
+         "f", "b", "end", "function f(\n  a,\n  b,\n  // the rest\n  ...rest\n) {}\n"),
+        ("js aligned", "k.js", "function f(a,\n           ...rest) {}\n", "f", "b", "end",
+         "function f(a,\n           b,\n           ...rest) {}\n"),
+        ("js rest alone on a line", "k.js", "function f(\n  ...rest\n) {}\n", "f", "b", "end",
+         "function f(\n  b,\n  ...rest\n) {}\n"),
+        ("ts rest with a type", "k.ts", "function f(a: number, ...rest: string[]) {}\n", "f", "b: number", "end",
+         "function f(a: number, b: number, ...rest: string[]) {}\n"),
+        ("ts arrow function", "k.ts", "const g = (a: number, ...r: number[]): void => {};\n", "g", "b?: string", "end",
+         "const g = (a: number, b?: string, ...r: number[]): void => {};\n"),
+        ("ts method", "k.ts", "class K {\n  m(a: number, ...r: number[]): void {}\n}\n", "K.m", "b = 1", "end",
+         "class K {\n  m(a: number, b = 1, ...r: number[]): void {}\n}\n"),
+        ("ts this, start", "k.ts", "function f(this: Window, a: number) {}\n", "f", "b: number", "start",
+         "function f(this: Window, b: number, a: number) {}\n"),
+        ("ts this alone, start", "k.ts", "function f(this: Window) {}\n", "f", "b: number", "start",
+         "function f(this: Window, b: number) {}\n"),
+        ("ts this and rest", "k.ts", "function f(this: Window, ...r: number[]) {}\n", "f", "b: number", "end",
+         "function f(this: Window, b: number, ...r: number[]) {}\n"),
+        ("go variadic (reported)", "k.go", "package main\n\nfunc f(a int, xs ...int) {}\n", "f", "b string", "end",
+         "package main\n\nfunc f(a int, b string, xs ...int) {}\n"),
+        ("go variadic alone", "k.go", "package main\n\nfunc f(xs ...int) {}\n", "f", "b string", "end",
+         "package main\n\nfunc f(b string, xs ...int) {}\n"),
+        ("go method", "k.go", "package main\n\ntype S struct{}\n\nfunc (s *S) f(a int, xs ...int) {}\n", "S.f", "b string",
+         "end", "package main\n\ntype S struct{}\n\nfunc (s *S) f(a int, b string, xs ...int) {}\n"),
+        ("go one per line", "k.go", "package main\n\nfunc f(\n\ta int,\n\txs ...int,\n) {}\n", "f", "b string", "end",
+         "package main\n\nfunc f(\n\ta int,\n\tb string,\n\txs ...int,\n) {}\n"),
+        ("java varargs", "K.java", "class A {\n    void f(int a, String... xs) {}\n}\n", "A.f", "int b", "end",
+         "class A {\n    void f(int a, int b, String... xs) {}\n}\n"),
+        ("java varargs, start", "K.java", "class A {\n    void f(int a, String... xs) {}\n}\n", "A.f", "int b", "start",
+         "class A {\n    void f(int b, int a, String... xs) {}\n}\n"),
+        ("java varargs one per line", "K.java", "class A {\n    void f(\n        int a,\n        String... xs\n    ) {}\n}\n",
+         "A.f", "int b", "end", "class A {\n    void f(\n        int a,\n        int b,\n        String... xs\n    ) {}\n}\n"),
+        ("java receiver, start", "K.java", "class A {\n    void g(A this, int a) {}\n}\n", "A.g", "int b", "start",
+         "class A {\n    void g(A this, int b, int a) {}\n}\n"),
+        ("c ...", "k.c", "int f(int a, ...) { return 0; }\n", "f", "int b", "end", "int f(int a, int b, ...) { return 0; }\n"),
+        ("c ..., start", "k.c", "int f(int a, ...) { return 0; }\n", "f", "int b", "start",
+         "int f(int b, int a, ...) { return 0; }\n"),
+        ("c prototype", "k.h", "int f(const char *fmt, ...);\n", "f", "int n", "end", "int f(const char *fmt, int n, ...);\n"),
+        ("c one per line", "k.c", "int f(\n    int a,\n    ...\n) { return 0; }\n", "f", "int b", "end",
+         "int f(\n    int a,\n    int b,\n    ...\n) { return 0; }\n"),
+        ("cpp ...", "k.cpp", "int f(int a, ...) { return 0; }\n", "f", "int b", "end", "int f(int a, int b, ...) { return 0; }\n"),
+        ("cpp ... alone", "k.cpp", "int f(...) { return 0; }\n", "f", "int b", "end", "int f(int b, ...) { return 0; }\n"),
+        ("cpp ... alone, start", "k.cpp", "int f(...) { return 0; }\n", "f", "int b", "start",
+         "int f(int b, ...) { return 0; }\n"),
+        ("cpp one per line", "k.cpp", "int f(\n    int a,\n    ...\n) { return 0; }\n", "f", "int b", "end",
+         "int f(\n    int a,\n    int b,\n    ...\n) { return 0; }\n"),
+        ("cpp parameter pack", "k.cpp", "template <typename... Ts> void h(int a, Ts... xs) {}\n", "h", "int b", "end",
+         "template <typename... Ts> void h(int a, int b, Ts... xs) {}\n"),
+        ("rb &blk", "k.rb", "def f(a, &blk)\nend\n", "f", "b", "end", "def f(a, b, &blk)\nend\n"),
+        ("rb **opts before &blk", "k.rb", "def f(a, **opts, &blk)\nend\n", "f", "b", "end", "def f(a, b, **opts, &blk)\nend\n"),
+        ("rb **opts", "k.rb", "def f(a, **opts)\nend\n", "f", "k: 1", "end", "def f(a, k: 1, **opts)\nend\n"),
+        ("rb **nil", "k.rb", "def f(a, **nil)\nend\n", "f", "b", "end", "def f(a, b, **nil)\nend\n"),
+        ("rb ...", "k.rb", "def f(a, ...)\nend\n", "f", "b", "end", "def f(a, b, ...)\nend\n"),
+        ("rb &blk alone", "k.rb", "def f(&blk)\nend\n", "f", "b", "end", "def f(b, &blk)\nend\n"),
+        ("rb without parentheses", "k.rb", "def f a, &blk\nend\n", "f", "b", "end", "def f a, b, &blk\nend\n"),
+        ("rb one per line", "k.rb", "def f(\n  a,\n  **opts,\n  &blk\n)\nend\n", "f", "b", "end",
+         "def f(\n  a,\n  b,\n  **opts,\n  &blk\n)\nend\n"),
+        ("rb aligned", "k.rb", "def f(**opts,\n      &blk)\nend\n", "f", "b", "end",
+         "def f(b,\n      **opts,\n      &blk)\nend\n"),
+        ("py **kw", "k.py", "def f(a, **kw):\n    pass\n", "f", "b", "end", "def f(a, b, **kw):\n    pass\n"),
+        ("py *args stays before it", "k.py", "def f(a, *args):\n    pass\n", "f", "b", "end",
+         "def f(a, *args, b):\n    pass\n"),
+        ("py *args and **kw", "k.py", "def f(a, *args, **kw):\n    pass\n", "f", "b", "end",
+         "def f(a, *args, b, **kw):\n    pass\n"),
+        ("js function expression", "k.js", "const f = function (a, ...r) {};\n", "f", "b", "end",
+         "const f = function (a, b, ...r) {};\n"),
+        ("js one per line, trailing comma", "k.js", "function f(\n  a,\n  ...rest,\n) {}\n", "f", "b", "end",
+         "function f(\n  a,\n  b,\n  ...rest,\n) {}\n"),
+        ("ts this one per line, start", "k.ts", "function f(\n  this: Window,\n  a: number\n) {}\n", "f", "b: number",
+         "start", "function f(\n  this: Window,\n  b: number,\n  a: number\n) {}\n"),
+        ("ts method this, start", "k.ts", "class K {\n  m(this: K, a: number): void {}\n}\n", "K.m", "b: number", "start",
+         "class K {\n  m(this: K, b: number, a: number): void {}\n}\n"),
+        ("go func literal", "k.go", "package main\n\nvar f = func(a int, xs ...int) {}\n", "f", "b string", "end",
+         "package main\n\nvar f = func(a int, b string, xs ...int) {}\n"),
+        ("java constructor varargs", "K.java", "class A {\n    A(int a, String... xs) {}\n}\n", "A.A", "int b", "end",
+         "class A {\n    A(int a, int b, String... xs) {}\n}\n"),
+        ("java receiver alone, start", "K.java", "class A {\n    void g(A this) {}\n}\n", "A.g", "int b", "start",
+         "class A {\n    void g(A this, int b) {}\n}\n"),
+        ("cpp method ...", "k.cpp", "class K {\n    int m(int a, ...) { return 0; }\n};\n", "K.m", "int b", "end",
+         "class K {\n    int m(int a, int b, ...) { return 0; }\n};\n"),
+        ("rb singleton method", "k.rb", "class K\n  def self.f(a, &blk)\n  end\nend\n", "K.f", "b", "end",
+         "class K\n  def self.f(a, b, &blk)\n  end\nend\n"),
+        ("rb anonymous ** and &", "k.rb", "def f(a, **, &)\nend\n", "f", "b", "end", "def f(a, b, **, &)\nend\n"),
+        ("rb one per line, comments", "k.rb", "def f(\n  a, # a\n  &blk # the block\n)\nend\n", "f", "b", "end",
+         "def f(\n  a, # a\n  b,\n  &blk # the block\n)\nend\n"),
+    ]
+    for label, name, source, target, parameter, position, expected in cases:
+        _exact(f"add_parameter ({label})",
+               _edit_result(name, source, lambda a, t=target, p=parameter, s=position: a.add_parameter(t, p, s)), expected)
+
+
+def test_final_c_variadic_parameters():
+    print("\n═══ remove_parameter keeps a named parameter before a C `...` ═══")
+
+    # Before C23 a C function needs a named parameter before its `...`, and
+    # tree-sitter takes `f(...)` anyway: removing the last one is refused in
+    # .c and .h files. C++ allows `f(...)`.
+    reason = "C needs a named parameter before `...`"
+    cases = [
+        ("a definition (reported)", "k.c", "int f(int a, ...) { return 0; }\n"),
+        ("a prototype", "k.h", "int f(int a, ...);\n"),
+        ("one per line", "k.c", "int f(\n    int a,\n    ...\n) { return 0; }\n"),
+        ("a comment stays in the list", "k.c", "int f(int a /* a */, ...) { return 0; }\n"),
+    ]
+    for label, name, source in cases:
+        _refused(f"c last named parameter before ... ({label})",
+                 _edit_result(name, source, lambda a: a.remove_parameter("f", "a")), reason)
+    cases = [
+        ("c another one stays", "k.c", "int f(int a, int b, ...) { return 0; }\n", "a", "int f(int b, ...) { return 0; }\n"),
+        ("c the last before ...", "k.c", "int f(int a, int b, ...) { return 0; }\n", "b", "int f(int a, ...) { return 0; }\n"),
+        ("cpp f(...)", "k.cpp", "int f(int a, ...) { return 0; }\n", "a", "int f(...) { return 0; }\n"),
+        ("cpp one per line", "k.cpp", "int f(\n    int a,\n    ...\n) { return 0; }\n", "a",
+         "int f(\n    ...\n) { return 0; }\n"),
+        ("cpp the last before ...", "k.cpp", "int f(int a, int b, ...) { return 0; }\n", "b",
+         "int f(int a, ...) { return 0; }\n"),
+        ("c the only one leaves (void)", "k.c", "int f(int a) { return 0; }\n", "a", "int f(void) { return 0; }\n"),
+    ]
+    for label, name, source, parameter, expected in cases:
+        _exact(f"remove_parameter beside ... ({label})",
+               _edit_result(name, source, lambda a, p=parameter: a.remove_parameter("f", p)), expected)
+
+
+def test_final_same_line_comments():
+    print("\n═══ delete_symbol keeps a comment before the symbol on its line on request ═══")
+
+    # With include_leading_comments=False a comment before the symbol on its
+    # first line stays, on a line of its own, spaced as one above it would
+    # be; with the default it goes, as one above it does.
+    cases = [
+        ("js (reported)", "k.js", "/** @type {X} */ let x;\nlet y;\n", "x",
+         "/** @type {X} */\nlet y;\n", "let y;\n"),
+        ("c", "k.c", "/* c */ int x;\nint y;\n", "x", "/* c */\nint y;\n", "int y;\n"),
+        ("ts", "k.ts", "/** c */ let x: number;\nlet y: number;\n", "x",
+         "/** c */\nlet y: number;\n", "let y: number;\n"),
+        ("go", "k.go", "package main\n\n/* c */ var x int\n\nvar y int\n", "x",
+         "package main\n\n/* c */\n\nvar y int\n", "package main\n\nvar y int\n"),
+        ("a java field", "K.java", "class A {\n    /** c */ int x;\n    int y;\n}\n", "A.x",
+         "class A {\n    /** c */\n    int y;\n}\n", "class A {\n    int y;\n}\n"),
+        ("a c++ field", "k.cpp", "class A {\n  /* c */ int x;\n  int y;\n};\n", "A.x",
+         "class A {\n  /* c */\n  int y;\n};\n", "class A {\n  int y;\n};\n"),
+        ("a function", "k.js", "/* c */ function f() {\n  return 1;\n}\nlet y;\n", "f",
+         "/* c */\nlet y;\n", "let y;\n"),
+        ("a comment above too", "k.js", "// a\n/** c */ let x;\nlet y;\n", "x",
+         "// a\n/** c */\nlet y;\n", "let y;\n"),
+        ("a block comment that began above", "k.js", "/* a\n b */ let x;\nlet y;\n", "x",
+         "/* a\n b */\nlet y;\n", "let y;\n"),
+        ("two comments", "k.js", "/* a */ /* b */ let x;\nlet y;\n", "x", "/* a */ /* b */\nlet y;\n", "let y;\n"),
+        ("a comment after it goes", "k.js", "/* a */ let x; // t\nlet y;\n", "x", "/* a */\nlet y;\n", "let y;\n"),
+        ("between blank lines", "k.js", "let a;\n\n/* c */ let x;\n\nlet y;\n", "x",
+         "let a;\n\n/* c */\n\nlet y;\n", "let a;\n\nlet y;\n"),
+        ("last", "k.js", "let a;\n\n/* c */ let x;\n", "x", "let a;\n\n/* c */\n", "let a;\n"),
+        # Code after it on its line stays there, after the comment or, when
+        # that goes with it, at the line's indentation.
+        ("code after it", "k.js", "/* c */ let x; let y;\n", "x", "/* c */ let y;\n", "let y;\n"),
+        ("code after it, a comment above", "k.js", "// a\n/* c */ let x; let y;\n", "x",
+         "// a\n/* c */ let y;\n", "let y;\n"),
+        ("code after it, a java field", "K.java", "class A {\n    /** c */ int x; int y;\n}\n", "A.x",
+         "class A {\n    /** c */ int y;\n}\n", "class A {\n    int y;\n}\n"),
+    ]
+    for label, name, source, target, kept, gone in cases:
+        _exact(f"same-line comment kept ({label})",
+               _edit_result(name, source, lambda a, t=target: a.delete_symbol(t, include_leading_comments=False)), kept)
+        _exact(f"same-line comment deleted ({label})",
+               _edit_result(name, source, lambda a, t=target: a.delete_symbol(t)), gone)
+    _exact("same-line comment kept (crlf)",
+           _edit_result("k.js", "/** c */ let x;\nlet y;\n",
+                        lambda a: a.delete_symbol("x", include_leading_comments=False), "\r\n"),
+           "/** c */\r\nlet y;\r\n")
+    _exact("same-line comment deleted (crlf)",
+           _edit_result("k.js", "/** c */ let x;\nlet y;\n", lambda a: a.delete_symbol("x"), "\r\n"), "let y;\r\n")
+    # A symbol without one is deleted as before.
+    _exact("same-line comment, none there",
+           _edit_result("k.js", "/** c */\nlet x;\nlet y;\n", lambda a: a.delete_symbol("x", include_leading_comments=False)),
+           "/** c */\nlet y;\n")
+
+
+def test_final_ruby_method_clauses():
+    print("\n═══ replace_function_body keeps a Ruby method's rescue, else and ensure clauses ═══")
+
+    # The body that replace_function_body replaces is the code before the
+    # method's first rescue, else or ensure clause, which stays; with no code
+    # there (only comments, or nothing) it is one level deeper than the def,
+    # as in an empty method.
+    clauses = [
+        ("rescue (reported)", "rescue => e\n  log(e)\n"),
+        ("ensure", "ensure\n  close\n"),
+        ("rescue and ensure", "rescue => e\n  log(e)\nensure\n  close\n"),
+        ("rescue and else", "rescue => e\n  log(e)\nelse\n  ok\n"),
+    ]
+    for label, clause in clauses:
+        expected = "def f\n  1\n" + clause + "end\n"
+        _exact(f"ruby body before {label}",
+               _edit_result("k.rb", "def f\n" + clause + "end\n", lambda a: a.replace_function_body("f", "1")), expected)
+        _exact(f"ruby body before {label}, code there",
+               _edit_result("k.rb", "def f\n  x\n  y\n" + clause + "end\n", lambda a: a.replace_function_body("f", "1")),
+               expected)
+        _exact(f"ruby body before {label}, a comment there",
+               _edit_result("k.rb", "def f\n  # c\n" + clause + "end\n", lambda a: a.replace_function_body("f", "1")),
+               expected)
+    cases = [
+        ("a method in a class", "class A\n  def f\n  rescue => e\n    log(e)\n  end\nend\n", "A.f", "a = 1\nb = a",
+         "class A\n  def f\n    a = 1\n    b = a\n  rescue => e\n    log(e)\n  end\nend\n"),
+        ("a method in a class, code there", "class A\n  def f\n    x\n  rescue => e\n    log(e)\n  end\nend\n", "A.f",
+         "1", "class A\n  def f\n    1\n  rescue => e\n    log(e)\n  end\nend\n"),
+        ("a singleton method", "def self.f\nrescue => e\n  log(e)\nend\n", "f", "1",
+         "def self.f\n  1\nrescue => e\n  log(e)\nend\n"),
+        ("parameters over lines", "def f(a,\n      b)\nrescue => e\n  log(e)\nend\n", "f", "1",
+         "def f(a,\n      b)\n  1\nrescue => e\n  log(e)\nend\n"),
+        ("a comment above the code stays", "def f\n  # c\n  x\nrescue => e\n  log(e)\nend\n", "f", "1",
+         "def f\n  # c\n  1\nrescue => e\n  log(e)\nend\n"),
+        # Content with clauses of its own replaces the method's.
+        ("content with its own rescue", "def f\n  x\nrescue => e\n  log(e)\nend\n", "f", "y\nrescue => e\n  warn(e)",
+         "def f\n  y\n  rescue => e\n    warn(e)\nend\n"),
+        ("content with its own ensure", "def f\nrescue => e\n  log(e)\nend\n", "f", "y\nensure\n  close",
+         "def f\n  y\n  ensure\n    close\nend\n"),
+        ("a blank line before the clause stays", "def f\n  x\n\nrescue => e\n  log(e)\nend\n", "f", "1",
+         "def f\n  1\n\nrescue => e\n  log(e)\nend\n"),
+        ("tabs", "class A\n\tdef f\n\trescue => e\n\t\tlog(e)\n\tend\nend\n", "A.f", "1",
+         "class A\n\tdef f\n\t\t1\n\trescue => e\n\t\tlog(e)\n\tend\nend\n"),
+        # A clause that shares a line with code moves to a line of its own.
+        ("a clause after code on its line", "def f\n  x; rescue => e\n  log(e)\nend\n", "f", "1",
+         "def f\n  1\nrescue => e\n  log(e)\nend\n"),
+        ("on one line", "def f; x; rescue => e; log(e); end\n", "f", "1", "def f\n  1\nrescue => e\n  log(e)\nend\n"),
+        # A method without clauses as before.
+        ("no clause", "def f\n  x\nend\n", "f", "1", "def f\n  1\nend\n"),
+        ("content with an if and else", "def f\n  x\nrescue => e\n  log(e)\nend\n", "f", "if a\n  b\nelse\n  c\nend",
+         "def f\n  if a\n    b\n  else\n    c\n  end\nrescue => e\n  log(e)\nend\n"),
+    ]
+    for label, source, target, content, expected in cases:
+        _exact(f"ruby body before its clauses ({label})",
+               _edit_result("k.rb", source, lambda a, t=target, c=content: a.replace_function_body(t, c)), expected)
+
+    _exact("ruby body before its clauses (crlf)",
+           _edit_result("k.rb", "def f\nrescue => e\n  log(e)\nend\n", lambda a: a.replace_function_body("f", "1"), "\r\n"),
+           "def f\r\n  1\r\nrescue => e\r\n  log(e)\r\nend\r\n")
+
+    # The other body tools on such a method, as before.
+    source = "def f\nrescue => e\n  log(e)\nensure\n  close\nend\n"
+    tools = [
+        ("insert at top", lambda a: a.insert_in_body("f", "y = 2", at="top"),
+         "def f\n  y = 2\nrescue => e\n  log(e)\nensure\n  close\nend\n"),
+        ("insert at bottom", lambda a: a.insert_in_body("f", "y = 2", at="bottom"),
+         "def f\n  y = 2\nrescue => e\n  log(e)\nensure\n  close\nend\n"),
+        ("replace_in_body", lambda a: a.replace_in_body("f", "log(e)", "warn(e)"),
+         "def f\nrescue => e\n  warn(e)\nensure\n  close\nend\n"),
+        ("delete_in_body", lambda a: a.delete_in_body("f", "close"), "def f\nrescue => e\n  log(e)\nensure\nend\n"),
+        ("insert after", lambda a: a.insert_in_body("f", "flush", after="close"),
+         "def f\nrescue => e\n  log(e)\nensure\n  close\n  flush\nend\n"),
+    ]
+    for label, action, expected in tools:
+        _exact(f"ruby clauses, {label}", _edit_result("k.rb", source, action), expected)
+    _exact("ruby clauses, insert at bottom in a class",
+           _edit_result("k.rb", "class A\n  def f\n  ensure\n    close\n  end\nend\n",
+                        lambda a: a.insert_in_body("A.f", "y = 2", at="bottom")),
+           "class A\n  def f\n    y = 2\n  ensure\n    close\n  end\nend\n")
+
+
+def test_final_cpp_method_access():
+    print("\n═══ add_method keeps a C++ method in the access section of the class's last method ═══")
+
+    # When an access label follows the class's last method, the new method
+    # goes after that method (its comment on its line too), so that it gets
+    # its access, spaced as add_method spaces methods; otherwise, and in a
+    # class without methods, after the last member as before.
+    cases = [
+        ("reported", "class Box {\npublic:\n    int get() { return v; }\nprivate:\n    int v;\n};\n", "Box", "void f() {}",
+         "class Box {\npublic:\n    int get() { return v; }\n\n    void f() {}\nprivate:\n    int v;\n};\n"),
+        ("a struct", "struct Box {\n    int get() { return v; }\nprivate:\n    int v;\n};\n", "Box", "void f() {}",
+         "struct Box {\n    int get() { return v; }\n\n    void f() {}\nprivate:\n    int v;\n};\n"),
+        ("declared methods", "class Box {\npublic:\n    int get();\n    int set(int);\nprivate:\n    int v;\n};\n", "Box",
+         "void f();", "class Box {\npublic:\n    int get();\n    int set(int);\n    void f();\nprivate:\n    int v;\n};\n"),
+        ("a declared destructor", "class Box {\npublic:\n    ~Box();\nprivate:\n    int v;\n};\n", "Box", "void f() {}",
+         "class Box {\npublic:\n    ~Box();\n\n    void f() {}\nprivate:\n    int v;\n};\n"),
+        ("a constructor", "class Box {\npublic:\n    Box() : v(0) {}\nprivate:\n    int v;\n};\n", "Box", "void f() {}",
+         "class Box {\npublic:\n    Box() : v(0) {}\n\n    void f() {}\nprivate:\n    int v;\n};\n"),
+        ("an operator", "class Box {\npublic:\n    bool operator==(const Box& o) const { return v == o.v; }\nprivate:\n"
+         "    int v;\n};\n", "Box", "void f() {}",
+         "class Box {\npublic:\n    bool operator==(const Box& o) const { return v == o.v; }\n\n    void f() {}\nprivate:\n"
+         "    int v;\n};\n"),
+        ("a defaulted operator", "class Box {\npublic:\n    Box& operator=(const Box&) = default;\nprivate:\n    int v;\n};\n",
+         "Box", "void f() {}",
+         "class Box {\npublic:\n    Box& operator=(const Box&) = default;\n\n    void f() {}\nprivate:\n    int v;\n};\n"),
+        ("a pure virtual method", "class Box {\npublic:\n    virtual int get() const = 0;\nprotected:\n    int v;\n};\n", "Box",
+         "virtual void f() = 0;",
+         "class Box {\npublic:\n    virtual int get() const = 0;\n\n    virtual void f() = 0;\nprotected:\n    int v;\n};\n"),
+        ("a member template", "class Box {\npublic:\n    template <typename T>\n    T as() const { return T(v); }\nprivate:\n"
+         "    int v;\n};\n", "Box", "void f() {}",
+         "class Box {\npublic:\n    template <typename T>\n    T as() const { return T(v); }\n\n    void f() {}\nprivate:\n"
+         "    int v;\n};\n"),
+        ("a comment after it on its line", "class Box {\npublic:\n    int get() { return v; }  // getter\nprivate:\n"
+         "    int v;\n};\n", "Box", "void f() {}",
+         "class Box {\npublic:\n    int get() { return v; }  // getter\n\n    void f() {}\nprivate:\n    int v;\n};\n"),
+        ("a comment below it", "class Box {\npublic:\n    int get() { return v; }\n    // fields\nprivate:\n    int v;\n};\n",
+         "Box", "void f() {}",
+         "class Box {\npublic:\n    int get() { return v; }\n\n    void f() {}\n    // fields\nprivate:\n    int v;\n};\n"),
+        ("a field after it", "class Box {\npublic:\n    int get() { return v; }\n    int w;\nprivate:\n    int v;\n};\n", "Box",
+         "void f() {}",
+         "class Box {\npublic:\n    int get() { return v; }\n\n    void f() {}\n    int w;\nprivate:\n    int v;\n};\n"),
+        ("a blank line before the label", "class Box {\npublic:\n    int get() { return v; }\n\nprivate:\n    int v;\n};\n",
+         "Box", "void f() {}",
+         "class Box {\npublic:\n    int get() { return v; }\n\n    void f() {}\n\nprivate:\n    int v;\n};\n"),
+        ("stacked methods", "class Box {\npublic:\n    int get() { return v; }\n    void set(int x) { v = x; }\nprivate:\n"
+         "    int v;\n};\n", "Box", "void f() {}",
+         "class Box {\npublic:\n    int get() { return v; }\n    void set(int x) { v = x; }\n    void f() {}\nprivate:\n"
+         "    int v;\n};\n"),
+        ("indented labels", "class Box {\n  public:\n    int get() { return v; }\n  protected:\n    int v;\n};\n", "Box",
+         "void f() {}",
+         "class Box {\n  public:\n    int get() { return v; }\n\n    void f() {}\n  protected:\n    int v;\n};\n"),
+        ("over several lines", "class Box {\npublic:\n    int get() {\n        return v;\n    }\nprivate:\n    int v;\n};\n",
+         "Box", "void f() {\n    v = 0;\n}",
+         "class Box {\npublic:\n    int get() {\n        return v;\n    }\n\n    void f() {\n        v = 0;\n    }\nprivate:\n"
+         "    int v;\n};\n"),
+        ("tabs", "class Box {\npublic:\n\tint get() { return v; }\nprivate:\n\tint v;\n};\n", "Box", "void f() {}",
+         "class Box {\npublic:\n\tint get() { return v; }\n\n\tvoid f() {}\nprivate:\n\tint v;\n};\n"),
+        ("a nested class", "class Outer {\npublic:\n    class Inner {\n    public:\n        void a() {}\n    private:\n"
+         "        int x;\n    };\n    void b() {}\nprivate:\n    int y;\n};\n", "Outer.Inner", "void f() {}",
+         "class Outer {\npublic:\n    class Inner {\n    public:\n        void a() {}\n\n        void f() {}\n    private:\n"
+         "        int x;\n    };\n    void b() {}\nprivate:\n    int y;\n};\n"),
+        ("the class around a nested class", "class Outer {\npublic:\n    class Inner {\n    public:\n        void a() {}\n"
+         "    private:\n        int x;\n    };\n    void b() {}\nprivate:\n    int y;\n};\n", "Outer", "void f() {}",
+         "class Outer {\npublic:\n    class Inner {\n    public:\n        void a() {}\n    private:\n        int x;\n    };\n"
+         "    void b() {}\n    void f() {}\nprivate:\n    int y;\n};\n"),
+        ("a friend and a function pointer are no methods", "class Box {\npublic:\n    int get() { return v; }\nprivate:\n"
+         "    friend bool eq(const Box&, const Box&);\n    int (*fp)(int);\n};\n", "Box", "void f() {}",
+         "class Box {\npublic:\n    int get() { return v; }\n\n    void f() {}\nprivate:\n"
+         "    friend bool eq(const Box&, const Box&);\n    int (*fp)(int);\n};\n"),
+        ("on one line", "class Box { public: int get() { return v; } private: int v; };\n", "Box", "void f() {}",
+         "class Box {\n  public: int get() { return v; }\n\n  void f() {}\n  private: int v;\n};\n"),
+        ("the label on its line", "class Box {\npublic:\n    int get() { return v; } private:\n    int v;\n};\n", "Box",
+         "void f() {}",
+         "class Box {\npublic:\n    int get() { return v; }\n\n    void f() {}\nprivate:\n    int v;\n};\n"),
+        # As before: no label after the last method, or no method.
+        ("no labels", "class Box {\n    int get() { return v; }\n    int v;\n};\n", "Box", "void f() {}",
+         "class Box {\n    int get() { return v; }\n    int v;\n\n    void f() {}\n};\n"),
+        ("no methods", "class Box {\npublic:\n    int w;\nprivate:\n    int v;\n};\n", "Box", "void f() {}",
+         "class Box {\npublic:\n    int w;\nprivate:\n    int v;\n\n    void f() {}\n};\n"),
+        ("the last method in the last section", "class Box {\nprivate:\n    int v;\npublic:\n    int get() { return v; }\n};\n",
+         "Box", "void f() {}",
+         "class Box {\nprivate:\n    int v;\npublic:\n    int get() { return v; }\n    void f() {}\n};\n"),
+        ("a comment after the last member", "class Box {\npublic:\n    int get() { return v; }\n    // end\n};\n", "Box",
+         "void f() {}", "class Box {\npublic:\n    int get() { return v; }\n    // end\n\n    void f() {}\n};\n"),
+    ]
+    for label, source, target, content, expected in cases:
+        _exact(f"cpp add_method access ({label})",
+               _edit_result("k.cpp", source, lambda a, t=target, c=content: a.add_method(t, c)), expected)
+    # Only C++ changes: a Java class has no access sections.
+    _exact("cpp add_method access (java as before)",
+           _edit_result("K.java", "class Box {\n    int get() { return v; }\n    private int v;\n}\n",
+                        lambda a: a.add_method("Box", "void f() {}")),
+           "class Box {\n    int get() { return v; }\n    private int v;\n\n    void f() {}\n}\n")
+
+
+def test_final_import_groups():
+    print("\n═══ add_import puts an import in its group, at its sorted place ═══")
+
+    # A group is a run of imports that no blank line or other code
+    # separates (comments may). The new import goes in the group it
+    # belongs with, at its sorted place when the group is sorted, else
+    # after the group's last import; when no group fits, after the last
+    # import, as before. The blank lines between groups stay.
+    # (label, file name, source, import text, expected file text)
+    py = "import os\nimport sys\n\nimport numpy\n\nfrom app import x\n\nX = 1\n"
+    c = '#include <stdio.h>\n#include <string.h>\n\n#include "b.h"\n#include "d.h"\n\nint x;\n'
+    go = 'package main\n\nimport (\n\t"fmt"\n\t"os"\n\n\t"github.com/a/b"\n\n\t"example.com/me/x"\n)\n'
+    js = 'import a from "a";\nimport c from "c";\n\nimport x from "./x";\nimport z from "./z";\n\nf();\n'
+    cjs = "const fs = require('fs');\nconst path = require('path');\n\nconst a = require('./a');\n"
+    mixed = 'import a from "a";\n\nconst b = require("b");\nconst d = require("d");\n'
+    java = ("package p;\n\nimport java.util.List;\nimport java.util.Map;\n\nimport org.junit.Test;\n\n"
+            "import static org.junit.Assert.assertEquals;\n\nclass A {}\n")
+    rb = "require 'json'\nrequire 'set'\n\nrequire_relative 'a'\nrequire_relative 'c'\n"
+    cases = [
+        ("py (reported)", "m.py", "import ast\nimport json\nfrom x import (\n    a,\n    b,\n)\n\nX = 1\n", "import functools",
+         "import ast\nimport functools\nimport json\nfrom x import (\n    a,\n    b,\n)\n\nX = 1\n"),
+        ("py standard library", "m.py", py, "import platform",
+         "import os\nimport platform\nimport sys\n\nimport numpy\n\nfrom app import x\n\nX = 1\n"),
+        ("py another module, the first group of others", "m.py", py, "import requests",
+         "import os\nimport sys\n\nimport numpy\nimport requests\n\nfrom app import x\n\nX = 1\n"),
+        ("py the same top-level package", "m.py", py, "from app.y import z",
+         "import os\nimport sys\n\nimport numpy\n\nfrom app import x\nfrom app.y import z\n\nX = 1\n"),
+        ("py an import line before the from-imports", "m.py", py, "import app",
+         "import os\nimport sys\n\nimport numpy\n\nimport app\nfrom app import x\n\nX = 1\n"),
+        ("py a from-import after the import lines", "m.py", "import os\nimport sys\n\nx = 1\n", "from collections import abc",
+         "import os\nimport sys\nfrom collections import abc\n\nx = 1\n"),
+        ("py from-imports sorted among the import lines", "m.py", "from collections import abc\nimport os\nfrom typing import Any\n",
+         "import json", "from collections import abc\nimport json\nimport os\nfrom typing import Any\n"),
+        ("py module names compared without case", "m.py", "import abc\nimport Cython\n", "import base64",
+         "import abc\nimport base64\nimport Cython\n"),
+        ("py an unsorted group", "m.py", "import sys\nimport os\n\nx = 1\n", "import json",
+         "import sys\nimport os\nimport json\n\nx = 1\n"),
+        ("py the standard library group after another", "m.py", "import numpy\n\nimport os\n", "import abc",
+         "import numpy\n\nimport abc\nimport os\n"),
+        ("py no group of its kind", "m.py", "import numpy\nimport pandas\n\nx = 1\n", "import os",
+         "import numpy\nimport pandas\nimport os\n\nx = 1\n"),
+        ("py a relative import", "m.py", "import os\n\nfrom . import a\nfrom .c import d\n", "from .b import e",
+         "import os\n\nfrom . import a\nfrom .b import e\nfrom .c import d\n"),
+        ("py above the comment over the next import", "m.py", "import a\n# for c\nimport c\n", "import b",
+         "import a\nimport b\n# for c\nimport c\n"),
+        ("py below a comment heading the group", "m.py", "# Standard library\nimport os\nimport sys\n", "import abc",
+         "# Standard library\nimport abc\nimport os\nimport sys\n"),
+        ("py between imports over several lines", "m.py", "from a import (\n    x,\n)\nfrom c import (\n    y,\n)\n",
+         "from b import z", "from a import (\n    x,\n)\nfrom b import z\nfrom c import (\n    y,\n)\n"),
+        ("py after a __future__ import", "m.py", "from __future__ import annotations\nimport os\nimport sys\n", "import abc",
+         "from __future__ import annotations\nimport abc\nimport os\nimport sys\n"),
+        ("py a __future__ import goes first", "m.py", "import os\n\nx = 1\n", "from __future__ import annotations",
+         "from __future__ import annotations\nimport os\n\nx = 1\n"),
+        ("py a __future__ import with the others", "m.py", "from __future__ import annotations\n\nimport os\n",
+         "from __future__ import division", "from __future__ import annotations\nfrom __future__ import division\n\nimport os\n"),
+        ("py a __future__ import in an unsorted group", "m.py", "from __future__ import annotations\nimport sys\nimport os\n",
+         "from __future__ import division",
+         "from __future__ import annotations\nfrom __future__ import division\nimport sys\nimport os\n"),
+        ("py after a group of __future__ imports", "m.py", "from __future__ import annotations\n\nx = 1\n", "import os",
+         "from __future__ import annotations\nimport os\n\nx = 1\n"),
+        ("c angle brackets", "m.c", c, "#include <stdlib.h>",
+         '#include <stdio.h>\n#include <stdlib.h>\n#include <string.h>\n\n#include "b.h"\n#include "d.h"\n\nint x;\n'),
+        ("c quotes", "m.c", c, '#include "c.h"',
+         '#include <stdio.h>\n#include <string.h>\n\n#include "b.h"\n#include "c.h"\n#include "d.h"\n\nint x;\n'),
+        ("c angle brackets after quotes", "m.c", '#include "a.h"\n\n#include <stdio.h>\n', "#include <assert.h>",
+         '#include "a.h"\n\n#include <assert.h>\n#include <stdio.h>\n'),
+        ("cpp a shared directory", "m.cpp", "#include <stdio.h>\n\n#include <sys/stat.h>\n#include <sys/wait.h>\n",
+         "#include <sys/types.h>", "#include <stdio.h>\n\n#include <sys/stat.h>\n#include <sys/types.h>\n#include <sys/wait.h>\n"),
+        ("cpp not with the file's own header", "foo.cpp", '#include "foo.h"\n\n#include <string>\n\n#include "bar/baz.h"\n',
+         '#include "abc.h"', '#include "foo.h"\n\n#include <string>\n\n#include "abc.h"\n#include "bar/baz.h"\n'),
+        ("c in an include guard", "m.h", "#ifndef M_H\n#define M_H\n\n#include <stdio.h>\n#include <string.h>\n\nint f(void);\n\n#endif\n",
+         "#include <stdlib.h>",
+         "#ifndef M_H\n#define M_H\n\n#include <stdio.h>\n#include <stdlib.h>\n#include <string.h>\n\nint f(void);\n\n#endif\n"),
+        ("go standard library", "m.go", go, '"io"',
+         'package main\n\nimport (\n\t"fmt"\n\t"io"\n\t"os"\n\n\t"github.com/a/b"\n\n\t"example.com/me/x"\n)\n'),
+        ("go a shared path", "m.go", go, 'import "example.com/me/y"',
+         'package main\n\nimport (\n\t"fmt"\n\t"os"\n\n\t"github.com/a/b"\n\n\t"example.com/me/x"\n\t"example.com/me/y"\n)\n'),
+        ("go another module, the first group of others", "m.go", go, '"golang.org/x/sync"',
+         'package main\n\nimport (\n\t"fmt"\n\t"os"\n\n\t"github.com/a/b"\n\t"golang.org/x/sync"\n\n\t"example.com/me/x"\n)\n'),
+        ("go an alias sorts by its path", "m.go", go, 'f "path/filepath"',
+         'package main\n\nimport (\n\t"fmt"\n\t"os"\n\tf "path/filepath"\n\n\t"github.com/a/b"\n\n\t"example.com/me/x"\n)\n'),
+        ("go the standard library group after another", "m.go", 'package main\n\nimport (\n\t"github.com/a/b"\n\n\t"fmt"\n)\n',
+         '"os"', 'package main\n\nimport (\n\t"github.com/a/b"\n\n\t"fmt"\n\t"os"\n)\n'),
+        ("go no group of its kind", "m.go", 'package main\n\nimport (\n\t"fmt"\n)\n', '"github.com/a/b"',
+         'package main\n\nimport (\n\t"fmt"\n\t"github.com/a/b"\n)\n'),
+        ("go import lines", "m.go", 'package main\n\nimport "fmt"\nimport "os"\n\nfunc main() {}\n', 'import "io"',
+         'package main\n\nimport "fmt"\nimport "io"\nimport "os"\n\nfunc main() {}\n'),
+        ("go not with cgo's C", "m.go", 'package main\n\n// #include <stdio.h>\nimport "C"\n\nimport "fmt"\n', 'import "os"',
+         'package main\n\n// #include <stdio.h>\nimport "C"\n\nimport "fmt"\nimport "os"\n'),
+        ("go above a ) that closes the last spec's line", "m.go", 'package main\n\nimport (\n\t"fmt"\n\t"os")\n', '"zz"',
+         'package main\n\nimport (\n\t"fmt"\n\t"zz"\n\t"os")\n'),
+        ("go a comment over the next spec", "m.go", 'package main\n\nimport (\n\t"fmt"\n\t// for os\n\t"os"\n)\n', '"io"',
+         'package main\n\nimport (\n\t"fmt"\n\t"io"\n\t// for os\n\t"os"\n)\n'),
+        ("js packages", "m.js", js, 'import b from "b";',
+         'import a from "a";\nimport b from "b";\nimport c from "c";\n\nimport x from "./x";\nimport z from "./z";\n\nf();\n'),
+        ("js relative paths", "m.js", js, 'import y from "./y";',
+         'import a from "a";\nimport c from "c";\n\nimport x from "./x";\nimport y from "./y";\nimport z from "./z";\n\nf();\n'),
+        ("js a parent directory", "m.js", js, 'import p from "../p";',
+         'import a from "a";\nimport c from "c";\n\nimport p from "../p";\nimport x from "./x";\nimport z from "./z";\n\nf();\n'),
+        ("js requires", "m.js", cjs, "const os = require('os');",
+         "const fs = require('fs');\nconst os = require('os');\nconst path = require('path');\n\nconst a = require('./a');\n"),
+        ("js a relative require", "m.js", cjs, "const b = require('./b');",
+         "const fs = require('fs');\nconst path = require('path');\n\nconst a = require('./a');\nconst b = require('./b');\n"),
+        ("js a require with requires", "m.js", mixed, "const c = require('c');",
+         'import a from "a";\n\nconst b = require("b");\nconst c = require(\'c\');\nconst d = require("d");\n'),
+        ("js an import with imports", "m.js", mixed, 'import z from "z";',
+         'import a from "a";\nimport z from "z";\n\nconst b = require("b");\nconst d = require("d");\n'),
+        ("ts a type import", "m.ts", 'import { A } from "a";\nimport { C } from "c";\n', 'import type { B } from "b";',
+         'import { A } from "a";\nimport type { B } from "b";\nimport { C } from "c";\n'),
+        ("java a shared package", "A.java", java, "import java.util.HashMap;",
+         java.replace("import java.util.List;", "import java.util.HashMap;\nimport java.util.List;")),
+        ("java the longest shared package", "A.java", java, "import org.junit.Before;",
+         java.replace("import org.junit.Test;", "import org.junit.Before;\nimport org.junit.Test;")),
+        ("java static with static", "A.java", java, "import static org.junit.Assert.assertTrue;",
+         java.replace("assertEquals;", "assertEquals;\nimport static org.junit.Assert.assertTrue;")),
+        ("java static, no shared package", "A.java", java, "import static java.util.Collections.sort;",
+         java.replace("import static org", "import static java.util.Collections.sort;\nimport static org")),
+        ("java no shared package, the first group", "A.java", java, "import com.foo.Bar;",
+         java.replace("import java.util.List;", "import com.foo.Bar;\nimport java.util.List;")),
+        ("rb require", "m.rb", rb, "require 'pp'",
+         "require 'json'\nrequire 'pp'\nrequire 'set'\n\nrequire_relative 'a'\nrequire_relative 'c'\n"),
+        ("rb require_relative", "m.rb", rb, "require_relative 'b'",
+         "require 'json'\nrequire 'set'\n\nrequire_relative 'a'\nrequire_relative 'b'\nrequire_relative 'c'\n"),
+    ]
+    for label, name, source, text, expected in cases:
+        _exact(f"add_import in its group ({label})", _edit_result(name, source, lambda a, t=text: a.add_import(t)), expected)
+
+    # A file without imports gets its first one after the preamble, as
+    # before, and an import already there is not added again.
+    _exact("add_import in its group (no imports yet)",
+           _edit_result("m.py", '"""Doc."""\n\nx = 1\n', lambda a: a.add_import("import os")),
+           '"""Doc."""\n\nimport os\n\nx = 1\n')
+    _exact("add_import in its group (already there)",
+           _edit_result("m.py", py, lambda a: a.add_import("import sys")), py)
+
+
+def test_final_import_name_order():
+    print("\n═══ add_import_name puts a name at its sorted place in sorted names ═══")
+
+    # Names in plain (case-sensitive) order, or else in isort's and ruff's
+    # order by type (CONSTANT_CASE, then CamelCase, then the rest), get the
+    # new one at its place in that order, an alias sorting by its name; one
+    # name counts as sorted in plain order. Other names get it at the end,
+    # as before. The list keeps its layout.
+    # (label, file name, source, module, name, expected file text)
+    by_type = "from m import TYPE_CHECKING, Any, cast\n"
+    cases = [
+        ("py one name per line (reported)", "m.py", "from x import (\n    alpha,\n    gamma,\n)\n", "x", "beta",
+         "from x import (\n    alpha,\n    beta,\n    gamma,\n)\n"),
+        ("py first, one name per line", "m.py", "from x import (\n    b,\n    c,\n)\n", "x", "a",
+         "from x import (\n    a,\n    b,\n    c,\n)\n"),
+        ("py without a trailing comma", "m.py", "from x import (\n    a,\n    c\n)\n", "x", "b",
+         "from x import (\n    a,\n    b,\n    c\n)\n"),
+        ("py above the comment over the next name", "m.py", "from x import (\n    a,\n    # about c\n    c,\n)\n", "x", "b",
+         "from x import (\n    a,\n    b,\n    # about c\n    c,\n)\n"),
+        ("py below a comment ending a name's line", "m.py", "from x import (\n    a,  # A\n    c,  # C\n)\n", "x", "b",
+         "from x import (\n    a,  # A\n    b,\n    c,  # C\n)\n"),
+        ("py inline", "m.py", "from x import a, c\n", "x", "b", "from x import a, b, c\n"),
+        ("py inline, first", "m.py", "from x import b, c\n", "x", "a", "from x import a, b, c\n"),
+        ("py inline in parentheses", "m.py", "from x import (a, c)\n", "x", "b", "from x import (a, b, c)\n"),
+        ("py aligned under the (", "m.py", "from x import (a,\n               c)\n", "x", "b",
+         "from x import (a,\n               b,\n               c)\n"),
+        ("py after a backslash continuation", "m.py", "from x import a, \\\n    c\n", "x", "b",
+         "from x import a, \\\n    b, c\n"),
+        ("py a new alias sorts by its name", "m.py", "from x import (\n    a as z,\n    c,\n)\n", "x", "b as y",
+         "from x import (\n    a as z,\n    b as y,\n    c,\n)\n"),
+        ("py an alias sorts by its name", "m.py", "from x import b as z, c\n", "x", "a", "from x import a, b as z, c\n"),
+        ("py order by type, a class", "m.py", by_type, "m", "Dict", "from m import TYPE_CHECKING, Any, Dict, cast\n"),
+        ("py order by type, a constant", "m.py", by_type, "m", "MAX", "from m import MAX, TYPE_CHECKING, Any, cast\n"),
+        ("py order by type, the rest", "m.py", by_type, "m", "bar", "from m import TYPE_CHECKING, Any, bar, cast\n"),
+        ("py plain order first", "m.py", "from typing import Any, Dict\n", "typing", "TYPE_CHECKING",
+         "from typing import Any, Dict, TYPE_CHECKING\n"),
+        ("py one name", "m.py", "from x import b\n", "x", "a", "from x import a, b\n"),
+        ("py one name, plain order", "m.py", "from typing import Any\n", "typing", "TYPE_CHECKING",
+         "from typing import Any, TYPE_CHECKING\n"),
+        ("py unsorted names", "m.py", "from x import c, a\n", "x", "b", "from x import c, a, b\n"),
+        ("py unsorted names one per line", "m.py", "from x import (\n    c,\n    a,\n)\n", "x", "b",
+         "from x import (\n    c,\n    a,\n    b,\n)\n"),
+        ("js inline", "m.js", 'import { a, c } from "m";\n', "m", "b", 'import { a, b, c } from "m";\n'),
+        ("js one name per line", "m.js", 'import {\n  a,\n  c,\n} from "m";\n', "m", "b",
+         'import {\n  a,\n  b,\n  c,\n} from "m";\n'),
+        ("js below a comment ending a name's line", "m.js", 'import {\n  a, // A\n  c, // C\n} from "m";\n', "m", "b",
+         'import {\n  a, // A\n  b,\n  c, // C\n} from "m";\n'),
+        ("js first", "m.js", 'import { b, c } from "m";\n', "m", "a", 'import { a, b, c } from "m";\n'),
+        ("js with a default import", "m.js", 'import D, { a, c } from "m";\n', "m", "b", 'import D, { a, b, c } from "m";\n'),
+        ("js an alias sorts by its name", "m.js", 'import { a as z, c } from "m";\n', "m", "b",
+         'import { a as z, b, c } from "m";\n'),
+        ("ts type-only names", "m.ts", 'import {\n  type A,\n  c,\n} from "m";\n', "m", "type B",
+         'import {\n  type A,\n  type B,\n  c,\n} from "m";\n'),
+        ("ts a type import", "m.ts", 'import type { A, C } from "m";\n', "m", "B", 'import type { A, B, C } from "m";\n'),
+        ("js order by type", "m.js", 'import { FOO, Bar, baz } from "m";\n', "m", "Qux",
+         'import { FOO, Bar, Qux, baz } from "m";\n'),
+        ("js unsorted names", "m.js", 'import { c, a } from "m";\n', "m", "b", 'import { c, a, b } from "m";\n'),
+    ]
+    for label, name, source, module, new, expected in cases:
+        _exact(f"add_import_name in order ({label})",
+               _edit_result(name, source, lambda a, m=module, n=new: a.add_import_name(m, n)), expected)
+
+
+def test_final_import_directives():
+    print("\n═══ add_import keeps next-line directives, cgo preambles and Go specs valid ═══")
+
+    # A comment heading a group stays above a new first import, but a
+    # directive for the next line right above the first import (a
+    # @ts-ignore, eslint-disable-next-line, NOLINTNEXTLINE, a Go //nolint)
+    # stays on that import. cgo's preamble stays right above import "C".
+    # A new `from __future__` import goes after the module docstring when
+    # code comes before the first import. A Go spec given without `import`
+    # gets the keyword when there is no block to put it in, and a block on
+    # one line takes it inline.
+    # (label, file name, source, import text, expected file text)
+    cases = [
+        ("ts a @ts-ignore over the first import (reported)", "m.ts",
+         '// @ts-ignore\nimport foo from "untyped";\nimport bar from "z";\n', 'import a from "a";',
+         'import a from "a";\n// @ts-ignore\nimport foo from "untyped";\nimport bar from "z";\n'),
+        ("js an eslint-disable-next-line (reported)", "m.js",
+         '// eslint-disable-next-line import/no-unresolved\nimport b from "b";\nimport c from "c";\n', 'import a from "a";',
+         'import a from "a";\n// eslint-disable-next-line import/no-unresolved\nimport b from "b";\nimport c from "c";\n'),
+        ("cpp a NOLINTNEXTLINE (reported)", "m.cpp",
+         "// NOLINTNEXTLINE(build/include)\n#include <b.h>\n#include <c.h>\n", "#include <a.h>",
+         "#include <a.h>\n// NOLINTNEXTLINE(build/include)\n#include <b.h>\n#include <c.h>\n"),
+        ("ts a heading comment above the directive stays first", "m.ts",
+         '// Packages\n// @ts-expect-error\nimport foo from "untyped";\n', 'import a from "a";',
+         '// Packages\nimport a from "a";\n// @ts-expect-error\nimport foo from "untyped";\n'),
+        ("ts a file pragma stays first", "m.ts", '// @ts-nocheck\nimport b from "b";\n', 'import a from "a";',
+         '// @ts-nocheck\nimport a from "a";\nimport b from "b";\n'),
+        ("py a pylint disable-next", "m.py", "import os\n\n# pylint: disable-next=import-error\nimport foo\nimport zed\n",
+         "import bar", "import os\n\nimport bar\n# pylint: disable-next=import-error\nimport foo\nimport zed\n"),
+        ("go a nolint over the first spec", "m.go", 'package p\n\nimport (\n\t//nolint:depguard\n\t"os"\n)\n', '"fmt"',
+         'package p\n\nimport (\n\t"fmt"\n\t//nolint:depguard\n\t"os"\n)\n'),
+        ("go not between the cgo preamble and import C (reported)", "m.go",
+         'package p\n\n// #include <stdio.h>\nimport "C"\nimport "github.com/x/y"\n', 'import "9fans.net/go/acme"',
+         'package p\n\n// #include <stdio.h>\nimport "C"\nimport "9fans.net/go/acme"\nimport "github.com/x/y"\n'),
+        ("go not between the cgo preamble and C in a block", "m.go",
+         'package p\n\nimport (\n\t// #include <stdio.h>\n\t"C"\n\t"github.com/x/y"\n)\n', '"9fans.net/go/acme"',
+         'package p\n\nimport (\n\t// #include <stdio.h>\n\t"C"\n\t"9fans.net/go/acme"\n\t"github.com/x/y"\n)\n'),
+        ("py a __future__ import after code (reported)", "m.py", '"""Doc."""\nx = 1\n\nimport os\n',
+         "from __future__ import annotations",
+         '"""Doc."""\n\nfrom __future__ import annotations\n\nx = 1\n\nimport os\n'),
+        ("py a __future__ import before a try block", "m.py",
+         "try:\n    import json\nexcept ImportError:\n    json = None\nimport os\n", "from __future__ import annotations",
+         "from __future__ import annotations\n\ntry:\n    import json\nexcept ImportError:\n    json = None\nimport os\n"),
+        ("py a __future__ import after the docstring and comments, still", "m.py",
+         '#!/usr/bin/env python\n"""Doc."""\n# imports\nimport os\n', "from __future__ import annotations",
+         '#!/usr/bin/env python\n"""Doc."""\n# imports\nfrom __future__ import annotations\nimport os\n'),
+        ("go a bare spec after import lines (reported)", "m.go", 'package p\n\nimport "fmt"\nimport "os"\n', '"io"',
+         'package p\n\nimport "fmt"\nimport "io"\nimport "os"\n'),
+        ("go a bare spec after one import line", "m.go", 'package p\n\nimport "fmt"\n', '"os"',
+         'package p\n\nimport "fmt"\nimport "os"\n'),
+        ("go an alias spec", "m.go", 'package p\n\nimport "fmt"\n', 'f "path/filepath"',
+         'package p\n\nimport "fmt"\nimport f "path/filepath"\n'),
+        ("go a bare spec, no imports yet", "m.go", "package p\n\nfunc main() {}\n", '"os"',
+         'package p\n\nimport "os"\n\nfunc main() {}\n'),
+        ("go a bare spec already there", "m.go", 'package p\n\nimport "fmt"\n', '"fmt"', 'package p\n\nimport "fmt"\n'),
+        ("go a block on one line (reported)", "m.go", 'package p\n\nimport ("fmt"; "os")\n', '"io"',
+         'package p\n\nimport ("fmt"; "io"; "os")\n'),
+        ("go a block on one line, last", "m.go", 'package p\n\nimport ("fmt"; "os")\n', 'import "sync"',
+         'package p\n\nimport ("fmt"; "os"; "sync")\n'),
+        ("go an empty block on one line", "m.go", "package p\n\nimport ()\n", '"fmt"', 'package p\n\nimport ("fmt")\n'),
+    ]
+    for label, name, source, text, expected in cases:
+        _exact(f"add_import directives ({label})", _edit_result(name, source, lambda a, t=text: a.add_import(t)), expected)
+
+    # add_import_name follows the same rule: a comment heading the names
+    # stays first, a directive stays on the name below it.
+    # (label, file name, source, module, name, expected file text)
+    names = [
+        ("py a comment heading the names (reported)", "m.py", "from x import (\n    # first\n    beta,\n    gamma,\n)\n",
+         "x", "alpha", "from x import (\n    # first\n    alpha,\n    beta,\n    gamma,\n)\n"),
+        ("ts a comment heading the names (reported)", "m.ts", 'import {\n  // types\n  B,\n  C,\n} from "m";\n', "m", "A",
+         'import {\n  // types\n  A,\n  B,\n  C,\n} from "m";\n'),
+        ("ts a directive over the first name", "m.ts", 'import {\n  // @ts-ignore\n  B,\n  C,\n} from "m";\n', "m", "A",
+         'import {\n  A,\n  // @ts-ignore\n  B,\n  C,\n} from "m";\n'),
+        ("py a comment over a later name, still", "m.py", "from x import (\n    a,\n    # about c\n    c,\n)\n", "x", "b",
+         "from x import (\n    a,\n    b,\n    # about c\n    c,\n)\n"),
+    ]
+    for label, name, source, module, new, expected in names:
+        _exact(f"add_import_name directives ({label})",
+               _edit_result(name, source, lambda a, m=module, n=new: a.add_import_name(m, n)), expected)
+
+
+def test_final_parameter_order():
+    print("\n═══ add_parameter keeps Ruby's parameter order and C/C++ variadic forms ═══")
+
+    # Ruby orders parameters: required, optional, the splat, required
+    # again, keywords, `**opts`, `&blk`. At the end, a new parameter goes
+    # before those that must come after its kind; at the start, first.
+    # A GNU named variadic macro parameter (`args...`) and the old C++
+    # `int a...` keep their `...` last.
+    # (label, file name, source, target, parameter, position, expected file text)
+    cases = [
+        ("rb a positional parameter before keyword ones (reported)", "m.rb", "def f(a, k: 1, &blk)\nend\n", "f", "b", "end",
+         "def f(a, b, k: 1, &blk)\nend\n"),
+        ("rb before a required keyword (reported)", "m.rb", "def f(a, k:)\nend\n", "f", "b", "end", "def f(a, b, k:)\nend\n"),
+        ("rb an optional parameter before the splat (reported)", "m.rb", "def f(a, *r)\nend\n", "f", "b = 1", "end",
+         "def f(a, b = 1, *r)\nend\n"),
+        ("rb a positional parameter after the splat", "m.rb", "def f(a, *r)\nend\n", "f", "b", "end", "def f(a, *r, b)\nend\n"),
+        ("rb an optional parameter before those after the splat", "m.rb", "def f(a = 1, *r, z)\nend\n", "f", "b = 2", "end",
+         "def f(a = 1, b = 2, *r, z)\nend\n"),
+        ("rb an optional parameter after optional ones", "m.rb", "def f(a, b = 1)\nend\n", "f", "c = 2", "end",
+         "def f(a, b = 1, c = 2)\nend\n"),
+        ("rb an optional parameter before a required one after it", "m.rb", "def f(a = 1, b)\nend\n", "f", "c = 2", "end",
+         "def f(a = 1, c = 2, b)\nend\n"),
+        ("rb a splat before keyword ones", "m.rb", "def f(a, k: 1)\nend\n", "f", "*r", "end", "def f(a, *r, k: 1)\nend\n"),
+        ("rb a destructured parameter before keyword ones", "m.rb", "def f(a, k: 1)\nend\n", "f", "(x, y)", "end",
+         "def f(a, (x, y), k: 1)\nend\n"),
+        ("rb before **nil", "m.rb", "def f(a, **nil)\nend\n", "f", "b", "end", "def f(a, b, **nil)\nend\n"),
+        ("rb a keyword parameter before **opts and &blk", "m.rb", "def f(a, **o, &b)\nend\n", "f", "k: 1", "end",
+         "def f(a, k: 1, **o, &b)\nend\n"),
+        ("rb a keyword parameter after keyword ones", "m.rb", "def f(a, k: 1)\nend\n", "f", "j: 2", "end",
+         "def f(a, k: 1, j: 2)\nend\n"),
+        ("rb **opts before &blk", "m.rb", "def f(a, &b)\nend\n", "f", "**o", "end", "def f(a, **o, &b)\nend\n"),
+        ("rb &blk last", "m.rb", "def f(a, k: 1)\nend\n", "f", "&blk", "end", "def f(a, k: 1, &blk)\nend\n"),
+        ("rb one per line", "m.rb", "def f(\n  a,\n  k: 1\n)\nend\n", "f", "b", "end", "def f(\n  a,\n  b,\n  k: 1\n)\nend\n"),
+        ("rb at the start", "m.rb", "def f(a, k: 1)\nend\n", "f", "z", "start", "def f(z, a, k: 1)\nend\n"),
+        ("c a GNU named variadic macro (reported)", "m.c", "#define M(a, args...) a\n", "M", "b", "end",
+         "#define M(a, b, args...) a\n"),
+        ("c only a named variadic macro parameter", "m.c", "#define M(args...) 0\n", "M", "b", "end",
+         "#define M(b, args...) 0\n"),
+        ("c a named variadic macro, at the start", "m.c", "#define M(a, args...) a\n", "M", "z", "start",
+         "#define M(z, a, args...) a\n"),
+        ("c a variadic macro, still", "m.c", "#define M(a, ...) a\n", "M", "b", "end", "#define M(a, b, ...) a\n"),
+        ("cpp the old variadic form (reported)", "m.cpp", "int g(int a...) { return 0; }\n", "g", "int b", "end",
+         "int g(int a, int b...) { return 0; }\n"),
+        ("cpp the old variadic form with a space", "m.cpp", "int g(int a ...);\n", "g", "int b", "end",
+         "int g(int a, int b ...);\n"),
+        ("cpp an unnamed parameter before the ..., still", "m.cpp", "void f(int...);\n", "f", "int b", "end",
+         "void f(int b, int...);\n"),
+        ("cpp the old variadic form, at the start", "m.cpp", "int g(int a...);\n", "g", "int z", "start",
+         "int g(int z, int a...);\n"),
+        ("cpp a parameter pack, still", "m.cpp", "template <class... Ts> void f(int a, Ts... xs);\n", "f", "int b", "end",
+         "template <class... Ts> void f(int a, int b, Ts... xs);\n"),
+        ("cpp a pack written like the old form in a template keeps its place", "m.cpp",
+         "template <class... Ts> void f(Ts a...);\n", "f", "int b", "end", "template <class... Ts> void f(int b, Ts a...);\n"),
+    ]
+    for label, name, source, target, parameter, position, expected in cases:
+        _exact(f"add_parameter order ({label})",
+               _edit_result(name, source, lambda a, t=target, p=parameter, w=position: a.add_parameter(t, p, w)), expected)
+
+
+def test_final_cpp_method_sections():
+    print("\n═══ add_method finds C++ methods in #ifdef blocks and indents moved labels ═══")
+
+    # A method inside an #if/#ifdef block (either branch) counts as the
+    # class's last method: the new one goes after the block's #endif, in
+    # that section. An access label moved off the method's line is indented
+    # like the class's other labels (at the class's indentation without any).
+    # (label, file name, source, class, content, expected file text)
+    cases = [
+        ("a method declared in an #ifdef (reported)", "m.cpp",
+         "class Box {\npublic:\n#ifdef X\n    void h();\n#endif\nprivate:\n    int v;\n};\n", "Box", "void f();",
+         "class Box {\npublic:\n#ifdef X\n    void h();\n#endif\n\n    void f();\nprivate:\n    int v;\n};\n"),
+        ("a method defined in an #ifdef (reported)", "m.cpp",
+         "class A {\npublic:\n#ifdef X\n    void g() {}\n#endif\nprivate:\n    int v;\n};\n", "A", "void k() {}",
+         "class A {\npublic:\n#ifdef X\n    void g() {}\n#endif\n\n    void k() {}\nprivate:\n    int v;\n};\n"),
+        ("a method in an #else branch", "m.cpp",
+         "class A {\npublic:\n#ifdef X\n    int x;\n#else\n    void g() {}\n#endif\nprivate:\n    int v;\n};\n", "A", "void k() {}",
+         "class A {\npublic:\n#ifdef X\n    int x;\n#else\n    void g() {}\n#endif\n\n    void k() {}\nprivate:\n    int v;\n};\n"),
+        ("nested #if blocks", "m.cpp",
+         "class A {\npublic:\n#if A\n#ifdef B\n    void g();\n#endif\n#endif\nprivate:\n    int v;\n};\n", "A", "void k();",
+         "class A {\npublic:\n#if A\n#ifdef B\n    void g();\n#endif\n#endif\n\n    void k();\nprivate:\n    int v;\n};\n"),
+        ("an #ifdef of fields after the method, still", "m.cpp",
+         "class A {\npublic:\n    void g() {}\n#ifdef X\n    int x;\n#endif\nprivate:\n    int v;\n};\n", "A", "void k() {}",
+         "class A {\npublic:\n    void g() {}\n\n    void k() {}\n#ifdef X\n    int x;\n#endif\nprivate:\n    int v;\n};\n"),
+        ("a label moved off the method's line (reported)", "m.cpp",
+         "class A {\npublic:\n    void g() {} private:\n    int v;\n};\n", "A", "void k() {}",
+         "class A {\npublic:\n    void g() {}\n\n    void k() {}\nprivate:\n    int v;\n};\n"),
+        ("a label moved off the method's line, labels indented", "m.cpp",
+         "class A {\n  public:\n    void g() {} private:\n    int v;\n};\n", "A", "void k() {}",
+         "class A {\n  public:\n    void g() {}\n\n    void k() {}\n  private:\n    int v;\n};\n"),
+        ("a label moved off the method's line, no other label", "m.cpp",
+         "struct A {\n    void g() {} private:\n    int v;\n};\n", "A", "void k() {}",
+         "struct A {\n    void g() {}\n\n    void k() {}\nprivate:\n    int v;\n};\n"),
+        ("a field moved off the method's line, still", "m.cpp",
+         "class A {\npublic:\n    void g() {} int w;\nprivate:\n    int v;\n};\n", "A", "void k() {}",
+         "class A {\npublic:\n    void g() {}\n\n    void k() {}\n    int w;\nprivate:\n    int v;\n};\n"),
+    ]
+    for label, name, source, cls, content, expected in cases:
+        _exact(f"add_method C++ sections ({label})",
+               _edit_result(name, source, lambda a, c=cls, t=content: a.add_method(c, t)), expected)
+
+
+def test_final_ruby_clause_layout():
+    print("\n═══ replace_function_body rebuilds Ruby clauses that share lines ═══")
+
+    # When the body of a Ruby method with rescue, else or ensure clauses
+    # is rebuilt over lines of its own, the clauses are too when they
+    # share a line with their code or the `end`: each clause's header,
+    # each of its statements and the `end` on a line of their own. Clauses
+    # laid out that way already stay as they are.
+    # (label, source, target, content, expected file text)
+    cases = [
+        ("a one-line method with rescue (reported)", "def f; x; rescue; y; end\n", "f", "1",
+         "def f\n  1\nrescue\n  y\nend\n"),
+        ("a clause on the line of the code (reported)", "def f\n  x; rescue; y\nend\n", "f", "1",
+         "def f\n  1\nrescue\n  y\nend\n"),
+        ("rescue with exceptions, else and ensure", "def f; x; rescue A, B => e; log(e); else w; ensure; q; end\n", "f", "1",
+         "def f\n  1\nrescue A, B => e\n  log(e)\nelse\n  w\nensure\n  q\nend\n"),
+        ("rescue then", "def f; x; rescue A then y; end\n", "f", "1", "def f\n  1\nrescue A\n  y\nend\n"),
+        ("several statements in a clause", "def f; x; rescue; y; z; end\n", "f", "1", "def f\n  1\nrescue\n  y\n  z\nend\n"),
+        ("an empty rescue clause", "def f; x; rescue; end\n", "f", "1", "def f\n  1\nrescue\nend\n"),
+        ("a method in a class", "class K\n  def f; x; rescue; y; end\nend\n", "K.f", "1",
+         "class K\n  def f\n    1\n  rescue\n    y\n  end\nend\n"),
+        ("a comment ending a clause's line", "def f\n  x; rescue; y # c\nend\n", "f", "1",
+         "def f\n  1\nrescue\n  y # c\nend\n"),
+        ("several lines of content", "def f; x; rescue; y; end\n", "f", "a = 1\nb(a)",
+         "def f\n  a = 1\n  b(a)\nrescue\n  y\nend\n"),
+        ("clauses on lines of their own, still", "def f; x\nrescue\n  # why\n  y\n\n  z\nend\n", "f", "1",
+         "def f\n  1\nrescue\n  # why\n  y\n\n  z\nend\n"),
+    ]
+    for label, source, target, content, expected in cases:
+        _exact(f"replace_function_body Ruby clauses ({label})",
+               _edit_result("m.rb", source, lambda a, t=target, c=content: a.replace_function_body(t, c)), expected)
+
+
 if __name__ == "__main__":
     test_python()
     test_python_decorated()
@@ -12853,6 +13708,19 @@ if __name__ == "__main__":
     test_content_layout()
     test_lists_docstrings_bodies()
     test_snippet_layout_followups()
+    test_final_docstring_literals()
+    test_final_keyword_only_parameters()
+    test_final_last_parameters()
+    test_final_c_variadic_parameters()
+    test_final_same_line_comments()
+    test_final_ruby_method_clauses()
+    test_final_cpp_method_access()
+    test_final_import_groups()
+    test_final_import_name_order()
+    test_final_import_directives()
+    test_final_parameter_order()
+    test_final_cpp_method_sections()
+    test_final_ruby_clause_layout()
 
     # Reset all fixtures to clean state after tests
     for lang in FIXTURES:

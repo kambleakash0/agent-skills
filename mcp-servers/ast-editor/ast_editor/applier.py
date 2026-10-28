@@ -4,6 +4,7 @@ import functools
 import json
 import os
 import re
+import sys
 import warnings
 from ast_editor.parser import (
     C_EXTS,
@@ -224,6 +225,18 @@ _RUBY_MAGIC_COMMENT = re.compile(
     r"[ \t]*#.*?\b(frozen_string_literal|warn_indent|shareable_constant_value)[ \t]*:"
 )
 
+# A comment on a line of its own that a tool reads as applying to the line
+# below it: TypeScript's @ts-ignore and @ts-expect-error, an
+# eslint/tslint/stylelint disable-next-line, pylint's disable-next, a
+# biome-ignore, deno-lint-ignore or prettier-ignore, clang-tidy's and
+# cpplint's NOLINTNEXTLINE, a Flow suppression, an istanbul/c8/v8 `ignore
+# next`, a Go //nolint or //lint:ignore and a JetBrains noinspection.
+_NEXT_LINE_DIRECTIVE = re.compile(
+    r"@ts-(?:ignore|expect-error)\b|disable-next(?:-line)?\b|\b(?:biome|deno-lint)-ignore(?![-\w])"
+    r"|prettier-ignore\b|NOLINTNEXTLINE\b|\$Flow(?:FixMe|ExpectedError|Ignore|Issue)\b"
+    r"|\b(?:istanbul|c8|v8)\s+ignore\s+next\b|^\W*(?:nolint|lint:ignore)\b|\bnoinspection\b"
+)
+
 
 def _split_key_path(path: str) -> list[str]:
     """Split a dotted key path into its segments: 'CONFIG."a.b".port' gives
@@ -262,6 +275,34 @@ def _unquote(text: str) -> str:
     if len(text) >= 2 and text[0] == text[-1] and text[0] in "\"'`":
         return text[1:-1]
     return text
+
+
+def _natural(text: str) -> list:
+    """`text` split for a natural sort, as isort and ruff sort: its runs of
+    digits as numbers, the text between them as text ('a9' before 'a10')."""
+    return [int(part) if i % 2 else part for i, part in enumerate(re.split(r"(\d+)", text))]
+
+
+def _name_type(name: str) -> int:
+    """The type of an imported name in isort's and ruff's order by type: 0
+    for CONSTANT_CASE (two characters or more), 1 for CamelCase, 2 for the
+    rest."""
+    if len(name) > 1 and name.isupper():
+        return 0
+    return 1 if name[:1].isupper() else 2
+
+
+def _sorted_index(keys: list[tuple], new: tuple) -> int | None:
+    """Where an item whose sort keys are `new` goes among items whose sort
+    keys are `keys`: each a tuple of keys, one per order the items may
+    follow, the first one preferred. In the first order the items follow,
+    before the first one that sorts after the new one (at the end when
+    none does); None when they follow none."""
+    for order, key in enumerate(new):
+        column = [k[order] for k in keys]
+        if all(a <= b for a, b in zip(column, column[1:])):
+            return next((i for i, k in enumerate(column) if k > key), len(column))
+    return None
 
 
 def _python_keys_equal(a: str, b: str) -> bool:
@@ -1085,6 +1126,21 @@ class Applier:
             start = start.parent
         return start is not None and start.is_named and "comment" not in start.type
 
+    def _comment_on_line(self, first):
+        """The first of the comments that come before the symbol starting
+        with `first` on its first line, where no code comes before it
+        (`/** @type {X} */ let x;`, or a block comment that began on a line
+        above, `/* a\\n b */ let x;`), or None when only spaces and tabs
+        do."""
+        if self._starts_line(first.start_byte):
+            return None
+        src = self.parser.source_bytes
+        pos = src.rfind(b"\n", 0, first.start_byte) + 1
+        while src[pos : pos + 1] in (b" ", b"\t"):
+            pos += 1
+        node = self.parser.tree.root_node.descendant_for_byte_range(pos, pos + 1)
+        return node if node is not None and "comment" in node.type and node.end_byte <= first.start_byte else None
+
     def _callable(self, node, target: str):
         """
         The function that `node`, found for `target`, defines: the
@@ -1713,7 +1769,9 @@ class Applier:
         is one indentation unit deeper than the line the function starts on.
         A body that shares a line with its signature or braces
         (`function f() { return 1; }`, `def f(): return 1`) is rebuilt over
-        lines of its own (_rebuild_body).
+        lines of its own (_rebuild_body). The body of a Ruby method with
+        rescue, else or ensure clauses is the code before them, and they
+        stay, unless the content has clauses of its own (_ruby_clause).
         """
         func_node, block_node = self._get_function_body_node(target, empty_ok=True)
         if block_node is None:
@@ -1733,12 +1791,30 @@ class Applier:
             # JS/TS/C/C++/Go/Java: body is `{ ... }` -- skip the opening brace line.
             start_line = block_node.start_point[0] + 1
             end_line = block_node.end_point[0]
+        code_end = end_line
+        clause = self._ruby_clause(block_node)
+        if clause is not None:
+            # A Ruby method's rescue, else and ensure clauses stay, unless the
+            # content has clauses of its own: the body is the code before
+            # them, or the lines between the signature and them when there is
+            # none, as in an empty method. A clause on the line of that code
+            # moves to a line of its own (_rebuild_body).
+            if not self._starts_line(clause.start_byte):
+                return self._rebuild_body(func_node, block_node, content)
+            before = [c for c in block_node.named_children if c.end_byte <= clause.start_byte]
+            if all("comment" in c.type for c in before):
+                start_line = self.parser.source_bytes.count(b"\n", 0, self._body_opening(func_node, block_node)) + 1
+                code_end = clause.start_point[0]
+            else:
+                code_end = self._last_row(before[-1]) + 1
+            if self._ruby_clause(self._ruby_method_body(content)) is None:
+                end_line = code_end
 
         # The body's indentation is that of its first line with code or a
         # comment; an empty body (`{` and `}` on lines of their own, maybe
         # with blank lines between them) is one level deeper than the line
         # the function starts on.
-        first = next((line for line in self.lines[start_line:end_line] if line.strip()), None)
+        first = next((line for line in self.lines[start_line:code_end] if line.strip()), None)
         if first is not None:
             target_indent = self._get_indent(first)
         else:
@@ -1799,7 +1875,10 @@ class Applier:
         Comments that follow the opening on its line, before any statement,
         stay there. A Python body ends with its last statement, and the
         comments after it on its line stay on the def's line, after the `:`
-        (`def b():  # old`).
+        (`def b():  # old`). A Ruby method's rescue, else and ensure clauses
+        stay, from a line of their own on, unless the content has its own,
+        and are rebuilt over lines of their own when they share lines
+        (_ruby_clause_lines).
         """
         ext = self.parser.ext
         src = self.parser.source_bytes
@@ -1830,12 +1909,22 @@ class Applier:
             self._write_bytes(src[:opening] + comment + b"\n" + text + src[end:])
             return "Update successful"
         close = func_node.children[-1].start_byte if ext == ".rb" else self._code_end(body) - 1
+        clause = self._ruby_clause(body)
+        if clause is not None and self._ruby_clause(self._ruby_method_body(content)) is None:
+            # A Ruby method's rescue, else and ensure clauses stay, from a
+            # line of their own on (see replace_function_body).
+            close = clause.start_byte
         line_end = src.find(b"\n", opening)
         # An empty Ruby method on one line has no body node (_empty_method).
         code = next((c for c in body.named_children if "comment" not in c.type), None) if body is not None else None
         if 0 <= line_end < close and (code is None or code.start_byte > line_end):
             opening = line_end
-        self._write_bytes(src[:opening] + b"\n" + text + b"\n" + base.encode("utf-8") + src[close:])
+        tail = src[close:]
+        if clause is not None and close == clause.start_byte:
+            # Clauses that share lines with their code or the `end` are
+            # rebuilt over lines of their own too (_ruby_clause_lines).
+            tail = self._ruby_clause_lines(func_node, body, base, unit) or tail
+        self._write_bytes(src[:opening] + b"\n" + text + b"\n" + base.encode("utf-8") + tail)
         return "Update successful"
 
     def add_method(self, class_target: str, content: str) -> str:
@@ -1843,7 +1932,9 @@ class Applier:
         Add a new method to a class. Placement varies by language:
           - Python/JS/TS/Java/C++/Ruby: inside the class body, after its
                 last member (see _insert_member for indentation and spacing;
-                a Java enum gets the `;` its constants need before it).
+                a Java enum gets the `;` its constants need before it), but
+                in C++ after the class's last method when an access label
+                follows it, so that it gets its access (_section_method).
           - Go: as a top-level sibling immediately after the type declaration
                 (Go methods are not lexically inside struct definitions).
         """
@@ -1880,7 +1971,9 @@ class Applier:
         contiguous leading comment block (Godoc, Javadoc, `#` comments, `//`
         comments, C-style `/* ... */` blocks or a Ruby `=begin` document)
         directly above the symbol -- pass `include_leading_comments=False` to
-        keep that comment in place. The comment lines right below the symbol
+        keep that comment in place. A comment before the symbol on its first
+        line (`/** @type {X} */ let x;`) goes with it too, or, kept, stays
+        there on a line of its own. The comment lines right below the symbol
         that are indented deeper than it, which end its code, go with it
         (_rows_below). The blank lines that separated the symbol from its
         neighbours go with it (see _separator_lines). A symbol that shares a
@@ -1915,10 +2008,21 @@ class Applier:
         start_line = first.start_point[0]
         end_line = self._rows_below(first, last, separator)
 
+        # A comment before the symbol on its first line (`/** @type {X} */
+        # let x;`) goes with it as one above it does, from its own first line
+        # on; kept, it stays on a line of its own.
+        comment = self._comment_on_line(first)
         if include_leading_comments:
+            if comment is not None:
+                start_line = comment.start_point[0]
             comment_range = self._find_leading_comment_range(start_line)
             if comment_range is not None:
                 start_line = comment_range[0]
+        elif comment is not None:
+            src = self.parser.source_bytes
+            line_start = src.rfind(b"\n", 0, first.start_byte) + 1
+            self.lines[start_line] = src[line_start : first.start_byte].decode("utf-8").rstrip(" \t")
+            start_line += 1
 
         start_line, end_line = self._separator_lines(first, last, start_line, end_line)
         self.lines = self.lines[:start_line] + self.lines[end_line:]
@@ -2018,10 +2122,11 @@ class Applier:
         is part of its span, see _symbol_span), the `;` or `,` before it that
         separated it from the code before (`x = 1; y = 2` loses `; y = 2`);
         so does a symbol that the `}` or `)` closing its container follows
-        (`{ a: 1, b: 2 }` minus b is `{ a: 1 }`). A symbol that starts
-        its line keeps the line's indentation for the code after it, and
-        takes its leading comment with it unless include_leading_comments is
-        False.
+        (`{ a: 1, b: 2 }` minus b is `{ a: 1 }`). A symbol that no code
+        comes before on its line keeps the line's indentation for the code
+        after it, and takes its leading comment and the comments before it
+        on its line (_comment_on_line) with it unless
+        include_leading_comments is False.
         """
         src = self.parser.source_bytes
         start = first.start_byte
@@ -2062,7 +2167,14 @@ class Applier:
                 end += 1
         head = src[:start]
         if not before and include_leading_comments:
-            comment_range = self._find_leading_comment_range(first.start_point[0])
+            # So do the comments before it on its line (_comment_on_line).
+            row = first.start_point[0]
+            comment = self._comment_on_line(first)
+            if comment is not None:
+                start, row = comment.start_byte, comment.start_point[0]
+                line_start = src.rfind(b"\n", 0, start) + 1
+                head = src[:start]
+            comment_range = self._find_leading_comment_range(row)
             if comment_range is not None:
                 # Whole comment lines go; the symbol's indentation stays.
                 comment_start = sum(len(line.encode("utf-8")) + 1 for line in self.lines[: comment_range[0]])
@@ -2406,18 +2518,24 @@ class Applier:
           - Go:     Either a full `import "fmt"` line, or just `"fmt"` /
                     `alias "pkg/path"` as a spec. When a parenthesized
                     `import ( ... )` block already exists, the spec is
-                    inserted inside that block (idiomatic Go).
+                    inserted inside that block (idiomatic Go), inline in
+                    one written on one line; without one, a spec gets
+                    its `import`.
           - Ruby:   "require 'foo'" or "require_relative 'bar'"
           - Java:   "import java.util.List;"
         Skips insertion if an identical import already exists.
-        Places the new import on the line after the last existing one (a
-        C/C++ conditional that only includes counts as one, and so do the
+        Places the new import in the group of imports it belongs with, at
+        its sorted place when the group is sorted, else on the line after
+        the group's last import (_import_groups, _import_place; a C/C++
+        conditional that only includes counts as an import, and so do the
         includes inside a header's include guard and a JS CommonJS
         `require`, see _is_import). A first import goes
         after the preamble (_find_preamble_end: a package clause, `#!` and
         magic comments, a module docstring, 'use strict', `#pragma once`,
         an include guard's `#define`), with a blank line between them and
-        one (two before a Python def or class) before the code after it.
+        one (two before a Python def or class) before the code after it,
+        and so does a Python `from __future__` import that its group would
+        put after code (_future_after_code).
         """
         valid_types = self._import_node_types()
         if not valid_types:
@@ -2430,21 +2548,26 @@ class Applier:
             go_block = self._find_go_import_block()
             if go_block is not None:
                 return self._add_import_to_go_block(go_block, import_text)
+            # Outside a block, a spec (`"fmt"`, `f "path/filepath"`) is
+            # written as an import declaration.
+            if not re.match(r"import\b", import_text.strip()):
+                import_text = "import " + import_text.strip()
 
         stripped = import_text.strip()
         for line in self.lines:
             if line.strip() == stripped:
                 return "Import already exists -- no change made"
 
-        imports = [c for c in self._top_level_nodes() if self._is_import(c)]
-        if imports:
-            # After the line the last import ends on (an #include ends
-            # with its line break).
-            insert_line = max(self._last_row(c) for c in imports) + 1
-            self.lines = self.lines[:insert_line] + [import_text] + self.lines[insert_line:]
-            return self._save()
+        groups = self._import_groups(self._top_level_nodes(), self._is_import)
+        if groups:
+            insert_line = self._import_line(*self._import_place(groups, import_text))
+            if not self._future_after_code(import_text, insert_line):
+                self.lines = self.lines[:insert_line] + [import_text] + self.lines[insert_line:]
+                return self._save()
 
-        # The first import: after the preamble, a blank line on each side.
+        # The first import, or a Python `from __future__` import that its
+        # group would put after code: after the preamble, a blank line on
+        # each side.
         at = self._find_preamble_end()
         before, after = self.lines[:at], self.lines[at:]
         blank = 0
@@ -2464,6 +2587,270 @@ class Applier:
         self.lines = before + ([""] if before else []) + [import_text] + [""] * gap + rest
         return self._save()
 
+    def _future_after_code(self, import_text: str, row: int) -> bool:
+        """Whether a Python `from __future__` import written on line `row`
+        would follow code, which Python refuses (and ast.parse lets
+        through): a statement other than the module docstring and other
+        __future__ imports, comments aside, starts above that line."""
+        if self.parser.ext != ".py" or not re.match(r"from\s+__future__\s+import\b", import_text.strip()):
+            return False
+        code = [
+            c
+            for c in self._top_level_nodes()
+            if c.start_point[0] < row and "comment" not in c.type and c.type != "future_import_statement"
+        ]
+        first = next((c for c in self.parser.tree.root_node.named_children if "comment" not in c.type), None)
+        if code and code[0] == first and self._string_statement(first):
+            code = code[1:]
+        return bool(code)
+
+    def _import_groups(self, nodes, is_import) -> list[list]:
+        """The groups of imports among `nodes` (the top-level nodes, or the
+        specs of a Go import block) for add_import: the runs of the nodes
+        that `is_import` takes for imports that no blank line or other code
+        separates (comments may)."""
+        groups: list[list] = []
+        code = False
+        for node in nodes:
+            if not is_import(node):
+                code = code or "comment" not in node.type
+                continue
+            if groups and not code:
+                rows = range(self._last_row(groups[-1][-1]) + 1, node.start_point[0])
+                if all(self.lines[row].strip() for row in rows):
+                    groups[-1].append(node)
+                    continue
+            groups.append([node])
+            code = False
+        return groups
+
+    def _import_place(self, groups: list[list], import_text: str) -> tuple[list, int]:
+        """
+        The group of imports (_import_groups) that add_import puts
+        `import_text` in, and its index there. It goes in a group that
+        holds imports of its kind (_import_info): of those, the one with an
+        import of that kind whose path shares the most leading parts with
+        its own, else the first, but in C/C++ not a group of only the
+        file's own header (`"foo.h"` in foo.cpp). There it goes at its
+        sorted place when the group is sorted (_sorted_index), else after
+        the group's last import, but not right above a Go import "C", whose
+        preamble comment cgo reads there. Without such a group, or when the
+        text is no import of one module, it goes after the last group's last
+        import.
+        Python `from __future__` imports stay first: a new one goes after
+        them, or before the file's first import, and other imports after
+        them.
+        """
+        src = self.parser.source_bytes
+        infos = [[self._import_info(node, src) for node in group] for group in groups]
+        new = self._new_import_info(import_text)
+        if new is None:
+            return groups[-1], len(groups[-1])
+        kind, path, keys = new
+        stem = os.path.splitext(os.path.basename(self.filepath))[0]
+
+        def own_header(info) -> bool:
+            return (
+                self.parser.ext in C_EXTS + CPP_EXTS
+                and info is not None
+                and info[0] == '"'
+                and os.path.splitext(info[1][-1])[0] == stem
+            )
+
+        def shared(info) -> int:
+            count = 0
+            while count < min(len(path), len(info[1])) and path[count] == info[1][count]:
+                count += 1
+            return count
+
+        fitting = [
+            i
+            for i, group in enumerate(infos)
+            if any(info is not None and info[0] == kind for info in group)
+            and not all(own_header(info) for info in group)
+        ]
+        if not fitting:
+            if kind == "future":
+                return groups[0], 0
+            return groups[-1], len(groups[-1])
+        best = max(
+            fitting,
+            key=lambda i: (max(shared(info) for info in infos[i] if info is not None and info[0] == kind), -i),
+        )
+        group, group_infos = groups[best], infos[best]
+        index = None
+        if all(info is not None for info in group_infos):
+            index = _sorted_index([info[2] for info in group_infos], keys)
+        if index is None:
+            index = len(group)
+        # Nothing goes between cgo's import "C" and its preamble, the
+        # comment right above it.
+        while (
+            self.parser.ext == ".go"
+            and index < len(group)
+            and group_infos[index] is not None
+            and group_infos[index][0] == "C"
+        ):
+            index += 1
+        futures = [i for i, info in enumerate(group_infos) if info is not None and info[0] == "future"]
+        if futures:
+            index = min(index, futures[-1] + 1) if kind == "future" else max(index, futures[-1] + 1)
+        return group, index
+
+    def _new_import_info(self, import_text: str):
+        """_import_info of the import add_import is given (a Go spec too,
+        `"fmt"`), None when the text is not one import."""
+        text = import_text.strip()
+        if self.parser.ext == ".go":
+            text = "package p\n" + (text if re.match(r"import\b", text) else f"import {text}")
+        data = (text + "\n").encode("utf-8")
+        root = self.parser.parse(data).root_node
+        nodes = [c for c in root.named_children if "comment" not in c.type and c.type != "package_clause"]
+        if len(nodes) != 1 or first_syntax_error(root) is not None:
+            return None
+        return self._import_info(nodes[0], data)
+
+    def _import_info(self, node, data: bytes):
+        """
+        What an import node of `data` (the file's source, or the text of a
+        new import) imports, for add_import: (kind, path, keys), or None
+        when it imports no one module (a C/C++ conditional, an #include of
+        a macro). Its kind picks its group: in Python 'future', 'stdlib'
+        (sys.stdlib_module_names), 'other' or 'local' (a relative import);
+        in C/C++ '<' or '"'; in Go whether the path is the standard
+        library's (no dot in its first part), cgo's "C" a kind of its own;
+        in JS/TS whether it is a `require` and whether its path is
+        relative ('./', '../'); in Java whether it is static; in Ruby the
+        method (`require`, `require_relative`). Its path is the module's,
+        split into its parts (a Python relative import's dots one of
+        them). Its keys sort it, one per order a group may follow
+        (_sorted_index): in Python import lines before from-imports, else
+        both together, by module name without case (numbers in numeric
+        order), a `from __future__` import first; elsewhere by the path
+        (in C/C++ as written, in its brackets or quotes).
+        """
+
+        def text(n) -> str:
+            return data[n.start_byte : n.end_byte].decode("utf-8")
+
+        ext = self.parser.ext
+        if ext == ".py":
+            if node.type == "future_import_statement":
+                module = "__future__"
+            elif node.type in ("import_statement", "import_from_statement"):
+                name = node.child_by_field_name("name" if node.type == "import_statement" else "module_name")
+                if name is not None and name.type == "aliased_import":
+                    name = name.child_by_field_name("name")
+                if name is None:
+                    return None
+                module = re.sub(r"\s+", "", text(name))
+            else:
+                return None
+            dots = len(module) - len(module.lstrip("."))
+            path = ([module[:dots]] if dots else []) + [part for part in module[dots:].split(".") if part]
+            if dots:
+                kind = "local"
+            elif path[0] == "__future__":
+                kind = "future"
+            else:
+                kind = "stdlib" if path[0] in sys.stdlib_module_names else "other"
+            first = 0 if kind == "future" else 1
+            name_key = (_natural(module.lower()), module)
+            return kind, path, ((first, node.type != "import_statement", name_key), (first, name_key))
+        if ext in _JS_EXTS:
+            source = None
+            if node.type == "import_statement":
+                clause = next((c for c in node.named_children if c.type == "import_require_clause"), node)
+                source = clause.child_by_field_name("source")
+            else:
+                stack = [node]
+                while stack and source is None:
+                    n = stack.pop()
+                    function, arguments = n.child_by_field_name("function"), n.child_by_field_name("arguments")
+                    if n.type == "call_expression" and function is not None and text(function) == "require":
+                        strings = [c for c in arguments.named_children if "comment" not in c.type] if arguments is not None else []
+                        source = strings[0] if len(strings) == 1 else None
+                    stack.extend(reversed(n.named_children))
+            if source is None or source.type not in ("string", "template_string"):
+                return None
+            path = _unquote(text(source))
+            relative = path.startswith(("./", "../")) or path in (".", "..")
+            return (node.type != "import_statement", relative), path.split("/"), (path,)
+        if ext in C_EXTS + CPP_EXTS:
+            path = node.child_by_field_name("path") if node.type == "preproc_include" else None
+            if path is None or path.type not in ("system_lib_string", "string_literal"):
+                return None
+            written = text(path)
+            return written[0], written[1:-1].split("/"), (written,)
+        if ext == ".go":
+            spec = node
+            if node.type == "import_declaration":
+                spec = next((c for c in node.named_children if c.type == "import_spec"), None)
+            path = spec.child_by_field_name("path") if spec is not None and spec.type == "import_spec" else None
+            if path is None:
+                return None
+            written = _unquote(text(path))
+            parts = written.split("/")
+            return ("C" if written == "C" else "." not in parts[0]), parts, (written,)
+        if ext == ".java":
+            name = next((c for c in node.named_children if c.type in ("scoped_identifier", "identifier")), None)
+            if node.type != "import_declaration" or name is None:
+                return None
+            parts = [part.strip() for part in text(name).split(".")]
+            if any(c.type == "asterisk" for c in node.named_children):
+                parts.append("*")
+            return any(c.type == "static" for c in node.children), parts, (".".join(parts),)
+        if ext == ".rb":
+            method, arguments = node.child_by_field_name("method"), node.child_by_field_name("arguments")
+            if node.type != "call" or method is None or arguments is None:
+                return None
+            string = next((c for c in arguments.named_children if c.type == "string"), None)
+            if string is None:
+                return None
+            path = _unquote(text(string))
+            return text(method), path.split("/"), (path,)
+        return None
+
+    def _import_line(self, group: list, index: int) -> int:
+        """The line add_import writes an import on to put it at `index` in
+        `group` (_import_place): above group[index] and the comments right
+        above it that go with it (_comments_above: above the group's first
+        import only the directives for the next line, the others heading
+        the group), else, and when group[index] follows other code on its
+        line, below the group's last import (an #include ends with its line
+        break)."""
+        if index < len(group):
+            node = group[index]
+            row, column = node.start_point
+            if not self.lines[row].encode("utf-8")[:column].strip():
+                floor = self._last_row(group[index - 1]) if index else -1
+                top = self._comments_above(node, floor, directives_only=not index)
+                return row if top is None else top.start_point[0]
+        return self._last_row(group[-1]) + 1
+
+    def _comments_above(self, node, floor: int, directives_only: bool):
+        """
+        The topmost of the comments right above `node` that stay with it
+        when an import or a name goes in above it (_import_line,
+        _insert_entry), or None: those that start after row `floor`, or,
+        with `directives_only` (above the first of a group or list, whose
+        other comments head it), the directives for the next line
+        (_NEXT_LINE_DIRECTIVE: `// @ts-ignore`, `// NOLINTNEXTLINE`) on
+        lines of their own right above it.
+        """
+        top, row = None, node.start_point[0]
+        above = node.prev_named_sibling
+        while above is not None and "comment" in above.type and above.start_point[0] > floor:
+            if directives_only and not (
+                self._last_row(above) == row - 1
+                and self._starts_line(above.start_byte)
+                and _NEXT_LINE_DIRECTIVE.search(self.parser.node_text(above))
+            ):
+                break
+            top, row = above, above.start_point[0]
+            above = above.prev_named_sibling
+        return top
+
     def _find_go_import_block(self):
         """Return the first Go `import_spec_list` node (parenthesized block content) if one exists, else None."""
         for child in self.parser.tree.root_node.named_children:
@@ -2475,7 +2862,9 @@ class Applier:
         return None
 
     def _add_import_to_go_block(self, spec_list_node, import_text: str) -> str:
-        """Insert an import spec into an existing Go parenthesized import block.
+        """Insert an import spec into an existing Go parenthesized import block,
+        in its group of specs, as add_import places an import (_import_place),
+        inline in a block written on one line (`import ("fmt"; "os")`).
         Accepts either a full `import "foo"` line or just `"foo"` / `alias "foo"`."""
         stripped = import_text.strip()
         # Callers may pass either `import "foo"` or just `"foo"`; strip the keyword.
@@ -2492,9 +2881,30 @@ class Applier:
             if existing == spec_text:
                 return "Import already exists -- no change made"
 
-        # Insert on a new tab-indented line immediately before the closing `)`
-        end_line = spec_list_node.end_point[0]
-        self.lines = self.lines[:end_line] + ["\t" + spec_text] + self.lines[end_line:]
+        specs = [c for c in spec_list_node.named_children if c.type == "import_spec"]
+        if spec_list_node.start_point[0] == spec_list_node.end_point[0]:
+            # A block on one line (`import ("fmt"; "os")`, `import ()`)
+            # takes the spec inline, at its place among the others.
+            src = self.parser.source_bytes
+            at, text = spec_list_node.end_byte - 1, spec_text
+            if specs:
+                groups = self._import_groups(spec_list_node.named_children, lambda node: node.type == "import_spec")
+                group, index = self._import_place(groups, spec_text)
+                if index < len(group):
+                    at, text = group[index].start_byte, f"{spec_text}; "
+                else:
+                    at, text = group[-1].end_byte, f"; {spec_text}"
+            self._write_bytes(src[:at] + text.encode("utf-8") + src[at:])
+            return "Update successful"
+
+        # On a new tab-indented line in the group of specs it belongs with
+        # (_import_place), or before the closing `)` of an empty block
+        # (and not below the `)` that closes the last spec's line).
+        line = spec_list_node.end_point[0]
+        if any(c.type == "import_spec" for c in spec_list_node.named_children):
+            groups = self._import_groups(spec_list_node.named_children, lambda node: node.type == "import_spec")
+            line = min(line, self._import_line(*self._import_place(groups, spec_text)))
+        self.lines = self.lines[:line] + ["\t" + spec_text] + self.lines[line:]
         return self._save()
 
     def remove_import(self, import_text: str) -> str:
@@ -2591,6 +3001,7 @@ class Applier:
         empty_trailing_comma: bool,
         default_unit: str,
         pad_empty: bool = True,
+        at: int | None = None,
     ) -> None:
         """
         Write `entry` (e.g. '"key": value') after the last of `entries` in a
@@ -2606,7 +3017,13 @@ class Applier:
         and an entry that ends with a comment of its own gets its comma
         before it (_with_separator). An empty container becomes `{ entry }`
         (`[entry]` without `pad_empty`), or with `expand_empty` is opened
-        onto separate lines (`empty_trailing_comma` adds a comma).
+        onto separate lines (`empty_trailing_comma` adds a comma). With
+        `at`, an index into `entries`, the entry goes before entries[at]
+        instead: on a line of its own at that entry's indentation, above
+        it and the comments right above it that go with it
+        (_comments_above: above the first entry only the directives for
+        the next line, the others heading the list), when the entry starts
+        its line, else inline before it (`a, new, b`).
         """
         src = self.parser.source_bytes
         open_brace, close_brace = container.children[0], container.children[-1]
@@ -2614,7 +3031,21 @@ class Applier:
         inner_indent = base_indent + self._indent_unit(default_unit)
         edits: list[tuple[int, int, str]] = []  # (start, end, replacement)
 
-        if entries:
+        if at is not None and at < len(entries):
+            # Before entries[at]: on a line of its own above it and the
+            # comments right above it when it starts its line, else inline.
+            target = entries[at]
+            start = target.start_byte - target.start_point[1]
+            if src[start : target.start_byte].strip():
+                edits.append((target.start_byte, target.start_byte, f"{entry}, "))
+            else:
+                indent = src[start : target.start_byte].decode("utf-8")
+                floor = self._last_row(entries[at - 1]) if at else open_brace.end_point[0]
+                top = self._comments_above(target, floor, directives_only=not at)
+                if top is not None:
+                    start = top.start_byte - top.start_point[1]
+                edits.append((start, start, f"{indent}{self._with_separator(entry, ',')}\n"))
+        elif entries:
             last = entries[-1]
             after = [
                 c
@@ -3755,11 +4186,13 @@ class Applier:
         """
         Insert content as a member of the class `node`, whose members `body`
         holds (None for an empty Ruby class): after the last member for
-        add_method (at_end=True), else before the first one, but after a
-        Python class docstring, for add_field. A Java enum's members are
-        those after its constants, which stay first (_java_enum_members),
-        and a C++ body that opens with an access label (`public:`) has the
-        field below it, in the first member's section (_insert_under_label).
+        add_method (at_end=True), or after the last method of a C++ class
+        when an access label follows it (_section_method); else before the
+        first one, but after a Python class docstring, for add_field. A
+        Java enum's members are those after its constants, which stay first
+        (_java_enum_members), and a C++ body that opens with an access label
+        (`public:`) has the field below it, in the first member's section
+        (_insert_under_label).
 
         The content is re-indented like the class's existing members (see
         _member_indent), keeping its own relative indentation (content in
@@ -3797,9 +4230,14 @@ class Applier:
             lines = self._tab_indent(lines)
         lines = self._reindent(lines, member_indent)
         method_types = self._interface_func_types() | {"method_signature", "abstract_method_signature"}
-        gap_before = self._method_gap(body, members, method_types) if at_end and members else 0
+        # A C++ method goes after the class's last method when an access
+        # label follows it, in its section (_section_method), spaced from it
+        # as from the last member.
+        anchor = self._section_method(members) if at_end else None
+        above = members if anchor is None else members[: members.index(anchor) + 1]
+        gap_before = self._method_gap(body, above, method_types) if at_end and members else 0
         # A one-line field after stacked one-line fields is stacked too.
-        code = [m for m in members if not self._is_aside(m)]
+        code = [m for m in above if not self._is_aside(m)]
         if at_end and code and not self._is_block(lines) and not self._is_block(code[-1]):
             comment_range = self._find_leading_comment_range(code[-1].start_point[0])
             far = self._sibling_above(code[-1], comment_range[0] if comment_range is not None else code[-1].start_point[0])
@@ -3867,6 +4305,11 @@ class Applier:
             parts = [indent + constants + semi, b""] if semi or constants else []
             if not existing:
                 parts.append(text)
+            elif anchor is not None:
+                # The code after that method goes on a line of its own below
+                # the new one.
+                parts += [indent + src[start : anchor.end_byte].strip()] + [b""] * gap_before + [text]
+                parts.append(indent + src[anchor.end_byte : close_b].strip())
             elif at_end:
                 parts += [indent + existing] + [b""] * gap_before + [text]
             else:
@@ -3893,7 +4336,24 @@ class Applier:
             new = src[: open_b + 1] + b"\n" + text + b"\n" + close_indent + src[close_b:]
         elif at_end:
             spacing = b"\n" * gap_before
-            if self._starts_line(close_b):
+            separator, after = self._line_sharing(anchor, anchor)[1:] if anchor is not None else (None, False)
+            if anchor is not None and after:
+                # Code follows the method on its line (`private:`): it moves
+                # to a line of its own below the new method, an access label
+                # indented like the class's others (_label_indent).
+                end = self._code_end(anchor) if separator is None else separator.end_byte
+                following = next((m for m in members if m.start_byte >= end), None)
+                lead = indent
+                if following is not None and following.type == "access_specifier":
+                    lead = self._label_indent(members, following, class_indent)
+                new = src[:end] + b"\n" + spacing + text + b"\n" + lead + src[end:].lstrip(b" \t")
+            elif anchor is not None:
+                # After the method's lines (_rows_below: a comment after it
+                # there, and those indented deeper below it).
+                row = self._rows_below(anchor, anchor, separator)
+                pos = sum(len(line.encode("utf-8")) + 1 for line in self.lines[:row])
+                new = src[:pos] + spacing + text + b"\n" + src[pos:]
+            elif self._starts_line(close_b):
                 # After the last member's line; blank lines that were
                 # before the `}` stay there.
                 pos = src.find(b"\n", members[-1].end_byte) + 1
@@ -4190,6 +4650,64 @@ class Applier:
         a C++ member template is what its `template <...>` declares."""
         entity = self._template_entity(node)
         return entity is not None and entity.type in method_types
+
+    def _section_method(self, members):
+        """
+        For add_method in a C++ class whose body holds `members` (comments
+        and access labels included): its last method when an access label
+        (`private:`) follows it, which the new method goes after so that it
+        gets that method's access rather than the last section's; else None.
+        A method is a function the class defines or declares (`int f();`,
+        `~A();`, `A& operator=(const A&) = default;`) or a member template
+        of one; a friend is no member, and a pointer to a function a field.
+        An #if or #ifdef block with a method in one of its branches counts
+        as that method (the new one goes after its #endif); one with an
+        access label in it leaves today's placement.
+        """
+        if self.parser.ext not in CPP_EXTS:
+            return None
+
+        def is_method(member) -> bool:
+            entity = self._template_entity(member)
+            return entity is not None and (
+                entity.type == "function_definition"
+                or (
+                    entity.type in ("field_declaration", "declaration")
+                    and any(self.parser.c_declares_function(name) for name in self.parser.declared_names(entity))
+                )
+            )
+
+        def inner(block) -> list:
+            # The members in a preprocessor block's branches, nested ones too.
+            found = []
+            for child in block.named_children:
+                found += inner(child) if child.type in _PREPROC_CONDITIONALS else [child]
+            return found
+
+        labelled = False
+        for member in reversed(members):
+            if member.type == "access_specifier":
+                labelled = True
+                continue
+            if member.type in _PREPROC_CONDITIONALS:
+                held = inner(member)
+                if any(m.type == "access_specifier" for m in held):
+                    return None
+                if any(is_method(m) for m in held):
+                    return member if labelled else None
+                continue
+            if is_method(member):
+                return member if labelled else None
+        return None
+
+    def _label_indent(self, members, label, class_indent: bytes) -> bytes:
+        """The indentation for the C++ access label `label` when add_method
+        moves it to a line of its own: that of the class's first other label
+        that starts its line, else the class's own, `class_indent`."""
+        for member in members:
+            if member.type == "access_specifier" and member.start_byte != label.start_byte and self._starts_line(member.start_byte):
+                return self._get_indent(self.lines[member.start_point[0]]).encode("utf-8")
+        return class_indent
 
     def replace_signature(self, target: str, new_signature: str) -> str:
         """
@@ -5095,6 +5613,91 @@ class Applier:
         same for a method on one line (`def h; end`)."""
         opening = self._body_opening(func_node, None)
         return self.parser.source_bytes.count(b"\n", 0, opening), func_node.children[-1].start_point[0]
+
+    @staticmethod
+    def _ruby_clause(body):
+        """The first rescue, else or ensure clause of the Ruby method body
+        `body` (a body_statement), or None; the code before it is what the
+        method runs (replace_function_body replaces only that)."""
+        if body is None or body.type != "body_statement":
+            return None
+        return next((c for c in body.named_children if c.type in ("rescue", "else", "ensure")), None)
+
+    def _ruby_method_body(self, content: str):
+        """The body_statement that Ruby body `content` parses to as the body
+        of a method, for _ruby_clause, or None."""
+        root = self.parser.parse(("def _\n" + content + "\nend\n").encode("utf-8")).root_node
+        method = next((c for c in root.named_children if c.type == "method"), None)
+        return next((c for c in method.children if c.type == "body_statement"), None) if method is not None else None
+
+    def _ruby_clause_lines(self, func_node, body, base: str, unit: str) -> bytes | None:
+        """
+        For _rebuild_body: the source from the first rescue, else or ensure
+        clause of the Ruby method func_node to the end of the file, with the
+        clauses rebuilt over lines of their own when they share a line with
+        their code or the method's `end` (`rescue; y; end`): each clause's
+        header (`rescue A => e`) on a line of its own at `base`, each of its
+        statements on one at `base` and `unit`, and the `end` at `base`; a
+        comment after a statement on its line stays there. None when they
+        are on lines of their own already, and when a statement goes over
+        several lines or a comment is outside the clauses' statements, which
+        keep their text then.
+        """
+        src = self.parser.source_bytes
+        end = func_node.children[-1]
+        clauses = [c for c in body.named_children if c.type in ("rescue", "else", "ensure")]
+        if end.type != "end" or not clauses:
+            return None
+        parts, held = [], set()
+        laid_out = self._starts_line(end.start_byte)
+        for clause in clauses:
+            then = next((c for c in clause.named_children if c.type == "then"), None)
+            if clause.type == "rescue":
+                head = [c for c in clause.children if c.type not in ("then", ";") and "comment" not in c.type]
+                items = (list(then.named_children) if then is not None else []) + [
+                    c for c in clause.named_children if "comment" in c.type
+                ]
+            else:
+                head = clause.children[:1]
+                items = list(clause.named_children)
+            items = sorted((c for c in items if c.type != "empty_statement"), key=lambda c: c.start_byte)
+            header = src[clause.start_byte : head[-1].end_byte]
+            laid_out = laid_out and self._starts_line(clause.start_byte)
+            lines, row, last = [header], head[-1].end_point[0], head[-1].end_byte
+            for item in items:
+                if item.start_point[0] != item.end_point[0]:
+                    return None
+                code = src[item.start_byte : item.end_byte]
+                if "comment" in item.type:
+                    held.add(item.start_byte)
+                    if item.start_point[0] == row:
+                        gap = src[last : item.start_byte]
+                        lines[-1] += gap if gap and not gap.strip(b" \t") else b" "
+                        lines[-1] += code
+                        last = item.end_byte
+                        continue
+                laid_out = laid_out and self._starts_line(item.start_byte)
+                lines.append((base + unit).encode("utf-8") + code)
+                row, last = item.end_point[0], item.end_byte
+            parts.append(lines)
+        # A comment or heredoc elsewhere between the first clause and the
+        # `end` would be lost.
+        stack = [func_node]
+        while stack:
+            node = stack.pop()
+            if node.end_byte <= clauses[0].start_byte or node.start_byte >= end.start_byte:
+                continue
+            if node.type == "heredoc_body" or ("comment" in node.type and node.start_byte not in held):
+                return None
+            stack.extend(node.named_children)
+        if laid_out:
+            return None
+        indent = base.encode("utf-8")
+        rebuilt = []
+        for i, clause_lines in enumerate(parts):
+            rebuilt.append((indent if i else b"") + clause_lines[0])
+            rebuilt.extend(clause_lines[1:])
+        return b"\n".join(rebuilt) + b"\n" + indent + src[end.start_byte :]
 
     def replace_in_body(self, target: str, old_snippet: str, new_snippet: str) -> str:
         """
@@ -6496,12 +7099,14 @@ class Applier:
           - Python:  `from <module> import a, b`  -> adds as a new name
           - JS/TS:   `import { a, b } from "module"`  -> adds as a new specifier
         Idempotent: if the name is already present, returns without changes.
-        Raises if no matching import statement exists. Names in braces or
-        parentheses follow their layout (_insert_entry): written one per
-        line, the new one gets a line of its own at their indentation, with
-        a comma after it when the last one has one (else the last one gets
-        the comma); an inline list stays inline, as does a Python list
-        without parentheses.
+        Raises if no matching import statement exists. The new name goes
+        at its sorted place when the names are sorted (_name_position),
+        else after the last one. Names in braces or parentheses follow
+        their layout (_insert_entry): written one per line, the new one
+        gets a line of its own at their indentation, with a comma after it
+        when the last one has one (else the last one gets the comma); an
+        inline list stays inline, as does a Python list without
+        parentheses.
         """
         ext = self.parser.ext
         if ext == ".py":
@@ -6526,23 +7131,22 @@ class Applier:
         if not name_nodes:
             raise ApplierError("Cannot add to an empty import list")
 
+        index = self._name_position(name_nodes, name)
         if stmt.children[-1].type == ")":
             # Names in parentheses follow their layout, one per line or
             # inline (_insert_entry). The statement stands in for the
             # parentheses: it ends with the `)`, and its `from` starts the
             # line of the `(`.
             self._insert_entry(
-                stmt, name_nodes, name, expand_empty=False, empty_trailing_comma=False, default_unit="    "
+                stmt, name_nodes, name, expand_empty=False, empty_trailing_comma=False, default_unit="    ", at=index
             )
             return "Update successful"
-        last = name_nodes[-1]
-        insertion = f", {name}"
+        if index < len(name_nodes):
+            offset, insertion = name_nodes[index].start_byte, f"{name}, "
+        else:
+            offset, insertion = name_nodes[-1].end_byte, f", {name}"
         source_bytes = self.parser.source_bytes
-        new_bytes = (
-            source_bytes[: last.end_byte]
-            + insertion.encode("utf-8")
-            + source_bytes[last.end_byte :]
-        )
+        new_bytes = source_bytes[:offset] + insertion.encode("utf-8") + source_bytes[offset:]
         self._write_bytes(new_bytes)
         return "Update successful"
 
@@ -6565,9 +7169,47 @@ class Applier:
 
         # One name per line or inline, as the braces have them.
         self._insert_entry(
-            named_imports, specs, name, expand_empty=False, empty_trailing_comma=False, default_unit="  "
+            named_imports,
+            specs,
+            name,
+            expand_empty=False,
+            empty_trailing_comma=False,
+            default_unit="  ",
+            at=self._name_position(specs, name),
         )
         return "Update successful"
+
+    def _name_position(self, names: list, name: str) -> int:
+        """The index in an import's list of names (Python names, JS/TS
+        specifiers) that add_import_name puts `name` at: its place in their
+        order when they are sorted (_sorted_index), in plain, case-sensitive
+        order (as one name is) or else in isort's and ruff's order by type
+        (_name_type, each type without case, numbers in numeric order);
+        else the end. A name sorts by the name it imports: `b` for `b as c`
+        and for a TS `type b`."""
+
+        def imported(node, data: bytes) -> str:
+            inner = node.child_by_field_name("name") if node.type in ("aliased_import", "import_specifier") else None
+            node = node if inner is None else inner
+            return data[node.start_byte : node.end_byte].decode("utf-8")
+
+        def keys(text: str) -> tuple:
+            return text, (_name_type(text), _natural(text.lower()), text)
+
+        if self.parser.ext == ".py":
+            data = f"from m import {name}\n".encode("utf-8")
+            statement = next(iter(self.parser.parse(data).root_node.named_children), None)
+            new = []
+            if statement is not None and statement.type == "import_from_statement":
+                new = statement.children_by_field_name("name")
+        else:
+            data = f'import {{ {name} }} from "m";\n'.encode("utf-8")
+            clause = self._find_js_named_imports_clause(self.parser.parse(data).root_node)
+            new = [c for c in clause.named_children if c.type == "import_specifier"] if clause is not None else []
+        text = imported(new[0], data) if len(new) == 1 else name.strip()
+        src = self.parser.source_bytes
+        index = _sorted_index([keys(imported(node, src)) for node in names], keys(text))
+        return len(names) if index is None else index
 
     def _find_js_named_import(self, module: str):
         """For JS/TS: find `import { ... } from "module"` matching the module.
@@ -6883,8 +7525,15 @@ class Applier:
         written one parameter per line gets the new one on a line of its own
         (_add_parameter_line), and so does an empty one whose `)` is on a
         line below its `(` (_add_parameter_below); comments are no
-        parameters. The end of a Python list is before its `**kwargs`
-        (_is_kwargs), which must stay last, and the `void` of a C or C++
+        parameters. The end of a list is before the parameters that must
+        stay last (_stays_last: a Python `**kwargs`, a JS/TS rest parameter,
+        a Go or Java variadic one, a C or C++ `...`, a GNU named variadic
+        macro parameter `args...`), in Ruby before those whose kind comes
+        after the new one's (_end_index: `b` before keyword parameters,
+        `b = 1` before the splat), and in the old C++ form `int a...`
+        before its `...` (_old_variadic); the start is after one that must
+        stay first (_stays_first: a TS `this`, a Java receiver parameter).
+        The `void` of a C or C++
         `(void)` gives way to the parameter (_void_parameter). A name the
         function already has is refused (_refuse_repeated_parameter).
         """
@@ -6893,17 +7542,28 @@ class Applier:
                 f"add_parameter: position must be 'start' or 'end', got '{position}'"
             )
         params = self._find_parameter_list(target)
-        existing = [c for c in params.named_children if "comment" not in c.type]
+        existing = self._parameter_entries(params)
         # The index of the parameter the new one goes before, None for after
-        # the last: a Python `**kwargs` must stay last.
-        before = 0 if position == "start" else None
-        if before is None and existing and self._is_kwargs(existing[-1]):
-            before = len(existing) - 1
+        # the last: those that must stay last (_end_index) or first
+        # (_stays_first) keep their places.
+        if position == "start":
+            before = 0
+            while before < len(existing) and self._stays_first(existing[before]):
+                before += 1
+        else:
+            before = self._end_index(existing, parameter)
+        if before == len(existing):
+            before = None
 
         source_bytes = self.parser.source_bytes
         new_bytes = None
         void = self._void_parameter(existing)
-        if void is not None:
+        ellipsis = self._old_variadic(params, existing) if position == "end" else None
+        if ellipsis is not None:
+            # `int a...` is `int a, ...`: the new parameter goes before the
+            # `...`, which stays on it (`int a, int b...`).
+            new_bytes = source_bytes[:ellipsis] + f", {parameter}".encode("utf-8") + source_bytes[ellipsis:]
+        elif void is not None:
             # A C or C++ `(void)` lists no parameters: the new one takes the
             # place of the `void`.
             new_bytes = source_bytes[: void.start_byte] + parameter.encode("utf-8") + source_bytes[void.end_byte :]
@@ -6954,8 +7614,9 @@ class Applier:
         comma and a comment there), with a comma of its own when the last
         one has one; else the last one gets the comma. A `)` on the last
         parameter's line (`def f(a,\\n      b):`) stays after the new one.
-        Before the parameter existing[before] (the first, at the start; a
-        Python `**kwargs` at the end) it goes where that parameter is, above
+        Before the parameter existing[before] (the first at the start, or the
+        one after a TS `this`; at the end the first of those that must stay
+        last, _stays_last) it goes where that parameter is, above
         the comments on lines of their own right before it, and that
         parameter moves to the next line, indented like the parameter after
         it when it follows the `(` (aligned parameters).
@@ -7105,12 +7766,153 @@ class Applier:
     def _is_kwargs(self, param_node) -> bool:
         """Whether a parameter is a Python `**kwargs` (typed or not), which
         must come last."""
+        return self._python_parameter_kind(param_node) == "dictionary_splat_pattern"
+
+    def _is_args(self, param_node) -> bool:
+        """Whether a parameter is a Python `*args` (typed or not), which
+        makes the parameters after it keyword-only."""
+        return self._python_parameter_kind(param_node) == "list_splat_pattern"
+
+    def _python_parameter_kind(self, param_node) -> str:
+        """The node type of a Python parameter without its annotation
+        (`*args: int` is a list_splat_pattern), '' outside Python."""
         if self.parser.ext != ".py":
-            return False
+            return ""
         node = param_node
         if node.type == "typed_parameter" and node.named_children:
             node = node.named_children[0]
-        return node.type == "dictionary_splat_pattern"
+        return node.type
+
+    def _parameter_entries(self, params) -> list:
+        """The parameters of a parameter list, comments left out, and the
+        `...` of a C++ variadic function (`f(int a, ...)`), which is a bare
+        token there rather than a node of its own like C's."""
+        return [c for c in params.children if (c.is_named and "comment" not in c.type) or c.type == "..."]
+
+    def _stays_last(self, param_node) -> bool:
+        """
+        Whether a parameter must come after the others, so that add_parameter
+        puts a new one before it at the end: a Python `**kwargs` (_is_kwargs),
+        a JS/TS rest parameter (`...rest`, with a type too), a Go or Java
+        variadic one (`xs ...int`, `String... xs`), the `...` of a C or C++
+        variadic function and a C++ parameter pack (`Ts... xs`), which is
+        deduced only there, a GNU named variadic macro parameter (`args...`,
+        its name and its `...`), and a Ruby `**opts`, `**nil`, `&blk` or
+        `...` (_end_index orders Ruby's other kinds).
+        """
+        ext = self.parser.ext
+        kind = param_node.type
+        if ext == ".py":
+            return self._is_kwargs(param_node)
+        if ext in _JS_EXTS:
+            pattern = param_node.child_by_field_name("pattern") if kind == "required_parameter" else None
+            return (pattern.type if pattern is not None else kind) == "rest_pattern"
+        if ext == ".go":
+            return kind == "variadic_parameter_declaration"
+        if ext == ".java":
+            return kind == "spread_parameter"
+        if ext == ".rb":
+            return kind in ("hash_splat_parameter", "hash_splat_nil", "block_parameter", "forward_parameter")
+        if ext in C_EXTS + CPP_EXTS:
+            if kind in ("variadic_parameter", "...", "variadic_parameter_declaration"):
+                return True
+            # A GNU named variadic macro parameter (`args...`): the name,
+            # then the `...` in an ERROR node of its own.
+            def ellipsis(node) -> bool:
+                return node is not None and node.type == "ERROR" and self.parser.node_text(node).strip() == "..."
+
+            return ellipsis(param_node) or (kind == "identifier" and ellipsis(param_node.next_sibling))
+        return False
+
+    def _stays_first(self, param_node) -> bool:
+        """Whether a parameter must come before the others, so that
+        add_parameter puts a new one after it at the start: a TS `this`
+        parameter (`this: Window`) and a Java receiver parameter (`A this`)."""
+        if self.parser.ext == ".java":
+            return param_node.type == "receiver_parameter"
+        if self.parser.ext in _JS_EXTS and param_node.type == "required_parameter":
+            pattern = param_node.child_by_field_name("pattern")
+            return pattern is not None and pattern.type == "this"
+        return False
+
+    def _end_index(self, existing: list, parameter: str) -> int:
+        """
+        The index among a parameter list's entries `existing` that
+        add_parameter's "end" puts `parameter` at: before the run of those
+        at the end that must stay last (_stays_last). In Ruby, whose
+        parameters come in an order of kinds (_ruby_parameter_ranks), it is
+        before those of a kind that comes after the new one's: a required
+        parameter goes after the splat (Ruby takes required parameters
+        there too) but before keyword parameters, `**opts` and `&blk`, an
+        optional one before the splat, a keyword one before `**opts`.
+        """
+        before = len(existing)
+        if self.parser.ext == ".rb":
+            data = f"def _({parameter})\nend\n".encode("utf-8")
+            root = self.parser.parse(data).root_node
+            method = root.named_children[0] if root.named_children else None
+            params = method.child_by_field_name("parameters") if method is not None else None
+            new = [c for c in params.named_children if "comment" not in c.type] if params is not None else []
+            if len(new) == 1 and first_syntax_error(root) is None:
+                rank = self._ruby_parameter_ranks(new)[0]
+                # A required parameter goes as late as Ruby takes one.
+                rank = 3 if rank == 0 else rank
+                ranks = self._ruby_parameter_ranks(existing)
+                while before > 0 and ranks[before - 1] > rank:
+                    before -= 1
+                return before
+        while before > 0 and self._stays_last(existing[before - 1]):
+            before -= 1
+        return before
+
+    @staticmethod
+    def _ruby_parameter_ranks(params: list) -> list[int]:
+        """The place of each of the Ruby parameters `params` in Ruby's order
+        of parameter kinds: 0 for a required parameter (a name or a
+        destructured one), 1 an optional one (`b = 1`), 2 the splat
+        (`*rest`), 3 a required one after an optional one or the splat, 4
+        a keyword one (`k:`, `k: 1`), 5 `**opts` or `**nil`, 6 `&blk`, 7
+        `...`; comments are no parameters."""
+        kinds = {
+            "optional_parameter": 1,
+            "splat_parameter": 2,
+            "keyword_parameter": 4,
+            "hash_splat_parameter": 5,
+            "hash_splat_nil": 5,
+            "block_parameter": 6,
+            "forward_parameter": 7,
+        }
+        ranks, late = [], False
+        for param in params:
+            rank = kinds.get(param.type, 3 if late else 0)
+            late = late or rank in (1, 2)
+            ranks.append(rank)
+        return ranks
+
+    def _old_variadic(self, params, existing: list) -> int | None:
+        """
+        For add_parameter's "end" in C++: where a new parameter goes when
+        the list ends with the old form of a C variadic function, a last
+        named parameter followed by `...` without a comma (`int a...`, the
+        name an ERROR node to tree-sitter), which is `int a, ...`: the byte
+        after that parameter, before the `...`. None for any other list
+        (`int...` takes the new one before it, as tree-sitter cannot read
+        `int, int b...`), and in a template, where `T a...` may be a
+        parameter pack (`Ts... xs` is one anywhere).
+        """
+        if self.parser.ext not in CPP_EXTS or not existing or existing[-1].type != "variadic_parameter_declaration":
+            return None
+        last = existing[-1]
+        declarator = last.child_by_field_name("declarator")
+        if declarator is None or declarator.type != "variadic_declarator" or declarator.named_children:
+            return None
+        node = params.parent
+        while node is not None:
+            if node.type == "template_declaration":
+                return None
+            node = node.parent
+        head = [c for c in last.named_children if c.end_byte <= declarator.start_byte]
+        return head[-1].end_byte if head and head[-1].type == "ERROR" else None
 
     def remove_parameter(self, target: str, parameter_name: str) -> str:
         """
@@ -7120,7 +7922,8 @@ class Applier:
         _delete_entry deletes an entry: one on a line of its own goes with
         that line, a comment at its end included (comments on other lines
         stay), and a last parameter with no comma after it takes the comma
-        before it. Comments are no parameters. A name of a Go declaration
+        before it. Comments are no parameters; a C++ `...` is one
+        (_parameter_entries). A name of a Go declaration
         of several (`a, b int`) goes alone with its comments, the others
         keep the type and theirs (_remove_grouped_name); a Go
         parameter given only as a type (`int`) has no name, and a method's
@@ -7129,8 +7932,11 @@ class Applier:
         (_remove_bound_name: `{a: x, b}` without x is `{b}`, `[a, b]`
         without a is `[, b]`, `(a, b)` without a is `(_, b)`); the
         pattern's last name takes the whole parameter. A Python `*` or `/`
-        left without the parameter it needs goes with it (_marker_span),
-        and a C function left with none gets `(void)` (_void_filled).
+        left without the parameter it needs goes with it (_marker_span), a
+        Python `*args` before keyword-only parameters leaves a bare `*` in
+        its place (`f(a, *args, b)` gives `f(a, *, b)`), and a C function
+        left with none gets `(void)` (_void_filled). In C (.c, .h), the last
+        named parameter before a `...` is refused: `f(...)` is C++ or C23.
         """
         params = self._find_parameter_list(target)
         if self._is_bare_arrow_parameter(params):
@@ -7140,7 +7946,7 @@ class Applier:
             source_bytes = self.parser.source_bytes
             self._write_bytes(source_bytes[: params.start_byte] + b"()" + source_bytes[params.end_byte :])
             return "Update successful"
-        existing = [c for c in params.named_children if "comment" not in c.type]
+        existing = self._parameter_entries(params)
 
         idx = None
         for i, p in enumerate(existing):
@@ -7161,8 +7967,23 @@ class Applier:
             self._remove_grouped_name(existing[idx], names.index(parameter_name))
             return "Update successful"
 
+        if self._is_args(existing[idx]) and not all(self._is_kwargs(p) for p in existing[idx + 1 :]):
+            # The parameters after `*args` but a `**kwargs` are keyword-only:
+            # a bare `*` takes its place to keep them so.
+            source_bytes = self.parser.source_bytes
+            args = existing[idx]
+            self._write_bytes(source_bytes[: args.start_byte] + b"*" + source_bytes[args.end_byte :])
+            return "Update successful"
+
         if params.children[0].type == "(" and params.children[-1].type == ")":
             first, count = self._marker_span(existing, idx)
+            left = existing[:first] + existing[first + count :]
+            if self.parser.ext in C_EXTS and left and all(p.type == "variadic_parameter" for p in left):
+                raise ApplierError(
+                    f"Removing '{parameter_name}' would leave only `...` in '{target}', and C needs a named "
+                    "parameter before `...` (before C23; C++ allows `f(...)`). Keep another parameter before "
+                    "it, or rewrite the list with replace_signature."
+                )
             new_bytes = self._entry_deleted(params, existing, first, count)
             if count == len(existing) and self.parser.ext in C_EXTS:
                 new_bytes = self._void_filled(params, existing[idx], new_bytes)
@@ -7449,8 +8270,9 @@ class Applier:
         """
         Replace or insert a Python docstring on a function or class, or on
         the module for the target "" (_replace_module_docstring). The
-        new_docstring should be a valid Python string literal including its
-        surrounding triple quotes. Python-specific. A new docstring for a
+        new_docstring must be one Python string literal including its
+        surrounding quotes, normally triple quotes; anything else is refused
+        (_refuse_non_literal). Python-specific. A new docstring for a
         body that shares the line of its signature (`def f(): return 1`) is
         refused.
         """
@@ -7459,6 +8281,7 @@ class Applier:
                 f"replace_docstring only supports .py files (got {self.parser.ext})"
             )
 
+        self._refuse_non_literal(new_docstring)
         if target == "":
             return self._replace_module_docstring(new_docstring)
         node = self.parser.find_node_by_name(target)
@@ -7529,11 +8352,10 @@ class Applier:
         (_file_directive_lines) with no blank line after them, a header
         comment with the blank lines it has below it. One blank line follows
         the docstring, two before a def or class (_sibling_gap). In a file
-        with no statement it goes last, a blank line below a comment. A
-        new_docstring that is no string literal is refused
-        (_refuse_non_literal).
+        with no statement it goes last, a blank line below a comment.
+        replace_docstring has refused a new_docstring that is no string
+        literal (_refuse_non_literal).
         """
-        self._refuse_non_literal(new_docstring)
         nodes = self.parser.tree.root_node.named_children
         first = next((c for c in nodes if "comment" not in c.type), None)
         if first is not None and self._is_docstring_node(first):

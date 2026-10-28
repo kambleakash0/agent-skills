@@ -105,7 +105,8 @@ def check_same(label: str, got: str, want: str) -> None:
     if got != want:
         import difflib
         for line in difflib.unified_diff(want.splitlines(True), got.splitlines(True), "expected", "got"):
-            print(f"     {line.rstrip(chr(10))}")
+            # A lone surrogate can't be printed as UTF-8: shown as its escape, so a failure doesn't end the run
+            print(f"     {line.rstrip(chr(10))}".encode("utf-8", "backslashreplace").decode("utf-8"))
 
 
 def write_doc(name: str, text: str) -> str:
@@ -2760,8 +2761,8 @@ def test_frontmatter_limits():
         # A lone UTF-16 surrogate can only be written as an escape, which R's yaml package rejects
         path = write_raw("limits.rmd", doc)
         check_same(f"key with a lone surrogate, {name}: refused", server.set_frontmatter_key(path, "a\ud800b", "1"),
-                   "Error: Frontmatter key 'a\\ud800b' holds U+D800, a lone UTF-16 surrogate, which YAML can only write as an "
-                   "escape that the libyaml in R's yaml package rejects, so the file was left unchanged")
+                   f"Error: Refused: the text holds a lone surrogate, U+D800, which is not a character and can't be "
+                   f"written as UTF-8. {path} was not modified.")
         check_same(f"key with a lone surrogate, {name}: file unchanged", read_raw(path), doc)
     path = write_raw("limits.rmd", "---\ntitle: t\n---\nBody\n")
     check("key with spaces and tabs around it: saved", server.set_frontmatter_key(path, " \ttitle ", "2"), "Saved")
@@ -3563,6 +3564,451 @@ def test_format_outputs_traceback():
 
 
 # ──────────────────────────────────────────────
+# Options kept by merges and edits, lone surrogates refused
+# ──────────────────────────────────────────────
+
+
+def test_final_merge_options():
+    print("\n═══ merge_cells: every chunk's options kept ═══")
+    from rmd_editor import server
+    # knitr reads options only in a chunk's header and in the option lines at its top: the merged chunk gets every
+    # chunk's option lines in one block at its top, under the engine's comment characters, and the other headers'
+    # options in its header; it keeps the first chunk's label, and an option set twice to one value is written once
+    for name, (doc, end, written) in {
+        "option lines of the second chunk": ("```{r}\nx\n```\n```{r}\n#| echo: false\ny\n```\n", 1,
+                                             "```{r}\n#| echo: false\nx\ny\n```\n"),
+        "option lines of both": ("```{r}\n#| echo: false\nx\n```\n```{r}\n#| warning: false\ny\n```\n", 1,
+                                 "```{r}\n#| echo: false\n#| warning: false\nx\ny\n```\n"),
+        "three chunks": ("```{r}\nx\n```\n```{r}\n#| echo: false\ny\n```\n```{r}\n#| warning: false\nz\n```\n", 2,
+                         "```{r}\n#| echo: false\n#| warning: false\nx\ny\nz\n```\n"),
+        "the same option line": ("```{r}\n#| echo: false\nx\n```\n```{r}\n#| echo: false\ny\n```\n", 1,
+                                 "```{r}\n#| echo: false\nx\ny\n```\n"),
+        "a dashed and a dotted name with one value": ("```{r}\n#| fig-width: 7\nx\n```\n```{r}\n#| fig.width: 7\ny\n```\n", 1,
+                                                      "```{r}\n#| fig-width: 7\nx\ny\n```\n"),
+        "a blank line after the option lines": ("```{r}\n#| echo: false\n\nx\n```\n```{r}\n#| warning: false\n\ny\n```\n", 1,
+                                                "```{r}\n#| echo: false\n#| warning: false\n\nx\ny\n```\n"),
+        "a comment among the option lines": (
+            "```{r}\n#| echo: false\nx\n```\n```{r}\n#| label: b\n#| # why\n#| warning: false\ny\n```\n", 1,
+            "```{r}\n#| echo: false\n#| warning: false\n#| # why\nx\ny\n```\n"),
+        "header options": ("```{r a}\nx\n```\n```{r b, echo=FALSE}\ny\n```\n", 1, "```{r a, echo=FALSE}\nx\ny\n```\n"),
+        "header options of both": ("```{r echo=FALSE}\nx\n```\n```{r fig.width=7}\ny\n```\n", 1,
+                                   "```{r echo=FALSE, fig.width=7}\nx\ny\n```\n"),
+        "the same header option": ("```{r echo=FALSE}\nx\n```\n```{r echo=FALSE}\ny\n```\n", 1, "```{r echo=FALSE}\nx\ny\n```\n"),
+        "a header option and an option line with its value": ("```{r echo=FALSE}\nx\n```\n```{r}\n#| echo: false\ny\n```\n", 1,
+                                                               "```{r echo=FALSE}\nx\ny\n```\n"),
+        "a header option and option lines": ("```{r echo=FALSE}\nx\n```\n```{r}\n#| warning: false\ny\n```\n", 1,
+                                             "```{r echo=FALSE}\n#| warning: false\nx\ny\n```\n"),
+        "option lines and a header option": ("```{r}\n#| echo: false\nx\n```\n```{r fig.width=7}\ny\n```\n", 1,
+                                             "```{r fig.width=7}\n#| echo: false\nx\ny\n```\n"),
+        "the second chunk's option label goes": ("```{r a}\nx\n```\n```{r}\n#| label: b\n#| echo: false\ny\n```\n", 1,
+                                                 "```{r a}\n#| echo: false\nx\ny\n```\n"),
+        "the second chunk's label= goes": ("```{r a}\nx\n```\n```{r label='b', echo=FALSE}\ny\n```\n", 1,
+                                           "```{r a, echo=FALSE}\nx\ny\n```\n"),
+        "the first chunk's option label stays": ("```{r}\n#| label: a\nx\n```\n```{r b}\n#| label: c\ny\n```\n", 1,
+                                                 "```{r}\n#| label: a\nx\ny\n```\n"),
+        "sql": ("```{sql}\nSELECT 1\n```\n```{sql}\n--| echo: false\nSELECT 2\n```\n", 1,
+                "```{sql}\n--| echo: false\nSELECT 1\nSELECT 2\n```\n"),
+        "sql option lines written two ways": (
+            "```{sql}\n--| echo: false\nSELECT 1\n```\n```{sql}\n#| eval: false\nSELECT 2\n```\n", 1,
+            "```{sql}\n--| echo: false\n--| eval: false\nSELECT 1\nSELECT 2\n```\n"),
+        "js": ("```{js}\n//| echo: false\nx;\n```\n```{js}\n//| eval: false\ny;\n```\n", 1,
+               "```{js}\n//| echo: false\n//| eval: false\nx;\ny;\n```\n"),
+        "c": ("```{c}\n/*| echo: false */\nint x;\n```\n```{c}\n/*| eval: false */\nint y;\n```\n", 1,
+              "```{c}\n/*| echo: false */\n/*| eval: false */\nint x;\nint y;\n```\n"),
+        "indented chunks": ("  ```{r}\n  x\n  ```\n  ```{r}\n  #| echo: false\n  y\n  ```\n", 1,
+                            "  ```{r}\n  #| echo: false\n  x\n  y\n  ```\n"),
+        "CRLF": ("```{r}\r\nx\r\n```\r\n```{r}\r\n#| echo: false\r\ny\r\n```\r\n", 1,
+                 "```{r}\r\n#| echo: false\r\nx\r\ny\r\n```\r\n"),
+    }.items():
+        path = write_raw("merge_options.rmd", doc)
+        check(f"merge, {name}: saved", server.merge_cells(path, 0, end), "Saved")
+        check_same(f"merge, {name}: file", read_raw(path), written)
+    path = write_raw("merge_options.rmd", "```{r a}\nx\n```\n```{r b, fig.width=7}\n#| echo: false\ny\n```\n")
+    server.merge_cells(path, 0, 1)
+    check_same("merge: knitr reads every option of the merged chunk", server.get_chunk_options(path, 0),
+               "language: r\nlabel: a\n  fig.width=7\n  #| echo: false")
+
+    def refused(label, doc, call, error):
+        """call(path) on a fresh file holding doc returns error and leaves the file as it was."""
+        path = write_raw("merge_options.rmd", doc)
+        check_same(f"merge, {label}: refused", call(path), error)
+        check_same(f"merge, {label}: file unchanged", read_raw(path), doc)
+
+    # The merged chunk can hold one value for an option: different values are refused, naming it
+    differ = ("but the merged chunk can hold one value, so the file was left unchanged: give them the same value with "
+              "set_chunk_option, or remove one with remove_chunk_option, first")
+    refused("an option line with two values", "```{r}\n#| echo: false\nx\n```\n```{r}\n#| echo: true\ny\n```\n",
+            lambda p: server.merge_cells(p, 0, 1),
+            f"Error: Can't merge cells 0 to 1: cell 0 sets option echo as #| echo: false and cell 1 as #| echo: true, {differ}")
+    refused("a header option with two values", "```{r echo=FALSE}\nx\n```\n```{r echo=TRUE}\ny\n```\n",
+            lambda p: server.merge_cells(p, 0, 1),
+            f"Error: Can't merge cells 0 to 1: cell 0 sets option echo as echo=FALSE and cell 1 as echo=TRUE, {differ}")
+    refused("a header option against an option line", "Intro\n```{r echo=FALSE}\nx\n```\n```{r}\n#| echo: true\ny\n```\n",
+            lambda p: server.merge_cells(p, 1, 2),
+            f"Error: Can't merge cells 1 to 2: cell 1 sets option echo as echo=FALSE and cell 2 as #| echo: true, {differ}")
+    refused("a dashed name against a dotted one in the third chunk",
+            "```{r}\n#| fig-width: 5\nx\n```\n```{r}\ny\n```\n```{r fig.width=7}\nz\n```\n", lambda p: server.merge_cells(p, 0, 2),
+            f"Error: Can't merge cells 0 to 2: cell 0 sets option fig.width as #| fig-width: 5 and cell 2 as fig.width=7, {differ}")
+    # Options that can't be read can't be checked against the others
+    refused("option lines that aren't YAML", "```{r}\nx\n```\n```{r}\n#| echo=FALSE\ny\n```\n", lambda p: server.merge_cells(p, 0, 1),
+            "Error: Can't merge cells 0 to 1: the option lines of cell 1 aren't YAML (key: value lines), so they can't be "
+            "checked against the other chunks' options, and the file was left unchanged: rewrite them as key: value lines, "
+            "or set the options with set_chunk_option, first")
+    refused("a header knitr fails on", "```{r}\n#| echo: false\nx\n```\n```{r echo=FALSE, a, b}\ny\n```\n",
+            lambda p: server.merge_cells(p, 0, 1),
+            "Error: Can't merge cells 0 to 1: knitr fails on the chunk header of cell 1 (get_chunk_options says why), so its "
+            "options can't be read, and the file was left unchanged")
+    # Lines that would read as other option lines once gathered at the top
+    runs_on = ("code below them that starts as an option line does runs them on, and in a c, css or sas chunk whose every "
+               "line ends with */, or ; for sas, it reads the first line alone as one")
+    refused("code that would become option lines", "```{r}\n```\n```{r}\n#| echo: false\n\n#| warning: false\n```\n",
+            lambda p: server.merge_cells(p, 0, 1),
+            f"Error: Can't merge cells 0 to 1: knitr would read other option lines at the top of the merged chunk than the "
+            f"chunks' own ({runs_on}), so the file was left unchanged")
+    refused("c chunks of option lines alone", "```{c}\n/*| a: 1 */\n```\n```{c}\n/*| b: 2 */\n```\n",
+            lambda p: server.merge_cells(p, 0, 1),
+            f"Error: Can't merge cells 0 to 1: knitr would read other option lines at the top of the merged chunk than the "
+            f"chunks' own ({runs_on}), so the file was left unchanged")
+    refused("option values over several lines", "```{r}\n#| fig-cap: |\n#|   a\nx\n```\n```{r}\n#| fig-cap: |\n#|   b\ny\n```\n",
+            lambda p: server.merge_cells(p, 0, 1),
+            "Error: Can't merge cells 0 to 1: cell 0 sets option fig.cap as #| fig-cap: |\\n#|   a and cell 1 as "
+            f"#| fig-cap: |\\n#|   b, {differ}")
+    for name, (doc, written) in {
+        "a header string and an option line with its text": ("```{r fig.cap='A'}\nx\n```\n```{r}\n#| fig-cap: A\ny\n```\n",
+                                                             "```{r fig.cap='A'}\nx\ny\n```\n"),
+        "an option line and a header option with its value": ("```{r}\n#| echo: false\nx\n```\n```{r echo=FALSE}\ny\n```\n",
+                                                              "```{r}\n#| echo: false\nx\ny\n```\n"),
+        "an option knitr reads over the header": ("```{r echo=TRUE}\n#| echo: false\nx\n```\n```{r echo=FALSE}\ny\n```\n",
+                                                  "```{r echo=TRUE}\n#| echo: false\nx\ny\n```\n"),
+        "a chunk with option lines alone": ("```{r}\n#| echo: false\n```\n```{r}\n#| warning: false\ny\n```\n",
+                                            "```{r}\n#| echo: false\n#| warning: false\ny\n```\n"),
+        "a header knitr fails on, with nothing to merge": ("```{r echo=FALSE, a, b}\nx\n```\n```{r c}\ny\n```\n",
+                                                           "```{r echo=FALSE, a, b}\nx\ny\n```\n"),
+    }.items():
+        path = write_raw("merge_options.rmd", doc)
+        check(f"merge, {name}: saved", server.merge_cells(path, 0, 1), "Saved")
+        check_same(f"merge, {name}: file", read_raw(path), written)
+
+
+def test_final_option_lines_after_code():
+    print("\n═══ option lines after code: refused by every tool that writes chunk text ═══")
+    from rmd_editor import server
+
+    def refused(label, doc, call, error):
+        """call(path) on a fresh file holding doc returns error and leaves the file as it was."""
+        path = write_raw("after_code.rmd", doc)
+        check_same(f"{label}: refused", call(path), error)
+        check_same(f"{label}: file unchanged", read_raw(path), doc)
+
+    # knitr reads option lines only at the top of a chunk: one after code is a plain comment there, the option lost
+    after = ("is a chunk option line after other lines, where knitr reads it as code (it reads option lines only at the "
+             "top of a chunk), so the file was left unchanged: move it up with the option lines at the top, or set the "
+             "option with set_chunk_option")
+    refused("append an option line", "```{r}\nx\n```\n", lambda p: server.append_to_cell(p, 0, "#| echo: false"),
+            f"Error: Line 1 of the new text, '#| echo: false', {after}")
+    refused("append an option line after code of the text", "```{r}\nx\n```\n",
+            lambda p: server.append_to_cell(p, 0, "y\n#| echo: false"), f"Error: Line 2 of the new text, '#| echo: false', {after}")
+    refused("append text starting with a line break", "```{r}\nx\n```\n",
+            lambda p: server.append_to_cell(p, 0, "\ny\n#| echo: false"), f"Error: Line 3 of the new text, '#| echo: false', {after}")
+    refused("append an option line below option lines and code", "```{r}\n#| echo: false\nx\n```\n",
+            lambda p: server.append_to_cell(p, 0, "#| warning: false"), f"Error: Line 1 of the new text, '#| warning: false', {after}")
+    refused("append an option line after a blank line", "```{r}\n#| echo: false\n\n```\n",
+            lambda p: server.append_to_cell(p, 0, "#| warning: false"), f"Error: Line 1 of the new text, '#| warning: false', {after}")
+    refused("append a copy of a line the code has", "```{r}\nx\n#| note\n```\n", lambda p: server.append_to_cell(p, 0, "#| note"),
+            f"Error: Line 1 of the new text, '#| note', {after}")
+    refused("append an sql option line", "```{sql}\nSELECT 1\n```\n", lambda p: server.append_to_cell(p, 0, "--| echo: false"),
+            f"Error: Line 1 of the new text, '--| echo: false', {after}")
+    refused("append a line that runs c option lines on", "```{c}\n/*| echo: false\nint x;\n```\n",
+            lambda p: server.append_to_cell(p, 0, "int y; */"),
+            "Error: Appending this text would change which lines of the chunk knitr reads as its option lines (as a line "
+            "ending in */ does under the /*| ... */ lines of a c chunk), so the file was left unchanged")
+    refused("add a chunk with an option line after code", "Intro\n", lambda p: server.add_cell(p, -1, "x\n#| echo: false"),
+            f"Error: Line 2 of the new text, '#| echo: false', {after}")
+    refused("add a chunk with an option line after a blank line", "Intro\n",
+            lambda p: server.add_cell(p, 0, "#| echo: false\n\n#| warning: false\nx"),
+            f"Error: Line 3 of the new text, '#| warning: false', {after}")
+    refused("prepend an option line after code", "```{r}\n#| echo: false\nx\n```\n",
+            lambda p: server.prepend_to_cell(p, 0, "y\n#| warning: false"), f"Error: Line 2 of the new text, '#| warning: false', {after}")
+    refused("replace with an option line after code", "```{r}\nx\n```\n", lambda p: server.replace_cell_source(p, 0, "y\n#| echo: false"),
+            f"Error: Line 2 of the new text, '#| echo: false', {after}")
+    refused("split before a js option line in the code", "```{js}\nx;\n//| echo: false\n```\n", lambda p: server.split_cell(p, 0, 1),
+            "Error: Can't split cell 0 at line_offset 1: line 2, '//| echo: false', would start the new chunk, where knitr "
+            "would read it as an option line instead of code, so the file was left unchanged")
+    for name, (doc, call, written) in {
+        "append option lines to an empty chunk": ("```{r}\n```\n", lambda p: server.append_to_cell(p, 0, "#| echo: false\nx"),
+                                                  "```{r}\n#| echo: false\nx\n```\n"),
+        "append an option line to option lines alone": ("```{r}\n#| echo: false\n```\n",
+                                                        lambda p: server.append_to_cell(p, 0, "#| warning: false"),
+                                                        "```{r}\n#| echo: false\n#| warning: false\n```\n"),
+        "append code below a line the code has": ("```{r}\nx\n#| note\n```\n", lambda p: server.append_to_cell(p, 0, "y"),
+                                                  "```{r}\nx\n#| note\ny\n```\n"),
+        "append to prose": ("Intro\n", lambda p: server.append_to_cell(p, 0, "#| not an option"), "Intro\n#| not an option\n"),
+        "add a chunk that starts with option lines": ("Intro\n", lambda p: server.add_cell(p, -1, "#| echo: false\nx"),
+                                                      "Intro\n```{r}\n#| echo: false\nx\n```\n"),
+        "add prose with a line like an option line": ("Intro\n",
+                                                      lambda p: server.add_cell(p, -1, "Text\n#| not an option", cell_type="markdown"),
+                                                      "Intro\nText\n#| not an option\n"),
+        "prepend code below option lines": ("```{r}\n#| echo: false\ny\n```\n", lambda p: server.prepend_to_cell(p, 0, "x"),
+                                            "```{r}\n#| echo: false\nx\ny\n```\n"),
+        "split below the option lines": ("```{r}\n#| echo: false\nx\ny\n```\n", lambda p: server.split_cell(p, 0, 2),
+                                         "```{r}\n#| echo: false\nx\n```\n```{r}\ny\n```\n"),
+    }.items():
+        path = write_raw("after_code.rmd", doc)
+        check(f"{name}: saved", call(path), "Saved")
+        check_same(f"{name}: file", read_raw(path), written)
+
+
+def test_final_lone_surrogates():
+    print("\n═══ a lone surrogate in a tool's text: refused before the file is touched ═══")
+    import asyncio
+    from rmd_editor import server
+    # JSON lets a client send half of a surrogate pair as an escape: it is not a character, has no UTF-8 form, and the
+    # escape YAML writes for it is one R's yaml package rejects, so every tool that takes text refuses it up front
+    lone = chr(0xD800)
+    doc = "---\ntitle: t\n---\nIntro\n\n```{r a, echo=FALSE}\n#| warning: false\nx\n```\n"
+
+    def refusal(path, point="D800"):
+        return (f"Error: Refused: the text holds a lone surrogate, U+{point}, which is not a character and can't be "
+                f"written as UTF-8. {path} was not modified.")
+
+    for name, call in {
+        "add_cell, code": lambda p: server.add_cell(p, -1, "y <- '" + lone + "'"),
+        "add_cell, markdown": lambda p: server.add_cell(p, -1, "Text " + lone, cell_type="markdown"),
+        "replace_cell_source": lambda p: server.replace_cell_source(p, 1, "y" + lone),
+        "prepend_to_cell": lambda p: server.prepend_to_cell(p, 0, lone),
+        "append_to_cell": lambda p: server.append_to_cell(p, 1, "# " + lone),
+        "set_chunk_option, key": lambda p: server.set_chunk_option(p, 1, "fig" + lone, "1"),
+        "set_chunk_option, header value": lambda p: server.set_chunk_option(p, 1, "echo", '"' + lone + '"'),
+        "set_chunk_option, option line value": lambda p: server.set_chunk_option(p, 1, "warning", '"' + lone + '"'),
+        "set_chunk_option, label": lambda p: server.set_chunk_option(p, 1, "label", "b" + lone),
+        "remove_chunk_option": lambda p: server.remove_chunk_option(p, 1, "echo" + lone),
+        "set_frontmatter_key, key": lambda p: server.set_frontmatter_key(p, "k" + lone, "1"),
+        "set_frontmatter_key, value": lambda p: server.set_frontmatter_key(p, "k", "a" + lone + "b"),
+        "set_frontmatter_key, an existing key's value": lambda p: server.set_frontmatter_key(p, "title", lone),
+        "set_frontmatter_key, nested value": lambda p: server.set_frontmatter_key(p, "k", "a:\n  b: x" + lone),
+        "set_frontmatter_key, list value": lambda p: server.set_frontmatter_key(p, "k", "[a, b" + lone + "]"),
+        "set_frontmatter_key, block list value": lambda p: server.set_frontmatter_key(p, "k", "- a\n- " + lone),
+        "remove_frontmatter_key": lambda p: server.remove_frontmatter_key(p, "title" + lone),
+        "find_in_rmd": lambda p: server.find_in_rmd(p, "x" + lone),
+        "create_rmd, title": lambda p: server.create_rmd(p, title="T" + lone, overwrite=True),
+        "create_rmd, author": lambda p: server.create_rmd(p, author=lone, overwrite=True),
+        "create_rmd, output_format": lambda p: server.create_rmd(p, output_format="html" + lone, overwrite=True),
+    }.items():
+        path = write_raw("surrogates.rmd", doc)
+        check_same(f"lone surrogate, {name}: refused", call(path), refusal(path))
+        check_same(f"lone surrogate, {name}: file unchanged", read_raw(path), doc)
+    path = write_raw("surrogates.rmd", doc)
+    check_same("lone surrogate, a low one: refused", server.set_frontmatter_key(path, "k", chr(0xDFFF)), refusal(path, "DFFF"))
+    check_same("lone surrogate, a low one: file unchanged", read_raw(path), doc)
+    new = os.path.join(WORK_DIR, "surrogate_new.rmd")
+    check_same("lone surrogate, create_rmd of a new file: refused", server.create_rmd(new, title=lone), refusal(new))
+    check("lone surrogate, create_rmd of a new file: no file", os.path.exists(new), False)
+    # Called directly, the manager refuses it the same way
+    try:
+        RmdManager(path).set_frontmatter_key("k", lone)
+        check("lone surrogate, the manager: refused", "saved", "refused")
+    except RmdManagerError as e:
+        check_same("lone surrogate, the manager: refused", str(e), refusal(path)[len("Error: "):])
+    check_same("lone surrogate, the manager: file unchanged", read_raw(path), doc)
+    # Over MCP, where the reply is JSON, which can't hold one either
+    reply = asyncio.run(server.mcp.call_tool("set_frontmatter_key", {"file_path": path, "key": "k", "value": "a" + lone}))
+    check_same("lone surrogate, over MCP: refused", reply.content[0].text, refusal(path))
+    check_same("lone surrogate, over MCP: file unchanged", read_raw(path), doc)
+    # A path holding one is shown with it escaped, so the reply can still be sent
+    bad = os.path.join(WORK_DIR, "a" + lone + ".rmd")
+    shown = os.path.join(WORK_DIR, "a" + chr(92) + "ud800.rmd")
+    check_same("lone surrogate in the path, list_cells: refused", server.list_cells(bad), refusal(shown))
+    check_same("lone surrogate in the path, create_rmd: refused", server.create_rmd(bad, title="t"), refusal(shown))
+    reply = asyncio.run(server.mcp.call_tool("add_cell", {"file_path": bad, "index": -1, "source": "x"}))
+    check("lone surrogate in the path, over MCP: the reply is JSON", "Refused: the text holds a lone surrogate" in reply.model_dump_json(), True)
+    # A character past U+FFFF is one character, not a lone surrogate
+    path = write_raw("surrogates.rmd", doc)
+    check("a character past U+FFFF: saved", server.set_frontmatter_key(path, "k", "a" + chr(0x10348) + "b"), "Saved")
+    check_same("a character past U+FFFF: written", read_raw(path), doc.replace("---\nIntro", "k: a" + chr(0x10348) + "b\n---\nIntro"))
+
+
+def test_final_surrogate_replies():
+    print("\n═══ lone surrogates from YAML escapes: shown escaped in replies, refused in new values ═══")
+    import asyncio
+    from rmd_editor import server
+    from rmd_editor.manager import _refusing_lone_surrogates
+    esc = chr(92) + "ud800"
+    # A #| label written as a YAML escape for a lone surrogate reads as one: replies, JSON sent as UTF-8, show it as
+    # that escape, so they can be sent and the server keeps running
+    doc = '```{r}\n#| label: "a' + esc + 'b"\nx\n```\n```{r}\ny\n```\n'
+    path = write_raw("surrogate_replies.rmd", doc)
+    listed = '[0] code (r label=a' + esc + 'b) 2L  #| label: "a' + esc + 'b"\n[1] code (r) 1L  y'
+    options = 'language: r\nlabel: a' + esc + 'b (from #| label: "a' + esc + 'b")\noptions: (none)'
+    check_same("label holding a lone surrogate: list_cells", server.list_cells(path), listed)
+    check_same("label holding a lone surrogate: get_chunk_options", server.get_chunk_options(path, 0), options)
+    for tool, args, want in (("list_cells", {"file_path": path}, listed),
+                             ("get_chunk_options", {"file_path": path, "index": 0}, options),
+                             ("get_cell", {"file_path": path, "index": 1}, "y")):
+        reply = asyncio.run(server.mcp.call_tool(tool, args))
+        try:
+            sent = json.loads(reply.model_dump_json())["content"][0]["text"]
+        except Exception as e:
+            sent = f"not sent: {e!r}"
+        check_same(f"label holding a lone surrogate, {tool} over MCP: sent", sent, want)
+    check_same("label holding a lone surrogate: file unchanged", read_raw(path), doc)
+    path = write_raw("surrogate_replies.rmd", '---\ntitle: "a' + esc + 'b"\n---\nx\n')
+    check_same("frontmatter value holding a lone surrogate: get_frontmatter", server.get_frontmatter(path),
+               'title: "a' + chr(92) + 'uD800b"')
+
+    # Every reply and error of the manager shows one it holds escaped
+    @_refusing_lone_surrogates
+    class Probe:
+        filepath = "probe.rmd"
+
+        def reply(self):
+            return "a" + chr(0xD800) + "b"
+
+        def fail(self):
+            raise RmdManagerError("a" + chr(0xD800) + "b")
+
+    check_same("a reply holding a lone surrogate: escaped", Probe().reply(), "a" + esc + "b")
+    try:
+        Probe().fail()
+        check("an error holding a lone surrogate: raised", "returned", "raised")
+    except RmdManagerError as e:
+        check_same("an error holding a lone surrogate: escaped", str(e), "a" + esc + "b")
+    # A frontmatter value is YAML: an escape for a surrogate there reads as a lone one, which R's yaml package rejects
+    doc = "---\ntitle: t\n---\nx\n"
+    rejects = ("a lone UTF-16 surrogate, which YAML can only write as an escape that the libyaml in R's yaml package "
+               "rejects, so the file was left unchanged")
+    for name, (key, value, point) in {
+        "a quoted string": ("k", '"a' + esc + 'b"', "D800"),
+        "an existing key's value": ("title", '"' + esc + '"', "D800"),
+        "a low one": ("k", '"' + chr(92) + 'udfff"', "DFFF"),
+        "an escaped pair, which YAML reads as two": ("k", '"' + chr(92) + 'ud83d' + chr(92) + 'ude00"', "D83D"),
+        "in a list": ("k", '[a, "b' + esc + '"]', "D800"),
+        "in a nested key": ("k", '{"b' + esc + '": 1}', "D800"),
+        "in a block mapping": ("k", 'a:\n  b: "x' + esc + '"', "D800"),
+        "a tagged value": ("k", '!r "x' + esc + '"', "D800"),
+    }.items():
+        path = write_raw("surrogate_replies.rmd", doc)
+        check_same(f"frontmatter value with a YAML escape for a lone surrogate, {name}: refused",
+                   server.set_frontmatter_key(path, key, value),
+                   f"Error: The value for frontmatter key {key!r} holds U+{point} as YAML reads it, {rejects}")
+        check_same(f"frontmatter value with a YAML escape for a lone surrogate, {name}: file unchanged", read_raw(path), doc)
+    # Text that YAML doesn't read as one is written as before
+    for name, (value, written) in {
+        "a backslash in plain text": ("a" + esc + "b", "k: a" + esc + "b\n"),
+        "an escape for a character past U+FFFF": ('"' + chr(92) + 'U0001F600"', 'k: "' + chr(92) + 'U0001F600"\n'),
+    }.items():
+        path = write_raw("surrogate_replies.rmd", doc)
+        check(f"frontmatter value, {name}: saved", server.set_frontmatter_key(path, "k", value), "Saved")
+        check_same(f"frontmatter value, {name}: file", read_raw(path), "---\ntitle: t\n" + written + "---\nx\n")
+
+
+def test_final_append_after_line_break():
+    print("\n═══ append_to_cell: a line break the text starts with leaves the chunk's last line its own ═══")
+    from rmd_editor import server
+    after = ("is a chunk option line after other lines, where knitr reads it as code (it reads option lines only at the "
+             "top of a chunk), so the file was left unchanged: move it up with the option lines at the top, or set the "
+             "option with set_chunk_option")
+    # The text's own line break is the one between it and the chunk, so the chunk's last line is no line of the text,
+    # a line that starts as an option line does, which knitr reads as code there, too
+    for name, (doc, text, written) in {
+        "below a stray option line": ("```{r}\nx\n#| note\n```\n", "\ny", "```{r}\nx\n#| note\ny\n```\n"),
+        "below a stray sql option line": ("```{sql}\nSELECT 1\n--| note\n```\n", "\nSELECT 2",
+                                          "```{sql}\nSELECT 1\n--| note\nSELECT 2\n```\n"),
+        "an option line below option lines alone": ("```{r}\n#| echo: false\n```\n", "\n#| warning: false",
+                                                    "```{r}\n#| echo: false\n#| warning: false\n```\n"),
+    }.items():
+        path = write_raw("append_break.rmd", doc)
+        check(f"append after a line break, {name}: saved", server.append_to_cell(path, 0, text), "Saved")
+        check_same(f"append after a line break, {name}: file", read_raw(path), written)
+    # The text's own option lines after other lines are still refused, numbered as lines of the text
+    for name, (doc, text, error) in {
+        "a copy of the stray line": ("```{r}\nx\n#| note\n```\n", "\n#| note", f"Error: Line 2 of the new text, '#| note', {after}"),
+        "after a blank line of the text": ("```{r}\nx\n```\n", "\n\n#| echo: false",
+                                           f"Error: Line 3 of the new text, '#| echo: false', {after}"),
+        "in an empty chunk": ("```{r}\n```\n", "\n#| echo: false", f"Error: Line 2 of the new text, '#| echo: false', {after}"),
+    }.items():
+        path = write_raw("append_break.rmd", doc)
+        check_same(f"append after a line break, {name}: refused", server.append_to_cell(path, 0, text), error)
+        check_same(f"append after a line break, {name}: file unchanged", read_raw(path), doc)
+
+
+def test_final_merge_values():
+    print("\n═══ merge_cells: option values compared and kept as knitr reads them ═══")
+    from rmd_editor import server
+    from rmd_editor.parser import _option_block
+
+    def refused(label, doc, error):
+        """merge_cells(path, 0, 1) on a fresh file holding doc returns error and leaves the file as it was."""
+        path = write_raw("merge_values.rmd", doc)
+        check_same(f"merge, {label}: refused", server.merge_cells(path, 0, 1), error)
+        check_same(f"merge, {label}: file unchanged", read_raw(path), doc)
+
+    # One value written two ways is set once, as the first chunk writes it
+    for name, (doc, written) in {
+        "a header string and a quoted option line string": ('```{r fig.cap="A"}\nx\n```\n```{r}\n#| fig-cap: "A"\ny\n```\n',
+                                                             '```{r fig.cap="A"}\nx\ny\n```\n'),
+        "a plain and a quoted string": ('```{r}\n#| fig-cap: A\nx\n```\n```{r}\n#| fig-cap: "A"\ny\n```\n',
+                                        '```{r}\n#| fig-cap: A\nx\ny\n```\n'),
+        "FALSE and false": ('```{r}\n#| echo: FALSE\nx\n```\n```{r}\n#| echo: false\ny\n```\n', '```{r}\n#| echo: FALSE\nx\ny\n```\n'),
+        "a value with a comment after it": ('```{r}\n#| echo: false # hide\nx\n```\n```{r}\n#| echo: false\ny\n```\n',
+                                            '```{r}\n#| echo: false # hide\nx\ny\n```\n'),
+        "a flow list and a block list": ('```{r}\n#| fig-cap: [a, b]\nx\n```\n```{r}\n#| fig-cap:\n#|   - a\n#|   - b\ny\n```\n',
+                                         '```{r}\n#| fig-cap: [a, b]\nx\ny\n```\n'),
+        "an option line string and the header's": ('```{r}\n#| fig-cap: \'a"b\'\nx\n```\n```{r fig.cap=\'a"b\'}\ny\n```\n',
+                                                   '```{r}\n#| fig-cap: \'a"b\'\nx\ny\n```\n'),
+    }.items():
+        path = write_raw("merge_values.rmd", doc)
+        check(f"merge, {name}: saved", server.merge_cells(path, 0, 1), "Saved")
+        check_same(f"merge, {name}: file", read_raw(path), written)
+    # Values R's yaml package reads apart stay apart: 7 is an integer there and 7.0 a double, and y unquoted is TRUE
+    differ = ("but the merged chunk can hold one value, so the file was left unchanged: give them the same value with "
+              "set_chunk_option, or remove one with remove_chunk_option, first")
+    refused("an integer and a double", "```{r}\n#| fig-width: 7\nx\n```\n```{r}\n#| fig-width: 7.0\ny\n```\n",
+            f"Error: Can't merge cells 0 to 1: cell 0 sets option fig.width as #| fig-width: 7 and cell 1 as #| fig-width: 7.0, {differ}")
+    refused("y and a quoted y", '```{r}\n#| fig-cap: y\nx\n```\n```{r}\n#| fig-cap: "y"\ny\n```\n',
+            f"Error: Can't merge cells 0 to 1: cell 0 sets option fig.cap as #| fig-cap: y and cell 1 as #| fig-cap: \"y\", {differ}")
+    # Without options in the other chunks, the first chunk's option lines must still be all knitr reads at the top
+    runs_on = ("Error: Can't merge cells 0 to 1: knitr would read other option lines at the top of the merged chunk than "
+               "the chunks' own (code below them that starts as an option line does runs them on, and in a c, css or sas "
+               "chunk whose every line ends with */, or ; for sas, it reads the first line alone as one), so the file was "
+               "left unchanged")
+    refused("c code that closes the first chunk's option comment", "```{c}\n/*| echo: false\nint x;\n```\n```{c}\nint y; */\n```\n",
+            runs_on)
+    refused("c code below a chunk whose every line ends with */", "```{c}\n/*| echo: false */\nx; */\n```\n```{c}\nint y;\n```\n",
+            runs_on)
+    path = write_raw("merge_values.rmd", "```{c}\n/*| echo: false */\nint x;\n```\n```{c}\nint y;\n```\n")
+    check("merge, c code below the first chunk's option lines: saved", server.merge_cells(path, 0, 1), "Saved")
+    check_same("merge, c code below the first chunk's option lines: file", read_raw(path),
+               "```{c}\n/*| echo: false */\nint x;\nint y;\n```\n")
+    # Option lines rewritten under the first block's comment characters read as before: a block scalar keeps its text
+    for name, (doc, written, value) in {
+        "a block scalar under c's /*| ... */": (
+            "```{c}\n/*| echo: false */\nint x;\n```\n```{c}\n#| fig-cap: |\n#|   a\nint y;\n```\n",
+            "```{c}\n/*| echo: false */\n/*| fig-cap: |*/\n/*|   a*/\nint x;\nint y;\n```\n", "a\n"),
+        "a block scalar from c's /*| ... */ under #|": (
+            "```{c}\n#| echo: false\nint x;\n```\n```{c}\n/*| fig-cap: | */\n/*|   a */\nint y;\n```\n",
+            "```{c}\n#| echo: false\n#| fig-cap: | \n#|   a \nint x;\nint y;\n```\n", "a \n"),
+    }.items():
+        path = write_raw("merge_values.rmd", doc)
+        check(f"merge, {name}: saved", server.merge_cells(path, 0, 1), "Saved")
+        check_same(f"merge, {name}: file", read_raw(path), written)
+        block = _option_block("c", RmdManager(path).cells[0].source)
+        check(f"merge, {name}: the values knitr reads", [entry.value for entry in block.entries] if block else None,
+              [False, value])
+    # Option lines of a later chunk that can't lose what the merged chunk drops: refused, naming the cell
+    lose = ("Error: Can't merge cells 0 to 1: the merged chunk keeps the first chunk's label and one copy of each option, "
+            "so the option lines of cell 1 lose")
+    rewrite = "so the file was left unchanged: rewrite them with replace_cell_source first"
+    refused("an alias to the anchor of an option the first chunk sets too",
+            "```{r}\n#| fig-width: &w 7\nx\n```\n```{r}\n#| fig-width: &w 7\n#| fig-height: *w\ny\n```\n",
+            f"{lose} fig-width, but that would change how the rest of them read (for example an alias to an anchor that "
+            f"goes) or make code below them option lines, {rewrite}")
+    refused("a label in one c comment over several lines",
+            "```{c}\n/*| echo: false */\nint x;\n```\n```{c}\n/*| eval: false\nlabel: b */\nint y;\n```\n",
+            f"{lose} label, but they are one /*| ... */ comment over several lines, which can't be edited line by line, "
+            f"{rewrite}")
+
+
+# ──────────────────────────────────────────────
 # Server schema
 # ──────────────────────────────────────────────
 
@@ -3675,6 +4121,12 @@ if __name__ == "__main__":
         test_julia_kernel_resolution()
         test_format_outputs_strips_ansi()
         test_format_outputs_traceback()
+        test_final_merge_options()
+        test_final_option_lines_after_code()
+        test_final_lone_surrogates()
+        test_final_surrogate_replies()
+        test_final_append_after_line_break()
+        test_final_merge_values()
         test_server_schema()
     finally:
         # Runs even if a test crashed: stop any kernel still registered, then drop every file

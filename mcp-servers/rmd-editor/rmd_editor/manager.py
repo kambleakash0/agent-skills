@@ -7,16 +7,17 @@ parsed into a Frontmatter + ordered list of Cells via rmd_editor.parser.
 """
 from __future__ import annotations
 
+import functools
 import os
 import re
 from typing import NamedTuple, Optional
 
 from rmd_editor.parser import (
-    Cell, Frontmatter, FrontmatterError, dump_yaml, parse, serialize, yaml_string,
-    _KNITR_CHUNK_BEGIN, _KNITR_CHUNK_END, _OptionBlock, _R_SPACE, _YAML_BREAKS, _chunk_body, _chunk_source,
-    _chunk_stop, _closed, _fence_close, _fence_indent, _indented, _join, _layout, _lines, _option_block, _option_extent,
-    _option_text, _pipe_labels, _r_string_value, _r_to_yaml, _r_trouble, _read_chunk_opening, _read_header,
-    _render_chunk_header, _with_newline,
+    Cell, Frontmatter, FrontmatterError, TaggedScalar, dump_yaml, parse, serialize, yaml_string,
+    _KNITR_CHUNK_BEGIN, _KNITR_CHUNK_END, _OptionBlock, _R_SPACE, _R_YAML_NOT_TEXT, _YAML_BREAKS, _chunk_body,
+    _chunk_source, _chunk_stop, _closed, _fence_close, _fence_indent, _indented, _join, _layout, _lines, _option_block,
+    _option_extent, _option_meta, _option_text, _pipe_labels, _r_string_value, _r_to_yaml, _r_trouble,
+    _read_chunk_opening, _read_header, _render_chunk_header, _with_newline,
 )
 
 
@@ -42,6 +43,63 @@ def _write_utf8(file_path: str, text: str) -> None:
         f.write(data)
 
 
+def _surrogates_escaped(text: str) -> str:
+    """text with each lone surrogate in it written as its escape, a backslash then ud800, which a reply can hold."""
+    return text.encode("utf-8", "backslashreplace").decode("utf-8")
+
+
+def _refuse_lone_surrogates(file_path: str, values) -> None:
+    """
+    Raise for the first string among values, a tool's arguments, that holds a
+    lone surrogate: JSON lets a client send half of a surrogate pair as an
+    escape, which is not a character, has no UTF-8 form and, as the escape
+    YAML writes for it, is rejected by R's yaml package. Checked before the
+    tool does anything with them, so every tool that takes text refuses it the
+    same way, the file untouched. The path is shown with any surrogate in it
+    escaped, as the reply can't hold one either.
+    """
+    for value in values:
+        if isinstance(value, str):
+            try:
+                value.encode("utf-8")
+            except UnicodeEncodeError as e:
+                shown = _surrogates_escaped(file_path)
+                raise RmdManagerError(
+                    f"Refused: the text holds a lone surrogate, U+{ord(value[e.start]):04X}, which is not a character "
+                    f"and can't be written as UTF-8. {shown} was not modified."
+                ) from e
+
+
+def _refusing_lone_surrogates(cls):
+    """
+    Class decorator for RmdManager: each public method first refuses text
+    holding a lone surrogate (see _refuse_lone_surrogates), and its reply or
+    error shows one it holds as an escape (see _surrogates_escaped): one the
+    file gives, as a YAML escape that a #| label is written with does, would
+    stop the reply, JSON sent as UTF-8, from being sent at all.
+    """
+
+    def checking(method):
+        @functools.wraps(method)
+        def wrapper(self, *args, **kwargs):
+            _refuse_lone_surrogates(self.filepath, (*args, *kwargs.values()))
+            try:
+                reply = method(self, *args, **kwargs)
+            except RmdManagerError as e:
+                shown = _surrogates_escaped(str(e))
+                if shown == str(e):
+                    raise
+                raise RmdManagerError(shown) from e
+            return _surrogates_escaped(reply) if isinstance(reply, str) else reply
+
+        return wrapper
+
+    for name, attr in list(vars(cls).items()):
+        if not name.startswith("_") and callable(attr):
+            setattr(cls, name, checking(attr))
+    return cls
+
+
 def create_rmd(
     file_path: str,
     title: str = "",
@@ -56,6 +114,7 @@ def create_rmd(
     Refuses to overwrite an existing file unless overwrite=True.
     Fails if the parent directory does not exist.
     """
+    _refuse_lone_surrogates(file_path, (file_path, title, author, output_format))
     _validate_path(file_path, must_exist=False)
     if os.path.exists(file_path) and not overwrite:
         raise RmdManagerError(f"File already exists: {file_path}")
@@ -452,6 +511,12 @@ def _pipe_line(block: _OptionBlock, prefix: str, value: str) -> str:
     return f"{block.start}{prefix} {value}" + (f" {block.end}" if block.end else "") + "\n"
 
 
+def _one_comment_over_lines(block: _OptionBlock) -> bool:
+    """Whether block's option lines are one comment over several ("/*| a: 1", then "b: 2 */"), not one per line."""
+    return bool(block.end) and not all(line.startswith(block.start) and line.rstrip(_R_SPACE).endswith(block.end)
+                                       for line in block.lines)
+
+
 def _pipe_edits(
     cell: Cell, block: _OptionBlock, removed: set[int], rewritten: dict[int, str],
     added: Optional[tuple[str, str]] = None,
@@ -467,9 +532,7 @@ def _pipe_edits(
     ("/*| a: 1", then "b: 2 */"): they aren't edited line by line.
     """
     language = cell.language
-    one_per_line = all(line.startswith(block.start) and line.rstrip(_R_SPACE).endswith(block.end)
-                       for line in block.lines)
-    if block.end and not one_per_line:
+    if _one_comment_over_lines(block):
         raise RmdManagerError(
             f"The option lines of this {language} chunk are one {block.start}... {block.end} comment over several "
             "lines, which can't be edited line by line, so the file was left unchanged"
@@ -568,12 +631,15 @@ def _stray_option_lines(language: str, source: str) -> list[tuple[int, str]]:
     return [(number, line) for number, line in enumerate(lines[top:], start=top + 1) if _is_option_line(language, line)]
 
 
-def _check_stray_option_lines(cell: Cell, source: str, start: int = 1) -> None:
+def _check_stray_option_lines(cell: Cell, source: str, start: int = 1, own: Optional[int] = None) -> None:
     """
     Raise if source, chunk cell's new source, has a line that starts as option
     lines do after other lines (see _stray_option_lines), where knitr reads it
     as code, unless cell's source has that line there too. The new text starts
-    at line start of source, so the error gives the line's number in the text.
+    at line start of source, so the error gives the line's number in the text;
+    the lines of source up to line own (start - 1 by default), which the text
+    doesn't hold, aren't checked: text appended after a line break of its own
+    starts on the chunk's last line, which stays the chunk's.
     A line right after the option lines is one they don't run on to: in a c,
     css or sas chunk whose every line ends with the comment's closing
     characters, knitr reads the first line alone as an option line.
@@ -582,7 +648,7 @@ def _check_stray_option_lines(cell: Cell, source: str, start: int = 1) -> None:
     lines = [line.rstrip("\n") for line in _lines(_chunk_body(source))]
     extent = _option_extent(cell.language, lines)
     for number, line in _stray_option_lines(cell.language, source):
-        if line in had:
+        if line in had or number <= (start - 1 if own is None else own):
             continue
         shown = f"Line {number - start + 1} of the new text, {line!r},"
         if extent and extent[1] and all(text.rstrip(_R_SPACE).endswith(extent[1]) for text in lines):
@@ -634,6 +700,34 @@ def _check_prepended(cell: Cell, source: str, text: str) -> None:
     _check_stray_option_lines(cell, source, _code_start(cell.language, old) + 1)
 
 
+def _check_appended(cell: Cell, source: str, text: str) -> None:
+    """
+    Raise unless source, chunk cell's source with text appended (see
+    _with_added), keeps the option lines knitr reads at the top of cell: text
+    can run them on only where the chunk holds nothing else (option lines
+    added to option lines alone, or to an empty chunk), and can't make knitr
+    read code above it as option lines (as a line ending in */ does under an
+    open /*| line of a c chunk). An option line of the text after other lines,
+    where knitr reads it as code, is refused too (see
+    _check_stray_option_lines), even a copy of one the chunk's code has.
+    """
+    old = [line.rstrip("\n") for line in _lines(_chunk_body(cell.source))]
+    new = [line.rstrip("\n") for line in _lines(_chunk_body(source))]
+    before, after = _option_extent(cell.language, old), _option_extent(cell.language, new)
+    count = before[2] if before else 0
+    if count < len(old) and (after[2] if after else 0) != count:
+        raise RmdManagerError(
+            "Appending this text would change which lines of the chunk knitr reads as its option lines (as a line "
+            "ending in */ does under the /*| ... */ lines of a c chunk), so the file was left unchanged"
+        )
+    # The text's lines come after the chunk's: a line break it starts with is the one between them, so its first line
+    # is the end of the chunk's last one, which stays the chunk's and isn't checked
+    start = len(old) + 1 - (1 if text.startswith("\n") else 0) if cell.source else 1
+    # Checked as in a chunk without lines, so no line of the text passes for one the chunk had
+    _check_stray_option_lines(Cell(cell_type="code", source="", language=cell.language), source, start,
+                              own=len(old) if cell.source else 0)
+
+
 def _with_added(cell: Cell, text: str, *, before: bool) -> str:
     """
     cell's source with text, "\\n" text, added before or after it; before a
@@ -663,6 +757,197 @@ def _with_added(cell: Cell, text: str, *, before: bool) -> str:
     return _chunk_source("".join(line + "\n" for line in lines))
 
 
+def _restyled(lines: list[str], block: _OptionBlock, start: str, end: str) -> list[str]:
+    """
+    lines, option lines of block without their line breaks, written with start
+    and end instead of block's own characters: each as start, its text and " "
+    end, when they read as the same YAML so, or else as start, the YAML knitr
+    reads in it (see parser._option_meta) and end right after it, which knitr
+    reads back as it was: the spaces a block scalar's lines (|) end with, or
+    the one before end, are its text.
+    """
+    pretty = []
+    for line in lines:
+        text = line[len(block.start):] if line.startswith(block.start) else line
+        if block.end and text.rstrip(_R_SPACE).endswith(block.end):
+            text = text.rstrip(_R_SPACE)[:-len(block.end)].rstrip(_R_SPACE)
+        pretty.append(start + text + (f" {end}" if end else ""))
+    read = [_option_meta(line, block.start, block.end) for line in lines]
+
+    def reading(texts: list[str]) -> Optional[str]:
+        """The YAML texts hold as one document, dumped; None if it doesn't read."""
+        data, error, _ = _read_header("".join(text + "\n" for text in texts))
+        return None if error is not None else dump_yaml(data)
+
+    was = reading(read)
+    if was is not None and reading([_option_meta(line, start, end) for line in pretty]) == was:
+        return pretty
+    return [start + text + end for text in read]
+
+
+def _option_value(cell: Cell, block: Optional[_OptionBlock], spelling: _Spelling) -> tuple[str, Optional[str]]:
+    """
+    The value spelling, one of chunk cell's options (see _option_spellings;
+    block is its option lines), gives it: as YAML text (a header's R value as
+    _r_to_yaml writes it), and as a dump of what YAML reads there, or None
+    where R's yaml package, which knitr reads option lines with, may read
+    another value than PyYAML: numbers and dates, which it reads by rules of
+    its own (7 is an integer there and 7.0 a double), and text it reads as
+    something else unquoted (see parser._R_YAML_NOT_TEXT), as y for TRUE,
+    which can't be told from a quoted string once read. Two values are one
+    when their texts are, or their dumps are and match: FALSE and false, "A"
+    and A, [a, b] and a block list of a and b.
+    """
+    if spelling.where == "pipe":
+        entry = block.entries[spelling.index]
+        written, text = entry.written, "".join(block.meta[entry.start:entry.end])
+    else:
+        written = _r_to_yaml(cell.options[spelling.index][1])
+        text = f"k: {written}\n"
+    data, error, _ = _read_header(text)
+    if error is not None or len(data) != 1:
+        # An entry that doesn't read on its own, as an alias to another key's anchor
+        return written, None
+    value = next(iter(data.values()))
+    # Each value once: aliases can share one, or hold themselves
+    seen, todo = set(), [value]
+    while todo:
+        item = todo.pop()
+        if id(item) in seen:
+            continue
+        seen.add(id(item))
+        if isinstance(item, dict):
+            todo += [part for pair in item.items() for part in pair]
+        elif isinstance(item, list):
+            todo += item
+        elif isinstance(item, TaggedScalar) or item is None or isinstance(item, bool):
+            continue
+        elif not isinstance(item, str) or _R_YAML_NOT_TEXT.fullmatch(item):
+            return written, None
+    return written, dump_yaml(value)
+
+
+def _merged_chunk(cells: list[Cell], first: int) -> tuple[list[tuple[str, str]], list[tuple[int, int, str]]]:
+    """
+    The header options and body lines of one chunk merging cells, the
+    document's chunks from first on, the lines as (cell, line number in its
+    body from 1, or 0 for an option line, text). knitr reads options only in a
+    chunk's header and in the option lines at its top, so none is lost or left
+    among code: the first chunk keeps its header and label, the others' header
+    options (not their labels) join it, and every chunk's option lines (but
+    label: and id: keys) go in one block at the top, under the first block's
+    comment characters, then the chunks' code in order, each later one's
+    without the blank line after its option lines, which knitr takes with
+    them; lines rewritten under other comment characters read as before (see
+    _restyled). An option several chunks set to one value, compared as knitr
+    reads it (see _option_value), is kept as the first of them sets it.
+    Raises for one they set to different values, for options that can't be
+    read (in a header knitr fails on, or option lines that aren't YAML), for
+    option lines of a later chunk that can't lose its label or an option set
+    again (see _pipe_edits), and if knitr would read other option lines at
+    the top of the merged chunk, also when no later chunk has options.
+    """
+    where = f"Can't merge cells {first} to {first + len(cells) - 1}"
+    language = cells[0].language
+    bodies = [[line.rstrip("\n") for line in _lines(_chunk_body(cell.source))] for cell in cells]
+    extents = [_option_extent(language, body) for body in bodies]
+    runs_on = (
+        f"{where}: knitr would read other option lines at the top of the merged chunk than the chunks' own (code "
+        "below them that starts as an option line does runs them on, and in a c, css or sas chunk whose every line "
+        "ends with */, or ; for sas, it reads the first line alone as one), so the file was left unchanged"
+    )
+    if not any(cell.options or extent for cell, extent in zip(cells[1:], extents[1:])):
+        # No other chunk has options: the lines are joined as they are, if knitr still reads the first chunk's option
+        # lines alone at their top (in a c chunk, code ending with */ runs an open /*| line on)
+        lines = [(first + k, number, line) for k, body in enumerate(bodies)
+                 for number, line in enumerate(body, start=1)]
+        extent = _option_extent(language, [line for _, _, line in lines])
+        if (extent[2] if extent else 0) != (extents[0][2] if extents[0] else 0):
+            raise RmdManagerError(runs_on)
+        return cells[0].options, lines
+    blocks = [_option_block(language, cell.source) for cell in cells]
+    for k, (cell, extent, block) in enumerate(zip(cells, extents, blocks)):
+        if len(_bare_names(cell)) > 1 or _quote_cut(cell) is not None:
+            raise RmdManagerError(
+                f"{where}: knitr fails on the chunk header of cell {first + k} (get_chunk_options says why), so its "
+                "options can't be read, and the file was left unchanged"
+            )
+        if extent and block is None:
+            raise RmdManagerError(
+                f"{where}: the option lines of cell {first + k} aren't YAML (key: value lines), so they can't be checked "
+                "against the other chunks' options, and the file was left unchanged: rewrite them as key: value lines, "
+                "or set the options with set_chunk_option, first"
+            )
+    # Each option as the first chunk to set it does, with its value (see _option_value); the spellings of a later chunk
+    # setting it again go
+    known: dict[str, tuple[int, str, tuple[str, Optional[str]]]] = {}
+    gone: list[set[tuple[str, int]]] = [set() for _ in cells]
+    for k, (cell, block) in enumerate(zip(cells, blocks)):
+        for name, spellings in _option_spellings(cell, block):
+            used = spellings[0]
+            value = _option_value(cell, block, used)
+            if name not in known:
+                known[name] = (k, used.text, value)
+                continue
+            j, text, was = known[name]
+            # One value if written alike, or read alike where R's yaml package reads it as PyYAML does
+            if value[0] != was[0] and (value[1] is None or value[1] != was[1]):
+                raise RmdManagerError(
+                    f"{where}: cell {first + j} sets option {name} as {_one_line(text)} and cell {first + k} as "
+                    f"{_one_line(used.text)}, but the merged chunk can hold one value, so the file was left unchanged: "
+                    "give them the same value with set_chunk_option, or remove one with remove_chunk_option, first"
+                )
+            gone[k].update((s.where, s.index) for s in spellings)
+    # The other headers' options join the first header, their labels (label= or a bare name) aside
+    options = list(cells[0].options) + [
+        (key, value) for k, cell in enumerate(cells[1:], start=1) for i, (key, value) in enumerate(cell.options)
+        if value and _key_name(key) != "label" and ("header", i) not in gone[k]
+    ]
+    style = next(((block.start, block.end) for block in blocks if block), None)
+    top, code, want = [], [], []
+    for k, (cell, body, extent, block) in enumerate(zip(cells, bodies, extents, blocks)):
+        lines = body[:extent[2] if extent else 0]
+        removed = set()
+        if k and block:
+            # The label of a later chunk goes, and so do the options a chunk before it sets
+            removed = {i for i, entry in enumerate(block.entries)
+                       if entry.key in ("label", "id") or ("pipe", i) in gone[k]}
+            if removed:
+                try:
+                    edits = _pipe_edits(cell, block, removed, {})
+                except RmdManagerError as e:
+                    reason = (f"they are one {block.start}... {block.end} comment over several lines, which can't be "
+                              "edited line by line" if _one_comment_over_lines(block) else
+                              "that would change how the rest of them read (for example an alias to an anchor that "
+                              "goes) or make code below them option lines")
+                    lost = " and ".join(str(block.entries[i].key) for i in sorted(removed))
+                    raise RmdManagerError(
+                        f"{where}: the merged chunk keeps the first chunk's label and one copy of each option, so the "
+                        f"option lines of cell {first + k} lose {lost}, but {reason}, so the file was left unchanged: "
+                        "rewrite them with replace_cell_source first"
+                    ) from e
+                lines = list(block.lines)
+                for start, end, text in sorted(edits, reverse=True):
+                    lines[start:end] = _lines(text)
+                lines = [line.rstrip("\n") for line in lines]
+            if (block.start, block.end) != style:
+                lines = _restyled(lines, block, *style)
+        want += [entry.key for i, entry in enumerate(block.entries if block else []) if i not in removed]
+        top += [(first + k, 0, line) for line in lines]
+        skip = len(lines) if k == 0 else _code_start(language, body)
+        code += [(first + k, number, line) for number, line in enumerate(body[skip:], start=skip + 1)]
+    # The lines gathered at the top, read with the code below them, must be the chunks' option lines, keys and all
+    texts = [line for _, _, line in top + code]
+    extent = _option_extent(language, texts)
+    after = _option_block(language, "".join(line + "\n" for line in texts))
+    broken = after is not None and _read_header("".join(after.meta))[1] is not None
+    if ((extent[2] if extent else 0) != len(top) or ([entry.key for entry in after.entries] if after else []) != want
+            or (broken and not any(_read_header("".join(block.meta))[1] for block in blocks if block))):
+        raise RmdManagerError(runs_on)
+    return options, top + code
+
+
+@_refusing_lone_surrogates
 class RmdManager:
     """
     Open, edit, and save a .rmd file. Mutations are written to disk on each
@@ -674,6 +959,8 @@ class RmdManager:
     """
 
     def __init__(self, file_path: str):
+        # Before the path is used: a lone surrogate in it can't be encoded, nor sent back in an error naming it
+        _refuse_lone_surrogates(file_path, (file_path,))
         _validate_path(file_path, must_exist=True)
         self.filepath = file_path
         # newline="": line breaks arrive as written, so _save can keep the file's own.
@@ -902,6 +1189,8 @@ class RmdManager:
         new_cell = Cell(cell_type=cell_type, source=_with_newline(source, "\n"))
         if cell_type == "code":
             _check_chunk_text(new_cell.source)
+            # knitr reads option lines only at the top of a chunk: one after other lines would be code there
+            _check_stray_option_lines(Cell(cell_type="code", source=""), new_cell.source)
         else:
             _check_prose_text(new_cell.source)
         new_cell.mark_dirty()
@@ -994,10 +1283,10 @@ class RmdManager:
                 )
             parts.append(c.source)
         if base.cell_type == "code":
-            # The other chunks' lines go under the first one's fence, where a fence line knitr read as code in its own
+            # Every chunk's options are kept where knitr reads them, the option lines at the top (see _merged_chunk). The
+            # other chunks' lines go under the first one's fence, where a fence line knitr read as code in its own
             # chunk can close the merged one or start another (see parser._chunk_stop)
-            lines = [(k, number, line.rstrip("\n")) for k in range(s, e + 1)
-                     for number, line in enumerate(_lines(_chunk_body(self.cells[k].source)), start=1)]
+            options, lines = _merged_chunk(self.cells[s:e + 1], s)
             indent = _fence_indent(base.fence)
             first = not self.frontmatter.present and all(c.cell_type == "markdown" and not c.source for c in self.cells[:s])
             texts = [f"{base.fence}{{{base.language}}}"] + [_indented(line, indent) for _, _, line in lines]
@@ -1010,8 +1299,9 @@ class RmdManager:
                     f"Can't merge cells {s} to {e}: in the merged chunk, line {number} of cell {k}, {line!r}, would be "
                     f"{what}, so the file was left unchanged"
                 )
-            # The chunks' bodies joined as they are: an empty chunk adds no line.
-            base.source = _chunk_source("".join(_chunk_body(part) for part in parts))
+            self._set_header(base, base.label, options, f"Can't merge cells {s} to {e}")
+            # An empty chunk adds no line.
+            base.source = _chunk_source("".join(line + "\n" for _, _, line in lines))
         else:
             base.source = "".join(parts)
         base.mark_dirty()
@@ -1049,7 +1339,11 @@ class RmdManager:
         cell = self.cells[idx]
         # As "\n" text, so the separator check sees "\r\n" and "\r" breaks too.
         source = _with_newline(source, "\n")
-        self._set_source(cell, _with_added(cell, source, before=False), source)
+        new_source = _with_added(cell, source, before=False)
+        if cell.cell_type == "code":
+            # knitr reads option lines only at the top of a chunk: one appended after code would be a plain comment
+            _check_appended(cell, new_source, source)
+        self._set_source(cell, new_source, source)
         return self._save()
 
     # ──────────────────────────────────────────────

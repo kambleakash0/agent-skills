@@ -89,11 +89,21 @@ class Frontmatter:
         indented block below it), it is written that way, keeping its quoting,
         comments and tags; otherwise the parsed value is written as YAML. A new
         key goes just before the closing fence. Raises FrontmatterError, leaving
-        the header unchanged, if the header can't be edited key by key.
+        the header unchanged, if the header can't be edited key by key, or if the
+        value reads with a lone UTF-16 surrogate (see _lone_surrogate).
         """
         # YAML reads "\r\n" and "\r" as "\n" too, so this keeps the value's meaning.
         value = _with_newline(value, "\n")
         parsed = _parse_yaml_value(value)
+        # A value YAML reads with a lone surrogate (from its escape) is written with that escape, which R's yaml rejects
+        surrogate = _lone_surrogate(parsed)
+        if surrogate is not None:
+            shown = key if len(key) <= 40 else key[:37] + "..."
+            raise FrontmatterError(
+                f"The value for frontmatter key {shown!r} holds U+{ord(surrogate):04X} as YAML reads it, a lone "
+                "UTF-16 surrogate, which YAML can only write as an escape that the libyaml in R's yaml package "
+                "rejects, so the file was left unchanged"
+            )
         if not self.present:
             header = "---\n" + _render_entry(_new_key_prefix(key), value, parsed) + "---\n"
             self._commit(key, _with_newline(header, self.newline), [key])
@@ -668,6 +678,20 @@ def _option_extent(language: str, lines: list[str]) -> Optional[tuple[str, str, 
     return start, end, next((i + 1 for i, c in enumerate(closed) if c), 1)
 
 
+def _option_meta(line: str, start: str, end: str) -> str:
+    """
+    The YAML knitr reads in line, one of a chunk's option lines without its
+    line break, whose lines start with start and end with end (see
+    _option_extent): the line without start, and, where it ends with end,
+    without as many characters off its end as end has, spaces after it or
+    not, as divide_chunk takes them off.
+    """
+    text = line[len(start):] if line.startswith(start) else line
+    if end and text.rstrip(_R_SPACE).endswith(end):
+        text = text[:-len(end)]
+    return text
+
+
 def _option_block(language: str, source: str) -> Optional[_OptionBlock]:
     """
     The option lines a chunk's source starts with (see _option_extent). Their
@@ -684,14 +708,7 @@ def _option_block(language: str, source: str) -> Optional[_OptionBlock]:
         return None
     start, end, count = extent
     lines = lines[:count]
-    meta = []
-    for line in lines:
-        text = line[:-1]
-        text = text[len(start):] if text.startswith(start) else text
-        if end and text.rstrip(_R_SPACE).endswith(end):
-            # divide_chunk takes as many characters off the end as the closing characters have, spaces after them or not
-            text = text[:-len(end)]
-        meta.append(text + "\n")
+    meta = [_option_meta(line[:-1], start, end) + "\n" for line in lines]
     if not _YAML_OPTIONS.match(meta[0]):
         return None
     _, _, keys = _read_header("".join(meta))
@@ -1322,6 +1339,32 @@ def _parse_yaml_value(value: str):
 
 # Every character YAML reads as a line break: "\n", "\r", NEL, U+2028 and U+2029. A new key can't hold one.
 _YAML_BREAKS = "\n\r\x85\N{LINE SEPARATOR}\N{PARAGRAPH SEPARATOR}"
+
+
+def _lone_surrogate(value) -> Optional[str]:
+    """
+    The first lone UTF-16 surrogate in value, a value as YAML reads it (its
+    strings, keys and tagged scalars at any depth), or None. A \\u escape in a
+    double-quoted string reads as the one character it names, so the escape
+    of either half of a surrogate pair reads as a lone one. Each value is
+    looked at once, so aliases that share one, or hold themselves, cost no
+    more than it does.
+    """
+    seen, todo = set(), [value]
+    while todo:
+        item = todo.pop()
+        if id(item) in seen:
+            continue
+        seen.add(id(item))
+        if isinstance(item, str):
+            found = next((c for c in item if 0xD800 <= ord(c) <= 0xDFFF), None)
+            if found is not None:
+                return found
+        elif isinstance(item, dict):
+            todo.extend(reversed([part for pair in item.items() for part in pair]))
+        elif isinstance(item, (list, tuple, set, frozenset)):
+            todo.extend(reversed(list(item)))
+    return None
 
 
 def _new_key_prefix(key: str) -> str:
