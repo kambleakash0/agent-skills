@@ -1,6 +1,6 @@
 [project]
 name = "rmd-editor-mcp"
-version = "1.4.1"
+version = "1.5.0"
 description = "MCP Server for editing R Markdown (.rmd) documents with chunk-level operations and R kernel execution"
 requires-python = ">=3.10"
 dependencies = [
